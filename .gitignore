@@ -9,3 +9,8 @@ dist
 coverage
 playwright-report
 test-results
+
+# jev sidecar runtime
+scripts/__pycache__/
+scripts/jev-sidecar-spend.json
+scripts/jev-sidecar-watchdog.log
