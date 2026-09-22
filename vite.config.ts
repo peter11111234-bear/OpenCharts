@@ -45,6 +45,20 @@ export default defineConfig({
         target: "ws://localhost:3000",
         ws: true,
       },
+      // Local shioaji server (行情/下單 Key 都在 server 端，前端不碰).
+      // NOTE: vite proxy keeps the matched prefix — strip it, the server
+      // only serves /api/... (without it salvo answers 405).
+      "/shioaji": {
+        target: "http://127.0.0.1:8080",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/shioaji/, ""),
+      },
+      // Jev decision sidecar (OPENROUTER_API_KEY 只在 server 端).
+      "/jev": {
+        target: "http://127.0.0.1:8787",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/jev/, ""),
+      },
     },
   },
 });
