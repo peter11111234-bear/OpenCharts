@@ -15,3 +15,16 @@ scripts/__pycache__/
 scripts/jev-sidecar-spend.json
 scripts/jev-sidecar-watchdog.log
 scripts/golden/*.actual.json
+
+# runtime artifacts
+logs/
+.bench/
+vite-restart.log
+scripts/watchdog.log
+scripts/scratch/
+scripts/qa_cov_*.json
+scripts/qa_cov_*.txt
+scripts/qa_cov_*.err
+dev/null
+scripts/__pycache__/
+scripts/hotscan/__pycache__/
