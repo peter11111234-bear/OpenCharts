@@ -15,7 +15,7 @@ import type {
   PreparedScript,
   ScriptingEngine,
 } from '@luxalgo/vela';
-import type { BarData, PlotOpts, RunResult, Value } from './contracts';
+import type { BarData, DrawObj, PlotOpts, RunResult, Value } from './contracts';
 import { parse } from './parser';
 import { collectInputs, runScript } from './interpreter';
 import './builtins/index';
@@ -241,45 +241,70 @@ export class PineInterpreterEngine implements ScriptingEngine {
     // when the bars snapshot is a partial history (backfill in progress).
     let deferred = req.historyState === 'backfill';
 
-    const run = async (bars: OHLCV[]) => {
-      const myRun = ++runId;
-      try {
-        const barData = toBarData(bars);
-        const barTimes = barData.map(b => b.openTime);
-        const result: RunResult = await runScript(parse(token.source), barData, {
-          symbol: req.market.symbol,
-          timeframe: req.market.timeframe,
-          fetchSeries: toFetch(req.fetchSeries, bars),
-          inputValues: { ...inputs },
-          syminfo: req.market.symbolInfo ? syminfoOf(req.market.symbolInfo) : undefined,
-        });
-        if (stopped || myRun !== runId) return;
-        handlers.onModel(buildModel(token.modelId, req, result, barTimes, inputs));
-        for (const w of result.warnings) handlers.onWarning?.({ message: w, bar: bars.length - 1 });
-        for (const a of result.alerts) {
-          handlers.onAlert?.({ id: a.id, message: a.msg, time: bars[bars.length - 1]?.time ?? 0, barIndex: bars.length - 1 });
+    // Single-flight + coalescing: at most one run in flight per session; if a
+    // re-run is requested while one is executing, only the LATEST request is
+    // kept (superseded ones are dropped before they even queue on the global
+    // runScript mutex). The in-flight run always finishes — aborting mid-run
+    // under a live tick stream would starve completion forever.
+    let running = false;
+    let pending: OHLCV[] | null = null;
+    const request = (bars: OHLCV[]) => {
+      if (stopped) return;
+      pending = bars;
+      if (!running) void drain();
+    };
+    const drain = async () => {
+      running = true;
+      while (pending && !stopped) {
+        const bars = pending;
+        pending = null;
+        const myRun = ++runId;
+        try {
+          const barData = toBarData(bars);
+          const barTimes = barData.map(b => b.openTime);
+          const result: RunResult = await runScript(parse(token.source), barData, {
+            symbol: req.market.symbol,
+            timeframe: req.market.timeframe,
+            fetchSeries: toFetch(req.fetchSeries, bars),
+            inputValues: { ...inputs },
+            syminfo: req.market.symbolInfo ? syminfoOf(req.market.symbolInfo) : undefined,
+            // stopped kills the run at its next yield; a superseded run keeps
+            // running (it holds the queue anyway) — its result is discarded
+            // by the myRun check below.
+            shouldAbort: () => stopped,
+          });
+          if (stopped || myRun !== runId) continue;
+          handlers.onModel(buildModel(token.modelId, req, result, barTimes, inputs));
+          for (const w of result.warnings) handlers.onWarning?.({ message: w, bar: bars.length - 1 });
+          for (const a of result.alerts) {
+            handlers.onAlert?.({ id: a.id, message: a.msg, time: bars[bars.length - 1]?.time ?? 0, barIndex: bars.length - 1 });
+          }
+          handlers.onDone?.();
+        } catch (e) {
+          if (stopped || myRun !== runId) continue;
+          handlers.onError?.(e instanceof Error ? e : new Error(String(e)));
         }
-        handlers.onDone?.();
-      } catch (e) {
-        if (stopped || myRun !== runId) return;
-        handlers.onError?.(e instanceof Error ? e : new Error(String(e)));
       }
+      running = false;
+      // A request may have arrived between the while-check and the flag
+      // flip — re-drain so it isn't stranded.
+      if (pending && !stopped) void drain();
     };
 
     const getBars = () => req.getBars?.() ?? req.bars;
-    if (!deferred) void run(getBars());
+    if (!deferred) request(getBars());
 
     return {
-      stop: () => { stopped = true; runId++; },
+      stop: () => { stopped = true; runId++; pending = null; },
       update: (next: Record<string, InputValue>) => {
         inputs = { ...inputs, ...next };
-        if (!deferred) void run(getBars());
+        if (!deferred) request(getBars());
       },
       setVisibleRange: () => { /* interpreter has no viewport builtins */ },
       notifyBars: (reason) => {
         if (reason === 'backfill') return; // partial history — wait for 'complete'/tick
         if (reason === 'complete') deferred = false;
-        if (!deferred) void run(getBars());
+        if (!deferred) request(getBars());
       },
     };
   }
@@ -319,6 +344,33 @@ type ModelBox = NonNullable<IndicatorModel['boxes']>[number];
 type ModelLabel = NonNullable<IndicatorModel['labels']>[number];
 type ModelBg = NonNullable<IndicatorModel['backgrounds']>[number];
 
+type ModelTable = NonNullable<IndicatorModel['tables']>[number];
+type ModelTableCell = ModelTable['cells'][number][number];
+type ModelPolyline = NonNullable<IndicatorModel['polylines']>[number];
+type ModelLinefill = NonNullable<IndicatorModel['linefills']>[number];
+
+/** line DrawObj props → DrawingLine (shared by the `lines` list and embedded
+ *  linefill legs — a linefill's endpoints must render identically). */
+const mapDrawingLine = (p: Record<string, unknown>, id: string): ModelLine | undefined => {
+  const x1 = propNum(p, 'x1'), y1 = propNum(p, 'y1');
+  const x2 = propNum(p, 'x2'), y2 = propNum(p, 'y2');
+  if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined) return undefined;
+  const styleStr = (propStr(p, 'style') ?? '').toLowerCase();
+  return {
+    id, paneId: '',
+    xloc: xlocOf(propStr(p, 'xloc')),
+    x1, y1, x2, y2,
+    extend: extendOf(propStr(p, 'extend')),
+    color: propStr(p, 'color'),
+    invisible: propStr(p, 'color') === undefined,
+    width: Math.max(1, propNum(p, 'width') ?? 1),
+    style: styleOf(propStr(p, 'style')),
+    arrowLeft: styleStr.includes('arrow_left') || styleStr.includes('arrow_both'),
+    arrowRight: styleStr.includes('arrow_right') || styleStr.includes('arrow_both'),
+  };
+};
+
+
 /** Exported for tests — maps an interpreter RunResult onto the Vela model. */
 export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult, barTimes: number[], inputOverrides?: Record<string, InputValue>): IndicatorModel => {
   const series: IndicatorModel['series'] = [];
@@ -329,9 +381,17 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
   const boxes: ModelBox[] = [];
   const labels: ModelLabel[] = [];
   const barColors: NonNullable<IndicatorModel['barColors']> = [];
+  const tables: ModelTable[] = [];
+  const polylines: ModelPolyline[] = [];
+  const linefills: ModelLinefill[] = [];
 
   // plot-sink index → emitted series id (fill() references these indexes).
   const plotSeriesId = new Map<number, string>();
+
+  // Sink indexes referenced by fill() — an hline referenced here also needs a
+  // hidden flat series so the fill band has geometry to anchor to.
+  const fillRefs = new Set<number>();
+  for (const f of r.fills ?? []) { fillRefs.add(f.plot1); fillRefs.add(f.plot2); }
 
   const hlineIdx = new Set<number>();
   for (const [title, plot] of r.plots) {
@@ -341,6 +401,20 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
 
     if (style === 'hline') {
       hlineIdx.add(plot.index);
+      if (fillRefs.has(plot.index)) {
+        // Hidden constant series — `visible: false` anchors fills without painting
+        // (the priceLine below is the visible line). Kept even under display.none.
+        const points = plot.values.map((v, i) => ({
+          time: plot.time[i] ?? barTimes[i] ?? 0,
+          value: numOf(v),
+        }));
+        plotSeriesId.set(plot.index, id);
+        series.push({
+          id, title, paneId: '', kind: 'line',
+          points, style: { color: opts.color ?? '#2962FF', width: opts.linewidth ?? 1, lineStyle: 'solid' as const },
+          visible: false,
+        });
+      }
       // display.none → drop the priceLine entirely (PriceLine has no visibility field).
       if (opts.display === 'display.none') continue;
       const price = numOf(plot.values[plot.values.length - 1]!);
@@ -363,7 +437,7 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
           time: plot.time[p.i] ?? barTimes[p.i] ?? 0,
           position: markerPosOf(String(opts.location ?? '')),
           shape: isChar ? 'none' : markerShape(String((opts.marker as string | undefined) ?? 'shape.xcross')),
-          color: opts.color ?? '#2962FF',
+          color: plot.colors[p.i] ?? opts.color ?? '#2962FF',
           text: typeof opts.text === 'string' && opts.text !== ''
             ? opts.text
             : (typeof opts.char === 'string' && opts.char !== '' ? opts.char : undefined),
@@ -384,7 +458,7 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
           time: plot.time[p.i] ?? barTimes[p.i] ?? 0,
           position: (p.v! > 0 ? 'belowBar' : 'aboveBar') as 'belowBar' | 'aboveBar',
           shape: (p.v! > 0 ? 'arrowUp' : 'arrowDown') as 'arrowUp' | 'arrowDown',
-          color: opts.color ?? '#2962FF',
+          color: plot.colors[p.i] ?? opts.color ?? '#2962FF',
         }));
       if (markers.length > 0) {
         plotSeriesId.set(plot.index, id);
@@ -416,6 +490,8 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
     const points = plot.values.map((v, i) => ({
       time: plot.time[i] ?? barTimes[i] ?? 0,
       value: numOf(v),
+      // Per-bar `color=` (conditional colors) — SeriesPoint.color override.
+      color: plot.colors[i],
     }));
     plotSeriesId.set(plot.index, id);
     series.push({
@@ -433,7 +509,7 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
     const toSeriesId = plotSeriesId.get(f.plot2);
     if (!fromSeriesId || !toSeriesId) {
       if (hlineIdx.has(f.plot1) || hlineIdx.has(f.plot2))
-        r.warnings.push(`fill() between hline plots not rendered — hline↔hline fills not yet supported (plot ${f.plot1}→${f.plot2})`);
+        r.warnings.push(`fill() references an hline with no series geometry (plot ${f.plot1}→${f.plot2})`);
       continue;
     }
     const key = `${fromSeriesId}|${toSeriesId}`;
@@ -492,23 +568,10 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
   for (const d of r.drawings) {
     const p = d.props;
     const did = `${modelId}:d${d.id}`;
+
     if (d.kind === 'line') {
-      const x1 = propNum(p, 'x1'), y1 = propNum(p, 'y1');
-      const x2 = propNum(p, 'x2'), y2 = propNum(p, 'y2');
-      if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined) continue;
-      const styleStr = (propStr(p, 'style') ?? '').toLowerCase();
-      lines.push({
-        id: did, paneId: '',
-        xloc: xlocOf(propStr(p, 'xloc')),
-        x1, y1, x2, y2,
-        extend: extendOf(propStr(p, 'extend')),
-        color: propStr(p, 'color'),
-        invisible: propStr(p, 'color') === undefined,
-        width: Math.max(1, propNum(p, 'width') ?? 1),
-        style: styleOf(propStr(p, 'style')),
-        arrowLeft: styleStr.includes('arrow_left') || styleStr.includes('arrow_both'),
-        arrowRight: styleStr.includes('arrow_right') || styleStr.includes('arrow_both'),
-      });
+      const l = mapDrawingLine(p, did);
+      if (l) lines.push(l);
     } else if (d.kind === 'label') {
       const x = propNum(p, 'x');
       if (x === undefined) continue;
@@ -555,9 +618,86 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
         bold: false,
         italic: false,
       });
+    } else if (d.kind === 'table') {
+      // props.cells is a live Map<'col,row', CellProps> — serialize to the
+      // row-major grid Vela's DrawingTable expects.
+      const cols = Math.max(0, propNum(p, 'columns') ?? 1);
+      const rows = Math.max(0, propNum(p, 'rows') ?? 1);
+      const posRaw = (propStr(p, 'position') ?? 'position.top_center').split('.').pop() ?? 'top_center';
+      const position = (['top_left', 'top_center', 'top_right', 'middle_left', 'middle_center', 'middle_right', 'bottom_left', 'bottom_center', 'bottom_right'] as const)
+        .includes(posRaw as 'top_left') ? (posRaw as ModelTable['position']) : 'top_center';
+      const cells: ModelTableCell[][] = Array.from({ length: rows }, () => new Array<ModelTableCell>(cols).fill(null));
+      const cellMap = p['cells'];
+      if (cellMap instanceof Map) {
+        for (const [key, cell] of cellMap as Map<string, Record<string, unknown>>) {
+          const [colRaw, rowRaw] = key.split(',').map(Number);
+          const col = colRaw ?? NaN, row = rowRaw ?? NaN;
+          if (!Number.isInteger(col) || !Number.isInteger(row)
+            || col < 0 || col >= cols || row < 0 || row >= rows) continue;
+          const rawSize = propStr(cell, 'text_size');
+          const sizeNum = rawSize !== undefined && !rawSize.startsWith('size.') ? Number(rawSize) : NaN;
+          cells[row]![col] = {
+            text: propStr(cell, 'text'),
+            textColor: propStr(cell, 'text_color'),
+            bgColor: propStr(cell, 'bgcolor'),
+            hAlign: alignOf(propStr(cell, 'text_halign')),
+            vAlign: valignOf(propStr(cell, 'text_valign')),
+            // numeric text_size = raw pixels; named sizes map via textSizeOf.
+            textSize: Number.isFinite(sizeNum) ? sizeNum : textSizeOf(rawSize),
+            fontFamily: 'default',
+            tooltip: propStr(cell, 'tooltip'),
+            width: propNum(cell, 'width'),
+            height: propNum(cell, 'height'),
+            bold: false,
+            italic: false,
+          };
+        }
+      }
+      const merges = (p['merges'] as { c1: number; r1: number; c2: number; r2: number }[] | undefined)
+        ?.map(m => ({ startCol: m.c1, startRow: m.r1, endCol: m.c2, endRow: m.r2 })) ?? [];
+      tables.push({
+        id: did, paneId: '',
+        position,
+        columns: cols, rows,
+        bgColor: propStr(p, 'bgcolor'),
+        frameColor: propStr(p, 'frame_color'),
+        frameWidth: Math.max(0, propNum(p, 'frame_width') ?? 0),
+        borderColor: propStr(p, 'border_color'),
+        borderWidth: Math.max(0, propNum(p, 'border_width') ?? 0),
+        cells,
+        merges,
+      });
+    } else if (d.kind === 'polyline') {
+      const pts = (p['points'] as { x: number; y: number }[] | undefined) ?? [];
+      if (pts.length === 0) continue;
+      const xloc = xlocOf(propStr(p, 'xloc'));
+      const styleStr = (propStr(p, 'line_style') ?? '').toLowerCase();
+      polylines.push({
+        id: did, paneId: '',
+        points: pts.map(pt => ({ xloc, x: pt.x, price: pt.y })),
+        curved: p['curved'] === true,
+        closed: p['closed'] === true,
+        lineColor: propStr(p, 'line_color'),
+        fillColor: propStr(p, 'fill_color'),
+        lineWidth: Math.max(1, propNum(p, 'line_width') ?? 1),
+        lineStyle: styleOf(propStr(p, 'line_style')),
+        arrowLeft: styleStr.includes('arrow_left') || styleStr.includes('arrow_both'),
+        arrowRight: styleStr.includes('arrow_right') || styleStr.includes('arrow_both'),
+        overlay: p['force_overlay'] === true ? true : undefined,
+      });
+    } else if (d.kind === 'linefill') {
+      // props.line1/line2 hold the live line DrawObjs — endpoint edits made
+      // after linefill.new (line.set_xy1 …) are already reflected.
+      const l1 = mapDrawingLine((p['line1'] as DrawObj | undefined)?.props ?? {}, `${did}:l1`);
+      const l2 = mapDrawingLine((p['line2'] as DrawObj | undefined)?.props ?? {}, `${did}:l2`);
+      if (!l1 || !l2) continue;
+      linefills.push({
+        id: did, paneId: '',
+        line1: l1, line2: l2,
+        color: propStr(p, 'color'),
+        overlay: p['force_overlay'] === true ? true : undefined,
+      });
     }
-    // tables/polylines: not yet mapped — the DrawingTable cell map is a Map,
-    // which needs a serialization pass before it can render.
   }
 
   return {
@@ -573,6 +713,9 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
     lines: lines.length > 0 ? lines : undefined,
     boxes: boxes.length > 0 ? boxes : undefined,
     labels: labels.length > 0 ? labels : undefined,
+    tables: tables.length > 0 ? tables : undefined,
+    polylines: polylines.length > 0 ? polylines : undefined,
+    linefills: linefills.length > 0 ? linefills : undefined,
     barColors: barColors.length > 0 ? barColors : undefined,
     trades: (r.execs && r.execs.length > 0)
       ? r.execs

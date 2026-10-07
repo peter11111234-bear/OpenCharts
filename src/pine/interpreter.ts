@@ -50,11 +50,11 @@ import {
 } from './contracts';
 import { PineRuntimeError, pineErr, wrapPineError } from './errors';
 import { FOR_IN } from './parser';
-import { BarSeries, histGetAt, valueAt } from './series';
+import { BarSeries, ForwardingSeries, histGetAt, valueAt } from './series';
 import { Scope, blockFrame, seriesOf, type Frame } from './scope';
 import { BarCtx, MemoryDrawSink } from './context';
 import { BUILTINS, getConstant, registerConstant } from './builtins/registry';
-import { truthy, type RtCtx } from './builtins/util';
+import { truthy, drainBindWarnings, type RtCtx } from './builtins/util';
 import { declDrawQuotas, INDICATOR_DECL_ORDER } from './builtins/draw';
 import { strategyDecl, execsAt } from './builtins/strategy';
 import {
@@ -119,11 +119,12 @@ interface RunState {
   callsiteSeq: number;
   /** Stack of active callsite ids (UDF nesting). Empty = top level. */
   siteStack: string[];
-  /** Decl node → numeric id (for composite slot keys). */
   nodeIds: Map<object, number>;
   nodeSeq: number;
   /** `nodeId|sitePath` → stable key object for declSlots/callHist/tupleKeys. */
   keyCache: Map<string, object>;
+  /** Stack-path object ids — siteKey composes them without string building. */
+  siteIds: Map<string, object>;
   warned: Set<string>;
   /** Top-level frame of the current bar (ctx.callUdf re-enters here). */
   topFrame: Frame | null;
@@ -150,6 +151,7 @@ function runOf(ctx: BuiltinCtx): RunState {
       nodeIds: new Map(),
       nodeSeq: 0,
       keyCache: new Map(),
+      siteIds: new Map(),
       warned: new Set(),
       topFrame: null,
       misc: new Map(),
@@ -192,7 +194,7 @@ function unseriesTruth(v: Value): boolean {
  * materializes a private BarSeries copy of the caller's recorded history, so
  * writes stay local to the call — Pine `param :=` rebinds a local.
  */
-class CowSeries extends BarSeries {
+class CowSeries extends ForwardingSeries {
   private cow: BarSeries | null = null;
 
   private inner: Series;
@@ -202,16 +204,25 @@ class CowSeries extends BarSeries {
     this.inner = inner;
   }
 
+  override readTarget(): Series {
+    return this.cow ?? this.inner;
+  }
+
   /** Re-point at the caller's (possibly new) slot at the next bar —
    *  keeps the materialized local copy (post-`:=` history) intact. */
   rebind(inner: Series): void { this.inner = inner; }
+
+  /** Re-seed the current bar's slot with the arg value — Pine re-binds params
+   *  every invocation, so a carried-forward `:=` value must not leak into the
+   *  next bar's reads. No-op until a write materialized the local copy. */
+  seed(v: Value, bar: number): void {
+    if (this.cow) this.cow.setAt(bar, v);
+  }
 
   /** Materialize the private copy, mapping `inner`'s history onto bar indexes. */
   private writable(bar: number): BarSeries {
     if (this.cow) return this.cow;
     const src = this.inner;
-    // BarSeries: anchor at its lastBar; plain Series: `set()` order → anchor
-    // the newest entry at the current bar.
     const base = src instanceof BarSeries ? src.currentBar : Math.max(bar, 0);
     const copy = new BarSeries();
     for (let b = 0; b <= base; b++) copy.setAt(b, histGetAt(src, base - b, base));
@@ -283,9 +294,11 @@ function siteKey(run: RunState, node: object): object {
   if (run.siteStack.length === 0) return node;
   let id = run.nodeIds.get(node);
   if (id === undefined) { id = run.nodeSeq++; run.nodeIds.set(node, id); }
-  const k = `${id}|${run.siteStack.join(',')}`;
-  let key = run.keyCache.get(k);
-  if (!key) { key = { k }; run.keyCache.set(k, key); }
+  const sp = run.siteStack.join('|');
+  let path = run.siteIds.get(sp) as Map<number, object> | undefined;
+  if (path === undefined) { path = new Map(); run.siteIds.set(sp, path); }
+  let key = path.get(id);
+  if (!key) { key = {}; path.set(id, key); }
   return key;
 }
 
@@ -455,14 +468,37 @@ function evalNode(node: Node, frame: Frame): Value {
     }
 
     case 'tuple': {
-      const v = evalExpr(node.value, frame);
-      const items =
-        v.kind === 'array' ? v.v : v.kind === 'matrix' ? v.v.flat() : [v];
       let keys = run.tupleKeys.get(siteKey(run, node) as Node);
       if (!keys) {
         keys = new Map();
         run.tupleKeys.set(siteKey(run, node) as Node, keys);
       }
+      if (node.var) {
+        // `var [a,b] = f()`: evaluate + bind on the first execution
+        // only; later executions re-bind the names to their persistent
+        // slots (ensureBar carry-forward supplies `x[1]` history),
+        // matching scalar `var x = e`.
+        const fresh = node.names.some(n => {
+          const k = keys!.get(n);
+          return k === undefined || !run.declSlots.has(k);
+        });
+        if (!fresh) {
+          const carried: Value[] = [];
+          for (const name of node.names) {
+            const s = run.declSlots.get(keys!.get(name)!);
+            if (s) {
+              scope.define(name, s);
+              carried.push(valueAt(s, bar));
+            } else {
+              carried.push(NA);
+            }
+          }
+          return { kind: 'array', v: carried };
+        }
+      }
+      const v = evalExpr(node.value, frame);
+      const items =
+        v.kind === 'array' ? v.v : v.kind === 'matrix' ? v.v.flat() : [v];
       node.names.forEach((name, i) => {
         let k = keys!.get(name);
         if (!k) {
@@ -856,17 +892,28 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
   }
 
   // `ns.fn(...)` — builtin namespace call when `ns` isn't a bound var.
-  if (
-    callee.type === 'member' &&
-    !callee.computed &&
-    callee.obj.type === 'ident' &&
-    scope.lookup(callee.obj.name) === undefined
-  ) {
-    const b = BUILTINS.get(`${callee.obj.name}.${callee.prop}`);
-    if (b) return invokeBuiltin(b, node, frame);
+  // Deeper chains (chart.point.new, request.security_lower_tf, …) flatten to
+  // a dotted key; a scope-bound receiver stops the flattening (it's a real
+  // object method, not a namespace path).
+  if (callee.type === 'member' && !callee.computed) {
+    const parts: string[] = [callee.prop];
+    let head: Node = callee.obj;
+    while (head.type === 'member' && !head.computed) {
+      parts.unshift(head.prop);
+      head = head.obj;
+    }
+    if (head.type === 'ident' && scope.lookup(head.name) === undefined) {
+      parts.unshift(head.name);
+      const b = BUILTINS.get(parts.join('.'));
+      if (b) return invokeBuiltin(b, node, frame);
+    }
   }
 
-  // `obj.method(...)` — UDT method first, then `<kind>.<method>` builtin.
+  // `obj.method(...)` — UDT receivers own their type, so user
+  // methods dispatch first. Builtin receivers keep `<kind>.<method>`
+  // builtins ahead of user methods: a `method push(array self, …)`
+  // must never shadow array.push — user methods extend builtin
+  // types with new names only.
   if (callee.type === 'member' && !callee.computed) {
     const obj = evalExpr(callee.obj, frame);
     const prop = callee.prop;
@@ -877,6 +924,17 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
         return callUdtMethod(obj.v, prop, bound, ctx);
       }
     } else {
+      const b = BUILTINS.get(`${obj.kind}.${prop}`);
+      if (b) {
+        const args: Value[] = [obj];
+        const named: Record<string, Value> = {};
+        for (const a of node.args) {
+          const v = evalArg(a, frame);
+          if (a.name) named[a.name] = v;
+          else args.push(v);
+        }
+        return callBuiltin(b, ctx, args, named, node);
+      }
       const prim = getUdtMethod(obj.kind, prop);
       if (prim) {
         const bound = bindCallArgs(node.args, prim.params.slice(1), frame);
@@ -885,17 +943,6 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
     }
     // Pine propagates na through member access — a method on na is a no-op.
     if (obj.kind === 'na') return NA;
-    const b = BUILTINS.get(`${obj.kind}.${prop}`);
-    if (b) {
-      const args: Value[] = [obj];
-      const named: Record<string, Value> = {};
-      for (const a of node.args) {
-        const v = evalArg(a, frame);
-        if (a.name) named[a.name] = v;
-        else args.push(v);
-      }
-      return callBuiltin(b, ctx, args, named, node);
-    }
     warn(run, ctx, `no method '${prop}' on ${obj.kind}`);
     return NA;
   }
@@ -950,7 +997,13 @@ function callBuiltin(
   node: Call,
 ): Value {
   try {
-    return b(ctx, args, named);
+    const r = b(ctx, args, named);
+    // Flush arg-binding warnings (e.g. `source=`+`series=` both given) now
+    // that a ctx is reachable; dedup so a per-bar builtin warns once.
+    for (const w of drainBindWarnings()) {
+      if (!ctx.warnings.includes(w)) ctx.warnings.push(w);
+    }
+    return r;
   } catch (e) {
     if (e === BREAK || e === CONTINUE || e instanceof ReturnSignal) throw e;
     throw wrapPineError(e, node);
@@ -1044,9 +1097,17 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
         let cow = byParam.get(p.name) as CowSeries | undefined;
         if (!cow) { cow = new CowSeries(a.v); byParam.set(p.name, cow); }
         else cow.rebind(a.v);
+        // Pine re-binds params each invocation: seed this bar's slot with the
+        // arg's current value so a previous bar's `:=` doesn't carry forward
+        // into this bar's reads (history stays bumped).
+        cow.seed(a.v.cur(), bar);
         callScope.define(p.name, cow);
       } else {
-        callScope.define(p.name, a.v instanceof CowSeries ? a.v : new CowSeries(a.v));
+        // No callNode (method dispatch via ctx.callUdf): seed a
+        // fresh CowSeries even when the arg is already one — the
+        // callee's `:=` must materialize a private copy, never
+        // write through into the caller's param series.
+        callScope.define(p.name, new CowSeries(a.v));
       }
     } else {
       const s = new BarSeries();
@@ -1077,15 +1138,19 @@ function evalReassign(node: Reassign, frame: Frame): Value {
   const t = node.target;
 
   if (t.type === 'ident') {
+    // `:=` requires a previously-declared name — resolve BEFORE evaluating the
+    // RHS so `x := x[1]+1` on an undeclared x errors (TV: "Cannot use x before
+    // declaration") instead of warning "identifier not found" mid-RHS.
+    const slot = scope.lookup(t.name);
+    if (slot === undefined) {
+      throw pineErr(node, `cannot reassign undeclared variable '${t.name}'`);
+    }
     const raw = evalExpr(node.value, frame);
     const v = unseries(raw);
-    const s = seriesOf(scope, t.name);
-    if (s instanceof BarSeries) {
-      s.setAt(bar, v);
-    } else if (s instanceof Series) {
-      s.set(v);
-    } else if (scope.lookup(t.name) === undefined) {
-      throw pineErr(node, `cannot reassign undeclared variable '${t.name}'`);
+    if (slot instanceof BarSeries) {
+      slot.setAt(bar, v);
+    } else if (slot instanceof Series) {
+      slot.set(v);
     } else {
       throw pineErr(node, `'${t.name}' is not a mutable variable`);
     }
@@ -1282,13 +1347,66 @@ export interface RunOptions {
   /** input.* overrides keyed by title or id. */
   inputValues?: Record<string, unknown>;
   syminfo?: Record<string, Value>;
+  /** Called at each macrotask yield during the bar loop; truthy = caller superseded this run, bail out. */
+  shouldAbort?: () => boolean;
 }
 
 export type ParsedInput =
   | Node[]
   | { decl?: IndicatorDecl | StrategyDecl | null; body: Node[] };
 
-export async function runScript(
+
+// Macrotask yield without setTimeout's 4ms clamp — MessageChannel ports are
+// available in browsers, Node, and workers. Keeps the UI responsive during
+// long bar loops while preserving per-run sequential semantics (a second
+// runScript only interleaves if the first one yields; engine callers pair
+// this with shouldAbort so a superseded run dies at its next yield).
+// Macrotask yield without setTimeout's 4ms clamp. MessageChannel requires the
+// onmessage PROPERTY to start the port — addEventListener alone leaves it
+// suspended in some environments (observed: headless Chromium never delivers).
+// One fixed onmessage serves a FIFO queue so concurrent yield callers can't
+// clobber each other's listener.
+let _yieldChannel: MessageChannel | null = null;
+const _yieldQueue: (() => void)[] = [];
+/** Diagnostics: per-run yield hop count + worst wait. */
+export const yieldStats = { hops: 0, maxWait: 0 };
+const yieldTask = (): Promise<void> => {
+  if (typeof MessageChannel === 'undefined') {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 0);
+    return promise;
+  }
+  if (!_yieldChannel) {
+    _yieldChannel = new MessageChannel();
+    _yieldChannel.port1.onmessage = () => _yieldQueue.shift()?.();
+  }
+  const t0 = nowMs();
+  const { promise, resolve } = Promise.withResolvers<void>();
+  _yieldQueue.push(() => {
+    const w = nowMs() - t0;
+    yieldStats.hops++;
+    if (w > yieldStats.maxWait) yieldStats.maxWait = w;
+    resolve();
+  });
+  _yieldChannel.port2.postMessage(null);
+  return promise;
+};
+const nowMs = typeof performance !== 'undefined' ? () => performance.now() : Date.now;
+// Serialize runScript executions — module state (UDT_REGISTRY, bindWarnQ,
+// warn dedup) is per-run; interleaving two live runs (possible now that the
+// bar loop yields) corrupts it. Queue in call order.
+let runScriptTail: Promise<void> = Promise.resolve();
+export function runScript(
+  parsed: ParsedInput,
+  bars: BarData[],
+  opts: RunOptions = {},
+): Promise<RunResult> {
+  const p = runScriptTail.then(() => runScriptInner(parsed, bars, opts));
+  runScriptTail = p.then(() => {}, () => {});
+  return p;
+}
+
+async function runScriptInner(
   parsed: ParsedInput,
   bars: BarData[],
   opts: RunOptions = {},
@@ -1307,6 +1425,7 @@ export async function runScript(
     bgcolors: new Map(),
     barcolors: new Map(),
     alerts: [],
+    alertconditions: [],
     warnings: [],
     inputs: collectInputs(body),
     props: declProps(decl),
@@ -1342,10 +1461,13 @@ export async function runScript(
   ctx.liveLabels = [];
   ctx.liveBoxes = [];
   ctx.liveTables = [];
+  ctx.livePolylines = [];
+  ctx.liveLinefills = [];
   ctx.bgcolors = new Map();
   ctx.barcolors = new Map();
   ctx.alertstate = new Map();
   ctx.fills = [];
+  ctx.fillSites = new Map();
   ctx.state = new Map();
 
   const run = runOf(ctx);
@@ -1390,11 +1512,14 @@ export async function runScript(
   // MTF pre-pass: collect security specs; resolve unique (sym,tf) fetches.
   if (mtf) {
     mtf.prepareSecurity(body, frame0);
+    (globalThis as Record<string, unknown>).__pineStage = 'prefetch';
     await mtf.prefetchSecurity(ctx, frame0, bars);
+    (globalThis as Record<string, unknown>).__pineStage = 'barloop';
   }
 
   // ── bar loop ──
   let barErr: PineRuntimeError | null = null;
+  let sliceStart = nowMs();
   for (let bar = 0; bar < bars.length; bar++) {
     if (bar > 0) barCtx.seek(bar);
     try {
@@ -1411,11 +1536,21 @@ export async function runScript(
     }
     // Densify every slot to `bar` (carry-forward for skipped statements).
     for (const s of run.allSeries) s.ensureBar(bar);
+    // Yield to the event loop when one bar batch has hogged >16ms so input,
+    // paint, and pending fetch callbacks can run. Fast bars (most scripts)
+    // amortize this to a near-zero-cost time check.
+    if (nowMs() - sliceStart > 16) {
+      await yieldTask();
+      sliceStart = nowMs();
+      if (opts.shouldAbort?.()) return empty();
+    }
   }
+  (globalThis as Record<string, unknown>).__pineStage = 'assemble';
+  if (opts.shouldAbort?.()) return empty();
   if (barErr) throw barErr;
 
   // ── assemble RunResult ──
-  const plots = new Map<string, { index: number; time: number[]; values: Value[]; opts: PlotOpts }>();
+  const plots: RunResult['plots'] = new Map();
   // Extrapolate off-range times by average bar duration, never bare indexes.
   const barDur = bars.length > 1
     ? (bars[bars.length - 1]!.openTime - bars[0]!.openTime) / (bars.length - 1)
@@ -1442,6 +1577,7 @@ export async function runScript(
       time: buf.map((p, i) => timeAt((p.barIndex ?? i) + offset)),
       values: buf.map(p => p.value),
       opts: buf[buf.length - 1]!.opts,
+      colors: buf.map(p => p.opts.color),
     });
   });
 
@@ -1453,6 +1589,7 @@ export async function runScript(
     barcolors: new Map(ctx.barcolors ?? []),
     execs: execsAt(ctx, ctx.barIndex),
     alerts: ctx.alerts.slice(),
+    alertconditions: (ctx.alertconditions ?? []).slice(),
     warnings: ctx.warnings.slice(),
     inputs: ctx.inputSchemas && ctx.inputSchemas.length > 0 ? ctx.inputSchemas : collectInputs(body),
     props: declProps(decl),
