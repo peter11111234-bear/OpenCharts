@@ -151,25 +151,31 @@ function mountIndicatorCountBadge(ws: VelaWorkspace, cell: ChartCell): void {
     "position:absolute;top:0;left:0;z-index:6;pointer-events:none;" +
     "background:#f9a825;color:#000;border-radius:8px;font:600 10px/14px " +
     "-apple-system,Segoe UI,sans-serif;padding:0 5px;margin:2px 0 0 10px;display:none;";
+  // No MutationObserver: observing host subtree created a feedback loop
+  // (badge writes re-triggered the observer) that saturated the main thread.
+  // Events + lazy-settle cover add/remove; worst case the count is one
+  // interaction stale — cheap trade for never freezing the page.
+  let last = -1;
   const refresh = () => {
     let n = 0;
     try { n = cell.chart.indicators().length; } catch { n = 0; }
+    if (n === last) return;
+    last = n;
     badge.textContent = String(n);
     badge.style.display = n > 0 ? "inline-block" : "none";
   };
-  const mo = new MutationObserver(refresh);
-  mo.observe(host, { childList: true, subtree: true });
-  // vela mounts rows lazily; the observer above keeps the count live,
-  // but also re-sync on the chart's state events in case a pane is
-  // created without a DOM mutation at the right spot.
   host.appendChild(badge);
   refresh();
+  // settle once after vela's lazy legend mount, then live on state events
+  const t1 = setTimeout(refresh, 500);
+  const t2 = setTimeout(refresh, 2000);
   const offState = ws.on("state:changed", refresh);
   const offDestroyed = ws.on("cell:destroyed", ({ id }) => {
     if (id === cell.id) {
       offState();
       offDestroyed();
-      mo.disconnect();
+      clearTimeout(t1);
+      clearTimeout(t2);
       badge.remove();
     }
   });
@@ -188,29 +194,85 @@ function mountIndicatorCountBadge(ws: VelaWorkspace, cell: ChartCell): void {
  * StrictMode mounts effects twice in dev: create() is synchronous and
  * destroy() is idempotent, so the second mount just rebuilds.
  */
+
+// Boot diagnostics: ?vela-diag writes a #vela-diag element with stage markers so a
+// broken tab can show WHERE boot died without devtools.
+function diag(stage: string, extra = ""): void {
+  if (!new URLSearchParams(window.location.search).has("vela-diag")) return;
+  let el = document.getElementById("vela-diag");
+  if (!el) {
+    el = document.createElement("pre");
+    el.id = "vela-diag";
+    el.style.cssText = "position:fixed;inset:0;z-index:99999;background:#000;color:#0f0;padding:12px;font:12px monospace;overflow:auto;";
+    document.body.appendChild(el);
+  }
+  el.textContent += stage + (extra ? " :: " + extra : "") + "\n";
+}
+window.addEventListener("error", (e) => diag("WINDOW-ERROR", e.message));
+window.addEventListener("unhandledrejection", (e) => diag("REJECTION", String(e.reason).slice(0, 300)));
+diag("MODULE-LOADED");
 export function VelaPage() {
   const hostRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
+    // Boot hygiene: ?fresh wipes the blob entirely; otherwise drop only the
+    // HEAVY restored scripts — ones calling request.security (MTF evalAt is
+    // O(bars×tf-bars) and hung the page on TRIS-class scripts). Light scripts
+    // (EMA/VWAP/FVG…) restore normally, matching TV's reload behaviour.
+    const fresh = new URLSearchParams(window.location.search).has("fresh");
+    try {
+      if (fresh) localStorage.removeItem("vela-workspace-v2");
+      else {
+        const raw = localStorage.getItem("vela-workspace-v2");
+        if (raw) {
+          interface ExtEntry { script?: unknown }
+          const doc = JSON.parse(raw) as {
+            charts?: Array<{ ext?: Record<string, unknown> }>;
+          };
+          let stripped = false;
+          for (const c of doc.charts ?? []) {
+            const entries = c.ext?.["opencharts.pine-scripts"];
+            if (!Array.isArray(entries)) continue;
+            const kept = (entries as ExtEntry[]).filter(
+              (e) => typeof e.script !== "string" || !e.script.includes("request.security"),
+            );
+            if (kept.length !== entries.length) {
+              if (kept.length) c.ext!["opencharts.pine-scripts"] = kept;
+              else delete c.ext!["opencharts.pine-scripts"];
+              stripped = true;
+            }
+          }
+          if (stripped) localStorage.setItem("vela-workspace-v2", JSON.stringify(doc));
+        }
+      }
+    } catch { /* corrupt blob or quota — let vela fall back to defaults */ }
 
-    const ws = new VelaWorkspace(host, {
-      layout: "1",
-      symbol: "TSE:2330",
-      timeframe: "5",
-      live: false, // 暫停：SSE tick 一直推 → main thread 洗 render
-      theme: "dark",
-      timezone: "Asia/Taipei",
-      timeframes: ["1", "5", "15", "30", "60", "240", "D", "W"],
-      providers: { shioaji: () => new ShioajiVelaProvider() },
-      engines: { pine: () => new InterpreterPineEngine() },
-      // Indicators picker manifest: bundled src/pine/*.pine + the user's
-      // personal script library (opencharts.pine.lib) under "My scripts".
-      indicators: async () => combinedManifestEntries(),
-      persist: "vela-workspace-v2",
-      sync: { drawings: true, style: true },
-    });
+    diag("EFFECT-START", "fresh=" + fresh + " blob=" + (localStorage.getItem("vela-workspace-v2")?.length ?? 0));
+    let ws: VelaWorkspace;
+    try {
+      ws = new VelaWorkspace(host, {
+        layout: "1",
+        symbol: "TSE:2330",
+        timeframe: "5",
+        live: false, // 暫停：SSE tick 一直推 → main thread 洗 render
+        theme: "dark",
+        timezone: "Asia/Taipei",
+        timeframes: ["1", "5", "15", "30", "60", "240", "D", "W"],
+        providers: { shioaji: () => new ShioajiVelaProvider() },
+        engines: { pine: () => new InterpreterPineEngine() },
+        // Indicators picker manifest: bundled src/pine/*.pine + the user's
+        // personal script library (opencharts.pine.lib) under "My scripts".
+        indicators: async () => combinedManifestEntries(),
+        persist: "vela-workspace-v2",
+        sync: { drawings: true, style: true },
+      });
+    } catch (e) {
+      diag("WS-THROW", e instanceof Error ? e.message + "\n" + e.stack : String(e));
+      throw e;
+    }
+    diag("WS-CREATED", "cells=" + ws.cells().length);
 
     // Debug handle for scripts/tests (chart.runIndicator, ws.state()).
     (window as unknown as Record<string, unknown>).__vela = ws;

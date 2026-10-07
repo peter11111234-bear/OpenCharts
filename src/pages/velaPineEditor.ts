@@ -52,7 +52,7 @@ const PINE_CSS = `
 .vela-pine-hbtn.primary:hover{color:#4a80ff;background:#2a2e39}
 .vela-pine-hbtn:disabled{color:#4a4e5c;cursor:default;background:none}
 .vela-pine-spacer{flex:1}
-.vela-pine-area{width:100%;flex:1;min-height:320px;resize:none;background:#161a24;color:#d5d8e0;border:0;padding:10px 14px;font:13px/1.55 ui-monospace,Consolas,monospace;white-space:pre;outline:none}
+.vela-pine-area{width:100%;flex:1;min-height:320px;max-height:60vh;overflow:auto;resize:none;background:#161a24;color:#d5d8e0;border:0;padding:10px 14px;font:13px/1.55 ui-monospace,Consolas,monospace;white-space:pre;outline:none}
 .vela-pine-statusbar{display:flex;align-items:center;gap:14px;padding:5px 12px;border-top:1px solid #2a2e39;color:#787b86;font-size:11px}
 .vela-pine-statusbar a{color:#2962ff;text-decoration:none}
 .vela-pine-statusbar a:hover{text-decoration:underline}
@@ -634,14 +634,17 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
       setStatus("Running…");
       try {
         const src = area.value;
-        const isOverlay = /indicator\s*\([^)]*overlay\s*=\s*true/i.test(src);
+        // No overlay detection here: the old regex missed multi-line decls and
+        // strategy() entirely, and passing {pane:"new"} overrides the script's
+        // own overlay=true. runIndicator with no options routes on the parsed
+        // model's overlay flag — TV semantics.
         if (editorState.handleId) {
           const handle = ctx.chart.indicators().find((h) => h.id === editorState.handleId);
           if (handle) {
             handle.updateCode(src);
             setStatus("Updated in place", "ok");
           } else {
-            const r = await ctx.chart.runIndicator(src, isOverlay ? { overlay: true } : { pane: "new" });
+            const r = await ctx.chart.runIndicator(src);
             if (r && typeof r === 'object' && 'ok' in r && r.ok === false) {
               setStatus(`Run failed: ${'error' in r ? String(r.error) : 'unknown'}`, "err");
               return;
@@ -652,12 +655,12 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
             if (added) editorState.handleId = added.id;
           }
         } else {
-          const r = await ctx.chart.runIndicator(src, isOverlay ? { overlay: true } : { pane: "new" });
+          const r = await ctx.chart.runIndicator(src);
           if (r && typeof r === 'object' && 'ok' in r && r.ok === false) {
             setStatus(`Run failed: ${'error' in r ? String(r.error) : 'unknown'}`, "err");
             return;
           }
-          setStatus(isOverlay ? "Added (overlay)" : "Added (new pane)", "ok");
+          setStatus("Added", "ok");
         }
         rebuildOnChart();
       } catch (e) {

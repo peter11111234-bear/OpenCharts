@@ -1,0 +1,802 @@
+//@version=6
+
+strategy(title="三指標共振系統 v3.87", shorttitle="TIRS v3.87", overlay=true,
+     initial_capital=500000, currency=currency.TWD, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=18,
+     slippage=1, pyramiding=0,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500,
+     calc_on_every_tick=true, process_orders_on_close=true)
+
+// ============================================
+// 1. 用戶輸入參數
+// ============================================
+grpTimeframe = "時間週期"
+tfMonthly = input.timeframe("M", "月線週期", group=grpTimeframe, inline="tf0")
+tfWeekly = input.timeframe("W", "週線週期", group=grpTimeframe, inline="tf0")
+tfDaily = input.timeframe("D", "日線週期", options=["D", "W"], group=grpTimeframe, inline="tf1")
+tf4H = input.timeframe("240", "4H週期", options=["240", "180", "120"], group=grpTimeframe, inline="tf1")
+tf1H = input.timeframe("60", "1H週期", options=["60", "30", "15"], group=grpTimeframe, inline="tf2")
+tf30M = input.timeframe("30", "30M週期", options=["30", "15", "5"], group=grpTimeframe, inline="tf2")
+tf15M = input.timeframe("15", "15M週期", options=["15", "5", "1"], group=grpTimeframe, inline="tf3")
+tf5M = input.timeframe("5", "5M週期", options=["5", "3", "1"], group=grpTimeframe, inline="tf3")
+tfExec = input.timeframe("15", "執行週期", options=["15", "5", "3"], group=grpTimeframe, inline="tf4")
+useCurrentTF = input.bool(true, "使用當前圖表週期", group=grpTimeframe, inline="tf4")
+
+grpIndicators = "指標參數"
+atrPeriod = input.int(10, "ST-ATR週期", minval=1, group=grpIndicators, inline="ind1")
+atrMultiplier = input.float(3.0, "ST-ATR乘數", step=0.1, group=grpIndicators, inline="ind1")
+rfPeriod = input.int(30, "RF-週期", minval=1, group=grpIndicators, inline="ind2")
+rfMultiplier = input.float(1.6, "RF-乘數", step=0.1, group=grpIndicators, inline="ind2")
+htAmplitude = input.int(2, "HT-振幅", minval=1, group=grpIndicators, inline="ind3")
+htDeviation = input.int(2, "HT-偏差", minval=1, group=grpIndicators, inline="ind3")
+htTimeout = input.int(0, "HT-超時重置K線數 (0=關閉)", minval=0, maxval=200, group=grpIndicators, inline="ind3")
+
+grpFilter = "盤整過濾設置"
+useTrendFilter = input.bool(true, "啟用盤整過濾 (ADX & CHOP)", group=grpFilter, inline="filter1")
+adxLen = input.int(14, "ADX週期", minval=5, maxval=50, group=grpFilter, inline="filter1")
+adxThreshold = input.float(25.0, "ADX 趨勢閥值 (>)", minval=10.0, maxval=50.0, step=1.0, group=grpFilter, inline="filter2")
+chopLen = input.int(14, "CHOP週期", minval=5, maxval=50, group=grpFilter, inline="filter2")
+chopThreshold = input.float(60.0, "CHOP 震盪閥值 (<)", minval=30.0, maxval=70.0, step=1.0, group=grpFilter, inline="filter3")
+
+grpGMMA = "顧比均線(GMMA)設置"
+showGMMA = input.bool(true, "顯示顧比均線", group=grpGMMA, inline="gmma1")
+showGMMAEarly = input.bool(true, "顯示快速反轉預警", group=grpGMMA, inline="gmma1")
+gmmaOpacity = input.int(70, "透明度%", minval=0, maxval=100, step=5, group=grpGMMA, inline="gmma2")
+gmmaLineWidth = input.int(1, "線寬", minval=1, maxval=3, group=grpGMMA, inline="gmma2")
+
+grpScoring = "評分權重 (總分僅含4H/1H/Exec)"
+weight4H_pct = input.float(50, "4H權重%", minval=0, maxval=100, step=5, group=grpScoring, inline="weight1") / 100
+weight1H_pct = input.float(30, "1H權重%", minval=0, maxval=100, step=5, group=grpScoring, inline="weight1") / 100
+weightExec_pct = input.float(20, "執行權重%", minval=0, maxval=100, step=5, group=grpScoring, inline="weight2") / 100
+
+grpTrading = "交易策略(TMF微台)"
+entryThreshold = input.float(0.65, "入場分數", minval=0.4, maxval=1.0, step=0.05, group=grpTrading, inline="trade1")
+riskPercent = input.float(2.0, "風險%", minval=0.1, maxval=10, step=0.1, group=grpTrading, inline="trade1")
+pointValue = input.float(10.0, "每點價值(TWD)", minval=1, group=grpTrading, inline="trade4")
+tmfMargin = input.int(35050, "微台原始保證金(TWD)", group=grpTrading, inline="trade4")
+slAtrMult = input.float(1.0, "止損ATR", minval=0.5, maxval=3, step=0.1, group=grpTrading, inline="trade2")
+tpAtrMult = input.float(1.5, "止盈ATR", minval=1.0, maxval=10, step=0.1, group=grpTrading, inline="trade2")
+maxContracts = input.int(3, "最大口數", minval=1, maxval=50, group=grpTrading, inline="trade3")
+
+grpDisplay = "顯示設置"
+showTable = input.bool(true, "顯示表格", group=grpDisplay, inline="disp1")
+showBg = input.bool(true, "顯示背景", group=grpDisplay, inline="disp1")
+showSignals = input.bool(true, "顯示信號", group=grpDisplay, inline="disp2")
+showSTTurn = input.bool(true, "顯示ST轉折", group=grpDisplay, inline="disp3")
+showSLTP = input.bool(true, "顯示止損止盈", group=grpDisplay, inline="disp4")
+showEMA = input.bool(true, "顯示EMA均線", group=grpDisplay, inline="disp5")
+showDebug = input.bool(false, "顯示調試信息", group=grpDisplay, inline="disp5")
+showMA5_60 = input.bool(true, "顯示15M MA5/MA60交叉訊號", group=grpDisplay, inline="disp6")
+show1HCandle = input.bool(true, "顯示即時60分K", group=grpDisplay, inline="h1c1")
+h1CandleOffset = input.int(12, "60分K偏移", minval=5, maxval=50, group=grpDisplay, inline="h1c2")
+h1CandleWidth = input.int(2, "60分K寬度", minval=2, maxval=6, group=grpDisplay, inline="h1c2")
+
+grpTurtle = "海龜55日線"
+showTurtle55 = input.bool(true, "顯示55日線", group=grpTurtle, inline="t55_1")
+turtlePeriod = input.int(55, "週期", minval=5, maxval=200, group=grpTurtle, inline="t55_1")
+turtleGreenOpacity = input.int(50, "綠線透明度%", minval=0, maxval=100, step=5, group=grpTurtle, inline="t55_2")
+turtleRedOpacity = input.int(50, "紅線透明度%", minval=0, maxval=100, step=5, group=grpTurtle, inline="t55_2")
+
+// ============================================
+// 2. 顏色定義
+// ============================================
+color c_text_bright = #ffffff
+color c_text_dim = #cccccc
+color c_green_strong = #00ff00
+color c_red_strong = #ff0000
+color c_yellow_bright = #ffff00
+color c_black = #000000
+color c_gmma_short = #2196F3
+color c_gmma_long = #FF5252
+
+// 權重正規化
+float weightSum = weight4H_pct + weight1H_pct + weightExec_pct
+float w4H = weightSum > 0 ? weight4H_pct / weightSum : 0.333
+float w1H = weightSum > 0 ? weight1H_pct / weightSum : 0.333
+float wExec = weightSum > 0 ? weightExec_pct / weightSum : 0.334
+
+// ============================================
+// 3. 核心指標函數（含顯式初始化）
+// ============================================
+f_supertrend(period, multiplier) =>
+    var float up = na
+    var float dn = na
+    var float trend = na
+    if barstate.isfirst
+        up := 0.0
+        dn := 0.0
+        trend := 1.0
+    float atr = ta.atr(period)
+    float hl2_price = (high + low) / 2
+    float upperBand = hl2_price + (multiplier * atr)
+    float lowerBand = hl2_price - (multiplier * atr)
+    float prev_up = nz(up[1], lowerBand)
+    float prev_dn = nz(dn[1], upperBand)
+    up := close[1] > prev_up ? math.max(lowerBand, prev_up) : lowerBand
+    dn := close[1] < prev_dn ? math.min(upperBand, prev_dn) : upperBand
+    trend := (nz(trend[1], 1.0) == -1.0 and close > prev_dn) ? 1.0 :
+             (nz(trend[1], 1.0) == 1.0 and close < prev_up) ? -1.0 : nz(trend[1], 1.0)
+    float stLine = trend == 1.0 ? up : dn
+    [stLine, int(trend)]
+
+f_rangefilter(src, period, multiplier) =>
+    var float filt = na
+    if barstate.isfirst
+        filt := src
+    float wper = period * 2 - 1
+    float avrng = ta.ema(math.abs(src - src[1]), period)
+    float smoothrng = ta.ema(avrng, int(wper)) * multiplier
+    filt := na(filt[1]) ? src : src > nz(filt[1]) ? ((src - smoothrng) < nz(filt[1]) ? nz(filt[1]) : (src - smoothrng)) :
+             ((src + smoothrng) > nz(filt[1]) ? nz(filt[1]) : (src + smoothrng))
+    var int upward = 0
+    var int downward = 0
+    upward := filt > filt[1] ? nz(upward[1]) + 1 : filt < filt[1] ? 0 : nz(upward[1])
+    downward := filt < filt[1] ? nz(downward[1]) + 1 : filt > filt[1] ? 0 : nz(downward[1])
+    int trend = upward > 0 ? 1 : downward > 0 ? -1 : 0
+    [filt, int(trend)]
+
+f_halftrend(amplitude, deviation, timeoutBars) =>
+    var int htState = 0
+    var int stateBars = 0
+    if barstate.isfirst
+        htState := 0
+        stateBars := 0
+    float atrValue = ta.atr(100)
+    float maxHigh = ta.highest(high, amplitude)
+    float minLow = ta.lowest(low, amplitude)
+    float changeAmplitude = ta.change(close, amplitude)
+    bool buyCond = low > nz(minLow[1]) and close > close[amplitude] and changeAmplitude > atrValue * deviation
+    bool sellCond = high < nz(maxHigh[1]) and close < close[amplitude] and changeAmplitude < -atrValue * deviation
+    if buyCond
+        htState := 1
+        stateBars := 0
+    else if sellCond
+        htState := -1
+        stateBars := 0
+    else
+        stateBars := nz(stateBars[1], 0) + 1
+        if timeoutBars > 0 and stateBars > timeoutBars
+            htState := 0
+            stateBars := 0
+    bool upTrend = htState == 1
+    bool downTrend = htState == -1
+    bool buySignal = upTrend and not upTrend[1]
+    bool sellSignal = downTrend and not downTrend[1]
+    [buySignal, sellSignal, upTrend, downTrend]
+
+// ============================================
+// 4. MTF 統一計算 — 命名引數
+// ============================================
+// MTF 即時值為 developing（HTF 未收盤），回測與實盤會分歧 — 維持即時性，見 B1
+// Monthly
+[stLineM_raw, stM_raw] = request.security(symbol = syminfo.tickerid, timeframe = tfMonthly, expression = f_supertrend(atrPeriod, atrMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, rfM_raw] = request.security(symbol = syminfo.tickerid, timeframe = tfMonthly, expression = f_rangefilter(close, rfPeriod, rfMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, _, htUpM_raw, htDnM_raw] = request.security(symbol = syminfo.tickerid, timeframe = tfMonthly, expression = f_halftrend(htAmplitude, htDeviation, htTimeout), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+// Weekly
+[stLineW_raw, stW_raw] = request.security(symbol = syminfo.tickerid, timeframe = tfWeekly, expression = f_supertrend(atrPeriod, atrMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, rfW_raw] = request.security(symbol = syminfo.tickerid, timeframe = tfWeekly, expression = f_rangefilter(close, rfPeriod, rfMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, _, htUpW_raw, htDnW_raw] = request.security(symbol = syminfo.tickerid, timeframe = tfWeekly, expression = f_halftrend(htAmplitude, htDeviation, htTimeout), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+// Daily
+[stLineD_raw, stD_raw] = request.security(symbol = syminfo.tickerid, timeframe = tfDaily, expression = f_supertrend(atrPeriod, atrMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, rfD_raw] = request.security(symbol = syminfo.tickerid, timeframe = tfDaily, expression = f_rangefilter(close, rfPeriod, rfMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, _, htUpD_raw, htDnD_raw] = request.security(symbol = syminfo.tickerid, timeframe = tfDaily, expression = f_halftrend(htAmplitude, htDeviation, htTimeout), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+// 4H
+[stLine4H_raw, st4H_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf4H, expression = f_supertrend(atrPeriod, atrMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, rf4H_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf4H, expression = f_rangefilter(close, rfPeriod, rfMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, _, htUp4H_raw, htDn4H_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf4H, expression = f_halftrend(htAmplitude, htDeviation, htTimeout), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+// 1H
+[stLine1H_raw, st1H_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf1H, expression = f_supertrend(atrPeriod, atrMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, rf1H_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf1H, expression = f_rangefilter(close, rfPeriod, rfMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, _, htUp1H_raw, htDn1H_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf1H, expression = f_halftrend(htAmplitude, htDeviation, htTimeout), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+// 30M
+[stLine30_raw, st30_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf30M, expression = f_supertrend(atrPeriod, atrMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, rf30_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf30M, expression = f_rangefilter(close, rfPeriod, rfMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, _, htUp30_raw, htDn30_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf30M, expression = f_halftrend(htAmplitude, htDeviation, htTimeout), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+// 15M
+[stLine15_raw, st15_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf15M, expression = f_supertrend(atrPeriod, atrMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, rf15_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf15M, expression = f_rangefilter(close, rfPeriod, rfMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, _, htUp15_raw, htDn15_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf15M, expression = f_halftrend(htAmplitude, htDeviation, htTimeout), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+// 5M
+[stLine5_raw, st5_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf5M, expression = f_supertrend(atrPeriod, atrMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, rf5_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf5M, expression = f_rangefilter(close, rfPeriod, rfMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[_, _, htUp5_raw, htDn5_raw] = request.security(symbol = syminfo.tickerid, timeframe = tf5M, expression = f_halftrend(htAmplitude, htDeviation, htTimeout), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+string execTF = useCurrentTF ? timeframe.period : tfExec
+
+// ============================================
+// 5. na 毒性清洗函數
+// ============================================
+f_safe_mtf(st, rf, htUp, htDn, stLine) =>
+    float safe_st = nz(st, 0)
+    float safe_rf = nz(rf, 0)
+    bool safe_htUp = htUp == true
+    bool safe_htDn = htDn == true
+    float safe_stLine = nz(stLine, close)
+    [safe_st, safe_rf, safe_htUp, safe_htDn, safe_stLine]
+
+// 清洗所有週期
+[stM, rfM, htUpM, htDnM, stLineM] = f_safe_mtf(stM_raw, rfM_raw, htUpM_raw, htDnM_raw, stLineM_raw)
+[stW, rfW, htUpW, htDnW, stLineW] = f_safe_mtf(stW_raw, rfW_raw, htUpW_raw, htDnW_raw, stLineW_raw)
+[stD, rfD, htUpD, htDnD, stLineD] = f_safe_mtf(stD_raw, rfD_raw, htUpD_raw, htDnD_raw, stLineD_raw)
+[st4H, rf4H, htUp4H, htDn4H, stLine4H] = f_safe_mtf(st4H_raw, rf4H_raw, htUp4H_raw, htDn4H_raw, stLine4H_raw)
+[st1H, rf1H, htUp1H, htDn1H, stLine1H] = f_safe_mtf(st1H_raw, rf1H_raw, htUp1H_raw, htDn1H_raw, stLine1H_raw)
+[st30, rf30, htUp30, htDn30, stLine30] = f_safe_mtf(st30_raw, rf30_raw, htUp30_raw, htDn30_raw, stLine30_raw)
+[st15, rf15, htUp15, htDn15, stLine15] = f_safe_mtf(st15_raw, rf15_raw, htUp15_raw, htDn15_raw, stLine15_raw)
+[st5, rf5, htUp5, htDn5, stLine5] = f_safe_mtf(st5_raw, rf5_raw, htUp5_raw, htDn5_raw, stLine5_raw)
+
+// ============================================
+// 6. 執行週期獲取
+// ============================================
+[stE, rfE, htUpE, htDnE, stLineExec] = if execTF == tfMonthly
+    [stM, rfM, htUpM, htDnM, stLineM]
+else if execTF == tfWeekly
+    [stW, rfW, htUpW, htDnW, stLineW]
+else if execTF == tfDaily
+    [stD, rfD, htUpD, htDnD, stLineD]
+else if execTF == tf4H
+    [st4H, rf4H, htUp4H, htDn4H, stLine4H]
+else if execTF == tf1H
+    [st1H, rf1H, htUp1H, htDn1H, stLine1H]
+else if execTF == tf30M
+    [st30, rf30, htUp30, htDn30, stLine30]
+else if execTF == tf15M
+    [st15, rf15, htUp15, htDn15, stLine15]
+else if execTF == tf5M
+    [st5, rf5, htUp5, htDn5, stLine5]
+else
+    [raw_stLineE, raw_st] = request.security(symbol = syminfo.tickerid, timeframe = execTF, expression = f_supertrend(atrPeriod, atrMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+    [_, raw_rf] = request.security(symbol = syminfo.tickerid, timeframe = execTF, expression = f_rangefilter(close, rfPeriod, rfMultiplier), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+    [_, _, raw_htUp, raw_htDn] = request.security(symbol = syminfo.tickerid, timeframe = execTF, expression = f_halftrend(htAmplitude, htDeviation, htTimeout), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+    f_safe_mtf(raw_st, raw_rf, raw_htUp, raw_htDn, raw_stLineE)
+
+// ============================================
+// 7. 評分邏輯
+// ============================================
+f_calc_score(st, rf, up, dn) =>
+    float stDir = st == 1 ? 1 : st == -1 ? -1 : 0
+    float rfDir = rf == 1 ? 1 : rf == -1 ? -1 : 0
+    float htDir = up ? 1 : dn ? -1 : 0
+    float bullCount = (stDir == 1 ? 1 : 0) + (rfDir == 1 ? 1 : 0) + (htDir == 1 ? 1 : 0)
+    float bearCount = (stDir == -1 ? 1 : 0) + (rfDir == -1 ? 1 : 0) + (htDir == -1 ? 1 : 0)
+    float s = 0.0
+    s += (st == 1 ? 0.4 : st == -1 ? -0.4 : 0)
+    s += (rf == 1 ? 0.3 : rf == -1 ? -0.3 : 0)
+    s += (up ? 0.3 : dn ? -0.3 : 0)
+    bool consensus = bullCount >= 2 or bearCount >= 2
+    float finalScore = consensus ? s : s * 0.5
+    math.max(-1.0, math.min(1.0, finalScore))
+
+float fastScoreMonthly = f_calc_score(stM, rfM, htUpM, htDnM)
+float fastScoreWeekly  = f_calc_score(stW, rfW, htUpW, htDnW)
+float fastScoreDaily   = f_calc_score(stD, rfD, htUpD, htDnD)
+float fastScore4H      = f_calc_score(st4H, rf4H, htUp4H, htDn4H)
+float fastScore1H      = f_calc_score(st1H, rf1H, htUp1H, htDn1H)
+float fastScore30M     = f_calc_score(st30, rf30, htUp30, htDn30)
+float fastScore15M     = f_calc_score(st15, rf15, htUp15, htDn15)
+float fastScore5M      = f_calc_score(st5, rf5, htUp5, htDn5)
+float fastScoreExec    = f_calc_score(stE, rfE, htUpE, htDnE)
+
+float fastTotalScore = (fastScore4H * w4H) + (fastScore1H * w1H) + (fastScoreExec * wExec)
+
+// ============================================
+// 8. 策略執行（盤整過濾 + 多空互斥）
+// ============================================
+bool isBullishZone = fastTotalScore >= entryThreshold
+bool isBearishZone = fastTotalScore <= -entryThreshold
+string n8n_ActionText = isBullishZone ? "逢低做多" : isBearishZone ? "逢高做空" : "觀望"
+
+[_, _, adxValue] = ta.dmi(diLength = adxLen, adxSmoothing = adxLen)
+float trSum = math.sum(ta.tr, chopLen)
+float highestHigh = ta.highest(high, chopLen)
+float lowestLow = ta.lowest(low, chopLen)
+float rangeDiff = highestHigh - lowestLow
+float chopValue = rangeDiff == 0 ? 100 : 100 * math.log10(trSum / rangeDiff) / math.log10(chopLen)
+bool isTrendingEnv = useTrendFilter ? (adxValue > adxThreshold and chopValue < chopThreshold) : true
+
+bool stLineCrossUp = ta.crossover(close, stLineExec)
+bool stLineCrossDown = ta.crossunder(close, stLineExec)
+
+// [Bug] v3.87 新增 barstate.isconfirmed 防止 tick 級訊號抖動
+bool longCondition = isBullishZone and stE == 1 and rfE == 1 and htUpE and stLineCrossUp and isTrendingEnv and barstate.isconfirmed
+bool shortCondition = isBearishZone and stE == -1 and rfE == -1 and htDnE and stLineCrossDown and isTrendingEnv and barstate.isconfirmed
+
+float currentATR = ta.atr(atrPeriod)
+float riskAmount = strategy.equity * (riskPercent / 100)
+float slDistance = currentATR * slAtrMult
+bool isFlat = strategy.position_size == 0
+
+f_calc_pos_size() =>
+    float riskPerContract = slDistance * pointValue
+    float calcC = riskPerContract > 0 ? riskAmount / riskPerContract : 0
+    float marginCap = strategy.equity / tmfMargin
+    int contracts = int(math.floor(math.min(calcC, math.min(marginCap, maxContracts))))
+    math.max(contracts, 0)
+
+var float lockedSL = na
+var float lockedTP = na
+
+float posSize = f_calc_pos_size()
+
+if longCondition and isFlat and posSize > 0
+    lockedSL := close - currentATR * slAtrMult
+    lockedTP := close + currentATR * tpAtrMult
+    strategy.entry("Long", strategy.long, qty=posSize)
+else if shortCondition and isFlat and posSize > 0
+    lockedSL := close + currentATR * slAtrMult
+    lockedTP := close - currentATR * tpAtrMult
+    strategy.entry("Short", strategy.short, qty=posSize)
+
+if strategy.position_size > 0
+    strategy.exit("Exit Long", "Long", stop=lockedSL, limit=lockedTP)
+
+if strategy.position_size < 0
+    strategy.exit("Exit Short", "Short", stop=lockedSL, limit=lockedTP)
+
+// ── 進場標記 + ST轉折 + 鎖定SL/TP（showSignals/showSTTurn/showSLTP 接回） ──
+plot(showSLTP and strategy.position_size != 0 ? lockedSL : na, "鎖定止損", color=color.orange, style=plot.style_linebr)
+plot(showSLTP and strategy.position_size != 0 ? lockedTP : na, "鎖定止盈", color=color.aqua, style=plot.style_linebr)
+plotshape(showSignals and longCondition ? low : na, "進場做多", style=shape.labelup,
+     location=location.belowbar, color=color.new(color.green, 20), text="多",
+     textcolor=color.white, size=size.small)
+plotshape(showSignals and shortCondition ? high : na, "進場做空", style=shape.labeldown,
+     location=location.abovebar, color=color.new(color.red, 20), text="空",
+     textcolor=color.white, size=size.small)
+plotshape(showSTTurn and stE == 1 and stE[1] != 1 ? low : na, "ST轉多", style=shape.circle,
+     location=location.belowbar, color=color.green, size=size.tiny)
+plotshape(showSTTurn and stE == -1 and stE[1] != -1 ? high : na, "ST轉空", style=shape.circle,
+     location=location.abovebar, color=color.red, size=size.tiny)
+
+// ============================================
+// 9. GMMA 繪圖 + 快速反轉預警
+// ============================================
+float gmma_s_ema3  = ta.ema(close, 3)
+float gmma_s_ema5  = ta.ema(close, 5)
+float gmma_s_ema10 = ta.ema(close, 10)
+float gmma_s_ema15 = ta.ema(close, 15)
+float gmma_ema20   = ta.ema(close, 20)
+float gmma_l_ema30 = ta.ema(close, 30)
+float gmma_l_ema60 = ta.ema(close, 60)
+float ema80        = ta.ema(close, 80)
+
+// ── 海龜55日線 ──
+float turtle_hi = ta.highest(high, turtlePeriod)[1]
+float turtle_lo = ta.lowest(low, turtlePeriod)[1]
+
+color gmma_short_color = color.new(c_gmma_short, 100 - gmmaOpacity)
+color gmma_long_color  = color.new(c_gmma_long, 100 - gmmaOpacity)
+
+plot(showGMMA ? gmma_s_ema3 : na, title="GMMA短3", color=gmma_short_color, linewidth=gmmaLineWidth + 1)
+plot(showGMMA ? gmma_s_ema5 : na, title="GMMA短5", color=gmma_short_color, linewidth=gmmaLineWidth)
+plot(showGMMA ? ta.ema(close, 8) : na, title="GMMA短8", color=gmma_short_color, linewidth=gmmaLineWidth)
+plot(showGMMA ? gmma_s_ema10 : na, title="GMMA短10", color=gmma_short_color, linewidth=gmmaLineWidth)
+plot(showGMMA ? ta.ema(close, 12) : na, title="GMMA短12", color=gmma_short_color, linewidth=gmmaLineWidth)
+plot(showGMMA ? gmma_s_ema15 : na, title="GMMA短15", color=gmma_short_color, linewidth=gmmaLineWidth + 1)
+
+plot(showGMMA ? gmma_l_ema30 : na, title="GMMA長30", color=gmma_long_color, linewidth=gmmaLineWidth + 1)
+plot(showGMMA ? ta.ema(close, 35) : na, title="GMMA長35", color=gmma_long_color, linewidth=gmmaLineWidth)
+plot(showGMMA ? ta.ema(close, 40) : na, title="GMMA長40", color=gmma_long_color, linewidth=gmmaLineWidth)
+plot(showGMMA ? ta.ema(close, 45) : na, title="GMMA長45", color=gmma_long_color, linewidth=gmmaLineWidth)
+plot(showGMMA ? ta.ema(close, 50) : na, title="GMMA長50", color=gmma_long_color, linewidth=gmmaLineWidth)
+plot(showGMMA ? gmma_l_ema60 : na, title="GMMA長60", color=gmma_long_color, linewidth=gmmaLineWidth + 1)
+
+bool gmmaGoldCross = ta.crossover(gmma_s_ema15, gmma_l_ema30) and (gmma_s_ema3 > gmma_s_ema15)
+bool gmmaDeathCross = ta.crossunder(gmma_s_ema15, gmma_l_ema30) and (gmma_s_ema3 < gmma_s_ema15)
+
+plotshape(showGMMA and gmmaGoldCross ? low : na, title="GMMA趨勢轉多", style=shape.labelup,
+          location=location.belowbar, color=color.new(c_green_strong, 20), text="GMMA 金叉",
+          textcolor=c_text_bright, size=size.small)
+plotshape(showGMMA and gmmaDeathCross ? high : na, title="GMMA趨勢轉空", style=shape.labeldown,
+          location=location.abovebar, color=color.new(c_red_strong, 20), text="GMMA 死叉",
+          textcolor=c_text_bright, size=size.small)
+
+// ── GMMA 快速反轉預警 ──
+float ema20_slope  = gmma_ema20 - gmma_ema20[1]
+float ema3_slope   = gmma_s_ema3 - gmma_s_ema3[1]
+bool isGreenCandle = close > open
+bool isRedCandle   = close < open
+
+bool crossUp5_10 = ta.crossover(gmma_s_ema5, gmma_s_ema10)
+bool crossDown5_10 = ta.crossunder(gmma_s_ema5, gmma_s_ema10)
+
+bool earlyBullish = crossUp5_10 and ema20_slope > 0 and isTrendingEnv and isGreenCandle
+bool earlyBearish = crossDown5_10 and ema20_slope < 0 and isTrendingEnv and isRedCandle
+
+float bodySize = math.abs(close - open)
+float candleRange = high - low
+float lowerWick = math.min(close, open) - low
+float upperWick = high - math.max(close, open)
+bool isLongLowerWick = candleRange > 0 and ((lowerWick > bodySize and (lowerWick / candleRange) > 0.3) or lowerWick > bodySize * 2)
+bool isLongUpperWick = candleRange > 0 and ((upperWick > bodySize and (upperWick / candleRange) > 0.3) or upperWick > bodySize * 2)
+
+var bool bearWarn = false
+var bool bullWarn = false
+var float lwClose = na
+var float uwClose = na
+var int lwBars = 100
+var int uwBars = 100
+var bool bearExitCond = false
+var bool bullExitCond = false
+
+if barstate.isconfirmed
+    if earlyBearish
+        bearWarn := true
+        lwClose := na
+        lwBars := 100
+        bullWarn := false
+        uwClose := na
+        uwBars := 100
+    if earlyBullish
+        bullWarn := true
+        uwClose := na
+        uwBars := 100
+        bearWarn := false
+        lwClose := na
+        lwBars := 100
+
+    if bearWarn and isLongLowerWick
+        lwClose := close
+        lwBars := 0
+    else
+        lwBars += 1
+    if bullWarn and isLongUpperWick
+        uwClose := close
+        uwBars := 0
+    else
+        uwBars += 1
+
+    bool bearExitA = bearWarn and (not earlyBearish) and (not na(lwClose)) and lwBars >= 1 and lwBars <= 3 and close > lwClose and isGreenCandle
+    bool bearExitB = bearWarn and (not earlyBearish) and crossUp5_10 and ema3_slope > 0 and isGreenCandle
+    bearExitCond := bearExitA or bearExitB
+
+    bool bullExitA = bullWarn and (not earlyBullish) and (not na(uwClose)) and uwBars >= 1 and uwBars <= 3 and close < uwClose and isRedCandle
+    bool bullExitB = bullWarn and (not earlyBullish) and crossDown5_10 and ema3_slope < 0 and isRedCandle
+    bullExitCond := bullExitA or bullExitB
+
+    if bearExitCond
+        bearWarn := false
+        lwClose := na
+        lwBars := 100
+    if bullExitCond
+        bullWarn := false
+        uwClose := na
+        uwBars := 100
+
+color c_early_warn = #4FC3F7
+color c_exit_signal = #FF9800
+plotshape(showGMMA and showGMMAEarly and earlyBullish ? low : na, title="快速反轉預警↑",
+          style=shape.triangleup, location=location.belowbar, color=c_early_warn, size=size.small)
+plotshape(showGMMA and showGMMAEarly and earlyBearish ? high : na, title="快速反轉預警↓",
+          style=shape.triangledown, location=location.abovebar, color=c_early_warn, size=size.small)
+plotshape(showGMMA and showGMMAEarly and bearExitCond ? low : na, title="下跌預警結束",
+          style=shape.diamond, location=location.belowbar, color=c_exit_signal, text="⚡止跌",
+          textcolor=c_exit_signal, size=size.small)
+plotshape(showGMMA and showGMMAEarly and bullExitCond ? high : na, title="上漲預警結束",
+          style=shape.diamond, location=location.abovebar, color=c_exit_signal, text="⚡止漲",
+          textcolor=c_exit_signal, size=size.small)
+
+// ── 15M MA5/MA60 金叉死叉訊號 ──
+[ma5_15, ma60_15] = request.security(symbol = syminfo.tickerid, timeframe = tf15M, expression = [ta.sma(close, 5), ta.sma(close, 60)], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+bool ma5_60_goldenCross = ta.crossover(ma5_15, ma60_15)
+bool ma5_60_deathCross = ta.crossunder(ma5_15, ma60_15)
+
+plotshape(showMA5_60 and ma5_60_goldenCross ? low : na, title="15M MA5/60金叉", style=shape.labelup,
+          location=location.belowbar, color=color.new(c_green_strong, 30), text="＋",
+          textcolor=c_text_bright, size=size.small)
+plotshape(showMA5_60 and ma5_60_deathCross ? high : na, title="15M MA5/60死叉", style=shape.labeldown,
+          location=location.abovebar, color=color.new(c_red_strong, 30), text="－",
+          textcolor=c_text_bright, size=size.small)
+
+// ============================================
+// 10. 極速表格
+// ============================================
+var table tbl = table.new(position=position.middle_right, columns=6, rows=13,
+                         bgcolor=color.new(#000000, 80), border_width=1, border_color=#333333)
+if barstate.isfirst and not showTable
+    table.delete(tbl)
+
+f_update_tbl_row(r_tbl, r_idx, r_score, r_thresh) =>
+    color r_color = r_score >= r_thresh ? c_green_strong : r_score <= -r_thresh ? c_red_strong : r_score > 0 ? c_yellow_bright : c_text_dim
+    table.cell_set_text(r_tbl, 1, r_idx, str.tostring(r_score, "#.##"))
+    table.cell_set_text_color(r_tbl, 1, r_idx, r_color)
+    table.cell_set_text(r_tbl, 2, r_idx, r_score > 0.1 ? "▲" : r_score < -0.1 ? "▼" : "─")
+    table.cell_set_text_color(r_tbl, 2, r_idx, r_color)
+
+if showTable and (barstate.isfirst or barstate.islast)
+    if barstate.isfirst
+        table.cell(tbl, 0, 0, "週期", text_color=c_yellow_bright, text_size=size.small)
+        table.cell(tbl, 1, 0, "分數", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 2, 0, "符號", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 3, 0, "總分", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 4, 0, "行動", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 5, 0, "閾值", text_color=c_text_bright, text_size=size.small)
+
+        table.cell(tbl, 0, 1, "Monthly", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 0, 2, "Weekly", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 0, 3, "Daily", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 0, 4, "4H", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 0, 5, "1H", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 0, 6, "30M", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 0, 7, "15M", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 0, 8, "5M", text_color=c_text_bright, text_size=size.small)
+        table.cell(tbl, 0, 9, "", text_color=c_text_bright, text_size=size.small)
+
+        table.cell(tbl, 1, 1, "", text_size=size.small)
+        table.cell(tbl, 2, 1, "", text_size=size.small)
+
+        table.cell(tbl, 1, 2, "", text_size=size.small)
+        table.cell(tbl, 2, 2, "", text_size=size.small)
+
+        table.cell(tbl, 1, 3, "", text_size=size.small)
+        table.cell(tbl, 2, 3, "", text_size=size.small)
+
+        table.cell(tbl, 1, 4, "", text_size=size.small)
+        table.cell(tbl, 2, 4, "", text_size=size.small)
+
+        table.cell(tbl, 1, 5, "", text_size=size.small)
+        table.cell(tbl, 2, 5, "", text_size=size.small)
+
+        table.cell(tbl, 1, 6, "", text_size=size.small)
+        table.cell(tbl, 2, 6, "", text_size=size.small)
+
+        table.cell(tbl, 1, 7, "", text_size=size.small)
+        table.cell(tbl, 2, 7, "", text_size=size.small)
+
+        table.cell(tbl, 1, 8, "", text_size=size.small)
+        table.cell(tbl, 2, 8, "", text_size=size.small)
+
+        table.cell(tbl, 1, 9, "", text_size=size.small)
+        table.cell(tbl, 2, 9, "", text_size=size.small)
+
+        table.cell(tbl, 0, 10, "─────", text_color=c_text_dim, text_size=size.small)
+        table.cell(tbl, 1, 10, "────", text_color=c_text_dim, text_size=size.small)
+        table.cell(tbl, 2, 10, "─", text_color=c_text_dim, text_size=size.small)
+
+        table.cell(tbl, 0, 11, "ADX(>"+str.tostring(adxThreshold,"#")+")", text_color=c_yellow_bright, text_size=size.small)
+        table.cell(tbl, 1, 11, "", text_size=size.small)
+        table.cell(tbl, 2, 11, "", text_size=size.small)
+
+        table.cell(tbl, 0, 12, "CHOP(<"+str.tostring(chopThreshold,"#")+")", text_color=c_yellow_bright, text_size=size.small)
+        table.cell(tbl, 1, 12, "", text_size=size.small)
+        table.cell(tbl, 2, 12, "", text_size=size.small)
+
+        table.cell(tbl, 3, 1, "", text_size=size.normal)
+        table.cell(tbl, 4, 1, "", text_size=size.normal)
+        table.cell(tbl, 5, 1, "", text_size=size.small)
+        table.merge_cells(tbl, 3, 1, 3, 12)
+        table.merge_cells(tbl, 4, 1, 4, 12)
+        table.merge_cells(tbl, 5, 1, 5, 12)
+
+    f_update_tbl_row(tbl, 1, fastScoreMonthly, entryThreshold)
+    f_update_tbl_row(tbl, 2, fastScoreWeekly, entryThreshold)
+    f_update_tbl_row(tbl, 3, fastScoreDaily, entryThreshold)
+    f_update_tbl_row(tbl, 4, fastScore4H, entryThreshold)
+    f_update_tbl_row(tbl, 5, fastScore1H, entryThreshold)
+    f_update_tbl_row(tbl, 6, fastScore30M, entryThreshold)
+    f_update_tbl_row(tbl, 7, fastScore15M, entryThreshold)
+    f_update_tbl_row(tbl, 8, fastScore5M, entryThreshold)
+
+    table.cell_set_text(tbl, 0, 9, execTF)
+    table.cell_set_text_color(tbl, 0, 9, c_text_bright)
+    f_update_tbl_row(tbl, 9, fastScoreExec, 0.5)
+
+    color adxC = adxValue > adxThreshold ? c_green_strong : c_red_strong
+    table.cell_set_text(tbl, 1, 11, str.tostring(adxValue, "#.1"))
+    table.cell_set_text_color(tbl, 1, 11, adxC)
+    table.cell_set_text(tbl, 2, 11, adxValue > adxThreshold ? "✓" : "✕")
+    table.cell_set_text_color(tbl, 2, 11, adxC)
+
+    color chopC = chopValue < chopThreshold ? c_green_strong : c_red_strong
+    table.cell_set_text(tbl, 1, 12, str.tostring(chopValue, "#.1"))
+    table.cell_set_text_color(tbl, 1, 12, chopC)
+    table.cell_set_text(tbl, 2, 12, chopValue < chopThreshold ? "✓" : "✕")
+    table.cell_set_text_color(tbl, 2, 12, chopC)
+
+    color totC = fastTotalScore >= entryThreshold ? c_green_strong : fastTotalScore <= -entryThreshold ? c_red_strong :
+           fastTotalScore > 0 ? c_yellow_bright : c_text_dim
+    table.cell_set_text(tbl, 3, 1, str.tostring(fastTotalScore, "#.##"))
+    table.cell_set_text_color(tbl, 3, 1, totC)
+    table.cell_set_text(tbl, 4, 1, n8n_ActionText)
+    table.cell_set_text_color(tbl, 4, 1, totC)
+    table.cell_set_text(tbl, 5, 1, str.tostring(entryThreshold, "#.##"))
+
+// ============================================
+// 11. 背景、除錯、警報
+// ============================================
+bgcolor(showBg ? (fastTotalScore >= entryThreshold ? color.new(c_green_strong, 85) : fastTotalScore <= -entryThreshold ? color.new(c_red_strong, 85) : na) : na)
+
+var label dL = na
+if showDebug and barstate.islast
+    if na(dL)
+        dL := label.new(bar_index, high, "", style=label.style_label_center,
+                        color=color.new(c_black, 40), textcolor=c_text_bright)
+    string debugText = "─── stLine (浮點數) ───"
+    debugText += "\n5M:  " + str.tostring(stLine5, "#.##")
+    debugText += "\n15M: " + str.tostring(stLine15, "#.##")
+    debugText += "\n30M: " + str.tostring(stLine30, "#.##")
+    debugText += "\n1H:  " + str.tostring(stLine1H, "#.##")
+    debugText += "\n4H:  " + str.tostring(stLine4H, "#.##")
+    debugText += "\nD:   " + str.tostring(stLineD, "#.##")
+    debugText += "\nW:   " + str.tostring(stLineW, "#.##")
+    debugText += "\nM:   " + str.tostring(stLineM, "#.##")
+    debugText += "\n─── SCORES ───"
+    debugText += "\n5M=" + str.tostring(fastScore5M,"#.##") + " 15M=" + str.tostring(fastScore15M,"#.##") + " 30M=" + str.tostring(fastScore30M,"#.##")
+    debugText += "\n1H=" + str.tostring(fastScore1H,"#.##") + " 4H=" + str.tostring(fastScore4H,"#.##") + " D=" + str.tostring(fastScoreDaily,"#.##")
+    debugText += "\nW=" + str.tostring(fastScoreWeekly,"#.##") + " M=" + str.tostring(fastScoreMonthly,"#.##")
+    if syminfo.pointvalue == 0
+        debugText += "\n⚠️ pointvalue=0"
+    label.set_text(dL, debugText)
+    label.set_x(dL, bar_index)
+    label.set_y(dL, high)
+
+// ── Debug 驗證：各週期 stLine 浮點數 ──
+plot(showDebug ? stLine5 : na, "stLine-5M", color=color.blue, linewidth=1, display=display.pane)
+plot(showDebug ? stLine15 : na, "stLine-15M", color=color.red, linewidth=1, display=display.pane)
+plot(showDebug ? stLine1H : na, "stLine-1H", color=color.green, linewidth=1, display=display.pane)
+plot(showDebug ? close : na, "close-Current", color=color.white, linewidth=1, display=display.pane)
+
+if barstate.isconfirmed
+    string alertMsg = '{"ticker":"' + syminfo.ticker + '"'
+    alertMsg += ',"price":"' + str.tostring(close, "#.##") + '"'
+    alertMsg += ',"atr":"' + str.tostring(currentATR, "#.##") + '"'
+    alertMsg += ',"total":"' + str.tostring(fastTotalScore, "#.##") + '"'
+    alertMsg += ',"s4h":"' + str.tostring(fastScore4H, "#.##") + '"'
+    alertMsg += ',"s1h":"' + str.tostring(fastScore1H, "#.##") + '"'
+    alertMsg += ',"sexec":"' + str.tostring(fastScoreExec, "#.##") + '"'
+    alertMsg += ',"sM":"' + str.tostring(fastScoreMonthly, "#.##") + '"'
+    alertMsg += ',"sW":"' + str.tostring(fastScoreWeekly, "#.##") + '"'
+    alertMsg += ',"sD":"' + str.tostring(fastScoreDaily, "#.##") + '"'
+    alertMsg += ',"action":"' + (longCondition ? "做多" : shortCondition ? "做空" : "無動作") + '"'
+    alertMsg += '}'
+    alert(alertMsg, alert.freq_once_per_bar)
+
+color ema20_color = ema20_slope >= 0 ? c_text_bright : color.gray
+plot(showEMA ? gmma_ema20 : na, title="EMA20", color=ema20_color, linewidth=2)
+plot(showEMA ? ema80 : na, title="EMA80", color=c_yellow_bright, linewidth=2)
+
+// ── 繪製55日線 ──
+plot(showTurtle55 ? turtle_hi : na, title="55日高(綠)", color=color.new(color.lime, 100 - turtleGreenOpacity), linewidth=2)
+plot(showTurtle55 ? turtle_lo : na, title="55日低(紅)", color=color.new(color.red, 100 - turtleRedOpacity), linewidth=2)
+
+// ============================================
+// 12. 即時滾動 K 棒（圖表週期自適應：小週期雙K，大週期單K）
+// 1-4分→雙15分 | 5-10分→雙1H | 15分→雙4H | 30分→單12H | 60分/1H→單日K
+// ============================================
+int secPerBar_rt = timeframe.in_seconds()
+string targetTF = secPerBar_rt <= 4 * 60 ? "15" : secPerBar_rt <= 10 * 60 ? "60" : secPerBar_rt <= 15 * 60 ? "240" : secPerBar_rt <= 30 * 60 ? "720" : secPerBar_rt <= 60 * 60 ? "D" : na
+string targetLabel = targetTF == "15" ? "15分" : targetTF == "60" ? "60分" : targetTF == "240" ? "4H" : targetTF == "720" ? "12H" : targetTF == "D" ? "日K" : ""
+bool showRoll = targetTF == "D" ? false : show1HCandle
+bool isSingleMode = targetTF == "720" or targetTF == "D"
+
+int bxTime = time + h1CandleOffset * secPerBar_rt * 1000
+int boxWTime = h1CandleWidth * secPerBar_rt * 1000
+int gapTime = 1 * secPerBar_rt * 1000
+
+f_htfBoth() => [open, high, low, close, open[1], high[1], low[1], close[1]]
+string secTF = na(targetTF) ? timeframe.period : targetTF
+[oHTF, hHTF, lHTF, cHTF, oHTF1, hHTF1, lHTF1, cHTF1] = request.security(syminfo.tickerid, secTF, f_htfBoth(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+int minsPerBar = math.max(1, math.round(secPerBar_rt / 60))
+int targetMins = targetTF == "15" ? 15 : targetTF == "60" ? 60 : targetTF == "240" ? 240 : targetTF == "720" ? 720 : targetTF == "D" ? 1440 : na
+int barsPerHTF = not na(targetMins) ? math.max(2, math.round(targetMins / minsPerBar)) : na
+float rOpen_fb = not na(barsPerHTF) ? open[barsPerHTF - 1] : na
+float rHigh_fb = not na(barsPerHTF) ? ta.highest(high, barsPerHTF) : na
+float rLow_fb  = not na(barsPerHTF) ? ta.lowest(low, barsPerHTF) : na
+float rClose_fb = close
+float pOpen_fb = not na(barsPerHTF) ? open[barsPerHTF * 2 - 1] : na
+float pHigh_fb = not na(barsPerHTF) ? ta.highest(high[barsPerHTF], barsPerHTF) : na
+float pLow_fb  = not na(barsPerHTF) ? ta.lowest(low[barsPerHTF], barsPerHTF) : na
+float pClose_fb = not na(barsPerHTF) ? close[barsPerHTF] : na
+
+// ── 30分單12H：錨定 15:00 動態會話K ──
+var float s720_O = na
+var float s720_H = na
+var float s720_L = na
+bool is15Start = hour == 15 and minute == 0
+if is15Start and barstate.isnew
+    s720_O := open
+    s720_H := high
+    s720_L := low
+else if na(s720_O)
+    s720_O := open
+    s720_H := high
+    s720_L := low
+else
+    s720_H := math.max(s720_H, high)
+    s720_L := math.min(s720_L, low)
+float s720_C = close
+
+// ── 60分/1H單日K：已停用（v3.87 移除，1H 圖不再繪製單日K） ──
+bool useSecurity = not na(targetTF) and targetTF != "720" and targetTF != "D"
+float rollOpen_base  = not na(targetTF) ? (useSecurity ? (na(oHTF) ? rOpen_fb : oHTF) : rOpen_fb) : na
+float rollHigh_base  = not na(targetTF) ? (useSecurity ? (na(hHTF) ? rHigh_fb : hHTF) : rHigh_fb) : na
+float rollLow_base   = not na(targetTF) ? (useSecurity ? (na(lHTF) ? rLow_fb : lHTF) : rLow_fb) : na
+float rollClose_base = not na(targetTF) ? (useSecurity ? (na(cHTF) ? rClose_fb : cHTF) : rClose_fb) : na
+float rollOpen  = targetTF == "720" ? s720_O : rollOpen_base
+float rollHigh  = targetTF == "720" ? s720_H : rollHigh_base
+float rollLow   = targetTF == "720" ? s720_L : rollLow_base
+float rollClose = targetTF == "720" ? s720_C : rollClose_base
+float prevFrozen_O = not na(targetTF) ? (useSecurity ? (na(oHTF1) ? pOpen_fb : oHTF1) : pOpen_fb) : na
+float prevFrozen_H = not na(targetTF) ? (useSecurity ? (na(hHTF1) ? pHigh_fb : hHTF1) : pHigh_fb) : na
+float prevFrozen_L = not na(targetTF) ? (useSecurity ? (na(lHTF1) ? pLow_fb : lHTF1) : pLow_fb) : na
+float prevFrozen_C = not na(targetTF) ? (useSecurity ? (na(cHTF1) ? pClose_fb : cHTF1) : pClose_fb) : na
+
+// 繪圖生命週期管理
+var label rollLabel = na
+var line rollWickLine = na
+var box rollBodyBox = na
+var line prevWickLine = na
+var box prevBodyBox = na
+
+if barstate.islast
+    label.delete(rollLabel)
+    line.delete(rollWickLine)
+    box.delete(rollBodyBox)
+    line.delete(prevWickLine)
+    box.delete(prevBodyBox)
+
+// ── 自適應雙K繪圖（xloc.bar_time 時間座標） ──
+float atrForBody = ta.atr(14)
+bool rollReady = not na(targetTF) and not na(rollOpen)
+bool prevReady = not isSingleMode and rollReady
+if barstate.islast and showRoll and rollReady
+    bool isBull = rollClose >= rollOpen
+    color clr = isBull ? color.green : color.red
+    color clrFill = isBull ? color.new(color.green, 50) : color.new(color.red, 50)
+
+    float pO = not na(prevFrozen_O) ? prevFrozen_O : not na(pOpen_fb) ? pOpen_fb : rollOpen
+    float pH = not na(prevFrozen_H) ? prevFrozen_H : not na(pHigh_fb) ? pHigh_fb : rollHigh
+    float pL = not na(prevFrozen_L) ? prevFrozen_L : not na(pLow_fb) ? pLow_fb : rollLow
+    float pC = not na(prevFrozen_C) ? prevFrozen_C : not na(pClose_fb) ? pClose_fb : rollClose
+
+    // bxTime = 前一小時K位置(左)，當前K在其右側
+    int curBxTime = bxTime + boxWTime + gapTime
+    int wickXTime = curBxTime + boxWTime / 2
+    rollWickLine := line.new(wickXTime, rollHigh, wickXTime, rollLow, color=color.gray, width=1, xloc=xloc.bar_time)
+
+    float bodyTop = math.max(rollOpen, rollClose)
+    float bodyBottom = math.min(rollOpen, rollClose)
+    float bodyH = bodyTop - bodyBottom
+    float minBody = na(atrForBody) ? 0 : atrForBody * 0.04
+    if bodyH < minBody
+        float mid = (bodyTop + bodyBottom) / 2
+        bodyTop := mid + minBody / 2
+        bodyBottom := mid - minBody / 2
+    rollBodyBox := box.new(curBxTime, bodyTop, curBxTime + boxWTime, bodyBottom,
+                           bgcolor=clrFill, border_color=clr, border_width=1, xloc=xloc.bar_time)
+
+    int labelTime = curBxTime + boxWTime + 2 * secPerBar_rt * 1000
+    rollLabel := label.new(labelTime, rollHigh,
+                           targetLabel + "\n" +
+                           "O:" + str.tostring(rollOpen, "#.##") + "\n" +
+                           "H:" + str.tostring(rollHigh, "#.##") + "\n" +
+                           "L:" + str.tostring(rollLow, "#.##") + "\n" +
+                           "C:" + str.tostring(rollClose, "#.##"),
+                           style=label.style_label_left,
+                           color=color.new(#222222, 20), textcolor=color.white,
+                           textalign=text.align_left, size=size.small, xloc=xloc.bar_time)
+
+    if prevReady
+        int prevBxTime = bxTime
+
+        bool prevBull = pC >= pO
+        color prevClr = prevBull ? color.green : color.red
+        color prevFill = prevBull ? color.new(color.green, 50) : color.new(color.red, 50)
+
+        int prevWickXTime = prevBxTime + boxWTime / 2
+        prevWickLine := line.new(prevWickXTime, pH, prevWickXTime, pL, color=color.gray, width=1, xloc=xloc.bar_time)
+
+        float pBodyTop = math.max(pO, pC)
+        float pBodyBot = math.min(pO, pC)
+        float pBodyH = pBodyTop - pBodyBot
+        if pBodyH < minBody
+            float pMid = (pBodyTop + pBodyBot) / 2
+            pBodyTop := pMid + minBody / 2
+            pBodyBot := pMid - minBody / 2
+        prevBodyBox := box.new(prevBxTime, pBodyTop, prevBxTime + boxWTime, pBodyBot,
+                               bgcolor=prevFill, border_color=prevClr, border_width=1, xloc=xloc.bar_time)
+
+
+
+
+
+

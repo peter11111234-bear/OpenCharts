@@ -546,15 +546,31 @@ export async function prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, allBars?:
       }
     }
   }
+  // Per-job timeout + failure isolation: a hung provider promise would hold
+  // the global runScript mutex forever (all Pine sessions wedge until reload),
+  // and Promise.all's first-rejection would kill the whole run — TV semantics
+  // degrade a failed security() to na, so do the same via an empty series.
+  const PREFETCH_TIMEOUT_MS = 30_000;
   const jobs = new Map<string, Promise<BarData[]>>();
   for (const spec of store.byNode.values()) {
     const sym = resolvedSym(spec), tf = resolvedTf(spec);
     if (sym === DYNAMIC || tf === DYNAMIC) continue;
     const key = `${sym}\n${tf}`;
     if (store.fetched.has(key) || jobs.has(key)) continue;
-    jobs.set(key, ctx.fetchSeries
+    const job = (ctx.fetchSeries
       ? ctx.fetchSeries(sym, tf)
       : Promise.resolve(chartBars!));
+    jobs.set(key, Promise.race([
+      job,
+      (() => {
+        const { promise, reject } = Promise.withResolvers<BarData[]>();
+        setTimeout(() => reject(new Error(`fetchSeries timeout ${PREFETCH_TIMEOUT_MS}ms`)), PREFETCH_TIMEOUT_MS);
+        return promise;
+      })(),
+    ]).catch((e) => {
+      console.warn(`[pine] prefetch ${sym} ${tf} failed:`, e instanceof Error ? e.message : e);
+      return [] as BarData[];
+    }));
   }
   const keys = [...jobs.keys()];
   const results = await Promise.all(keys.map(k => jobs.get(k)!));
