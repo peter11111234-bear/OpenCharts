@@ -190,8 +190,6 @@ registerLegendAction({
   order: 10,
   when: (ind) => ind.source !== undefined,
   run: (ctx, ind) => {
-    editorState.currentId = null;
-    editorState.handleId = ind.id;
     openEditor(ctx, ind.source ?? "", ind.id);
   },
 });
@@ -240,14 +238,14 @@ registerLegendCallout({
             ? act('原始碼…', true, (c, i) => {
                 const match = pineLibList().find(s => s.source === i.source);
                 if (match) openPineEditorWithScript(c, match.id);
-                else { editorState.currentId = null; editorState.handleId = i.id; openEditor(c, i.source ?? '', i.id); }
+                else openEditor(c, i.source ?? '', i.id);
               })
             : dis('原始碼（內建指標不可編輯）'),
           sep,
           isPine
             ? act('複製', false, (c, i) => {
-                void navigator.clipboard?.writeText(i.source ?? '');
-                try { c.toast?.('已複製', 'success'); } catch { /* no toast */ }
+                const p = navigator.clipboard?.writeText(i.source ?? '');
+                if (p) void p.then(() => { try { c.toast?.('已複製', 'success'); } catch {} }, () => { try { c.toast?.('複製失敗', 'error'); } catch {} });
               })
             : dis('複製（內建指標無來源）'),
           act('隱藏', false, (c, i) => { c.chart.indicators().find(x => x.id === i.id)?.setVisible(false); }),
@@ -307,12 +305,13 @@ const TEMPLATES = {
   builtin: `//@version=6\n// Copied from a built-in — replace the body.\nindicator("Built-in copy", overlay=true)\nplot(ta.sma(close, 20))\n`,
 };
 
-function closeModal(overlay: HTMLElement): void {
+function closeModal(overlay: HTMLElement, menus?: HTMLElement[]): void {
+  for (const m of menus ?? []) m.remove();
   overlay.remove();
   open = false;
 }
 
-function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): void {
+function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scriptId?: string): void {
   if (open) return;
   open = true;
   if (!migrated) { migrated = true; try { pineLibMigrateLegacyHist(); } catch { /* first run */ } }
@@ -323,10 +322,17 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   const dialog = doc.createElement("div");
   dialog.className = "vela-pine-dialog";
 
-  // initialSrc (legend ⋯ → 原始碼) means we're editing an indicator, not the
-  // previously-opened library script — reset currentId so Save doesn't write
-  // the buffer over an unrelated script.
-  editorState = { currentId: initialSrc ? null : editorState.currentId, dirty: false, handleId: editingId };
+  // scriptId is authoritative (caller resolved "this buffer IS that script").
+  // Without it, a non-empty initialSrc means editing an indicator — reset
+  // currentId so Save can't overwrite an unrelated script.
+  editorState = {
+    currentId: scriptId ?? (initialSrc ? null : editorState.currentId),
+    dirty: false,
+    handleId: editingId,
+  };
+  // Popup menus append to doc.body (outside overlay) — track so closeModal
+  // can clean them; otherwise they survive as ghost UI.
+  const openMenus: HTMLElement[] = [];
   const area = doc.createElement("textarea");
   area.className = "vela-pine-area";
   area.spellcheck = false;
@@ -436,6 +442,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
     }
     const dismiss = (e: MouseEvent) => { if (!menu.contains(e.target as Node)) { menu.remove(); doc.removeEventListener("mousedown", dismiss); } };
     doc.addEventListener("mousedown", dismiss);
+    openMenus.push(menu);
     doc.body.appendChild(menu);
   };
 
@@ -480,6 +487,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
     }
     const dismiss = (e: MouseEvent) => { if (!menu.contains(e.target as Node)) { menu.remove(); doc.removeEventListener("mousedown", dismiss); } };
     doc.addEventListener("mousedown", dismiss);
+    openMenus.push(menu);
     doc.body.appendChild(menu);
   };
 
@@ -533,6 +541,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
 
     const dismiss = (e: MouseEvent) => { if (!menu.contains(e.target as Node)) { menu.remove(); doc.removeEventListener("mousedown", dismiss); } };
     doc.addEventListener("mousedown", dismiss);
+    openMenus.push(menu);
     doc.body.appendChild(menu);
   };
   nameBtn.addEventListener("click", openNameMenu);
@@ -579,6 +588,9 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
               return;
             }
             setStatus("Original gone — added new", "ok");
+            // Update handleId to the new indicator so next Add hits updateCode.
+            const added = ctx.chart.indicators().at(-1);
+            if (added) editorState.handleId = added.id;
           }
         } else {
           const r = await ctx.chart.runIndicator(src, isOverlay ? { overlay: true } : { pane: "new" });
@@ -624,7 +636,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   collapseBtn.title = "Collapse";
   collapseBtn.addEventListener("click", () => {
     try { sessionStorage.setItem("opencharts.pine.draft", JSON.stringify({ id: editorState.currentId, src: area.value })); } catch { /* quota */ }
-    closeModal(overlay);
+    closeModal(overlay, openMenus);
   });
 
   const closeBtn = doc.createElement("button");
@@ -634,7 +646,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   closeBtn.title = "Close";
   closeBtn.addEventListener("click", () => {
     if (editorState.dirty && !doc.defaultView?.confirm?.("Unsaved changes will be lost. Close anyway?")) return;
-    closeModal(overlay);
+    closeModal(overlay, openMenus);
   });
 
   const spacer = doc.createElement("div");
@@ -761,13 +773,13 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) {
       if (editorState.dirty && !doc.defaultView?.confirm?.("Unsaved changes will be lost. Close anyway?")) return;
-      closeModal(overlay);
+      closeModal(overlay, openMenus);
     }
   });
   overlay.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       if (editorState.dirty && !doc.defaultView?.confirm?.("Unsaved changes will be lost. Close anyway?")) return;
-      closeModal(overlay);
+      closeModal(overlay, openMenus);
     }
     if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); saveScript(); }
     if ((e.ctrlKey || e.metaKey) && e.key === "o") { e.preventDefault(); openScriptsDialogAction(); }
@@ -775,7 +787,13 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
 
   // Append to document.body — ctx.host is a cell host that dies on
   // cell:destroyed (undo, layout change, state restore), taking the modal with it.
+  // MutationObserver catches external .remove() (HMR, devtools, other teardown)
+  // so `open` doesn't latch permanently.
+  const mo = new MutationObserver(() => {
+    if (!overlay.isConnected) { open = false; mo.disconnect(); }
+  });
   doc.body.appendChild(overlay);
+  mo.observe(doc.documentElement, { childList: true, subtree: true });
   area.focus();
 }
 
@@ -783,8 +801,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
 export function openPineEditorWithScript(ctx: WidgetContext, scriptId: string): void {
   const s = pineLibGet(scriptId);
   if (!s) return;
-  editorState.currentId = s.id;
-  openEditor(ctx, s.source);
+  openEditor(ctx, s.source, undefined, s.id);
 }
 
 

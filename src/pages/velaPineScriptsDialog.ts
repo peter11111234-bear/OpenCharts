@@ -149,12 +149,12 @@ export function openScriptsDialog(ctx: WidgetContext, onPick: (id: string) => vo
   // hook every close path: ✕ button, overlay click, Escape, and MutationObserver
   // for external .remove() calls.
   const mo = new MutationObserver(() => { if (!overlay.isConnected) { detach(); mo.disconnect(); } });
-  mo.observe(doc.documentElement, { childList: true, subtree: true });
+  dialog.append(head, searchWrap, list);
   overlay.appendChild(dialog);
 
   overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
   overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") overlay.remove(); });
-
+  mo.observe(doc.documentElement, { childList: true, subtree: true });
   doc.body.appendChild(overlay);
   search.focus();
 }
