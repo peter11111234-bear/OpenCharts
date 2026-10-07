@@ -135,6 +135,44 @@ function mountCellToolbar(ws: VelaWorkspace, cell: ChartCell): void {
 
   bar.append(symInput, dataList, tfWrap, stWrap);
   cell.host.appendChild(bar);
+  mountIndicatorCountBadge(ws, cell);
+}
+
+/** Indicator-count badge next to the legend fold chevron — TV shows a
+ *  "˅ N" chip with N even when NOT folded; vela's chevron is bare when
+ *  unfolded, so we overlay the count. Observer-driven: vela rebuilds its
+ *  legend DOM internally, so we watch childList and re-derive the badge.
+ *  Badge unmounts with the host on cell:destroyed. */
+function mountIndicatorCountBadge(ws: VelaWorkspace, cell: ChartCell): void {
+  const host = cell.host;
+  const badge = host.ownerDocument.createElement("span");
+  badge.className = "vela-ind-count-badge";
+  badge.style.cssText =
+    "position:absolute;top:0;left:0;z-index:6;pointer-events:none;" +
+    "background:#f9a825;color:#000;border-radius:8px;font:600 10px/14px " +
+    "-apple-system,Segoe UI,sans-serif;padding:0 5px;margin:2px 0 0 10px;display:none;";
+  const refresh = () => {
+    let n = 0;
+    try { n = cell.chart.indicators().length; } catch { n = 0; }
+    badge.textContent = String(n);
+    badge.style.display = n > 0 ? "inline-block" : "none";
+  };
+  const mo = new MutationObserver(refresh);
+  mo.observe(host, { childList: true, subtree: true });
+  // vela mounts rows lazily; the observer above keeps the count live,
+  // but also re-sync on the chart's state events in case a pane is
+  // created without a DOM mutation at the right spot.
+  host.appendChild(badge);
+  refresh();
+  const offState = ws.on("state:changed", refresh);
+  const offDestroyed = ws.on("cell:destroyed", ({ id }) => {
+    if (id === cell.id) {
+      offState();
+      offDestroyed();
+      mo.disconnect();
+      badge.remove();
+    }
+  });
 }
 
 /**
