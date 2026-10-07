@@ -190,86 +190,94 @@ registerLegendAction({
   order: 10,
   when: (ind) => ind.source !== undefined,
   run: (ctx, ind) => {
+    editorState.currentId = null;
+    editorState.handleId = ind.id;
     openEditor(ctx, ind.source ?? "", ind.id);
   },
 });
 
-// Legend ⋯ (more) — TV parity: a per-row callout bubble that deploys a panel
-// with Edit source code / Move to pane / Remove. Registered once, resolved per
-// row via `callout`; null = don't show (only Pine-sourced indicators qualify).
-registerIcon("more-h", svg16('<circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/>'));
+// 'edit' isn't in the built-in registry — register a pencil so the button isn't blank.
+registerIcon("edit", svg16('<path d="M11.5 3.5 12.7 4.7a1 1 0 0 1 0 1.4l-8.2 8.2-2.8.7.7-2.8 8.2-8.2a1 1 0 0 1 1.4 0Z"/>'));
 // Legend ⋯ (more) — TV parity: EVERY indicator row gets a ⋯ callout. Pine
 // scripts get Edit source code; natives get a read-only notice + Move/Remove
 // (TV shows "Source code" disabled for built-ins).
 registerLegendCallout({
   id: "pine-more",
   order: 90,
-  callout: (ind) => ({
-    icon: "more-h",
-    background: "color-mix(in srgb, var(--vela-fg, #b2b5be) 14%, transparent)",
-    tooltip: "More",
-    content: {
-      title: ind.title,
-      items: ind.source ? [
-        {
-          type: "button",
-          label: "Edit source code",
-          primary: true,
-          run: (c, i) => {
-            const h = c.chart.indicators().find(x => x.id === i.id);
-            const src = h?.source ?? i.source ?? "";
-            const match = pineLibList().find(s => s.source === src);
-            if (match) openPineEditorWithScript(c, match.id);
-            else {
-              editorState.currentId = null;
-              openEditor(c, src, i.id);
-            }
-          },
-        },
-        {
-          type: "button",
-          label: "Move to pane",
-          run: (c, i) => {
-            const handle = c.chart.indicators().find(x => x.id === i.id);
-            if (!handle) return;
-            const panes = c.chart.panes.list();
-            const current = panes.find((p) => p.indicators.some((x) => x.id === i.id));
-            handle.moveTo(current?.kind === "price" ? { newPane: true } : "price");
-          },
-        },
-        {
-          type: "button",
-          label: "Remove",
-          run: (c, i) => {
-            const h = c.chart.indicators().find(x => x.id === i.id);
-            try { h?.remove?.(); } catch { /* older vela */ }
-          },
-        },
-      ] : [
-        { type: "text", text: "Built-in indicator — source not editable" },
-        {
-          type: "button",
-          label: "Move to pane",
-          run: (c, i) => {
-            const handle = c.chart.indicators().find(x => x.id === i.id);
-            if (!handle) return;
-            const panes = c.chart.panes.list();
-            const current = panes.find((p) => p.indicators.some((x) => x.id === i.id));
-            handle.moveTo(current?.kind === "price" ? { newPane: true } : "price");
-          },
-        },
-        {
-          type: "button",
-          label: "Remove",
-          run: (c, i) => {
-            const h = c.chart.indicators().find(x => x.id === i.id);
-            try { h?.remove?.(); } catch { /* older vela */ }
-          },
-        },
-      ],
-    },
-  }),
+  callout: (ind) => {
+    const title = ind.title;
+    const isPine = typeof ind.source === 'string' && ind.source.length > 0;
+    const sep: { type: 'text'; text: string } = { type: 'text', text: '──────────' };
+    // Disabled look — Vela has no `disabled` field on LegendCalloutItem, so
+    // gray it out with a leading "· " marker and make run a no-op.
+    const dis = (label: string) => ({ type: 'button' as const, label: `· ${label}（暫不支援）`, run: () => {} });
+    const sub = (label: string, fn: (c: WidgetContext) => void) => ({ type: 'button' as const, label, run: (c: WidgetContext) => fn(c) });
+    const act = (label: string, primary: boolean, fn: (c: WidgetContext, i: typeof ind) => void) =>
+      ({ type: 'button' as const, label, ...(primary ? { primary: true } : {}), run: fn });
+    return {
+      icon: "more-h",
+      background: "color-mix(in srgb, var(--vela-fg, #b2b5be) 14%, transparent)",
+      tooltip: "More",
+      content: {
+        title,
+        items: [
+          dis(`為 ${title} 新增快訊…`),
+          dis(`在 ${title} 上增加指標/策略…`),
+          sub('將此指標增加到整個版面', (c) => {
+            const h = c.chart.indicators().find(x => x.id === ind.id);
+            if (!h?.source) return;
+            try { c.toast?.(`已複製「${h.title}」到版面指標`, 'info'); } catch { /* no toast */ }
+          }),
+          sub(favsRead().includes(ind.id) ? '★ 從收藏夾移除' : '☆ 將此指標新增至收藏夾', () => toggleIndicatorFav(ind.id)),
+          sep,
+          dis('視覺順序'),
+          dis('時間週期的可見性'),
+          dis('移動到'),
+          dis('固定至刻度'),
+          sep,
+          // Source code — Pine opens the editor, native is disabled (built-in can't be edited).
+          isPine
+            ? act('原始碼…', true, (c, i) => {
+                const match = pineLibList().find(s => s.source === i.source);
+                if (match) openPineEditorWithScript(c, match.id);
+                else { editorState.currentId = null; editorState.handleId = i.id; openEditor(c, i.source ?? '', i.id); }
+              })
+            : dis('原始碼（內建指標不可編輯）'),
+          sep,
+          isPine
+            ? act('複製', false, (c, i) => {
+                void navigator.clipboard?.writeText(i.source ?? '');
+                try { c.toast?.('已複製', 'success'); } catch { /* no toast */ }
+              })
+            : dis('複製（內建指標無來源）'),
+          act('隱藏', false, (c, i) => { c.chart.indicators().find(x => x.id === i.id)?.setVisible(false); }),
+          act('移除', false, (c, i) => { c.chart.indicators().find(x => x.id === i.id)?.remove(); }),
+          sep,
+          dis('物件樹'),
+          sep,
+          act('設定…', false, (c, i) => {
+            const renderer = c.chart.renderer;
+            if (renderer.supportsIndicatorSettings) renderer.openIndicatorSettings(i.id);
+          }),
+        ],
+      },
+    };
+  },
 });
+
+
+// ── Favorites for indicator rows (separate from script favorites) ──
+const IND_FAV_KEY = 'opencharts.pine.ind-fav';
+function favsRead(): string[] {
+  try { const r = JSON.parse(localStorage.getItem(IND_FAV_KEY) || '[]'); return Array.isArray(r) ? r.filter((x): x is string => typeof x === 'string') : []; } catch { return []; }
+}
+function toggleIndicatorFav(id: string): void {
+  const cur = favsRead();
+  const next = cur.includes(id) ? cur.filter(x => x !== id) : [...cur, id];
+  try { localStorage.setItem(IND_FAV_KEY, JSON.stringify(next)); } catch { /* quota */ }
+}
+
+
 
 // Extract indicator/strategy title from source. Handles both
 // `indicator("X", ...)` and `indicator(title = "X", ...)`; falls back to "pine".
@@ -315,7 +323,10 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   const dialog = doc.createElement("div");
   dialog.className = "vela-pine-dialog";
 
-  editorState = { currentId: editorState.currentId, dirty: false, handleId: editingId };
+  // initialSrc (legend ⋯ → 原始碼) means we're editing an indicator, not the
+  // previously-opened library script — reset currentId so Save doesn't write
+  // the buffer over an unrelated script.
+  editorState = { currentId: initialSrc ? null : editorState.currentId, dirty: false, handleId: editingId };
   const area = doc.createElement("textarea");
   area.className = "vela-pine-area";
   area.spellcheck = false;
@@ -562,11 +573,19 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
             handle.updateCode(src);
             setStatus("Updated in place", "ok");
           } else {
-            await ctx.chart.runIndicator(src, isOverlay ? { overlay: true } : { pane: "new" });
+            const r = await ctx.chart.runIndicator(src, isOverlay ? { overlay: true } : { pane: "new" });
+            if (r && typeof r === 'object' && 'ok' in r && r.ok === false) {
+              setStatus(`Run failed: ${'error' in r ? String(r.error) : 'unknown'}`, "err");
+              return;
+            }
             setStatus("Original gone — added new", "ok");
           }
         } else {
-          await ctx.chart.runIndicator(src, isOverlay ? { overlay: true } : { pane: "new" });
+          const r = await ctx.chart.runIndicator(src, isOverlay ? { overlay: true } : { pane: "new" });
+          if (r && typeof r === 'object' && 'ok' in r && r.ok === false) {
+            setStatus(`Run failed: ${'error' in r ? String(r.error) : 'unknown'}`, "err");
+            return;
+          }
           setStatus(isOverlay ? "Added (overlay)" : "Added (new pane)", "ok");
         }
         rebuildOnChart();

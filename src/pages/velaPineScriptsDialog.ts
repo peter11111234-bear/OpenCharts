@@ -142,12 +142,14 @@ export function openScriptsDialog(ctx: WidgetContext, onPick: (id: string) => vo
   rebuild();
 
   search.addEventListener("input", () => { query = search.value.trim().toLowerCase(); rebuild(); });
-
-  // live refresh if another tab/cell mutates the library
+  // live refresh if another tab/cell mutates the library — unsubscribe on close.
+  // DOM has no 'remove' event; poll the connection flag instead.
   const unsub = pineLibSubscribe(rebuild);
-  overlay.addEventListener("remove", () => unsub());
-
-  dialog.append(head, searchWrap, list);
+  const detach = () => { unsub(); };
+  // hook every close path: ✕ button, overlay click, Escape, and MutationObserver
+  // for external .remove() calls.
+  const mo = new MutationObserver(() => { if (!overlay.isConnected) { detach(); mo.disconnect(); } });
+  mo.observe(doc.documentElement, { childList: true, subtree: true });
   overlay.appendChild(dialog);
 
   overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
