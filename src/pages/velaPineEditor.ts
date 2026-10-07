@@ -11,15 +11,21 @@
  * Registered at module scope (the workspace resolves contributed actions at
  * construction — "register at import time" per the SDK docs).
  */
+// All contribution APIs must come from `@luxalgo/vela/plugin` — Vite resolves
+// the bare `@luxalgo/vela` root and `/ui` subpath into SEPARATE module instances,
+// so the contribution registry Map is duplicated. Registering on the root while
+// the workspace reads the plugin instance → callouts/actions never render.
 import {
   registerWidgetAction,
   registerStatePersistence,
   registerLegendAction,
-  type CellStateContext,
-  type WidgetContext,
   registerLegendCallout,
   registerIcon,
-} from "@luxalgo/vela";
+  type CellStateContext,
+  type WidgetContext,
+} from "@luxalgo/vela/plugin";
+// `svg16` is a pure helper (builds markup), but it lives only in /ui — the
+// registry itself is chunk-BZQM2XO7.js, shared via plugin's re-export.
 import { svg16 } from "@luxalgo/vela/ui";
 import {
   pineLibCreate, pineLibGet, pineLibList, pineLibSave, pineLibRename,
@@ -192,16 +198,19 @@ registerLegendAction({
 // with Edit source code / Move to pane / Remove. Registered once, resolved per
 // row via `callout`; null = don't show (only Pine-sourced indicators qualify).
 registerIcon("more-h", svg16('<circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/>'));
+// Legend ⋯ (more) — TV parity: EVERY indicator row gets a ⋯ callout. Pine
+// scripts get Edit source code; natives get a read-only notice + Move/Remove
+// (TV shows "Source code" disabled for built-ins).
 registerLegendCallout({
   id: "pine-more",
   order: 90,
-  callout: (ind) => ind.source ? {
+  callout: (ind) => ({
     icon: "more-h",
     background: "color-mix(in srgb, var(--vela-fg, #b2b5be) 14%, transparent)",
     tooltip: "More",
     content: {
       title: ind.title,
-      items: [
+      items: ind.source ? [
         {
           type: "button",
           label: "Edit source code",
@@ -236,9 +245,30 @@ registerLegendCallout({
             try { h?.remove?.(); } catch { /* older vela */ }
           },
         },
+      ] : [
+        { type: "text", text: "Built-in indicator — source not editable" },
+        {
+          type: "button",
+          label: "Move to pane",
+          run: (c, i) => {
+            const handle = c.chart.indicators().find(x => x.id === i.id);
+            if (!handle) return;
+            const panes = c.chart.panes.list();
+            const current = panes.find((p) => p.indicators.some((x) => x.id === i.id));
+            handle.moveTo(current?.kind === "price" ? { newPane: true } : "price");
+          },
+        },
+        {
+          type: "button",
+          label: "Remove",
+          run: (c, i) => {
+            const h = c.chart.indicators().find(x => x.id === i.id);
+            try { h?.remove?.(); } catch { /* older vela */ }
+          },
+        },
       ],
     },
-  } : null,
+  }),
 });
 
 // Extract indicator/strategy title from source. Handles both
@@ -500,6 +530,26 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   addToChartBtn.type = "button";
   addToChartBtn.className = "vela-pine-hbtn primary";
   addToChartBtn.textContent = "Add to chart";
+
+  // TV's two refresh icons: ~ (reload script = reload source from library) and
+  // ⭮ (re-compile = re-run the buffer without saving). Both are tiny icon
+  // buttons; using text glyphs keeps it ASCII.
+  const reloadBtn = doc.createElement("button");
+  reloadBtn.type = "button";
+  reloadBtn.className = "vela-pine-hbtn";
+  reloadBtn.textContent = "↻";
+  reloadBtn.title = "Reload script from library";
+  reloadBtn.addEventListener("click", () => {
+    if (!editorState.currentId) { setStatus("Nothing to reload", "err"); return; }
+    const s = pineLibGet(editorState.currentId);
+    if (!s) { setStatus("Script no longer in library", "err"); return; }
+    if (editorState.dirty && !doc.defaultView?.confirm?.("Discard unsaved changes?")) return;
+    area.value = s.source;
+    editorState.dirty = false;
+    refreshName();
+    setStatus("Reloaded", "ok");
+  });
+
   addToChartBtn.addEventListener("click", () => {
     void (async () => {
       setStatus("Running…");
@@ -532,6 +582,15 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   saveBtn.textContent = "Save";
   saveBtn.addEventListener("click", saveScript);
 
+  // TV header order: [Publish script] [⋯] [—] [✕]. Publish is a community
+  // feature we don't have — keep it disabled for pixel-parity.
+  const publishBtn = doc.createElement("button");
+  publishBtn.type = "button";
+  publishBtn.className = "vela-pine-hbtn";
+  publishBtn.textContent = "Publish script";
+  publishBtn.disabled = true;
+  publishBtn.title = "Publish: not available locally";
+
   const moreBtn = doc.createElement("button");
   moreBtn.type = "button";
   moreBtn.className = "vela-pine-hbtn";
@@ -562,7 +621,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   const spacer = doc.createElement("div");
   spacer.className = "vela-pine-spacer";
 
-  headbar.append(appTitle, nameBtn, spacer, addToChartBtn, saveBtn, moreBtn, collapseBtn, closeBtn);
+  headbar.append(appTitle, nameBtn, reloadBtn, spacer, addToChartBtn, saveBtn, publishBtn, moreBtn, collapseBtn, closeBtn);
 
   // ── Buffer init: legend-edit src > collapsed draft > library entry > template ──
   const draft = (() => { try { return JSON.parse(sessionStorage.getItem("opencharts.pine.draft") || "null") as { id: string | null; src: string } | null; } catch { return null; } })();
@@ -637,7 +696,10 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   // ── Statusbar ──
   const statusbar = doc.createElement("div");
   statusbar.className = "vela-pine-statusbar";
-  const cursorPos = doc.createElement("span");
+  const cursorPos = doc.createElement("button");
+  cursorPos.type = "button";
+  cursorPos.className = "vela-pine-hbtn";
+  cursorPos.title = "Go to line";
   const updateCursor = () => {
     const pos = area.selectionStart;
     const before = area.value.slice(0, pos);
@@ -649,6 +711,21 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string): vo
   area.addEventListener("keyup", updateCursor);
   area.addEventListener("click", updateCursor);
   area.addEventListener("input", updateCursor);
+  cursorPos.addEventListener("click", () => {
+    const input = doc.defaultView?.prompt?.("Go to line:column", "1:1");
+    if (!input) return;
+    const m = /^(\d+)(?::(\d+))?$/.exec(input.trim());
+    if (!m) { setStatus("Use line:col", "err"); return; }
+    const line = Math.max(1, parseInt(m[1]!, 10));
+    const col = Math.max(1, parseInt(m[2] ?? "1", 10));
+    const lines = area.value.split("\n");
+    let pos = 0;
+    for (let i = 0; i < Math.min(line - 1, lines.length); i++) pos += lines[i]!.length + 1;
+    pos += Math.min(col - 1, lines[Math.min(line - 1, lines.length - 1)]!.length);
+    area.focus();
+    area.setSelectionRange(pos, pos);
+    updateCursor();
+  });
 
   const verLabel = doc.createElement("a");
   verLabel.textContent = "Pine Script v6";
