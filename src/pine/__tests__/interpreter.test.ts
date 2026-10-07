@@ -119,10 +119,77 @@ describe('var / assign / reassign', () => {
     );
   });
 
+  it(':= self-reference on undeclared name errors (x := x[1]+1)', async () => {
+    await expect(
+      runScript([reassign('x', bin('+', histref(ident('x'), num(1)), num(1)))], mkBars(3)),
+    ).rejects.toThrow(/undeclared/);
+  });
+
+  it('var x = 0; x := nz(x[1])+1 accumulates 1,2,3 across bars', async () => {
+    // TV: x[1] on bar 0 is na and na+1 propagates na — the counter idiom is nz().
+    const body: Node[] = [
+      varDecl('x', num(0)),
+      reassign('x', bin('+', call(ident('nz'), [{ value: histref(ident('x'), num(1)) }]), num(1))),
+      plot(ident('x'), 'x'),
+    ];
+    const res = await runScript(body, mkBars(4));
+    expect(nums(firstPlotValues(res))).toEqual([1, 2, 3, 4]);
+  });
+
+  it('x = 0 then x := x+1 (non-var decl) still reassigns', async () => {
+    const body: Node[] = [
+      assign('x', num(0)),
+      reassign('x', bin('+', ident('x'), num(1))),
+      plot(ident('x'), 'x'),
+    ];
+    const res = await runScript(body, mkBars(3));
+    // `=` declares the slot; `:=` writes it — non-var x resets to 0 each bar
+    // before the := line, so every bar yields 1.
+    expect(nums(firstPlotValues(res))).toEqual([1, 1, 1]);
+  });
+
   it('plain assign creates per-bar series', async () => {
     const body: Node[] = [assign('x', ident('close')), plot(histref(ident('x'), num(1)))];
     const res = await runScript(body, mkBars(4));
     expect(nums(firstPlotValues(res))).toEqual(['na', 1, 2, 3]);
+  });
+
+  it('var [a,b] = f() binds once and persists; plain tuple resets per bar', async () => {
+    // pair() → [close, high] — a fresh array every bar.
+    const pair = funcDecl('pair', [], {
+      type: 'arraylit', items: [ident('close'), ident('high')],
+    });
+    const tup = (names: string[], v: Node, isVar: boolean): Node =>
+      isVar
+        ? { type: 'tuple', names, value: v, var: true }
+        : { type: 'tuple', names, value: v };
+
+    // var: pair() runs once at bar 0 (a=close[0], b=high[0]) and
+    // never again; a[1] reads the carried bar-0 value on later bars.
+    const vr = await runScript([
+      pair,
+      tup(['a', 'b'], call(ident('pair'), []), true),
+      plot(ident('a'), 'a'),
+      plot(histref(ident('a'), num(1)), 'a1'),
+      plot(ident('b'), 'b'),
+    ], mkBars(4));
+    const vPlots = [...vr.plots.values()].map(p => nums(p.values));
+    expect(vPlots[0]).toEqual([1, 1, 1, 1]);      // a stays bar-0 close
+    expect(vPlots[1]).toEqual(['na', 1, 1, 1]);   // a[1] = previous bar's a
+    expect(vPlots[2]).toEqual([2, 2, 2, 2]);      // b stays bar-0 high
+
+    // plain tuple: re-evaluated every bar — a tracks close, b tracks high.
+    const pr = await runScript([
+      pair,
+      tup(['a', 'b'], call(ident('pair'), []), false),
+      plot(ident('a'), 'a'),
+      plot(histref(ident('a'), num(1)), 'a1'),
+      plot(ident('b'), 'b'),
+    ], mkBars(4));
+    const pPlots = [...pr.plots.values()].map(p => nums(p.values));
+    expect(pPlots[0]).toEqual([1, 2, 3, 4]);      // a = close per bar
+    expect(pPlots[1]).toEqual(['na', 1, 2, 3]);   // a[1] = previous bar's close
+    expect(pPlots[2]).toEqual([2, 3, 4, 5]);      // b = high per bar
   });
 });
 
@@ -587,8 +654,56 @@ describe('review regressions', () => {
       plot(ident('lagged')),
     ];
     const res = await runScript(body, mkBars(4));
-    // x[1] sees the caller's history (unbumped): copy-on-write preserves it.
-    expect(nums(firstPlotValues(res))).toEqual(['na', 1, 2, 3]);
+    // Pine re-binds the param each bar (seeded to the arg's current value),
+    // but `:=` writes accumulate — x[1] reads the PREVIOUS bar's bumped value.
+    expect(nums(firstPlotValues(res))).toEqual(['na', 1001, 1002, 1003]);
+  });
+
+  it(':= on a method param stays local through ctx.callUdf (no-callNode path)', async () => {
+    // Method calls dispatch via ctx.callUdf WITHOUT a callNode — the
+    // callee's series param must be a copy-on-write wrapper, never the
+    // caller UDF's own param CowSeries, or the method's `:=` would
+    // write through into the caller's slot.
+    const body: Node[] = [
+      {
+        type: 'typedecl',
+        name: 'Pt',
+        fields: [{ type: 'field', name: 'x', typeAnn: 'float' }],
+      },
+      {
+        type: 'method',
+        selfType: 'Pt',
+        name: 'bump',
+        params: [
+          { name: 'self', typeAnn: 'Pt' },
+          { name: 'v' },
+        ],
+        body: [
+          reassign('v', bin('+', ident('v'), num(1000))),
+          ident('v'),
+        ],
+      },
+      // outer: invoke the method with its own param, then return the
+      // param — the method's `v :=` must not corrupt outer's `x`.
+      funcDecl('outer', ['x'], [
+        assign('pt', call(member(ident('Pt'), 'new'), [])),
+        call(member(ident('pt'), 'bump'), [{ value: ident('x') }]),
+        ident('x'),
+      ]),
+      // outerRet: return the method's result so the := is proven to run.
+      funcDecl('outerRet', ['x'], [
+        assign('pt2', call(member(ident('Pt'), 'new'), [])),
+        call(member(ident('pt2'), 'bump'), [{ value: ident('x') }]),
+      ]),
+      assign('res', call(ident('outer'), [{ value: ident('close') }])),
+      assign('bumped', call(ident('outerRet'), [{ value: ident('close') }])),
+      plot(ident('res'), 'res'),
+      plot(ident('bumped'), 'bumped'),
+    ];
+    const res = await runScript(body, mkBars(4));
+    const vals = [...res.plots.values()].map(p => nums(p.values));
+    expect(vals[0]).toEqual([1, 2, 3, 4]);            // caller param uncorrupted
+    expect(vals[1]).toEqual([1001, 1002, 1003, 1004]); // method := did execute
   });
 
   it('expr[n] inside a UDF tracks history per callsite', async () => {

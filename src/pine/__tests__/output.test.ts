@@ -10,6 +10,9 @@ import type { RtCtx } from '../builtins/util';
 import '../builtins/input';
 import '../builtins/plot';
 import '../builtins/draw';
+import { parse } from '../parser';
+import { runScript } from '../interpreter';
+import { PineInterpreterEngine, buildModel } from '../engine';
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -314,6 +317,41 @@ describe('plot family', () => {
     expect(ctx.fills![0]).toMatchObject({ plot1: 0, plot2: 1, color: 'rgba(0,255,0,0.3)' });
   });
 
+  it('fill links two hline ids', () => {
+    const ctx = mkCtx(1);
+    feed(ctx, mkBars(1)[0]!);
+    const h1 = call(ctx, 'hline', '#0', [f(50)]);
+    const h2 = call(ctx, 'hline', '#1', [f(60)]);
+    call(ctx, 'fill', '#2', [h1, h2, col('#FF0000')]);
+    expect(ctx.fills!.length).toBe(1);
+    expect(ctx.fills![0]).toMatchObject({ plot1: 0, plot2: 1, color: '#FF0000' });
+  });
+
+  it('fill links a plot id and an hline id', () => {
+    const ctx = mkCtx(1);
+    feed(ctx, mkBars(1)[0]!);
+    const p = call(ctx, 'plot', '#0', [{ kind: 'series', v: ctx.close }]);
+    const h = call(ctx, 'hline', '#1', [f(50)]);
+    call(ctx, 'fill', '#2', [p, h, col('rgba(255,0,0,0.5)')]);
+    expect(ctx.fills!.length).toBe(1);
+    expect(ctx.fills![0]).toMatchObject({ plot1: 0, plot2: 1, color: 'rgba(255,0,0,0.5)' });
+  });
+
+  it('fill is one object per callsite — repeated bars update, not append', () => {
+    const ctx = mkCtx(3);
+    const bars = mkBars(3);
+    for (let i = 0; i < 3; i++) {
+      ctx.barIndex = i;
+      feed(ctx, bars[i]!);
+      const h1 = call(ctx, 'hline', '#0', [f(50)]);
+      const h2 = call(ctx, 'hline', '#1', [f(60)]);
+      call(ctx, 'fill', '#2', [h1, h2, col(i === 2 ? '#00FF00' : '#FF0000')]);
+    }
+    expect(ctx.fills!.length).toBe(1);
+    // Latest bar's color wins — TV updates the existing fill object.
+    expect(ctx.fills![0]!.color).toBe('#00FF00');
+  });
+
   it('bgcolor/barcolor record per-bar color events; na clears', () => {
     const ctx = mkCtx(3);
     for (let i = 0; i < 3; i++) {
@@ -353,6 +391,88 @@ describe('plot family', () => {
     expect(ctx.alerts).toHaveLength(1);
     call(ctx, 'alert', '#1', [s('hi'), s('alert.freq_all')]);
     expect(ctx.alerts).toHaveLength(2);
+  });
+});
+
+// ── alertcondition → RunResult ───────────────────────────────────────────────
+
+describe('alertcondition reaches RunResult', () => {
+  it('runScript carries registered alertconditions out of the interpreter', async () => {
+    const bars = mkBars(5);
+    const r = await runScript(
+      parse([
+        'indicator("AC", overlay=true)',
+        'alertcondition(close > open, "up", "crossed up")',
+        'alertcondition(close < open, "down", "crossed down")',
+      ].join('\n')),
+      bars,
+    );
+    expect(r.alertconditions).toEqual([
+      { title: 'up', msg: 'crossed up' },
+      { title: 'down', msg: 'crossed down' },
+    ]);
+    // Registration-only: it never becomes a runtime alert().
+    expect(r.alerts).toHaveLength(0);
+  });
+
+  it('registers once per title even though alertcondition runs every bar', async () => {
+    const bars = mkBars(6);
+    const r = await runScript(
+      parse([
+        'indicator("AC", overlay=true)',
+        'alertcondition(close > open, "up", "crossed up")',
+      ].join('\n')),
+      bars,
+    );
+    expect(r.alertconditions).toEqual([{ title: 'up', msg: 'crossed up' }]);
+  });
+
+  it('a false condition still registers — Pine defines the template, the alert engine evaluates it', async () => {
+    const bars = mkBars(3);
+    const r = await runScript(
+      parse([
+        'indicator("AC", overlay=true)',
+        'alertcondition(false, "never", "never fires")',
+      ].join('\n')),
+      bars,
+    );
+    expect(r.alertconditions).toEqual([{ title: 'never', msg: 'never fires' }]);
+  });
+
+  it('no alertcondition call → empty array, and a zero-bar run still carries it', async () => {
+    const bars = mkBars(3);
+    const r = await runScript(parse('indicator("AC", overlay=true)\nplot(close)'), bars);
+    expect(r.alertconditions).toEqual([]);
+
+    // No alertcondition in source means nothing can be registered; the field is
+    // still present (never undefined) so callers need no optional chaining.
+    const empty = await runScript(parse('indicator("AC")'), []);
+    expect(empty.alertconditions).toEqual([]);
+  });
+
+  it('buildModel does not drop or mangle them (IndicatorModel has no alert field)', async () => {
+    const bars = mkBars(4);
+    const src = [
+      'indicator("AC", overlay=true)',
+      'alertcondition(close > open, "up", "crossed up")',
+    ].join('\n');
+    const engine = new PineInterpreterEngine();
+    const prepared = await engine.prepare(src, 't1');
+    const r = await runScript(parse(src), bars, { symbol: 'TEST', timeframe: '60' });
+    const token = prepared.token as { modelId: string };
+    const model = buildModel(
+      token.modelId,
+      { prepared, market: { symbol: 'TEST', timeframe: '60' }, bars: bars.map(b => ({
+        time: b.openTime, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume,
+      })), mode: 'static' },
+      r,
+      bars.map(b => b.openTime),
+    );
+    // RunResult is the sole outlet — Vela's IndicatorModel carries no alerts
+    // or alertConditions field, so nothing lands on the model.
+    expect(r.alertconditions).toHaveLength(1);
+    expect('alertconditions' in model).toBe(false);
+    expect('alerts' in model).toBe(false);
   });
 });
 
@@ -483,6 +603,9 @@ beforeAll(() => {
     'label.new', 'label.set_text', 'label.delete',
     'box.new', 'box.set_rightbottom', 'box.delete',
     'table.new', 'table.cell', 'table.merge_cells', 'table.clear',
+    'chart.point.new', 'chart.point.from_index', 'chart.point.from_time', 'chart.point.now', 'chart.point.copy',
+    'polyline.new', 'polyline.delete',
+    'linefill.new', 'linefill.delete', 'linefill.set_line1', 'linefill.set_line2', 'linefill.set_color', 'linefill.get_color',
   ]) {
     expect(BUILTINS.has(k), k).toBe(true);
   }

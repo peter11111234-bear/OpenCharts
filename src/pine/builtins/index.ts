@@ -18,4 +18,5 @@ import './draw';
 import './core';
 import './time';
 import './strategy';
+import './strategyEquity';
 import './util';

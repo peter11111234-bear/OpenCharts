@@ -31,7 +31,7 @@
 import type { Arg, BarData, BuiltinCtx, Call, Node, Param, UdfDecl, Value } from './contracts';
 import { NA, Scope, Series } from './contracts';
 import { evalBlock, evalExpr, registerMtf } from './interpreter';
-import { BarSeries } from './series';
+import { BarSeries, ForwardingSeries, histGetAt, seriesHooks } from './series';
 import type { Frame } from './scope';
 
 // ── evaluator hooks ─────────────────────────────────────────────────────────
@@ -147,6 +147,8 @@ interface SecuritySpec {
   scope: Scope | null;            // persistent tf scope (parent = caller pivot)
   pivot: Scope | null;            // delegates to the live caller scope
   callerScope: Scope | null;      // scope that invoked security this bar
+  durableCache: Map<Node, WeakMap<Scope, Map<number, Value>>> | null; // eval cache for the stable root scope
+  seenCallers: WeakSet<Scope>;        // caller scopes seen before — recurring ⇒ durable cache
   ctx: BuiltinCtx | null;         // child ctx with tf series
   series: Record<string, BarSeries>;
   loaded: number;                 // tf bars pushed into series so far
@@ -157,6 +159,14 @@ interface SecuritySpec {
   varProg: Node[];                // ordered top-level stmts writing mutated globals
   varUpto: number;                // varProg replayed through this tf bar
   varInited: Set<string>;         // `once` globals already initialized
+  /** First-hit warm-up done: tf bars 0..last j evaluated so strict-window
+   *  expressions see full history when the call is chart-gated. */
+  warmed?: boolean;
+  /** Chart-domain emit history per expr node — `security(...)[n]` on the chart
+   *  reads the previous CHART bar's mapped value, not the previous tf bar. */
+  chartHist?: Map<Node, BarSeries>;
+  /** Latest chart bar this spec emitted on (chartHist write guard). */
+  lastChartBar?: number;
 }
 
 interface MtfStore {
@@ -444,7 +454,7 @@ export function prepareSecurity(body: Node[], _frame0?: unknown): void {
       gaps: constFlag(gapsNode, 'gaps_on'),
       lookahead: constFlag(laNode, 'lookahead_on'),
       isLtf,
-      bars: null, scope: null, pivot: null, callerScope: null, ctx: null,
+      bars: null, scope: null, pivot: null, callerScope: null, durableCache: null, seenCallers: new WeakSet(), ctx: null,
       series: {}, loaded: 0,
       nodeCache: new Map(), lastEmit: -1,
       warned: new Set(),
@@ -652,6 +662,15 @@ BarSeries.prototype.atOffset = function (this: BarSeries, bar: number, n: number
   return barSeriesAtOffset.call(this, bar, n);
 };
 
+// Frozen readers (math.ts lazy lifts) must replay exactly what a live get(i)
+// would have answered: tf-domain series anchor on the tf bar, everything else
+// on its own lastBar. touch() mirrors the tfDirty marking a write performs.
+seriesHooks.anchor = (s) =>
+  tfAnchor !== null && (tfOwned.has(s) || tfDirty.has(s)) ? tfAnchor.barIndex : s.currentBar;
+seriesHooks.touch = (s) => {
+  if (tfAnchor !== null) tfDirty.add(s);
+};
+
 /**
  * spec.scope's parent — delegates to whichever scope invoked the security()
  * call this bar. Rebound per call via `spec.callerScope`, so the same call
@@ -808,6 +827,97 @@ class TfVarSeries extends BarSeries {
   }
 }
 
+/**
+ * Chart-frame view of a series-valued security() result. `evalAt` evaluates
+ * `node` in the tf frame, where a plain ident resolves to a tf-domain
+ * BarSeries whose history is indexed by tf bar. Returning that object
+ * verbatim leaks it into the chart frame: `cur()`/`get(n)`/`ensureBar` then
+ * anchor on tf `loaded`/`lastBar` while chart reads pass chart indexes —
+ * corrupt under lookahead_on (lastBar already points past the mapped bar j)
+ * and meaningless on security_lower_tf specs. Instead, wrap the source so the
+ * chart sees a series whose `cur()` is the tf-bar-j value and whose `[n]`
+ * reads chart-domain history (the previous chart bar's mapped value, per
+ * TradingView semantics — not the previous tf bar). `atOffset`/`get` delegate
+ * to `spec.chartHist`, which tryEvalSecurity fills once per chart bar.
+ * Writes are dropped with a warning — a security() result is read-only.
+ */
+class SecSeries extends BarSeries {
+  constructor(
+    private spec: SecuritySpec,
+    private src: Series,
+    private j: number,
+    /** src.size() captured at wrap time — lazy ctx-anchored series drift later. */
+    private srcLen: number,
+    /** The security() expression node this series came from (chartHist key). */
+    private exprNode: Node,
+  ) { super(8); }
+  /** Scalar the chart should see for absolute tf bar `k` (na before tf bar 0). */
+  private atTf(k: number): Value {
+    if (!Number.isFinite(k) || k < 0) return NA;
+    const s = this.src;
+    if (s instanceof BarSeries) return s.atOffset(k, 0);
+    return this.srcLen > 0 ? s.get(this.srcLen - 1 - k) : NA; // non-absolute fallback
+  }
+  /** Chart-domain emit history for this expr — populated by tryEvalSecurity. */
+  private chartHist(): BarSeries | undefined {
+    return this.spec.chartHist?.get(this.exprNode);
+  }
+  override atOffset(bar: number, n: number): Value {
+    const h = this.chartHist();
+    // Chart-domain history: `[n]` reads the mapped value n CHART bars back.
+    // Falls back to tf-domain when no chart history exists (pre-warm calls).
+    if (h) return h.atOffset(bar, n);
+    const k = Math.floor(n);
+    return Number.isFinite(k) && k >= 0 ? this.atTf(this.j - k) : NA;
+  }
+  override get(n: number): Value {
+    const h = this.chartHist();
+    if (h) return h.get(n);
+    return this.atOffset(0, n);
+  }
+  override cur(): Value {
+    return this.atTf(this.j);
+  }
+  override size(): number {
+    return this.j + 1;
+  }
+  override setAt(_bar: number, _v: Value): void {
+    warnOnce(this.spec, this.spec.ctx!,
+      'request.security: writes to a security() result series are not supported — value ignored');
+  }
+  override set(v: Value): void {
+    this.setAt(this.j, v);
+  }
+  override ensureBar(_bar: number): void { /* reads anchored on tf indexes; nothing to materialize */ }
+}
+
+/**
+ * tf→chart boundary adapter for evalAt results. `{kind:'series'}` becomes a
+ * chart-anchored SecSeries (preserving `[n]` history access); `{kind:'array'}`
+ * elements are aligned recursively so tuple-destructured members and
+ * array-literal exprs behave like their single-expr counterparts.
+ *
+ * A BarSeries source (absolute atOffset indexing) is wrapped lazily. A lazy
+ * non-BarSeries source (FnSeries, CalSeries — reads anchored on ctx.barIndex
+ * and the newest-loaded tf slot) is snapshotted NOW, while ctx.barIndex === j
+ * and spec.loaded === j + 1: deferring the read would silently shift which tf
+ * bar `get(0)` resolves to.
+ */
+function alignToChart(spec: SecuritySpec, node: Node, v: Value, j: number): Value {
+  if (v.kind === 'series') {
+    let src = v.v;
+    if (!(src instanceof BarSeries)) {
+      const snap = new BarSeries();
+      const len = src.size();
+      for (let k = Math.max(0, j - len + 1); k <= j; k++) snap.setAt(k, src.get(len - 1 - k));
+      src = snap;
+    }
+    return { kind: 'series', v: new SecSeries(spec, src, j, src.size(), node) };
+  }
+  if (v.kind === 'array') return { kind: 'array', v: v.v.map(e => alignToChart(spec, node, e, j)) };
+  return v;
+}
+
 /** Drop a spec's tf frame so the next ensureTfFrame rebuilds it (tf switched). */
 function resetTfFrame(spec: SecuritySpec): void {
   spec.ctx = null;
@@ -817,10 +927,15 @@ function resetTfFrame(spec: SecuritySpec): void {
   spec.series = {};
   spec.loaded = 0;
   spec.nodeCache.clear();
+  spec.durableCache = null;
+  spec.seenCallers = new WeakSet();
   spec.lastEmit = -1;
   spec.varProg = [];
   spec.varUpto = -1;
   spec.varInited.clear();
+  spec.warmed = false;
+  spec.chartHist = undefined;    // chart-domain history is tf-frame-scoped
+  spec.lastChartBar = undefined;
 }
 
 function ensureTfFrame(spec: SecuritySpec, frame: { scope: Scope; ctx: BuiltinCtx }): void {
@@ -905,10 +1020,74 @@ function advanceTo(spec: SecuritySpec, j: number): void {
 }
 
 /**
+ * Copy-on-write param series — local mirror of the interpreter's private
+ * CowSeries (it isn't exported; mtf mirrors interpreter internals here the same
+ * way ReturnSignal is duck-typed below). Reads/`x[n]` see the caller's
+ * history; the first `x := …` materializes a private BarSeries so the write
+ * stays local to this call instead of mutating the caller's slot.
+ */
+class CowSeries extends ForwardingSeries {
+  private cow: BarSeries | null = null;
+
+  private inner: Series;
+
+  constructor(inner: Series) {
+    super();
+    this.inner = inner;
+  }
+
+  override readTarget(): Series {
+    return this.cow ?? this.inner;
+  }
+
+  /** Materialize the private copy, mapping `inner`'s history onto bar indexes. */
+  private writable(bar: number): BarSeries {
+    if (this.cow) return this.cow;
+    const src = this.inner;
+    const base = src instanceof BarSeries ? src.currentBar : Math.max(bar, 0);
+    const copy = new BarSeries();
+    for (let b = 0; b <= base; b++) copy.setAt(b, histGetAt(src, base - b, base));
+    this.cow = copy;
+    return copy;
+  }
+
+  override get currentBar(): number {
+    return this.cow ? this.cow.currentBar
+      : this.inner instanceof BarSeries ? this.inner.currentBar : 0;
+  }
+  override setAt(bar: number, v: Value): void {
+    this.writable(this.cow ? this.cow.currentBar : bar).setAt(bar, v);
+  }
+  override set(v: Value): void {
+    if (this.cow) this.cow.set(v);
+    else this.writable(0).set(v);
+  }
+  override get(n: number): Value {
+    return (this.cow ?? this.inner).get(n);
+  }
+  override cur(): Value {
+    return (this.cow ?? this.inner).cur();
+  }
+  override size(): number {
+    return (this.cow ?? this.inner).size();
+  }
+  override atOffset(bar: number, n: number): Value {
+    const src = this.cow ?? this.inner;
+    return src instanceof BarSeries ? src.atOffset(bar, n) : src.get(n);
+  }
+  override ensureBar(bar: number): void {
+    if (this.cow) this.cow.ensureBar(bar);
+    else if (this.inner instanceof BarSeries) this.inner.ensureBar(bar);
+  }
+}
+
+/**
  * UDF invocation from a tf-context builtin callback — mirrors the
  * interpreter's callUdfValue: `{kind:'series'}` args ALIAS the caller's slot
- * (so `p[1]` inside the body sees real history), scalars seed a fresh param
- * slot at the current tf bar, and a `return` in the body unwinds via the
+ * through a CowSeries — reads (incl. `p[1]` history) see the caller's real
+ * series, while `p := …` inside the body materializes a private copy so the
+ * write can't mutate the caller's slot. Scalars seed a fresh param slot at
+ * the current tf bar, and a `return` in the body unwinds via the
  * interpreter's private ReturnSignal. That class isn't importable here (mtf
  * is injected through registerMtf, not statically imported), so it's
  * duck-typed: ReturnSignal is the only non-Error object the evaluator throws
@@ -920,7 +1099,7 @@ function invokeUdf(spec: SecuritySpec, fn: UdfDecl, args: Value[]): Value {
   fn.params.forEach((p, i) => {
     const a = args[i] ?? (p.default ? evalNode(p.default, spec, ctx.barIndex, callScope) : NA);
     if (a.kind === 'series') {
-      callScope.define(p.name, a.v);
+      callScope.define(p.name, new CowSeries(a.v));
     } else {
       const s = new BarSeries();
       s.setAt(ctx.barIndex, a);
@@ -969,7 +1148,7 @@ function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
   tfAnchor = spec.ctx;
   let v: Value;
   try {
-    v = evalNode(node, spec, j);
+    v = alignToChart(spec, node, evalNode(node, spec, j), j);
   } catch (e) {
     // warn once per (message); `j` stays out of the text so a persistent
     // failure doesn't re-warn per bar, but the node's source loc keeps the
@@ -1039,6 +1218,24 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   // expression must resolve params/locals against the live caller.
   spec.callerScope = frame.scope;
   ensureTfFrame(spec, frame);
+  // nodeCache routing: evalAt caches per (expr node, caller scope, tf bar).
+  // The caller scope is the right key — an ephemeral UDF call scope binds
+  // different params per invocation, so two callers must never share an
+  // entry. But that also means an ephemeral key can NEVER hit on a later
+  // bar (a fresh Scope is allocated per call), so retaining entries under it
+  // only grows a dead WeakMap. Route evals through a per-invocation
+  // transient map until the caller proves itself stable: a Scope object that
+  // shows up a second time (the root scope, held by frame0 across bars, or a
+  // long-lived harness scope) graduates to the durable cross-bar cache. The
+  // first sighting keeps the transient map — entries under a caller may only
+  // be reused by that same caller anyway.
+  if (spec.seenCallers.has(frame.scope)) {
+    if (!spec.durableCache) spec.durableCache = new Map();
+    spec.nodeCache = spec.durableCache;
+  } else {
+    spec.seenCallers.add(frame.scope);
+    spec.nodeCache = new Map();
+  }
 
   // ── map chart bar → tf bar index ──
   const t0 = numOf(ctx.time.get(0));
@@ -1064,12 +1261,27 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     const lo0 = lt >= 0 && bars[lt]!.openTime === t0 ? lt : lt + 1;
     const lo1 = tfBarAtOrBefore(bars, t0 + chartDur - 1);
     if (lo0 >= bars.length || lo1 < lo0) return { kind: 'array', v: [] };
+    // Warm-up: a gated first call creates the frame mid-series — replay tf
+    // bars 0..lo1 once so strict-window exprs (ta.sma needs L bars of real
+    // history) see the same history an ungated run produced. nodeCache makes
+    // each eval a one-shot; cost is the work an ungated run does anyway.
+    if (!spec.warmed) {
+      for (let w = 0; w <= lo1; w++) for (const e of spec.exprs) evalAt(spec, e, w);
+      spec.warmed = true;
+    }
     const out: Value[] = [];
+    // evalAt wraps series results in SecSeries for chart-anchored [n] access;
+    // inside the array payload consumers read raw values, so unwrap to the
+    // tf-bar-j2 scalar.
+    const scalarAt = (e: Node, j2: number): Value => {
+      const v = evalAt(spec, e, j2);
+      return v.kind === 'series' ? v.v.cur() : v;
+    };
     for (let j2 = lo0; j2 <= lo1; j2++) {
       out.push(
         spec.exprs.length === 1
-          ? evalAt(spec, spec.exprs[0]!, j2)
-          : { kind: 'array', v: spec.exprs.map(e => evalAt(spec, e, j2)) },
+          ? scalarAt(spec.exprs[0]!, j2)
+          : { kind: 'array', v: spec.exprs.map(e => scalarAt(e, j2)) },
       );
     }
     return { kind: 'array', v: out };
@@ -1086,15 +1298,45 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   }
   if (j < 0) return NA;
 
-  if (spec.gaps === 'on') {
-    if (spec.lastEmit === j) return NA;   // only first chart bar per tf bar emits
-    spec.lastEmit = j;
+  // Record the emitted value into chart-domain history so `security(...)[n]`
+  // on the chart reads the previous chart bar's mapped value (Pine semantics)
+  // instead of reaching back into tf bars. gaps_on skipped bars emit NA — the
+  // value TV produces there.
+  const emit = (e: Node, v: Value): void => {
+    const hist = (spec.chartHist ??= new Map());
+    let s = hist.get(e);
+    if (!s) { s = new BarSeries(); hist.set(e, s); }
+    s.setAt(ctx.barIndex, v.kind === 'series' ? v.v.cur() : v);
+  };
+  const emitAll = (v: Value): void => {
+    if (spec.lastChartBar === ctx.barIndex) return;   // dedup same-bar re-entry
+    if (spec.exprs.length === 1) emit(spec.exprs[0]!, v);
+    else {
+      const arr = v.kind === 'array' ? v.v : [];
+      spec.exprs.forEach((e, i) => emit(e, arr[i] ?? NA));
+    }
+    spec.lastChartBar = ctx.barIndex;
+  };
+
+  if (spec.gaps === 'on' && spec.lastEmit === j) {
+    emitAll(NA);
+    return NA;                                      // only first chart bar per tf bar emits
+  }
+  if (spec.gaps === 'on') spec.lastEmit = j;
+
+  // Same warm-up on the non-ltf path: replay tf bars 0..j on first hit.
+  if (!spec.warmed) {
+    for (let w = 0; w <= j; w++) for (const e of spec.exprs) evalAt(spec, e, w);
+    spec.warmed = true;
   }
 
-  return spec.exprs.length === 1
+  const res = spec.exprs.length === 1
     ? evalAt(spec, spec.exprs[0]!, j)
-    : { kind: 'array', v: spec.exprs.map(e => evalAt(spec, e, j)) };
+    : { kind: 'array' as const, v: spec.exprs.map(e => evalAt(spec, e, j)) };
+  emitAll(res);
+  return res;
 }
+
 
 /** Evaluate a sym/tf arg at the current chart bar (dynamic resolution path). */
 function runConst(node: Node, frame: Frame): string | null {

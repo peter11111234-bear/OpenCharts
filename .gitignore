@@ -14,3 +14,4 @@ test-results
 scripts/__pycache__/
 scripts/jev-sidecar-spend.json
 scripts/jev-sidecar-watchdog.log
+scripts/golden/*.actual.json

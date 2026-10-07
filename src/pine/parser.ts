@@ -10,7 +10,7 @@
 //    `x = e` untyped → Assign. `x := e` → Reassign.
 //  - `var x = e` → VarDecl (init-once). `var a=1, var float b=na` → VarDecl
 //    with `multi`; first decl duplicated into .name/.typeAnn/.value.
-//    `var [a,b] = f()` → TupleAssign (var-ness dropped — documented limit).
+//    `var [a,b] = f()` → TupleAssign flagged `var` (bindings init once).
 //  - Top-level `indicator(...)`/`strategy(...)` → returned as `decl`, NOT
 //    included in `body`. `strategy.entry(...)` still parses as a normal call.
 //  - `export <decl>` flattens: the inner decl node is returned with
@@ -286,7 +286,7 @@ class Parser {
           if (depth === 0) return this.toks[i + 1]?.type === 'ident';
         } else if (tk.type !== 'ident' && tk.type !== 'keyword' &&
                    !(tk.type === 'op' &&
-                     (tk.v === ',' || tk.v === '[' || tk.v === ']'))) {
+                     (tk.v === ',' || tk.v === '[' || tk.v === ']' || tk.v === '.'))) {
           return false;
         }
       }
@@ -310,11 +310,11 @@ class Parser {
   }
 
   /** `var [type] name = e` (+ multi `, [var] [type] name = e`), or
-   *  `var [a,b] = f()` → TupleAssign. `varip` enters via varip=true and sets
-   *  the `varip` flag on the resulting VarDecl. */
+   *  `var [a,b] = f()` → TupleAssign carrying `var`. `varip` enters
+   *  via varip=true and sets the `varip` flag on the resulting VarDecl. */
   private varDecl(loc: { line: number; col: number }, varip = false): Node {
     if (this.atOp('[')) {
-      return this.tupleAssign(); // var-ness can't ride on TupleAssign (limit)
+      return this.tupleAssign(true); // `var [a,b] = f()` — bindings persist
     }
     const parts: { name: string; typeAnn?: string; value: Node }[] = [];
     for (;;) {
@@ -405,7 +405,7 @@ class Parser {
         if (t.type === 'op') {
           if (t.v === '<') depth++;
           else if (t.v === '>') depth--;
-          else if (t.v !== ',' && t.v !== '[' && t.v !== ']') {
+          else if (t.v !== ',' && t.v !== '[' && t.v !== ']' && t.v !== '.') {
             this.err(`unexpected '${t.v}' in type parameters`);
           }
         } else if (t.type !== 'ident' && t.type !== 'keyword') {
@@ -422,7 +422,7 @@ class Parser {
     return ann;
   }
 
-  private tupleAssign(): TupleAssign {
+  private tupleAssign(varFlag = false): TupleAssign {
     const loc = this.expectOp('[').loc;
     const names: string[] = [];
     if (!this.atOp(']')) {
@@ -435,7 +435,9 @@ class Parser {
     this.expectOp(']');
     this.expectOp('=');
     const value = this.expr();
-    return { type: 'tuple', names, value, loc };
+    return varFlag
+      ? { type: 'tuple', names, value, loc, var: true }
+      : { type: 'tuple', names, value, loc };
   }
 
   // ── functions ──────────────────────────────────────────────────────────────
@@ -460,9 +462,16 @@ class Parser {
     const out: Param[] = [];
     while (!this.atOp(')') && !this.at('eof')) {
       const words: Token[] = [];
+      // Commas inside type parameters (`map<string,int>`) separate
+      // type arguments, not params — only a depth-0 comma ends the
+      // annotation word run.
+      let genericDepth = 0;
       for (;;) {
         const t = this.peek();
-        if (t.type === 'op' && (t.v === ',' || t.v === '=' || t.v === ')')) break;
+        if (t.type === 'op' && t.v === '<') genericDepth++;
+        else if (t.type === 'op' && t.v === '>' && genericDepth > 0) genericDepth--;
+        if (t.type === 'op' && (t.v === '=' || t.v === ')')) break;
+        if (t.type === 'op' && t.v === ',' && genericDepth === 0) break;
         if (t.type === 'eof' || t.type === 'newline') {
           this.err('unterminated parameter list');
         }
@@ -875,7 +884,7 @@ class Parser {
         }
       } else if (t.type !== 'ident' && t.type !== 'keyword' &&
                  !(t.type === 'op' &&
-                   (t.v === ',' || t.v === '[' || t.v === ']'))) {
+                   (t.v === ',' || t.v === '[' || t.v === ']' || t.v === '.'))) {
         return false;
       }
     }

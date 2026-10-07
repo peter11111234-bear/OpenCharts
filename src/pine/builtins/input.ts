@@ -114,7 +114,12 @@ function scalarInput(
     const bound = bindArgs(args, named, INPUT_ORDER);
     const raw = rawDefval(unwrapped(bound.get('defval') ?? dflt));
     const { override } = recordAndOverride(ctx, bound, schemaType, raw);
-    if (override !== undefined) return coerceOverride(override, kind);
+    // Vela's input panel sends '' for untouched color/string inputs — treat
+    // an empty string as "no override" so the script's defval survives.
+    if (override !== undefined && !(kind === 'color' && override === '')
+        && !(kind === 'string' && override === '')) {
+      return coerceOverride(override, kind);
+    }
     // Normalize defval to the declared kind (input.int(10.5) → 10).
     return coerceOverride(raw, kind);
   };

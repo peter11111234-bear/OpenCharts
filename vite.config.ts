@@ -36,6 +36,10 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // Never auto-increment: a port collision means a stray vite is already
+    // serving this repo — fail loudly instead of spawning :5174/:5175
+    // zombies (the multi-tab/multi-server incident of 2026-10-07).
+    strictPort: true,
     proxy: {
       "/api": {
         target: "http://localhost:3000",

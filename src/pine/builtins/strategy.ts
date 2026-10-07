@@ -93,6 +93,45 @@ export interface ExecRec {
   tradeId: number;
 }
 
+/** An open entry leg — one strategy.opentrades row (FIFO exit consumption). */
+export interface TradeLeg {
+  bar: number;
+  time: number;
+  price: number;
+  /** Signed side (+1 long / -1 short). */
+  dir: number;
+  /** Remaining open contracts. */
+  qty: number;
+  /** Contracts this leg opened — the trade's size. */
+  openedQty: number;
+  /** Realized price P&L accumulated from exit fills (before commission). */
+  pnl: number;
+  /** Commission on the entry fill. */
+  entryComm: number;
+  /** Commission on exit fills applied to this leg. */
+  exitComm: number;
+  /** Contracts already closed by exit fills (weighted exit avg). */
+  exitQty: number;
+  exitNotional: number;
+  exitBar: number;
+  exitTime: number;
+}
+
+/** A fully-closed entry leg — one strategy.closedtrades row. */
+export interface ClosedTrade {
+  entryBar: number;
+  entryTime: number;
+  entryPrice: number;
+  dir: number;
+  openedQty: number;
+  exitBar: number;
+  exitTime: number;
+  exitPrice: number;
+  /** Net of entry + exit commission. */
+  profit: number;
+  commission: number;
+}
+
 interface Sim {
   qty: number;
   avgEntry: number;
@@ -103,6 +142,10 @@ interface Sim {
   execs: ExecRec[];
   /** Current round-trip counter; entries at flat position bump it. */
   curTrade: number;
+  /** Open entry legs feeding the position (FIFO exit consumption). */
+  openLegs: TradeLeg[];
+  /** Fully-closed entry legs, chronological — strategy.closedtrades.* rows. */
+  closed: ClosedTrade[];
 }
 
 const ORDERS_KEY = 'strategy|orders';
@@ -160,6 +203,13 @@ const openAt = (ctx: BuiltinCtx, bar: number, upto: number) => numAt(ctx.open, b
 const closeAt = (ctx: BuiltinCtx, bar: number, upto: number) => numAt(ctx.close, bar, upto);
 const highAt = (ctx: BuiltinCtx, bar: number, upto: number) => numAt(ctx.high, bar, upto);
 const lowAt = (ctx: BuiltinCtx, bar: number, upto: number) => numAt(ctx.low, bar, upto);
+const timeAt = (ctx: BuiltinCtx, bar: number, upto: number) => numAt(ctx.time, bar, upto);
+
+/** Empty simulation — shared by `simAt` early-outs and the `simulate` init. */
+const emptySim = (): Sim => ({
+  qty: 0, avgEntry: 0, realizedPnl: 0, closedTrades: 0, openTrades: 0,
+  execs: [], curTrade: 0, openLegs: [], closed: [],
+});
 
 // ── replay ──────────────────────────────────────────────────────────────────
 
@@ -169,7 +219,7 @@ const lowAt = (ctx: BuiltinCtx, bar: number, upto: number) => numAt(ctx.low, bar
  * depend on call order or call sites.
  */
 export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, uptoBar: number): Sim {
-  const sim: Sim = { qty: 0, avgEntry: 0, realizedPnl: 0, closedTrades: 0, openTrades: 0, execs: [], curTrade: 0 };
+  const sim: Sim = emptySim();
   if (uptoBar < 0) return sim;
   const n = orders.length;
   const tick = mintickOf(ctx);
@@ -381,7 +431,8 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
       qty: traded,
       tradeId: sim.curTrade,
     });
-    sim.realizedPnl -= commission(match, price);
+    const comm = commission(match, price);
+    sim.realizedPnl -= comm;
     const closeLeg = (c: number): void => {
       const q = Math.min(Math.abs(c), Math.abs(sim.qty));
       sim.realizedPnl += q * (price - sim.avgEntry) * Math.sign(sim.qty);
@@ -395,6 +446,46 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
         sim.openTrades = 0;
       }
     };
+    // Trade ledger: open legs are strategy.opentrades rows; exit fills consume
+    // them FIFO — a fully-consumed leg becomes a strategy.closedtrades row.
+    // The fill's commission lands on the closing side's legs when the fill
+    // reduces a position, otherwise on the leg it opens.
+    const closing = Math.min(Math.abs(match), Math.abs(sim.qty));
+    const opening = Math.abs(match) - closing;
+    if (closing > 0) {
+      let left = closing;
+      while (left > 1e-12 && sim.openLegs.length > 0) {
+        const leg = sim.openLegs[0]!;
+        const q = Math.min(left, leg.qty);
+        leg.pnl += q * (price - leg.price) * leg.dir;
+        leg.exitQty += q;
+        leg.exitNotional += q * price;
+        leg.exitBar = bar;
+        leg.exitTime = timeAt(ctx, bar, uptoBar);
+        leg.exitComm += comm * (q / closing);
+        leg.qty -= q;
+        left -= q;
+        if (leg.qty <= 1e-12) {
+          sim.openLegs.shift();
+          sim.closed.push({
+            entryBar: leg.bar, entryTime: leg.time, entryPrice: leg.price,
+            dir: leg.dir, openedQty: leg.openedQty,
+            exitBar: leg.exitBar, exitTime: leg.exitTime,
+            exitPrice: leg.exitNotional / leg.exitQty,
+            profit: leg.pnl - leg.entryComm - leg.exitComm,
+            commission: leg.entryComm + leg.exitComm,
+          });
+        }
+      }
+    }
+    if (opening > 1e-12) {
+      sim.openLegs.push({
+        bar, time: timeAt(ctx, bar, uptoBar), price, dir: Math.sign(match),
+        qty: opening, openedQty: opening, pnl: 0,
+        entryComm: closing > 0 ? 0 : comm,
+        exitComm: 0, exitQty: 0, exitNotional: 0, exitBar: -1, exitTime: NaN,
+      });
+    }
     if (sim.qty === 0) {
       sim.qty = match;
       sim.avgEntry = price;
@@ -450,9 +541,9 @@ interface SimCache { count: number; byBar: Map<number, Sim> }
 
 function simAt(ctx: BuiltinCtx, uptoBar: number): Sim {
   const st = stateOf(ctx);
-  if (!st) return { qty: 0, avgEntry: 0, realizedPnl: 0, closedTrades: 0, openTrades: 0, execs: [], curTrade: 0 };
+  if (!st) return emptySim();
   const orders = st.get(ORDERS_KEY) as StratOrder[] | undefined;
-  if (!orders || orders.length === 0) return { qty: 0, avgEntry: 0, realizedPnl: 0, closedTrades: 0, openTrades: 0, execs: [], curTrade: 0 };
+  if (!orders || orders.length === 0) return emptySim();
   let cache = st.get(CACHE_KEY) as SimCache | undefined;
   if (!cache || cache.count !== orders.length) { cache = { count: orders.length, byBar: new Map() }; st.set(CACHE_KEY, cache); }
   let r = cache.byBar.get(uptoBar);
@@ -584,6 +675,7 @@ registerBuiltin('strategy', 'close_all', (c, args, named) => {
     kind: 'close', id: '', fromEntry: '', dir: 0,
     qty: 0, eqPct: 0, limit: undefined, stop: undefined,
     immediate: imm !== undefined && truthy(imm),
+    comment: strOf(bound.get('comment')) || undefined,
   });
   return { kind: 'void' };
 });
@@ -683,6 +775,69 @@ registerLazyConstant('strategy', 'closedtrades', (c) => {
 registerLazyConstant('strategy', 'opentrades', (c) => {
   const ctx = c as BuiltinCtx | undefined;
   return numVal(simAt(ctx!, ctx?.barIndex ?? -1).openTrades);
+});
+
+// ── per-trade function accessors + P&L rollups ─────────────────────────────
+// strategy.closedtrades.* / strategy.opentrades.* take trade_num: closed rows
+// are most-recent-first (0 = last closed), open rows oldest-first. Out of
+// range → na. Fields missing on a row kind → na.
+
+function regClosed(name: string, pick: (t: ClosedTrade) => number): void {
+  registerBuiltin('strategy.closedtrades', name, (c, args) => {
+    if (!c) return NA;
+    const rows = simAt(c, c.barIndex).closed;
+    const i = curNum(args[0] ?? NA);
+    const t = i !== undefined && i >= 0 && i < rows.length ? rows[rows.length - 1 - Math.trunc(i)]! : undefined;
+    if (t === undefined) return NA;
+    const v = pick(t);
+    return Number.isFinite(v) ? numVal(v) : NA;
+  });
+}
+
+function regOpen(name: string, pick: (t: TradeLeg) => number): void {
+  registerBuiltin('strategy.opentrades', name, (c, args) => {
+    if (!c) return NA;
+    const rows = simAt(c, c.barIndex).openLegs;
+    const i = curNum(args[0] ?? NA);
+    const t = i !== undefined && i >= 0 && i < rows.length ? rows[Math.trunc(i)]! : undefined;
+    if (t === undefined) return NA;
+    const v = pick(t);
+    return Number.isFinite(v) ? numVal(v) : NA;
+  });
+}
+
+regClosed('entry_bar_index', t => t.entryBar);
+regClosed('entry_price', t => t.entryPrice);
+regClosed('entry_time', t => t.entryTime);
+regClosed('exit_bar_index', t => t.exitBar);
+regClosed('exit_price', t => t.exitPrice);
+regClosed('exit_time', t => t.exitTime);
+regClosed('profit', t => t.profit);
+regClosed('size', t => t.openedQty * t.dir);
+regClosed('commission', t => t.commission);
+
+regOpen('entry_bar_index', t => t.bar);
+regOpen('entry_price', t => t.price);
+regOpen('entry_time', t => t.time);
+regOpen('size', t => t.qty * t.dir);
+regOpen('commission', t => t.entryComm + t.exitComm);
+
+registerLazyConstant('strategy', 'grossprofit', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  if (!ctx) return NA;
+  return { kind: 'float', v: simAt(ctx, ctx.barIndex).closed.reduce((s, t) => t.profit > 0 ? s + t.profit : s, 0) };
+});
+
+registerLazyConstant('strategy', 'grossloss', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  if (!ctx) return NA;
+  return { kind: 'float', v: Math.abs(simAt(ctx, ctx.barIndex).closed.reduce((s, t) => t.profit < 0 ? s + t.profit : s, 0)) };
+});
+
+registerLazyConstant('strategy', 'netprofit', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  if (!ctx) return NA;
+  return { kind: 'float', v: simAt(ctx, ctx.barIndex).closed.reduce((s, t) => s + t.profit, 0) };
 });
 
 // ── enum / currency constants ───────────────────────────────────────────────

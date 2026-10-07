@@ -36,7 +36,36 @@ const methodMap = new Map<string, UdtMethodDef>(); // key: `${selfType}.${name}`
 /** Global scope bound at run start so method bodies can see script globals. */
 let udtGlobalScope: Scope | null = null;
 
-const methodKey = (selfType: string, name: string) => `${selfType}.${name}`;
+/** SelfType qualifiers that may precede a base type name. */
+const SELF_TYPE_QUALIFIERS: Record<string, true> = {
+  series: true, simple: true, const: true, input: true,
+};
+
+/**
+ * Normalize a method selfType annotation to the receiver's
+ * Value.kind. Generic builtin annotations carry type parameters
+ * the runtime drops: `array<float>` / `float[]` → 'array',
+ * `map<string,int>` → 'map', `series float` → 'float'. Plain
+ * names (user UDTs, bare primitives) pass through unchanged.
+ * Registration and dispatch both key through methodKey, so a
+ * method declared on `array<float>` is found for any array
+ * receiver.
+ */
+export function normalizeSelfType(selfType: string): string {
+  let ann = selfType.trim();
+  for (;;) {
+    const sp = ann.indexOf(' ');
+    if (sp < 0 || !SELF_TYPE_QUALIFIERS[ann.slice(0, sp)]) break;
+    ann = ann.slice(sp + 1);
+  }
+  const generic = /^([A-Za-z_]\w*)\s*</.exec(ann);
+  if (generic) return generic[1]!;
+  if (ann.endsWith('[]')) return 'array';
+  return ann;
+}
+
+const methodKey = (selfType: string, name: string) =>
+  `${normalizeSelfType(selfType)}.${name}`;
 
 /** Singleton registry — also usable directly for introspection/reset in tests. */
 export const UDT_REGISTRY = {

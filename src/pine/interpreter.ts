@@ -1356,19 +1356,13 @@ export type ParsedInput =
   | { decl?: IndicatorDecl | StrategyDecl | null; body: Node[] };
 
 
-// Macrotask yield without setTimeout's 4ms clamp — MessageChannel ports are
-// available in browsers, Node, and workers. Keeps the UI responsive during
-// long bar loops while preserving per-run sequential semantics (a second
-// runScript only interleaves if the first one yields; engine callers pair
-// this with shouldAbort so a superseded run dies at its next yield).
-// Macrotask yield without setTimeout's 4ms clamp. MessageChannel requires the
-// onmessage PROPERTY to start the port — addEventListener alone leaves it
-// suspended in some environments (observed: headless Chromium never delivers).
-// One fixed onmessage serves a FIFO queue so concurrent yield callers can't
-// clobber each other's listener.
-let _yieldChannel: MessageChannel | null = null;
-const _yieldQueue: (() => void)[] = [];
-/** Diagnostics: per-run yield hop count + worst wait. */
+// Macrotask yield without setTimeout's 4ms clamp. One MessageChannel per
+// yield, self-closing on delivery — a persistent channel keeps Node's event
+// loop alive forever (hangs CLI/test teardown; observed: bench process never
+// exited). The onmessage PROPERTY must be assigned to start the port —
+// addEventListener alone leaves it suspended (observed: headless Chromium
+// never delivers).
+/** Diagnostics: cumulative yield hop count + worst wait across all runs. */
 export const yieldStats = { hops: 0, maxWait: 0 };
 const yieldTask = (): Promise<void> => {
   if (typeof MessageChannel === 'undefined') {
@@ -1376,19 +1370,19 @@ const yieldTask = (): Promise<void> => {
     setTimeout(resolve, 0);
     return promise;
   }
-  if (!_yieldChannel) {
-    _yieldChannel = new MessageChannel();
-    _yieldChannel.port1.onmessage = () => _yieldQueue.shift()?.();
-  }
   const t0 = nowMs();
   const { promise, resolve } = Promise.withResolvers<void>();
-  _yieldQueue.push(() => {
+  const ch = new MessageChannel();
+  ch.port1.onmessage = () => {
+    ch.port1.onmessage = null;
+    ch.port1.close();
+    ch.port2.close();
     const w = nowMs() - t0;
     yieldStats.hops++;
     if (w > yieldStats.maxWait) yieldStats.maxWait = w;
     resolve();
-  });
-  _yieldChannel.port2.postMessage(null);
+  };
+  ch.port2.postMessage(null);
   return promise;
 };
 const nowMs = typeof performance !== 'undefined' ? () => performance.now() : Date.now;
@@ -1516,6 +1510,8 @@ async function runScriptInner(
     await mtf.prefetchSecurity(ctx, frame0, bars);
     (globalThis as Record<string, unknown>).__pineStage = 'barloop';
   }
+  // A stopped run pays full prefetch otherwise — check before the bar loop.
+  if (opts.shouldAbort?.()) return empty();
 
   // ── bar loop ──
   let barErr: PineRuntimeError | null = null;

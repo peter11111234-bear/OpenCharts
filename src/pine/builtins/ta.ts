@@ -257,16 +257,31 @@ function stdevWin(vs: VS, b: number, L: number, biased: boolean): number | undef
 
 function emaVs(ctx: BuiltinCtx, src: VS, len: number, tag: string): VS {
   const a = 2 / (len + 1);
-  return vseries(ctx, `ema|${tag}|${len}`, (b) => {
-    const x = src.get(b);
-    if (x === undefined) return undefined;
-    const p = b > 0 ? emaVsGet(ctx, src, len, tag, b - 1) : undefined;
-    return p === undefined ? x : a * x + (1 - a) * p;
+  // Same recurrence as before (ema(b) seeds from ema(b-1), na source → na),
+  // but resolved iteratively against this VS's own memo: the recursive form
+  // re-built the state key and re-walked the state map for every historical
+  // bar, so a fresh source series made each bar O(bar) map lookups.
+  return stateFor<VS>(ctx, `dvs|ema|${tag}|${len}`, () => {
+    const memo = new Map<number, number | undefined>();
+    const self: VS = {
+      last: -1,
+      get(b: number): number | undefined {
+        if (b > self.last) self.last = b;
+        if (memo.has(b)) return memo.get(b);
+        let k = b;
+        while (k >= 0 && !memo.has(k)) k--;
+        let p = k >= 0 ? memo.get(k) : undefined;
+        for (let i = k + 1; i <= b; i++) {
+          const x = src.get(i);
+          const v = x === undefined ? undefined : p === undefined || i === 0 ? x : a * x + (1 - a) * p;
+          memo.set(i, v);
+          p = v;
+        }
+        return memo.get(b);
+      },
+    };
+    return self;
   });
-}
-// split accessor so the recursion above sees the same memoized VS
-function emaVsGet(ctx: BuiltinCtx, src: VS, len: number, tag: string, b: number): number | undefined {
-  return emaVs(ctx, src, len, tag).get(b);
 }
 
 /** Wilder RMA: seeded with SMA of the first `len` bars → na until bar len-1. */

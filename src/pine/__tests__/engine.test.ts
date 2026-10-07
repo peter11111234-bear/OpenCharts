@@ -211,4 +211,78 @@ describe('regressions — R2 verification findings', () => {
     expect(m.inputValues['len']).toBe(5);
     session.stop();
   });
+
+  it('fill between hline plots renders via hidden constant anchor series', async () => {
+    const m = await runModel(
+      `//@version=6\nindicator("d")\nh1 = hline(70)\nh2 = hline(30)\nfill(h1, h2, color=color.new(color.blue, 90))\n`,
+      mkBars(5));
+    expect(m.priceLines).toHaveLength(2);
+    expect(m.fills).toHaveLength(1);
+    const anchors = m.series.filter(s => s.visible === false);
+    expect(anchors).toHaveLength(2);
+    expect(anchors.every(s => s.kind === 'line')).toBe(true);
+    const anchorIds = anchors.map(s => s.id);
+    expect(anchorIds).toContain(m.fills[0]!.fromSeriesId);
+    expect(anchorIds).toContain(m.fills[0]!.toSeriesId);
+  });
+
+  it('table.new/cell/merge_cells serialize into model.tables', async () => {
+    const m = await runModel(
+      `//@version=6\nindicator("t")\nvar table dash = table.new(position.top_right, 2, 2, frame_color=color.gray, frame_width=1, border_color=color.white, border_width=1)\nif bar_index == 0\n    table.cell(dash, 0, 0, "A", text_color=color.white, text_size=size.small, bgcolor=color.new(color.green, 30))\n    table.cell(dash, 1, 1, "B")\n    table.merge_cells(dash, 0, 0, 1, 0)\n`,
+      mkBars(10));
+    const t = m.tables?.[0];
+    expect(t).toBeDefined();
+    expect(t!.position).toBe('top_right');
+    expect(t!.columns).toBe(2);
+    expect(t!.rows).toBe(2);
+    expect(t!.cells[0]![0]).toMatchObject({ text: 'A', textSize: 'small', hAlign: 'left', vAlign: 'center' });
+    expect(t!.cells[0]![0]!.bgColor).toContain('rgba');
+    expect(t!.cells[1]![1]!.text).toBe('B');
+    expect(t!.cells[0]![1]).toBeNull();
+    expect(t!.merges).toEqual([{ startCol: 0, startRow: 0, endCol: 1, endRow: 0 }]);
+    expect(t!.frameWidth).toBe(1);
+  });
+
+  it('strategy.close_all captures comment on the exit marker', async () => {
+    const m = await runModel(
+      `//@version=6\nstrategy("s", overlay=true)\nif bar_index == 2\n    strategy.entry("L", strategy.long)\nif bar_index == 5\n    strategy.close_all(comment="bye")\n`,
+      mkBars(10));
+    const exit = m.trades!.find(x => x.kind === 'exit');
+    expect(exit).toBeDefined();
+    expect(exit!.label).toBe('bye');
+  });
+
+  it('polyline.new via chart.point vertices reaches model.polylines', async () => {
+    const m = await runModel(
+      `//@version=6\nindicator("p", overlay=true)\nvar array<chart.point> pts = array.new<chart.point>()\nif bar_index == 2\n    pts.push(chart.point.from_index(0, 100))\n    pts.push(chart.point.from_index(2, 110))\n    polyline.new(pts, closed=true, line_color=color.teal, fill_color=color.new(color.teal, 80), line_width=2)\n`,
+      mkBars(5));
+    expect(m.polylines).toHaveLength(1);
+    const p = m.polylines![0]!;
+    expect(p.points).toEqual([
+      { xloc: 'bar_index', x: 0, price: 100 },
+      { xloc: 'bar_index', x: 2, price: 110 },
+    ]);
+    expect(p.closed).toBe(true);
+    expect(p.fillColor).toContain('rgba');
+    expect(p.lineWidth).toBe(2);
+  });
+
+  it('linefill.new embeds live lines — post-creation edits propagate', async () => {
+    const m = await runModel(
+      `//@version=6\nindicator("lf", overlay=true)\nif bar_index == 1\n    l1 = line.new(0, 100, 4, 100)\n    l2 = line.new(0, 90, 4, 90)\n    linefill.new(l1, l2, color.new(color.orange, 80))\n    line.set_y2(l1, 120)\n`,
+      mkBars(5));
+    expect(m.linefills).toHaveLength(1);
+    const lf = m.linefills![0]!;
+    // line.set_y2 ran AFTER linefill.new — embedded legs see the edit.
+    expect(lf.line1.y2).toBe(120);
+    expect(lf.line2.y1).toBe(90);
+    expect(lf.color).toContain('rgba');
+  });
+
+  it('table.all / polyline.all / linefill.all expose live objects', async () => {
+    const m = await runModel(
+      `//@version=6\nindicator("a", overlay=true)\nif bar_index == 1\n    table.new(position.top_right, 1, 1)\n    polyline.new(array.from(chart.point.from_index(0, 1), chart.point.from_index(1, 2)))\n    l1 = line.new(0, 1, 1, 2)\n    l2 = line.new(0, 2, 1, 3)\n    linefill.new(l1, l2, color.red)\nif bar_index == 2\n    label.new(0, 0, str.tostring(array.size(table.all)) + str.tostring(array.size(polyline.all)) + str.tostring(array.size(linefill.all)))\n`,
+      mkBars(5));
+    expect(m.labels?.[0]?.text).toBe('111');
+  });
 });

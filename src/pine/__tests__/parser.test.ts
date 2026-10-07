@@ -122,6 +122,17 @@ describe('declarations', () => {
     expect(s.value).toMatchObject({ type: 'call' });
   });
 
+  it('var [a, b] = f() → TupleAssign flagged var; plain tuple unflagged', () => {
+    const s = one('var [m, s] = ta.macd(close, 12, 26, 9)') as TupleAssign;
+    expect(s.type).toBe('tuple');
+    expect(s.names).toEqual(['m', 's']);
+    expect(s.var).toBe(true);
+    expect(s.value).toMatchObject({ type: 'call' });
+    const plain = one('[m, s] = ta.macd(close, 12, 26, 9)') as TupleAssign;
+    expect(plain.type).toBe('tuple');
+    expect(plain.var).toBeUndefined();
+  });
+
   it('varip int cnt = 0 → VarDecl flagged varip (runtime warn is interp-side)', () => {
     const s = one('varip int cnt = 0') as VarDecl;
     expect(s.type).toBe('var');

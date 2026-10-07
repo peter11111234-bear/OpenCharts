@@ -19,7 +19,6 @@ import {
   registerWidgetAction,
   registerStatePersistence,
   registerLegendAction,
-  registerLegendCallout,
   registerIcon,
   type CellStateContext,
   type WidgetContext,
@@ -164,22 +163,6 @@ registerStatePersistence({
  */
 export { PineInterpreterEngine as InterpreterPineEngine } from '../pine/engine.ts';
 
-// 「移到 K 線 / 獨立 pane」 legend action — TradingView 的 move/merge。
-// 在 price pane 的按下去搬到新 pane；在 study pane 的按下去搬到 price。
-registerLegendAction({
-  id: "move-to-pane",
-  icon: "move",
-  tooltip: "移到主圖 / 新 pane",
-  order: 50,
-  when: (ind) => ind.source !== undefined,
-  run: (ctx, ind) => {
-    const handle = ctx.chart.indicators().find((h) => h.id === ind.id);
-    if (!handle) return;
-    const panes = ctx.chart.panes.list();
-    const current = panes.find((p) => p.indicators.some((i) => i.id === ind.id));
-    handle.moveTo(current?.kind === "price" ? { newPane: true } : "price");
-  },
-});
 
 // 「Edit」legend action — 把指標的 source 拉回 Pine editor（openEditor 吃
 // initial source，textarea 直接載入讓你改）。
@@ -195,73 +178,149 @@ registerLegendAction({
 });
 
 // 'edit' isn't in the built-in registry — register a pencil so the button isn't blank.
+// Horizontal ellipsis for the legend ⋯ bubble — vela's built-in "kebab" is
+// vertical (⋮); TV uses horizontal "..." so register our own.
+registerIcon("more-h", svg16('<circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/>', 'fill="currentColor" stroke="none"'));
 registerIcon("edit", svg16('<path d="M11.5 3.5 12.7 4.7a1 1 0 0 1 0 1.4l-8.2 8.2-2.8.7.7-2.8 8.2-8.2a1 1 0 0 1 1.4 0Z"/>'));
-// Legend ⋯ (more) — TV parity: EVERY indicator row gets a ⋯ callout. Pine
-// scripts get Edit source code; natives get a read-only notice + Move/Remove
-// (TV shows "Source code" disabled for built-ins).
-registerLegendCallout({
+// Legend ⋯ (more) — a legend-row action at the END of the hover controls
+// (eye / move / edit / ⋯ / ✕). The callout API renders an always-visible
+// bubble instead, which floats OVER the controls — wrong slot. So this is a
+// plain LegendAction whose run() deploys a small dropdown panel we manage.
+registerLegendAction({
   id: "pine-more",
-  order: 90,
-  callout: (ind) => {
-    const title = ind.title;
-    const isPine = typeof ind.source === 'string' && ind.source.length > 0;
-    const sep: { type: 'text'; text: string } = { type: 'text', text: '──────────' };
-    // Disabled look — Vela has no `disabled` field on LegendCalloutItem, so
-    // gray it out with a leading "· " marker and make run a no-op.
-    const dis = (label: string) => ({ type: 'button' as const, label: `· ${label}（暫不支援）`, run: () => {} });
-    const sub = (label: string, fn: (c: WidgetContext) => void) => ({ type: 'button' as const, label, run: (c: WidgetContext) => fn(c) });
-    const act = (label: string, primary: boolean, fn: (c: WidgetContext, i: typeof ind) => void) =>
-      ({ type: 'button' as const, label, ...(primary ? { primary: true } : {}), run: fn });
-    return {
-      icon: "more-h",
-      background: "color-mix(in srgb, var(--vela-fg, #b2b5be) 14%, transparent)",
-      tooltip: "More",
-      content: {
-        title,
-        items: [
-          dis(`為 ${title} 新增快訊…`),
-          dis(`在 ${title} 上增加指標/策略…`),
-          sub('將此指標增加到整個版面', (c) => {
-            const h = c.chart.indicators().find(x => x.id === ind.id);
-            if (!h?.source) return;
-            try { c.toast?.(`已複製「${h.title}」到版面指標`, 'info'); } catch { /* no toast */ }
-          }),
-          sub(favsRead().includes(ind.id) ? '★ 從收藏夾移除' : '☆ 將此指標新增至收藏夾', () => toggleIndicatorFav(ind.id)),
-          sep,
-          dis('視覺順序'),
-          dis('時間週期的可見性'),
-          dis('移動到'),
-          dis('固定至刻度'),
-          sep,
-          // Source code — Pine opens the editor, native is disabled (built-in can't be edited).
-          isPine
-            ? act('原始碼…', true, (c, i) => {
-                const match = pineLibList().find(s => s.source === i.source);
-                if (match) openPineEditorWithScript(c, match.id);
-                else openEditor(c, i.source ?? '', i.id);
-              })
-            : dis('原始碼（內建指標不可編輯）'),
-          sep,
-          isPine
-            ? act('複製', false, (c, i) => {
-                const p = navigator.clipboard?.writeText(i.source ?? '');
-                if (p) void p.then(() => { try { c.toast?.('已複製', 'success'); } catch {} }, () => { try { c.toast?.('複製失敗', 'error'); } catch {} });
-              })
-            : dis('複製（內建指標無來源）'),
-          act('隱藏', false, (c, i) => { c.chart.indicators().find(x => x.id === i.id)?.setVisible(false); }),
-          act('移除', false, (c, i) => { c.chart.indicators().find(x => x.id === i.id)?.remove(); }),
-          sep,
-          dis('物件樹'),
-          sep,
-          act('設定…', false, (c, i) => {
-            const renderer = c.chart.renderer;
-            if (renderer.supportsIndicatorSettings) renderer.openIndicatorSettings(i.id);
-          }),
-        ],
-      },
-    };
-  },
+  icon: "more-h",
+  tooltip: "更多",
+  order: 999,
+  run: (ctx, ind) => toggleMoreMenu(ctx, ind),
 });
+
+// ── More-menu dropdown (self-managed; positioned under the clicked ⋯) ──
+// Track the last real click so the ⋯ menu can anchor to the clicked button —
+// `run` receives no DOM node and activeElement isn't reliable for these.
+let lastPointer = { x: 0, y: 0 };
+let openMoreMenuEl: HTMLElement | null = null;
+document.addEventListener('pointerdown', (e) => { lastPointer = { x: e.clientX, y: e.clientY }; }, true);
+
+function closeMoreMenu(): void {
+  openMoreMenuEl?.remove();
+  openMoreMenuEl = null;
+}
+
+function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; source?: string }): void {
+  if (openMoreMenuEl) { closeMoreMenu(); return; }
+  const doc = ctx.host.ownerDocument;
+
+  type Item = { label: string; disabled?: boolean; primary?: boolean; sep?: boolean; run?: () => void };
+  const isPine = typeof ind.source === 'string' && ind.source.length > 0;
+  const items: Item[] = [
+    { label: `為 ${ind.title} 新增快訊…`, disabled: true },
+    { label: `在 ${ind.title} 上增加指標/策略…`, disabled: true },
+    { label: '將此指標增加到整個版面', run: () => {
+        const h = ctx.chart.indicators().find(x => x.id === ind.id);
+        if (!h?.source) return;
+        try { ctx.toast?.(`已複製「${h.title}」到版面指標`, 'info'); } catch { /* no toast */ }
+      } },
+    { label: favsRead().includes(ind.id) ? '★ 從收藏夾移除' : '☆ 將此指標新增至收藏夾', run: () => toggleIndicatorFav(ind.id) },
+    { label: '', sep: true },
+    { label: '視覺順序', disabled: true },
+    { label: '時間週期的可見性', disabled: true },
+    { label: '移動到', disabled: true },
+    { label: '固定至刻度', disabled: true },
+    { label: '', sep: true },
+    isPine
+      ? { label: '原始碼…', primary: true, run: () => {
+            const match = pineLibList().find(s => s.source === ind.source);
+            if (match) openPineEditorWithScript(ctx, match.id);
+            else openEditor(ctx, ind.source ?? '', ind.id);
+          } }
+      : { label: '原始碼（內建指標不可編輯）', disabled: true },
+    { label: '', sep: true },
+    isPine
+      ? { label: '複製', run: () => {
+            const p = navigator.clipboard?.writeText(ind.source ?? '');
+            if (p) void p.then(() => { try { ctx.toast?.('已複製', 'success'); } catch {} }, () => { try { ctx.toast?.('複製失敗', 'error'); } catch {} });
+          } }
+      : { label: '複製（內建指標無來源）', disabled: true },
+    { label: '隱藏', run: () => { ctx.chart.indicators().find(x => x.id === ind.id)?.setVisible(false); } },
+    { label: '移除', run: () => { ctx.chart.indicators().find(x => x.id === ind.id)?.remove(); } },
+    { label: '', sep: true },
+    { label: '物件樹', disabled: true },
+    { label: '', sep: true },
+    { label: '設定…', run: () => {
+        const renderer = ctx.chart.renderer;
+        if (renderer.supportsIndicatorSettings) renderer.openIndicatorSettings(ind.id);
+      } },
+  ];
+
+  const menu = doc.createElement('div');
+  menu.style.cssText =
+    'position:fixed;z-index:10001;min-width:220px;padding:4px;background:#1e222d;' +
+    'border:1px solid #363c4e;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.5);' +
+    'font:12px/1.5 -apple-system,"Segoe UI",sans-serif;color:#d5d8e0;user-select:none;';
+
+  for (const it of items) {
+    if (it.sep) {
+      const hr = doc.createElement('div');
+      hr.style.cssText = 'height:1px;margin:4px 8px;background:#2a2e39;';
+      menu.appendChild(hr);
+      continue;
+    }
+    const b = doc.createElement('button');
+    b.textContent = it.label;
+    b.style.cssText =
+      'display:block;width:100%;text-align:left;padding:5px 12px;border:0;border-radius:4px;' +
+      'background:transparent;color:' + (it.disabled ? '#5d606b' : it.primary ? '#2962ff' : '#d5d8e0') + ';' +
+      'font:inherit;cursor:' + (it.disabled ? 'default' : 'pointer');
+    if (!it.disabled) {
+      b.addEventListener('mouseenter', () => { b.style.background = '#2a2e39'; });
+      b.addEventListener('mouseleave', () => { b.style.background = 'transparent'; });
+      b.addEventListener('click', () => { closeMoreMenu(); it.run?.(); });
+    }
+    menu.appendChild(b);
+  }
+
+  // Anchor: last real pointer position (the ⋯ click) → open below it. Fall
+  // back to the legend row matched by the title span, then dead-center.
+  let anchor: DOMRect | null = null;
+  if (lastPointer.x > 0 && lastPointer.y > 0) {
+    anchor = new DOMRect(lastPointer.x - 8, lastPointer.y - 8, 16, 16);
+  }
+  if (!anchor) {
+    for (const pane of doc.querySelectorAll('[data-vela-pane]')) {
+      for (const row of pane.querySelectorAll('div')) {
+        const name = row.querySelector('span span');
+        if (name && name.textContent === ind.title) { anchor = row.getBoundingClientRect(); break; }
+      }
+      if (anchor) break;
+    }
+  }
+
+  doc.body.appendChild(menu);
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  const vw = doc.defaultView?.innerWidth ?? 1280;
+  const vh = doc.defaultView?.innerHeight ?? 720;
+  const left = anchor ? Math.min(anchor.left, vw - mw - 8) : vw / 2 - mw / 2;
+  const top = anchor ? (anchor.bottom + 4 + mh > vh ? anchor.top - 4 - mh : anchor.bottom + 4) : vh / 2 - mh / 2;
+  menu.style.left = Math.max(8, left) + 'px';
+  menu.style.top = Math.max(8, top) + 'px';
+  openMoreMenuEl = menu;
+
+  const dismiss = (ev: MouseEvent) => {
+    if (!menu.contains(ev.target as Node)) {
+      closeMoreMenu();
+      doc.removeEventListener('mousedown', dismiss, true);
+    }
+  };
+  const esc = (ev: KeyboardEvent) => {
+    if (ev.key === 'Escape') {
+      closeMoreMenu();
+      doc.removeEventListener('keydown', esc, true);
+      doc.removeEventListener('mousedown', dismiss, true);
+    }
+  };
+  doc.addEventListener('mousedown', dismiss, true);
+  doc.addEventListener('keydown', esc, true);
+}
 
 
 // ── Favorites for indicator rows (separate from script favorites) ──

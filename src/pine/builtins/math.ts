@@ -4,7 +4,7 @@
 
 import { NA } from '../contracts';
 import type { BuiltinCtx, BuiltinFn, Value } from '../contracts';
-import { BarSeries } from '../series';
+import { BarSeries, LiftedSeries, freezeReader } from '../series';
 import { registerBuiltin, registerConstant } from './registry';
 import { asNum, bindArgs, numVal } from './util';
 
@@ -19,8 +19,11 @@ import { asNum, bindArgs, numVal } from './util';
 // plots). setAt() writes oldest→newest so ring order stays correct.
 
 /** Build a BarSeries from a per-offset fn; `len` = number of bars to write.
- *  Offset 0 = current bar. Writes oldest→newest (setAt can't retro-append). */
-function seriesFromOffsets(ctx: BuiltinCtx, len: number, fn: (off: number) => Value): Value {
+ *  Offset 0 = current bar. Writes oldest→newest (setAt can't retro-append).
+ *  `lazy` (fn reads only frozen sources) defers each entry until it is read —
+ *  same observable series, O(1) instead of O(history) per call. */
+function seriesFromOffsets(ctx: BuiltinCtx, len: number, fn: (off: number) => Value, lazy = false): Value {
+  if (lazy && len > 0) return { kind: 'series', v: new LiftedSeries(ctx.barIndex, len, fn, fn(0)) };
   const out = new BarSeries();
   if (len <= 0) return { kind: 'series', v: out };
   const base = ctx.barIndex - len + 1;
@@ -33,37 +36,59 @@ function seriesFromOffsets(ctx: BuiltinCtx, len: number, fn: (off: number) => Va
   }
   return { kind: 'series', v: out };
 }
+
+/** Per-offset readers fixed to each arg's current view (scalars read as
+ *  themselves at every offset, like the old `get`-or-value read). Null when a
+ *  series arg has no replayable storage — the caller must build eagerly. */
+function freezeArgs(vs: Value[]): ((i: number) => Value)[] | null {
+  const out: ((i: number) => Value)[] = [];
+  for (const v of vs) {
+    if (v.kind !== 'series') {
+      out.push(() => v);
+      continue;
+    }
+    const r = freezeReader(v.v);
+    if (r === null) return null;
+    out.push(r);
+  }
+  return out;
+}
+
 type NumKernel = (xs: [number | null, ...(number | null)[]]) => number | null;
 type OutKind = 'int' | 'float' | 'auto';
 
 export function liftNums(f: NumKernel, kind: OutKind = 'float'): BuiltinFn {
   return (ctx: BuiltinCtx, args: Value[], named: Record<string, Value>) => {
     const vs = args.concat(Object.values(named));
-    const at = (v: Value, i: number): number | null => {
-      const u = v.kind === 'series' ? v.v.get(i) : v;
-      return u.kind === 'int' || u.kind === 'float' ? u.v : null;
-    };
-    const wrap = (r: number | null, sample: Value[]): Value => {
+    const asN = (u: Value): number | null => (u.kind === 'int' || u.kind === 'float' ? u.v : null);
+    // 'auto' → int only when every input is int-typed right now; decided once
+    // per call so deferred entries agree with an eager build.
+    const outKind: 'int' | 'float' =
+      kind !== 'auto'
+        ? kind
+        : vs.every(
+            (v) =>
+              v.kind === 'int' ||
+              v.kind === 'na' ||
+              (v.kind === 'series' && v.v.cur().kind === 'int'),
+          )
+          ? 'int'
+          : 'float';
+    const wrap = (r: number | null): Value => {
       if (r === null) return NA;
-      const k =
-        kind === 'auto'
-          ? sample.every(
-              (v) =>
-                v.kind === 'int' ||
-                v.kind === 'na' ||
-                (v.kind === 'series' && v.v.cur().kind === 'int'),
-            )
-            ? 'int'
-            : 'float'
-          : kind;
-      return k === 'int' ? { kind: 'int', v: Math.trunc(r) } : { kind: 'float', v: r };
+      return outKind === 'int' ? { kind: 'int', v: Math.trunc(r) } : { kind: 'float', v: r };
     };
     if (!vs.some((v) => v.kind === 'series')) {
-      return wrap(f(vs.map((v) => at(v, 0)) as [number | null, ...(number | null)[]]), vs);
+      return wrap(f(vs.map(asN) as [number | null, ...(number | null)[]]));
     }
     const len = Math.max(0, ...vs.map((v) => (v.kind === 'series' ? v.v.size() : 0)));
+    const readers = freezeArgs(vs);
+    if (readers) {
+      return seriesFromOffsets(ctx, len, (i) =>
+        wrap(f(readers.map((r) => asN(r(i))) as [number | null, ...(number | null)[]])), true);
+    }
     return seriesFromOffsets(ctx, len, (i) =>
-      wrap(f(vs.map((v) => at(v, i)) as [number | null, ...(number | null)[]]), vs));
+      wrap(f(vs.map((v) => asN(v.kind === 'series' ? v.v.get(i) : v)) as [number | null, ...(number | null)[]])));
   };
 }
 
@@ -143,6 +168,8 @@ registerBuiltin('math', 'round', (ctx, args, named) => {
   const toInt = (u: Value): Value =>
     u.kind === 'float' || u.kind === 'int' ? { kind: 'int', v: Math.trunc(u.v) } : u;
   if (r.kind === 'series') {
+    const rd = freezeReader(r.v);
+    if (rd) return seriesFromOffsets(ctx, r.v.size(), (i) => toInt(rd(i)), true);
     return seriesFromOffsets(ctx, r.v.size(), (i) => toInt(r.v.get(i)));
   }
   return toInt(r);
@@ -178,18 +205,20 @@ registerBuiltin('math', 'sum', (_ctx, args, named) => {
   const lenV = bound.get('length');
   const len = lenV ? Math.trunc(asNum(lenV)) : 0;
   if (!src || len <= 0) return NA;
-  const sumAt = (i: number): Value => {
+  const sumWith = (read: (k: number) => Value) => (i: number): Value => {
     let acc = 0;
     for (let k = 0; k < len; k++) {
-      const u = src.kind === 'series' ? src.v.get(i + k) : i === 0 ? src : NA;
+      const u = read(i + k);
       if (u.kind !== 'int' && u.kind !== 'float') return NA;
       acc += u.v;
     }
     return { kind: 'float', v: acc };
   };
-  if (src.kind !== 'series') return sumAt(0);
+  if (src.kind !== 'series') return sumWith((k) => (k === 0 ? src : NA))(0);
   const hist = src.v.size();
-  return seriesFromOffsets(_ctx, hist, sumAt);
+  const rd = freezeReader(src.v);
+  if (rd) return seriesFromOffsets(_ctx, hist, sumWith(rd), true);
+  return seriesFromOffsets(_ctx, hist, sumWith((k) => src.v.get(k)));
 });
 
 // nz(source, replacement=0) — unwrap na. Registered both namespaced and bare.
@@ -201,6 +230,15 @@ const nzFn: BuiltinFn = (_ctx, args, named) => {
   if (src.kind !== 'series') {
     if (src.kind === 'na') return rep ?? { kind: 'int', v: 0 };
     return src;
+  }
+  const srcRd = freezeReader(src.v);
+  const repRd = rep?.kind === 'series' ? freezeReader(rep.v) : undefined;
+  if (srcRd && repRd !== null) {
+    const repAt = (i: number): Value => (!rep ? { kind: 'int', v: 0 } : repRd ? repRd(i) : rep);
+    return seriesFromOffsets(_ctx, src.v.size(), (i) => {
+      const u = srcRd(i);
+      return u.kind === 'na' ? repAt(i) : u;
+    }, true);
   }
   const repAt = (i: number): Value => {
     if (!rep) return { kind: 'int', v: 0 };

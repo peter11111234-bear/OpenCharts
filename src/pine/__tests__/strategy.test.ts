@@ -1,7 +1,7 @@
 // ── strategy.* simulation layer tests ───────────────────────────────────────
 
 import { describe, expect, it } from 'vitest';
-import { NA, Series, type BarData, type BuiltinCtx, type Node, type StrategyDecl, type Value } from '../contracts';
+import { Series, type BarData, type BuiltinCtx, type Node, type StrategyDecl, type Value } from '../contracts';
 import { BarCtx } from '../context';
 import { parse } from '../parser';
 import { runScript } from '../interpreter';
@@ -432,5 +432,131 @@ describe('strategy order gating', () => {
     barCtx.seek(4); // bar4 high 14 would fill B — must stay cancelled
     expect(numV(getConstant('strategy.position_size', ctx))).toBe(1);
     expect(numV(getConstant('strategy.closedtrades', ctx))).toBe(0);
+  });
+});
+
+// ── trade comments ──────────────────────────────────────────────────
+
+describe('strategy trade comments', () => {
+  it('close_all(comment=) labels the exit execution', async () => {
+    const src = `strategy("s")
+if bar_index == 0
+  strategy.entry("L", strategy.long)
+if bar_index == 2
+  strategy.close_all(comment="tp-hit")
+plot(strategy.position_size)`;
+    const r = await runScript(parse(src), mkBars(5, 10), { symbol: 'TEST', timeframe: 'D' });
+    const exit = r.execs!.find(e => e.kind === 'exit');
+    expect(exit).toBeDefined();
+    expect(exit!.label).toBe('tp-hit');
+    expect(exit!.tradeId).toBe(r.execs!.find(e => e.kind === 'entry')!.tradeId);
+  });
+
+  it('order(comment=) labels the entry execution', async () => {
+    const src = `strategy("s")
+if bar_index == 0
+  strategy.order("O", strategy.long, comment="scale-in")
+plot(strategy.position_size)`;
+    const r = await runScript(parse(src), mkBars(3, 10), { symbol: 'TEST', timeframe: 'D' });
+    const entry = r.execs!.find(e => e.kind === 'entry');
+    expect(entry).toBeDefined();
+    expect(entry!.label).toBe('scale-in');
+  });
+});
+
+// ── per-trade accessors + P&L rollups ───────────────────────────────────────
+
+describe('strategy.closedtrades/opentrades accessors', () => {
+  // bars: open=close=10..17. Entry fills next-bar open:
+  //   L entry(bar0) → fills bar1 @11; exit(bar2) → fills bar3 @13 → +2
+  //   S entry(bar4) → fills bar5 @15; exit(bar6) → fills bar7 @17 → -2
+  const twoTrades = () => {
+    const bars = mkBars(8, 10);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    callStrategy('entry', [{ kind: 'string', v: 'L' }, { kind: 'string', v: 'strategy.long' }], {}, ctx);
+    barCtx.seek(2);
+    callStrategy('exit', [{ kind: 'string', v: 'XL' }, { kind: 'string', v: 'L' }], {}, ctx);
+    barCtx.seek(4);
+    callStrategy('entry', [{ kind: 'string', v: 'S' }, { kind: 'string', v: 'strategy.short' }], {}, ctx);
+    barCtx.seek(6);
+    callStrategy('exit', [{ kind: 'string', v: 'XS' }, { kind: 'string', v: 'S' }], {}, ctx);
+    barCtx.seek(7);
+    return { ctx, barCtx };
+  };
+
+  const callTrades = (name: string, ctx: BuiltinCtx, i: number): Value =>
+    callStrategy(name, [{ kind: 'int', v: i }], {}, ctx);
+
+  it('closedtrades.* expose per-trade fields, index 0 = most recent', () => {
+    const { ctx } = twoTrades();
+    expect(numV(getConstant('strategy.closedtrades', ctx))).toBe(2);
+    // Most recent = the short trade (entry 15 → exit 17, loss).
+    expect(numV(callTrades('closedtrades.entry_bar_index', ctx, 0))).toBe(5);
+    expect(numV(callTrades('closedtrades.entry_price', ctx, 0))).toBe(15);
+    expect(numV(callTrades('closedtrades.entry_time', ctx, 0))).toBe(5 * 60000);
+    expect(numV(callTrades('closedtrades.exit_bar_index', ctx, 0))).toBe(7);
+    expect(numV(callTrades('closedtrades.exit_price', ctx, 0))).toBe(17);
+    expect(numV(callTrades('closedtrades.exit_time', ctx, 0))).toBe(7 * 60000);
+    expect(numV(callTrades('closedtrades.profit', ctx, 0))).toBeCloseTo(-2);
+    expect(numV(callTrades('closedtrades.size', ctx, 0))).toBe(-1);
+    expect(numV(callTrades('closedtrades.commission', ctx, 0))).toBe(0);
+    // Older trade = the long (entry 11 → exit 13, win).
+    expect(numV(callTrades('closedtrades.entry_price', ctx, 1))).toBe(11);
+    expect(numV(callTrades('closedtrades.profit', ctx, 1))).toBeCloseTo(2);
+    expect(numV(callTrades('closedtrades.size', ctx, 1))).toBe(1);
+    // Out of range → na.
+    expect(callTrades('closedtrades.profit', ctx, 2).kind).toBe('na');
+    expect(callTrades('closedtrades.profit', ctx, -1).kind).toBe('na');
+  });
+
+  it('opentrades.* describe live entry legs', () => {
+    // Long closed by bar 5; short entry fills bar5 @15 — one live leg.
+    const bars = mkBars(8, 10);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    callStrategy('entry', [{ kind: 'string', v: 'L' }, { kind: 'string', v: 'strategy.long' }], {}, ctx);
+    barCtx.seek(2);
+    callStrategy('exit', [{ kind: 'string', v: 'XL' }, { kind: 'string', v: 'L' }], {}, ctx);
+    barCtx.seek(4);
+    callStrategy('entry', [{ kind: 'string', v: 'S' }, { kind: 'string', v: 'strategy.short' }], {}, ctx);
+    barCtx.seek(5);
+    expect(numV(getConstant('strategy.opentrades', ctx))).toBe(1);
+    expect(numV(callTrades('opentrades.entry_bar_index', ctx, 0))).toBe(5);
+    expect(numV(callTrades('opentrades.entry_price', ctx, 0))).toBe(15);
+    expect(numV(callTrades('opentrades.entry_time', ctx, 0))).toBe(5 * 60000);
+    expect(numV(callTrades('opentrades.size', ctx, 0))).toBe(-1);
+    expect(callTrades('opentrades.entry_price', ctx, 1).kind).toBe('na');
+  });
+
+  it('grossprofit / grossloss / netprofit roll up closed trades', () => {
+    const { ctx } = twoTrades();
+    expect(numV(getConstant('strategy.grossprofit', ctx))).toBeCloseTo(2);
+    expect(numV(getConstant('strategy.grossloss', ctx))).toBeCloseTo(2);
+    expect(numV(getConstant('strategy.netprofit', ctx))).toBeCloseTo(0);
+  });
+
+  it('accessors resolve through runScript (dotted-call dispatch)', async () => {
+    const src = `strategy("s")
+if bar_index == 0
+  strategy.entry("L", strategy.long)
+if bar_index == 2
+  strategy.exit("XL", "L")
+if bar_index == 4
+  strategy.entry("S", strategy.short)
+if bar_index == 6
+  strategy.exit("XS", "S")
+plot(strategy.closedtrades.profit(0), "p0")
+plot(strategy.closedtrades.profit(1), "p1")
+plot(strategy.closedtrades.entry_price(0), "e0")
+plot(strategy.netprofit, "np")
+plot(strategy.grossprofit, "gp")
+plot(strategy.grossloss, "gl")`;
+    const r = await runScript(parse(src), mkBars(8, 10), { symbol: 'TEST', timeframe: 'D' });
+    const last = (k: string) => numV(r.plots.get(k)!.values.at(-1));
+    expect(last('p0')).toBeCloseTo(-2);
+    expect(last('p1')).toBeCloseTo(2);
+    expect(last('e0')).toBe(15);
+    expect(last('np')).toBeCloseTo(0);
+    expect(last('gp')).toBeCloseTo(2);
+    expect(last('gl')).toBeCloseTo(2);
   });
 });

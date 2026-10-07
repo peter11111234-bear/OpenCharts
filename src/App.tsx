@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { TradingPage } from "./pages/TradingPage.tsx";
+import { VelaPage } from "./pages/VelaPage.tsx";
 import { useAuthStore, useTradingStore } from "./services/store.tsx";
 
 /**
@@ -10,6 +11,10 @@ import { useAuthStore, useTradingStore } from "./services/store.tsx";
  * demo "login" seeds the local user/account and starts the market-data feed.
  */
 export function App() {
+  // /vela → shioaji-backed Vela workspace (TW stocks/futures + Pine engine);
+  // every other path keeps the demo trading terminal.
+  if (window.location.pathname.startsWith("/vela")) return <VelaPage />;
+
   const [ready, setReady] = useState(false);
   const demoLogin = useAuthStore((s) => s.demoLogin);
   const loadSymbols = useTradingStore((s) => s.loadSymbols);

@@ -32,7 +32,7 @@ export const VFALSE: Value = { kind: 'bool', v: false };
 export interface DrawObj {
   id: number;
   // union of line/label/box/table fields; runtime narrows by `kind`
-  kind: 'line' | 'label' | 'box' | 'table' | 'polyline';
+  kind: 'line' | 'label' | 'box' | 'table' | 'polyline' | 'linefill';
   props: Record<string, unknown>;
 }
 
@@ -110,7 +110,7 @@ export interface Arg { name?: string; value: Node }
 export interface Member extends Base { type: 'member'; obj: Node; prop: string; computed?: boolean }
 export interface ArrayLit extends Base { type: 'arraylit'; items: Node[] }
 /** `[a, b, c] = expr` */
-export interface TupleAssign extends Base { type: 'tuple'; names: string[]; value: Node }
+export interface TupleAssign extends Base { type: 'tuple'; names: string[]; value: Node; /** `var [a,b] = f()` — each binding inits once and persists across bars. */ var?: boolean }
 /** `x = expr` (declare) */
 export interface Assign extends Base { type: 'assign'; name: string; typeAnn?: string; value: Node }
 /** `x := expr` (reassign) */
@@ -220,8 +220,10 @@ export interface UdfDecl {
 // ── Interpreter result ──────────────────────────────────────────────────────
 
 export interface RunResult {
-  /** Named plot series: title → per-bar values + originating sink index. */
-  plots: Map<string, { index: number; time: number[]; values: Value[]; opts: PlotOpts }>;
+  /** Named plot series: title → per-bar values + originating sink index.
+   *  `colors` carries the per-bar `color=` opt (aligned to `values`) so
+   *  conditional colors (`close>0 ? green : red`) survive to the model. */
+  plots: Map<string, { index: number; time: number[]; values: Value[]; opts: PlotOpts; colors: (string | undefined)[] }>;
   /** Drawing objects alive at end. */
   drawings: DrawObj[];
   /** fill() descriptors; plot1/plot2 are plot-sink indexes (see `plots[].index`). */
@@ -233,6 +235,11 @@ export interface RunResult {
   /** Strategy order executions — buildModel maps to IndicatorModel.trades. */
   execs?: { bar: number; price: number; dir: number; kind: 'entry' | 'exit'; label?: string; qty: number; tradeId: number }[];
   alerts: { id: string; msg: string }[];
+  /** Registered `alertcondition(...)` templates — Pine defines these at global
+   *  scope for the Create-Alert dialog; the condition is evaluated later by the
+   *  alert engine, so an entry is recorded once per title regardless of the
+   *  condition's value. Kept separate from `alerts` (runtime `alert()` fires). */
+  alertconditions: { title: string; msg: string }[];
   warnings: string[];
   /** Script-declared inputs (from input.* calls). */
   inputs: InputSchemaLite[];

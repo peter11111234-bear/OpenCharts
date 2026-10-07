@@ -12,7 +12,7 @@ import { NA } from '../contracts';
 import { registerBuiltin, registerConstant, registerLazyConstant } from './registry';
 import {
   RtCtx, bindArgs, bindDeclArgs, truthy, asNum, asStr, asColor, strArg,
-  numArg, colorArg, numVal,
+  numArg, colorArg, numVal, boolArg, warnOnce, unwrapped,
 } from './util';
 
 // ── Enum constants ──────────────────────────────────────────────────────────
@@ -70,34 +70,39 @@ function drawSink(ctx: RtCtx): DrawSink {
   return ctx.drawings[0]!;
 }
 
-function liveArr(ctx: RtCtx, kind: 'line' | 'label' | 'box' | 'table'): DrawObj[] {
+function liveArr(ctx: RtCtx, kind: 'line' | 'label' | 'box' | 'table' | 'polyline' | 'linefill'): DrawObj[] {
   switch (kind) {
     case 'line': return ctx.liveLines ??= [];
     case 'label': return ctx.liveLabels ??= [];
     case 'box': return ctx.liveBoxes ??= [];
+    case 'polyline': return ctx.livePolylines ??= [];
+    case 'linefill': return ctx.liveLinefills ??= [];
     default: return ctx.liveTables ??= [];
   }
 }
 
-// ── Drawing quotas (TV max_lines_count / max_labels_count / max_boxes_count) ──
+// ── Drawing quotas (TV max_*_count) ──
 // TV auto-deletes the oldest objects of a kind once the live count exceeds the
 // declared limit (default 50). Quotas come from the indicator()/strategy()
-// declaration via declDrawQuotas → ctx.declQuotas.
+// declaration via declDrawQuotas → ctx.declQuotas. Linefills draw from the
+// `lines` pool — TV has no separate linefill limit.
 
 const DEFAULT_QUOTA = 50;
 
-const QUOTA_KEY: Record<'line' | 'label' | 'box', 'lines' | 'labels' | 'boxes'> = {
+const QUOTA_KEY: Record<'line' | 'label' | 'box' | 'table' | 'polyline' | 'linefill', 'lines' | 'labels' | 'boxes' | 'tables' | 'polylines'> = {
   line: 'lines',
   label: 'labels',
   box: 'boxes',
+  table: 'tables',
+  polyline: 'polylines',
+  linefill: 'lines',
 };
 
 /** Create a drawing, mirror it live, and evict the oldest beyond the quota. */
-function created(ctx: RtCtx, kind: 'line' | 'label' | 'box' | 'table', props: Record<string, unknown>): DrawObj {
+function created(ctx: RtCtx, kind: 'line' | 'label' | 'box' | 'table' | 'polyline' | 'linefill', props: Record<string, unknown>): DrawObj {
   const obj = drawSink(ctx).create(kind, props);
   const live = liveArr(ctx, kind);
   live.push(obj);
-  if (kind === 'table') return obj; // no quota field in this interpreter's decl set
   const quota = ctx.declQuotas?.[QUOTA_KEY[kind]] ?? DEFAULT_QUOTA;
   while (live.length > quota) {
     const old = live[0]!;
@@ -106,6 +111,7 @@ function created(ctx: RtCtx, kind: 'line' | 'label' | 'box' | 'table', props: Re
   }
   return obj;
 }
+
 
 /** Numeric literal from a decl arg node (num / unary-minus num), else undefined. */
 function declNum(n: Node | undefined): number | undefined {
@@ -139,10 +145,16 @@ export function declDrawQuotas(ctx: BuiltinCtx, args: Arg[] | undefined, order: 
   if (labels !== undefined) q.labels = labels;
   const boxes = declNum(bound.get('max_boxes_count'));
   if (boxes !== undefined) q.boxes = boxes;
+  const tables = declNum(bound.get('max_tables_count'));
+  if (tables !== undefined) q.tables = tables;
+  const polylines = declNum(bound.get('max_polylines_count'));
+  if (polylines !== undefined) q.polylines = polylines;
 }
 
-/** Obj arg → DrawObj; narrows on the typed drawing Value kinds. */
+/** Obj arg → DrawObj; narrows on the typed drawing Value kinds. evalArg wraps
+ *  every arg in a per-callsite BarSeries — unwrap before switching on kind. */
 function asObj(v: Value | undefined): DrawObj | undefined {
+  if (v?.kind === 'series') return asObj(v.v.cur());
   switch (v?.kind) {
     case 'line': case 'label': case 'box': case 'table':
     case 'polyline': case 'linefill':
@@ -483,12 +495,170 @@ registerBuiltin('table', 'delete', (c, args) => {
   return { kind: 'void' };
 });
 
+// ── chart.point — polyline vertices ─────────────────────────────────────────
+// A point is a UDT instance { time, index, price }; xloc picks which x the
+// engine reads. `chart.point.new(...)` dispatches through the flattened
+// member-call path (interpreter joins the dotted chain before BUILTINS lookup).
+
+const chartPoint = (time: Value | undefined, index: Value | undefined, price: Value | undefined): Value => {
+  const fields = new Map<string, Value>();
+  fields.set('time', time ?? NA);
+  fields.set('index', index ?? NA);
+  fields.set('price', price ?? NA);
+  return { kind: 'udt', v: { typeName: 'chart.point', fields } };
+};
+
+registerBuiltin('chart.point', 'new', (_c, args, named) => {
+  const bound = bindArgs(args, named, ['time', 'index', 'price'] as const);
+  return chartPoint(unwrapped(bound.get('time')), unwrapped(bound.get('index')), unwrapped(bound.get('price')));
+});
+registerBuiltin('chart.point', 'from_index', (_c, args, named) => {
+  const bound = bindArgs(args, named, ['index', 'price'] as const);
+  return chartPoint(undefined, unwrapped(bound.get('index')), unwrapped(bound.get('price')));
+});
+registerBuiltin('chart.point', 'from_time', (_c, args, named) => {
+  const bound = bindArgs(args, named, ['time', 'price'] as const);
+  return chartPoint(unwrapped(bound.get('time')), undefined, unwrapped(bound.get('price')));
+});
+registerBuiltin('chart.point', 'now', (c, args, named) => {
+  const ctx = c as RtCtx;
+  const bound = bindArgs(args, named, ['price'] as const);
+  const t = ctx.time.cur();
+  return chartPoint(t, numVal(ctx.barIndex), unwrapped(bound.get('price')));
+});
+registerBuiltin('chart.point', 'copy', (_c, args) => {
+  const p = unwrapped(args[0]);
+  if (p?.kind !== 'udt') return NA;
+  return chartPoint(p.v.fields.get('time'), p.v.fields.get('index'), p.v.fields.get('price'));
+});
+
+/** chart.point udt → {x,y} pair honoring the polyline's xloc. */
+const pointXY = (p: Value | undefined, xloc: string): { x: number; y: number } | undefined => {
+  if (p?.kind !== 'udt') return undefined;
+  const num = (k: string): number | undefined => {
+    const v = p.v.fields.get(k);
+    return v !== undefined && (v.kind === 'int' || v.kind === 'float') ? v.v : undefined;
+  };
+  const x = xloc === 'xloc.bar_time' ? num('time') : num('index');
+  const y = num('price');
+  return x === undefined || y === undefined ? undefined : { x, y };
+};
+
+// ── polyline ────────────────────────────────────────────────────────────────
+
+registerBuiltin('polyline', 'new', (c, args, named) => {
+  const ctx = c as RtCtx;
+  const bound = bindArgs(args, named, [
+    'points', 'curved', 'closed', 'xloc', 'line_color', 'fill_color',
+    'line_style', 'line_width', 'force_overlay',
+  ] as const);
+  const arr = unwrapped(bound.get('points'));
+  const xloc = strArg(bound, 'xloc', 'xloc.bar_index');
+  const pts: { x: number; y: number }[] = [];
+  if (arr?.kind === 'array') {
+    for (const el of arr.v) {
+      const p = pointXY(unwrapped(el), xloc);
+      if (p) pts.push(p);
+    }
+  }
+  const props: Record<string, unknown> = {
+    points: pts,
+    xloc,
+    curved: boolArg(bound, 'curved', false),
+    closed: boolArg(bound, 'closed', false),
+    // Absent → TV default blue; explicit color=na → no stroke (Vela undefined).
+    line_color: bound.has('line_color') ? colorArg(bound, 'line_color') : '#2962FF',
+    fill_color: colorArg(bound, 'fill_color'),
+    line_style: strArg(bound, 'line_style', 'line.style_solid'),
+    line_width: numArg(bound, 'line_width', 1),
+    force_overlay: boolArg(bound, 'force_overlay', false),
+  };
+  const obj = created(ctx, 'polyline', props);
+  return { kind: 'polyline', v: obj };
+});
+
+registerBuiltin('polyline', 'delete', (c, args) => {
+  const ctx = c as RtCtx;
+  const obj = asObj(args[0]);
+  if (obj) {
+    drawSink(ctx).remove(obj);
+    const live = liveArr(ctx, 'polyline');
+    const i = live.indexOf(obj);
+    if (i >= 0) live.splice(i, 1);
+  }
+  return { kind: 'void' };
+});
+
+// ── linefill ────────────────────────────────────────────────────────────────
+// Bands between two line objects; TV counts them against max_lines_count
+// (QUOTA_KEY maps 'linefill' → 'lines'). The engine embeds the live line
+// DrawObjs so endpoint edits propagate without a snapshot.
+
+registerBuiltin('linefill', 'new', (c, args, named) => {
+  const ctx = c as RtCtx;
+  const bound = bindArgs(args, named, [
+    'line1', 'line2', 'color', 'force_overlay',
+  ] as const);
+  const l1 = asObj(bound.get('line1'));
+  const l2 = asObj(bound.get('line2'));
+  if (!l1 || !l2 || l1.kind !== 'line' || l2.kind !== 'line') {
+    warnOnce(ctx, 'linefill|noline', 'linefill.new() requires two line objects');
+    return NA;
+  }
+  const props: Record<string, unknown> = {
+    line1: l1, line2: l2,
+    color: colorArg(bound, 'color'),
+    force_overlay: boolArg(bound, 'force_overlay', false),
+  };
+  const obj = created(ctx, 'linefill', props);
+  return { kind: 'linefill', v: obj };
+});
+
+for (const which of ['line1', 'line2'] as const) {
+  registerBuiltin('linefill', `set_${which}`, (c, args, named) => {
+    const bound = bindArgs(args, named, ['id', which] as const);
+    const obj = asObj(bound.get('id'));
+    const l = asObj(bound.get(which));
+    if (obj && l?.kind === 'line') drawSink(c as RtCtx).update(obj, { [which]: l });
+    return { kind: 'void' };
+  });
+  registerBuiltin('linefill', `get_${which}`, (_c, args) => {
+    const obj = asObj(args[0]);
+    const l = obj?.props[which];
+    return l ? ({ kind: 'line', v: l } as Value) : NA;
+  });
+}
+
+registerBuiltin('linefill', 'set_color', (c, args, named) => {
+  const bound = bindArgs(args, named, ['id', 'color'] as const);
+  const obj = asObj(bound.get('id'));
+  if (obj) drawSink(c as RtCtx).update(obj, { color: asColor(bound.get('color') ?? NA) });
+  return { kind: 'void' };
+});
+registerBuiltin('linefill', 'get_color', (_c, args) => {
+  const obj = asObj(args[0]);
+  const col = obj?.props['color'];
+  return typeof col === 'string' ? ({ kind: 'color', v: col } as Value) : NA;
+});
+
+registerBuiltin('linefill', 'delete', (c, args) => {
+  const ctx = c as RtCtx;
+  const obj = asObj(args[0]);
+  if (obj) {
+    drawSink(ctx).remove(obj);
+    const live = liveArr(ctx, 'linefill');
+    const i = live.indexOf(obj);
+    if (i >= 0) live.splice(i, 1);
+  }
+  return { kind: 'void' };
+});
+
 // ── *.all — live object arrays ──────────────────────────────────────────────
 // Lazy constants: evaluated per access so mutations during the bar are seen.
 // getConstant(key, ctx) callers get the live array; without ctx → empty.
 // A same-named BUILTIN is the fallback if the interpreter resolves `line.all`
 // through BUILTINS instead of constants.
-for (const kind of ['line', 'label', 'box'] as const) {
+for (const kind of ['line', 'label', 'box', 'table', 'polyline', 'linefill'] as const) {
   registerLazyConstant(kind, 'all', (c) => {
     const ctx = c as RtCtx | undefined;
     const live = ctx ? liveArr(ctx, kind) : [];

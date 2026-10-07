@@ -576,6 +576,28 @@ describe('evalArg series-wrap regressions', () => {
     expect(numv(v[1]!)).toBeCloseTo(4 + 3 * Math.SQRT2, 9);
     expect(numv(v[2]!)).toBeCloseTo(4 - 3 * Math.SQRT2, 9);
   });
+
+  it('ta.bb named series= alias binds to source (TD_BB regression)', () => {
+    const bars = mkBars(6, (i) => ({ close: [1, 2, 3, 4, 5, 6][i]! }));
+    // `series=` is the TradingView-doc name for the source param on bb/bbw/kc;
+    // before the alias, named-only callers silently got na.
+    const r = runBars(bars, (c) => call('bb', c, [], {
+      series: ser(c.close), length: wrap(5)(c), mult: wrap(3)(c),
+    }));
+    const v = arrv(r[5]!);
+    expect(numv(v[0]!)).toBeCloseTo(4, 9);
+    expect(numv(v[1]!)).toBeCloseTo(4 + 3 * Math.SQRT2, 9);
+    expect(numv(v[2]!)).toBeCloseTo(4 - 3 * Math.SQRT2, 9);
+  });
+
+  it('ta.bbw named series= alias binds to source', () => {
+    const bars = mkBars(6, (i) => ({ close: [1, 2, 3, 4, 5, 6][i]! }));
+    const r = runBars(bars, (c) => call('bbw', c, [], {
+      series: ser(c.close), length: wrap(5)(c), mult: wrap(3)(c),
+    }));
+    // bandwidth = (upper-lower)/basis = 6·√2/4
+    expect(numv(r[5]!)).toBeCloseTo(6 * Math.SQRT2 / 4, 9);
+  });
 });
 
 // ── degenerate-window na guards ──────────────────────────────────────────────

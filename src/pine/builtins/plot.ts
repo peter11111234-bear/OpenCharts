@@ -334,13 +334,21 @@ registerBuiltin('', 'fill', (c, args, named) => {
   const ub = b?.kind === 'series' ? b.v.cur() : b;
   const nOf = (u: Value | undefined): number =>
     u && (u.kind === 'int' || u.kind === 'float') ? u.v : -1;
-  ctx.fills.push({
+  const entry = {
     plot1: nOf(ua),
     plot2: nOf(ub),
     color: colorArg(bound, 'color'),
     title: bound.has('title') ? strArg(bound, 'title', '') : undefined,
     fillgaps: boolArg(bound, 'fillgaps', false),
-  });
+  };
+  // TV: one fill object per call site, updated each bar (not re-created).
+  // Keep at most one descriptor per callsite so r.fills stays 1:1 with fills.
+  const site = ctx.callsite;
+  if (site === undefined) { ctx.fills.push(entry); return { kind: 'void' }; }
+  ctx.fillSites ??= new Map();
+  const prior = ctx.fillSites.get(site);
+  if (prior !== undefined) ctx.fills[prior] = entry;
+  else { ctx.fillSites.set(site, ctx.fills.length); ctx.fills.push(entry); }
   return { kind: 'void' };
 });
 

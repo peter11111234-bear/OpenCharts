@@ -18,6 +18,7 @@ import type {
 import type { BarData, DrawObj, PlotOpts, RunResult, Value } from './contracts';
 import { parse } from './parser';
 import { collectInputs, runScript } from './interpreter';
+import { tfFloor, tfNext } from './mtf';
 import './builtins/index';
 import './mtf';
 
@@ -96,14 +97,29 @@ const toBarData = (bars: OHLCV[]): BarData[] =>
   }));
 
 /** Vela fetchSeries (with BarRange) → interpreter fetchSeries (sym, tf).
- *  LTF requests need a multiple of the chart bar count to cover the same
- *  span, so the limit scales with the chart and pins `to` to its last bar. */
+ *  Sizing is span-aware: a script on an N-bar chart needs `span/tfMs` tf bars
+ *  for coverage plus a fixed warmup window for convergent series (ATR/EMA
+ *  families settle within ~100 bars; 500 is a 5× margin). The old blanket
+ *  `bars.length × 4` over-fetched HTF (300 chart bars → 1200 MONTHLY bars for
+ *  a ~1-day span needing ~2) and under-covered LTF. Calendar units (D/W/M)
+ *  count via tfFloor/tfNext bucketing, capped to bound cost. */
+const FETCH_WARMUP = 500;
+const FETCH_CAP = 20_000;
 const toFetch = (fetch: FetchSeries | undefined, bars: OHLCV[]): ((symbol: string, tf: string) => Promise<BarData[]>) | undefined => {
   if (!fetch) return undefined;
-  const limit = Math.max(bars.length * 4, 500);
+  const first = bars[0]?.time;
   const to = bars[bars.length - 1]?.time;
+  const limit = (tf: string): number => {
+    if (first === undefined || to === undefined || to <= first) {
+      return Math.min(Math.max(bars.length * 4, FETCH_WARMUP), FETCH_CAP);
+    }
+    let n = 0;
+    for (let t = tfFloor(first, tf); t <= to && n < FETCH_CAP; n++) t = tfNext(t, tf);
+    return Math.min(Math.max(n + FETCH_WARMUP, FETCH_WARMUP), FETCH_CAP);
+  };
   return async (symbol: string, tf: string) => {
-    const out = await fetch(symbol, tf, to !== undefined ? { limit, to } : { limit });
+    const lim = limit(tf);
+    const out = await fetch(symbol, tf, to !== undefined ? { limit: lim, to } : { limit: lim });
     return toBarData(out);
   };
 };
@@ -255,40 +271,54 @@ export class PineInterpreterEngine implements ScriptingEngine {
     };
     const drain = async () => {
       running = true;
-      while (pending && !stopped) {
-        const bars = pending;
-        pending = null;
-        const myRun = ++runId;
-        try {
-          const barData = toBarData(bars);
-          const barTimes = barData.map(b => b.openTime);
-          const result: RunResult = await runScript(parse(token.source), barData, {
-            symbol: req.market.symbol,
-            timeframe: req.market.timeframe,
-            fetchSeries: toFetch(req.fetchSeries, bars),
-            inputValues: { ...inputs },
-            syminfo: req.market.symbolInfo ? syminfoOf(req.market.symbolInfo) : undefined,
-            // stopped kills the run at its next yield; a superseded run keeps
-            // running (it holds the queue anyway) — its result is discarded
-            // by the myRun check below.
-            shouldAbort: () => stopped,
-          });
-          if (stopped || myRun !== runId) continue;
-          handlers.onModel(buildModel(token.modelId, req, result, barTimes, inputs));
-          for (const w of result.warnings) handlers.onWarning?.({ message: w, bar: bars.length - 1 });
-          for (const a of result.alerts) {
-            handlers.onAlert?.({ id: a.id, message: a.msg, time: bars[bars.length - 1]?.time ?? 0, barIndex: bars.length - 1 });
+      // try/finally: a throwing handler (esp. onError) must not wedge the
+      // session — `running` stuck true would silently deaden every future
+      // request() forever.
+      try {
+        while (pending && !stopped) {
+          const bars = pending;
+          pending = null;
+          const myRun = ++runId;
+          try {
+            const barData = toBarData(bars);
+            const barTimes = barData.map(b => b.openTime);
+            // Snapshot inputs at run start — a mid-run update() must not let the
+            // stale emit advertise input values the curves weren't computed with.
+            const runInputs = { ...inputs };
+            const result: RunResult = await runScript(parse(token.source), barData, {
+              symbol: req.market.symbol,
+              timeframe: req.market.timeframe,
+              fetchSeries: toFetch(req.fetchSeries, bars),
+              inputValues: runInputs,
+              syminfo: req.market.symbolInfo ? syminfoOf(req.market.symbolInfo) : undefined,
+              // Only stop() kills a run mid-flight. A superseded run still emits
+              // (myRun check is only reachable via stop()) — the pending re-run
+              // right after it carries the latest bars+inputs, so the stale
+              // emit is one frame of lag, not a wrong final state.
+              shouldAbort: () => stopped,
+            });
+            if (stopped || myRun !== runId) continue;
+            handlers.onModel(buildModel(token.modelId, req, result, barTimes, runInputs));
+            for (const w of result.warnings) handlers.onWarning?.({ message: w, bar: bars.length - 1 });
+            for (const a of result.alerts) {
+              handlers.onAlert?.({ id: a.id, message: a.msg, time: bars[bars.length - 1]?.time ?? 0, barIndex: bars.length - 1 });
+            }
+            handlers.onDone?.();
+          } catch (e) {
+            if (stopped || myRun !== runId) continue;
+            try {
+              handlers.onError?.(e instanceof Error ? e : new Error(String(e)));
+            } catch {
+              // Host handler threw — the run already failed; keep the session alive.
+            }
           }
-          handlers.onDone?.();
-        } catch (e) {
-          if (stopped || myRun !== runId) continue;
-          handlers.onError?.(e instanceof Error ? e : new Error(String(e)));
         }
+      } finally {
+        running = false;
+        // A request may have arrived between the while-check and the flag
+        // flip — re-drain so it isn't stranded.
+        if (pending && !stopped) void drain();
       }
-      running = false;
-      // A request may have arrived between the while-check and the flag
-      // flip — re-drain so it isn't stranded.
-      if (pending && !stopped) void drain();
     };
 
     const getBars = () => req.getBars?.() ?? req.bars;

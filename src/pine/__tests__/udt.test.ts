@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import type { BuiltinCtx, FieldDecl, MethodDecl, Node, Param, TypeDecl, UdfDecl, Value } from '../contracts';
+import type { BarData, BuiltinCtx, FieldDecl, MethodDecl, Node, Param, TypeDecl, UdfDecl, Value } from '../contracts';
 import { NA, Scope, Series } from '../contracts';
+import { parse } from '../parser';
+import { runScript } from '../interpreter';
+import '../builtins';
 import {
   UDT_REGISTRY,
   bindUdtGlobalScope,
@@ -10,6 +13,7 @@ import {
   hasUdtMethod,
   isUdtType,
   newUdt,
+  normalizeSelfType,
   parseArrayElemType,
   registerMethod,
   registerType,
@@ -250,5 +254,92 @@ describe('registry introspection', () => {
     expect(UDT_REGISTRY.types.get('A')?.fields.map((f) => f.name)).toEqual(['x', 'y']);
     UDT_REGISTRY.reset();
     expect(isUdtType('A')).toBe(false);
+  });
+});
+
+// ── methods on builtin container types ──────────────────────────────
+
+/** mkBars: close = i + 1. */
+function mkBars(n: number): BarData[] {
+  return Array.from({ length: n }, (_, i) => ({
+    openTime: i * 60_000,
+    open: i + 1,
+    high: i + 2,
+    low: i,
+    close: i + 1,
+    volume: 1000 + i,
+  }));
+}
+
+describe('methods on builtin types', () => {
+  it('array<float> selfType registers under the base kind', () => {
+    registerMethod({
+      type: 'method', name: 'bump', selfType: 'array<float>',
+      params: [{ name: 'self', typeAnn: 'array<float>' }, { name: 'n', typeAnn: 'int' }],
+      body: binary('+', ident('n'), num(1)),
+    });
+    expect(hasUdtMethod('array', 'bump')).toBe(true);
+    expect(hasUdtMethod('array<float>', 'bump')).toBe(true);
+    expect(getUdtMethod('array<float>', 'bump')?.name).toBe('bump');
+    const arr: Value = { kind: 'array', v: [] };
+    expect(callUdtMethod(arr, 'bump', [{ kind: 'int', v: 41 }], mkCtx()))
+      .toEqual({ kind: 'int', v: 42 });
+  });
+
+  it('map<string,int> and float[] selfTypes normalize to map/array', () => {
+    registerMethod({
+      type: 'method', name: 'k', selfType: 'map<string,int>',
+      params: [{ name: 'self', typeAnn: 'map<string,int>' }],
+      body: num(1),
+    });
+    registerMethod({
+      type: 'method', name: 'last', selfType: 'float[]',
+      params: [{ name: 'self', typeAnn: 'float[]' }],
+      body: num(2),
+    });
+    expect(hasUdtMethod('map', 'k')).toBe(true);
+    expect(hasUdtMethod('array', 'last')).toBe(true);
+  });
+
+  it('normalizeSelfType strips qualifiers, generics, array suffixes', () => {
+    expect(normalizeSelfType('array<float>')).toBe('array');
+    expect(normalizeSelfType('map<string,int>')).toBe('map');
+    expect(normalizeSelfType('map<string,array<int>>')).toBe('map');
+    expect(normalizeSelfType('float[]')).toBe('array');
+    expect(normalizeSelfType('series float')).toBe('float');
+    expect(normalizeSelfType('series array<float>')).toBe('array');
+    expect(normalizeSelfType('Level')).toBe('Level');
+    expect(normalizeSelfType('int')).toBe('int');
+  });
+
+  it('a.firstOr(0) dispatches on an array receiver (full script)', async () => {
+    const src = [
+      'method firstOr(array<float> self, float fb) => self.size() > 0 ? self.get(0) : fb',
+      'var a = array.new<float>()',
+      'if bar_index == 0',
+      '    a.push(3.5)',
+      'plot(a.firstOr(0.0))',
+      'plot(a.size())',
+    ].join('\n');
+    const r = await runScript(parse(src), mkBars(3));
+    const vals = [...r.plots.values()].map(p =>
+      p.values.map(v => (v.kind === 'int' || v.kind === 'float' ? v.v : 'na')));
+    expect(vals[0]).toEqual([3.5, 3.5, 3.5]);
+    expect(vals[1]).toEqual([1, 1, 1]);
+  });
+
+  it('a.push stays the builtin when a user array method exists', async () => {
+    const src = [
+      'method sz(array<float> self) => self.size() + 1000',
+      'var a = array.new<float>()',
+      'a.push(1.0)',
+      'plot(array.size(a))',
+      'plot(a.sz())',
+    ].join('\n');
+    const r = await runScript(parse(src), mkBars(3));
+    const vals = [...r.plots.values()].map(p =>
+      p.values.map(v => (v.kind === 'int' || v.kind === 'float' ? v.v : 'na')));
+    expect(vals[0]).toEqual([1, 2, 3]);          // builtin array.push ran
+    expect(vals[1]).toEqual([1001, 1002, 1003]); // user method dispatched
   });
 });

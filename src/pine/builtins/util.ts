@@ -25,11 +25,13 @@ export interface RtCtx extends BuiltinCtx {
   plotIds?: Map<string, number>;
   /** Next free plot sink index (also counts hline sinks). */
   plotSeq?: number;
-  /** Live drawing objects backing `line.all` / `label.all` / `box.all`. */
+  /** Live drawing objects backing `*.all` constants. */
   liveLines?: DrawObj[];
   liveLabels?: DrawObj[];
   liveBoxes?: DrawObj[];
   liveTables?: DrawObj[];
+  livePolylines?: DrawObj[];
+  liveLinefills?: DrawObj[];
   /** barIndex → (callsite → color) for `bgcolor` / `barcolor` — per-callsite layers. */
   bgcolors?: Map<number, Map<string, string>>;
   barcolors?: Map<number, Map<string, string>>;
@@ -39,6 +41,9 @@ export interface RtCtx extends BuiltinCtx {
   alertconditions?: { title: string; msg: string }[];
   /** fill() descriptors linking two plot indices. */
   fills?: { plot1: number; plot2: number; color?: string; title?: string; fillgaps?: boolean }[];
+  /** fill() call-site → index into `fills` — TV keeps one fill object per call
+   *  site, updated each bar, so we overwrite rather than push duplicates. */
+  fillSites?: Map<string, number>;
   /** Internal counter for generated input ids / fill ids. */
   miscSeq?: number;
   /** Per-run persistent state for stateful builtins (ta.rma/ema chains, supertrend…).
@@ -52,8 +57,8 @@ export interface RtCtx extends BuiltinCtx {
   /** Set of warn-once keys already emitted this run (see warnOnce). */
   warnKeys?: Set<string>;
   /** Drawing object quotas from the indicator()/strategy() declaration
-   *  (max_lines_count/max_labels_count/max_boxes_count). Absent → default 50. */
-  declQuotas?: { lines?: number; labels?: number; boxes?: number };
+   *  (max_*_count). Absent → default 50. */
+  declQuotas?: { lines?: number; labels?: number; boxes?: number; tables?: number; polylines?: number };
 }
 
 /** Emit a warning at most once per run+key (warnings land on ctx.warnings). */
@@ -143,6 +148,15 @@ export function asColor(v: Value): string {
 
 // ── Arg binding ─────────────────────────────────────────────────────────────
 
+/** Bind-time warnings queued until the caller's ctx is reachable. Drained by
+ *  the interpreter's callBuiltin funnel. */
+const bindWarnQ: string[] = [];
+
+/** Pop all queued bind-time warnings (empties the queue). */
+export function drainBindWarnings(): string[] {
+  return bindWarnQ.splice(0, bindWarnQ.length);
+}
+
 /**
  * Bind positional+named args against a Pine parameter order.
  * Named args win their slot; positional args fill remaining slots in order —
@@ -154,8 +168,18 @@ export function bindArgs(
   named: Record<string, Value>,
   order: readonly string[],
 ): Map<string, Value> {
+  // TV's reference names differ from our internal order names on a few
+  // functions (ta.bb(series, …), ta.bbw(series, …), ta.kc(series, …) vs our
+  // 'source'). A named arg that isn't in `order` remaps through this table
+  // when its alias target is — otherwise `ta.bb(series=…)` silently binds
+  // nothing and returns na (observed: TD_BB Basis/Upper/Lower all-na).
   const out = new Map<string, Value>();
-  for (const [k, v] of Object.entries(named)) out.set(k, v);
+  for (const [k, v] of Object.entries(named)) {
+    const canon = !order.includes(k) && k === 'series' && order.includes('source') ? 'source' : k;
+    if (out.has(canon)) bindWarnQ.push(
+      `named arg '${k}' collides with '${canon}' — the earlier binding is overwritten`);
+    out.set(canon, v);
+  }
   let i = 0;
   for (const name of order) {
     if (i >= args.length) break;

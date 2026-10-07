@@ -13,6 +13,8 @@ import {
 import { parse } from '../parser';
 import { evalExpr, runScript } from '../interpreter';
 import '../builtins'; // registers builtins for the e2e test
+import { registerMethod } from '../udt';
+
 
 // ── AST builders ────────────────────────────────────────────────────────────
 
@@ -353,6 +355,68 @@ describe('request.security regression fixes', () => {
     expect(gotA).not.toEqual(gotB);
   });
 
+  it('series param := inside a ctx.callUdf UDF cannot mutate the caller series', async () => {
+    // A method dispatched through spec.ctx.callUdf binds a `{kind:'series'}`
+    // arg into a param slot. Without CowSeries the body's `s := …` writes
+    // straight into spec.series.close — every later ident read in the SAME
+    // spec sees the corrupted tf bar. Tuple [n.twist(close), close] pins it:
+    // the second element must still read the unmutated tf close.
+    registerMethod({
+      type: 'method', name: 'twistP2', selfType: 'int',
+      params: [{ name: 'self', typeAnn: 'int' }, { name: 's', typeAnn: 'series' }],
+      body: [
+        { type: 'reassign', target: ident('s'), value: binary('+', ident('s'), num(1)) } as Node,
+        ident('s'),
+      ],
+    });
+    const chartBars = mkBars(8, M15, 0);
+    const tf60 = mkBars(2, H1, 0, i => 10 + i);
+    const twist = call(member(num(1), 'twistP2'), ident('close'));
+    const body = [
+      assign('x', security(str(''), str('60'), arraylit([twist, ident('close')]))),
+    ];
+    const { values, warnings } = await runSecurity(body, chartBars, '15', { '|60': tf60 });
+    const cell = (i: number): (number | 'na')[] =>
+      values[i]!.kind === 'array' ? values[i]!.v.map(valOf) : [];
+    expect(warnings).toEqual([]);
+    for (let i = 4; i < 8; i++) expect(cell(i)).toEqual([11, 10]); // bumped copy, pristine close
+  });
+
+  it('security() inside a UDF stays consistent across bars (transient cache, no thrash)', async () => {
+    // Each bar's UDF call allocates a fresh call scope. Caching evalAt results
+    // under that ephemeral Scope object can never hit on the next bar — and a
+    // STABLE key would be wrong (bindings differ per call). The cache now lives
+    // per invocation; this pins the per-bar values a direct call produces.
+    const chartBars = mkBars(8, M15, 0);   // close i
+    const tf60 = mkBars(2, H1, 0, i => 10 + i);
+    const fDecl: Node = {
+      type: 'func', name: 'f', params: [{ name: 'x' }],
+      body: security(str(''), str('60'), ident('x')),
+    };
+    const body = [
+      fDecl,
+      assign('a', call(ident('f'), ident('close'))),
+    ];
+    resetMtf();
+    const scope = new Scope();
+    prepareSecurity(body);
+    const warnings: string[] = [];
+    const fetchSeries = async (_s: string, t: string): Promise<BarData[]> =>
+      Promise.resolve(t === '60' ? tf60 : []);
+    evalExpr(fDecl, { scope, ctx: mkCtx(chartBars, 0, '15', { fetchSeries, warnings }) });
+    await prefetchSecurity(mkCtx(chartBars, 0, '15', { fetchSeries, warnings }));
+    const gotA: (number | 'na')[] = [];
+    for (let i = 0; i < chartBars.length; i++) {
+      const ctx = mkCtx(chartBars, i, '15', { fetchSeries, warnings });
+      evalExpr(fDecl, { scope, ctx });
+      gotA.push(valOf(evalExpr(body[1]!, { scope, ctx })));
+    }
+    // completed 60m bar0 for chart bars 4-7 → chart close at those bars.
+    expect(gotA.slice(0, 4)).toEqual(['na', 'na', 'na', 'na']);
+    expect(gotA.slice(4, 8)).toEqual([4, 5, 6, 7]);
+    expect(warnings).toEqual([]);
+  });
+
   it('chartDur uses nominal tf duration — a Fri→Mon gap does not stretch the lower window', async () => {
     // Daily chart bars Fri/Mon/Tue/Wed; security_lower_tf("60") must return
     // exactly the hourly bars of each day. With chartDur = t0−t1 the Monday
@@ -423,6 +487,86 @@ describe('request.security regression fixes', () => {
     const { values, warnings } = await runSecurity(body, chartBars, '15', { '|60': tf60 });
     expect(values.every(v => v.kind === 'na')).toBe(true);
     expect(warnings.some(w => w.includes('request.security eval error') && w.includes('line 7'))).toBe(true);
+  });
+
+  it('series-valued expr (ta.tr) does not leak the tf series — lookahead_off anchoring', async () => {
+    // `ta.tr` resolves to a lazy FnSeries — a tf-context series returned as
+    // {kind:'series'}. Returned verbatim it leaks tf-indexed history into the
+    // chart frame; the wrap must re-anchor cur()/get(n) at the mapped tf bar j.
+    // tr@0 na (no prev close); tr@k = max(2, |1-(-0.5)|, |−1-0.5|) + k*100 base.
+    const chartBars = mkBars(16, M15, 0);
+    const tf60 = mkBars(3, H1, 0, i => i * 100);
+    const body = [assign('x', security(str(''), str('60'), member(ident('ta'), 'tr')))];
+    const { values } = await runSecurity(body, chartBars, '15', { '|60': tf60 });
+    const got = values.map(v => (v.kind === 'series' ? valOf(v.v.cur()) : valOf(v)));
+    expect(got.slice(0, 8)).toEqual(Array(8).fill('na'));          // no completed bar / tr@0 = na
+    expect(got.slice(8, 12)).toEqual([101, 101, 101, 101]); // tr@tf bar1
+    expect(got.slice(12, 16)).toEqual([101, 101, 101, 101]); // tr@tf bar2
+  });
+
+  it('series-valued expr under lookahead_on reads the developing tf bar, not the loaded lastBar', async () => {
+    // With the leak the chart read the tf series' newest-loaded slot — the
+    // same value on every chart bar within a tf bar's range. After the wrap,
+    // cur() is pinned to the developing bar j this chart bar maps to.
+    const chartBars = mkBars(12, M15, 0);
+    const tf60 = mkBars(3, H1, 0, i => i * 100);
+    const body = [assign('x', security(str(''), str('60'), member(ident('ta'), 'tr'),
+      member(ident('barmerge'), 'gaps_off'), member(ident('barmerge'), 'lookahead_on')))];
+    const { values } = await runSecurity(body, chartBars, '15', { '|60': tf60 });
+    const got = values.map(v => (v.kind === 'series' ? valOf(v.v.cur()) : valOf(v)));
+    expect(got.slice(0, 4)).toEqual(['na', 'na', 'na', 'na']);      // developing bar0: tr needs prev close
+    expect(got.slice(4, 8)).toEqual([101, 101, 101, 101]);  // developing bar1
+    expect(got.slice(8, 12)).toEqual([101, 101, 101, 101]); // developing bar2
+  });
+
+  it('security(...)[n] on a series-valued expr reads CHART-domain history', async () => {
+    // TV semantics: `[]` outside request.security() is chart-domain — the
+    // previous chart bar's mapped value, flat within a tf period and stepping
+    // only at the first chart bar of the new tf bar.
+    // Layout: 15m chart, 60m tf. Completed-bar mapping (lookahead_off):
+    //   chart 0-3 → j=-1 (na), 4-7 → j=0 (tr@0=na), 8-11 → j=1 (tr@1=101),
+    //   12-15 → j=2 (tr@2=101).
+    // Reads must happen INSIDE the loop: get(n) is newest-relative, and bars
+    // sharing a tf period share one cached SecSeries — a post-loop read would
+    // anchor every history read at the final bar.
+    const chartBars = mkBars(16, M15, 0);
+    const tf60 = mkBars(3, H1, 0, i => i * 100);
+    const body = [assign('x', security(str(''), str('60'), member(ident('ta'), 'tr')))];
+    resetMtf();
+    const scope = new Scope();
+    prepareSecurity(body);
+    const warnings: string[] = [];
+    const fetchSeries = async (_s: string, t: string): Promise<BarData[]> =>
+      Promise.resolve(t === '60' ? tf60 : []);
+    await prefetchSecurity(mkCtx(chartBars, 0, '15', { fetchSeries, warnings }));
+    const callNode = findSecurityCall(body)!;
+    const got: (number | 'na')[] = [];
+    for (let i = 0; i < chartBars.length; i++) {
+      const v = tryEvalSecurity(callNode,
+        { scope, ctx: mkCtx(chartBars, i, '15', { fetchSeries, warnings }) }) ?? NA;
+      got.push(v.kind === 'series' ? valOf(v.v.get(1)) : valOf(v));
+    }
+    // x[1] = emit of the previous chart bar (not previous tf bar).
+    expect(got.slice(0, 8)).toEqual(Array(8).fill('na'));
+    // bar 8: prev emit (bar7) = tr@0 = na; bars 9-11: prev emit = tr@1 = 101
+    expect(got.slice(8, 12)).toEqual(['na', 101, 101, 101]);
+    // bars 12-15: prev emit = tr@2 = 101
+    expect(got.slice(12, 16)).toEqual([101, 101, 101, 101]);
+  });
+
+  it('security_lower_tf emits scalars for a series-valued expr', async () => {
+    // Chart 15m, lower tf 5m: each chart bar spans 3 tf bars; the array
+    // payload must carry per-lower-bar scalar tr values, not live tf series.
+    const m5 = 300_000;
+    const chartBars = mkBars(4, M15, 0);
+    const tf5 = mkBars(12, m5, 0, i => 10 + i);
+    const body = [assign('x', call(member(ident('request'), 'security_lower_tf'),
+      str(''), str('5'), member(ident('ta'), 'tr')))];
+    const { values } = await runSecurity(body, chartBars, '15', { '|5': tf5 });
+    const cell = (i: number): (number | 'na')[] =>
+      values[i]!.kind === 'array' ? values[i]!.v.map(valOf) : [];
+    expect(cell(0)).toEqual(['na', 2, 2]);  // tr@0 na; tr@k = max(2, 2, 0) = 2
+    expect(cell(1)).toEqual([2, 2, 2]);
   });
 });
 
@@ -548,5 +692,33 @@ describe('request.security end-to-end', () => {
     const res = await runScript(parse(src), chartBars, { timeframe: '15' });
     const values = [...res.plots.values()][0]!.values.map(valOf);
     expect(values).toEqual(['na', 10, 11, 12, 13, 14]);
+  });
+
+  it('chart-gated security warms the tf frame — strict-window expr matches ungated', async () => {
+    resetMtf();
+    // barstate.islast gate: security evaluated only on the final chart bar.
+    // Without warm-up the tf frame starts cold at j≈N-1 and ta.sma(close[1],20)
+    // can never fill its window → na. After the fix the value equals the
+    // ungated run (probe: scripts/dbg_mtf_cond_na.ts).
+    const sec = 'request.security(syminfo.tickerid, "15", ta.sma(close[1], 20), barmerge.gaps_off, barmerge.lookahead_off)';
+    const chartBars = mkBars(500, 60_000, 0, i => 100 + Math.sin(i / 10) * 5 + i * 0.1);
+    const gated = await runScript(parse(`float v = barstate.islast ? ${sec} : na\nplot(v)`), chartBars, { symbol: 'T', timeframe: '1' });
+    const plain = await runScript(parse(`float v = ${sec}\nplot(v)`), chartBars, { symbol: 'T', timeframe: '1' });
+    const gLast = [...gated.plots.values()][0]!.values.at(-1)!;
+    const pLast = [...plain.plots.values()][0]!.values.at(-1)!;
+    expect(gLast.kind).not.toBe('na');
+    expect(gLast.kind === 'na' || pLast.kind === 'na' ? 0 : Math.abs((gLast as { v: number }).v - (pLast as { v: number }).v)).toBeLessThan(1e-9);
+  });
+
+  it('chart-gated security warms stateful fns — ema does not return an unaudited seed', async () => {
+    resetMtf();
+    const sec = 'request.security(syminfo.tickerid, "15", ta.ema(close[1], 20), barmerge.gaps_off, barmerge.lookahead_off)';
+    const chartBars = mkBars(500, 60_000, 0, i => 100 + Math.sin(i / 10) * 5 + i * 0.1);
+    const gated = await runScript(parse(`float v = barstate.islast ? ${sec} : na\nplot(v)`), chartBars, { symbol: 'T', timeframe: '1' });
+    const plain = await runScript(parse(`float v = ${sec}\nplot(v)`), chartBars, { symbol: 'T', timeframe: '1' });
+    const gLast = [...gated.plots.values()][0]!.values.at(-1)!;
+    const pLast = [...plain.plots.values()][0]!.values.at(-1)!;
+    expect(gLast.kind).not.toBe('na');
+    expect(gLast.kind === 'na' || pLast.kind === 'na' ? 0 : Math.abs((gLast as { v: number }).v - (pLast as { v: number }).v)).toBeLessThan(1e-9);
   });
 });
