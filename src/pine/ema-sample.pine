@@ -1,0 +1,5 @@
+//@version=6
+//@enabled
+//@category=範例
+indicator("EMA 20", overlay=true)
+plot(ta.ema(close, 20), color=color.orange, linewidth=2)

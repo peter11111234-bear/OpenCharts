@@ -1,0 +1,40 @@
+# TV-ALIGNMENT PROGRESS
+- 17:44:16 plan saved: docs/superpowers/plans/2026-10-05-tv-alignment.md (13 tasks, D1-D5)
+- 18:07:33 inline edits done: T4 barstate, T5 siteStack+evalArg, T6 siteKey (stable keyCache), T8 primitive method dispatch, T9 prefetch frame0+plot offset shift; interpreter.test 32/32 green
+- 18:12:55 T12 security_lower_tf implemented in mtf.ts; na() literal-callee dispatch fixed; strategyDecl wired
+- 18:17:39 StrategyAgent done (14/14 strategy tests); strategyDecl wired; security_lower_tf implemented; K455 e2e passes with warn-only NaN coercion
+- 19:03:58 e2e: 8/8 pass; remaining warns diagnosed — runConst globals/staticEnv fallback added (res/targetTf/execTF prefetch); ta.bb+ta.bbw added for TD_BB
+- 19:25:00 session resumed after crash; root cause of e2e warn storm found: prefetch pfScope can't see UDFs + speculative globals warn — hoisted func decls into top scope (interpreter.ts:1243) + mtf.ts funcs store + scratch warnings buffer
+- 19:35:00 8/8 scripts warn-free (TD_BB/TRIS390/MACD701/turtle/高量/macdV7/macd72: warns []); K455 1 benign dedup warn; array/request warns deduped; e2e asserts added (warns≤3, minPlots, minDrawings); 300/300 unit tests green
+- 20:50:00 QA: 429 殺掉 10 subagent → 手動替代驗證：strategy/util 未註冊進 index.ts 已修（turtle 回歸綠）；ta golden (sma/ema/rsi/macd/nz/na) 6 plots 無 warn；error-path 6/6 受控（undef→warn+na, oob/div0/plot(na) 不 crash, y:=5 正確 throw）；perf K455 50/100/200 bars = 847/1282/2979ms（~線性偏超，contracts.ts:57+series.ts:53,88 unshift O(n²) 待優化）；已知缺口：engine.ts 不存在、runScript 無 app 呼叫端（Vela 走舊 pinets worker）
+- 21:12:00 engine.ts 缺口補上：PineInterpreterEngine 實作 ScriptingEngine（prepare/collectInputs+decl meta → execute/runScript → IndicatorModel：line/histogram/markers/hline→priceLines/plotbar-candle/barColors/bgcolors/fills→fills+backgrounds/drawings→lines-boxes-labels）；VelaPage engines.pine 切到 InterpreterPineEngine；smoke MACD701/K455/TRIS390 全過；unit 291/291 綠；fills/backgrounds 映射 + line/label/box 細節待補
+- 21:08:09 MTF QA: scripts/qa_mtf.mjs 9 cases（lookahead on/off、gaps_on、close[1]、UDF、tuple、global g/g[1]）→ 1 finding：tf ctx series 用 plain Series（LIFO，get(0)=最新載入 bar），global[n] 內層讀 j-off<頭時讀到最新 bar；修：tf series 改 BarSeries + setAt(絕對 bar)，evalAt 加 j<0→na guard；mtf.test 回歸 +1（14/14），全套 360/360 綠
+- 22:14:21 ULTRA-QA（5 子代理）→ MTF 修正本身 PASS；另找到 BUG-1 UDF 內裸 tf series 讀 chart series、BUG-2 巢狀 global 失去 tf 語意（皆靜默錯值）、F1 input.* defval 被 series 包裝污染（input.int→NaN、input.bool(false)→true、schema defval='close'）。已修（用戶核可範圍）：mtf.ts 於 tf scope 以 TfGlobalSeries 影子化全域+以 spec.scope 為 closure 影子化 UDF，evalAt 還原 barIndex；input.ts 加 unwrapped 於 scalarInput/input.time/generic input。新增回歸：mtf.test UDF/巢狀global(+1)、output.test 包裝 defval(+2)；全套 364/364 綠；TRIS390 驗收：stLine-* 由 200 假值→0、55日高/低由 0→445、warns 0。待決：高量1.46 因 input 修正而新觸發 3 個 drawing-on-na warning（e2e 上限=3，根基層非本次改動）
+- 2026-10-06 REVIEW R2 (6 subagents: CoreInterp/MtfReview/TaReview/BuiltinsReview/EngineReview + 2 free-model audit/adversarial): 模組切片 review，確認的 P0/P1：
+  - **P0 engine.ts**: buildModel 丟棄全部繪圖輸出 — `r.drawings`/`fills`/`bgcolors`/`barColors` 算出但從未進 IndicatorModel（RunResult 連 fills/bgcolors/barcolors 欄位都沒有）。e2e 只測 runScript 沒測 buildModel → acceptance「K455 drawings render」實際壞。
+  - **P1 語意**: `:=` 寫穿 UDF param alias → 污染 caller series（含 builtin close）；evalHistref 無 siteKey → UDF 內 `(expr)[n]` 跨 callsite 歷史互串；int/int 除法截斷（TV 5/2=2.5）；% 用 trunc 非 floor（TV -7%3=2）；na 比較回傳 na/true 而非 false；UDT registry 跨 run 不清。
+  - **P1 strategy**: strategyDecl 死代碼（parser 把 decl 抽出 body，runScript 只跑 body → process_orders_on_close 等設定全部失效）；`when=` 綁了不讀；`immediately=true` 因 evalArg series-wrap 永不觸發；limit+stop 同 bar 雙觸發（應 OCO）；partial exit 虛增 closedtrades。
+  - **P1 MTF**: nested evalAt 讓 stateful builtin 讀到 lastBar 而非 ctx.barIndex → `security(sym,tf,g[1])` 洩漏未來 bar；chartDur=t0-t1 跨資料缺口 → security_lower_tf 多吃後續 bar + lookahead_on 洩未來；security() 在 UDF 內 spec.scope 綁死第一個 caller frame；invokeUdf 不處理 series alias/ReturnSignal。
+  - **P1 builtins**: pivothigh(src,l,r)、highest(N)、bb/bbw(mult) 因 evalArg series-wrap 全部恆 na；ta.kc 位置參數順序錯+RMA而非EMA；timestamp(tz,...) 恆 na；bare hour/dayofmonth 是 function 非 series；time(tf) 忽略參數；a[na] misparsed（histref 丟失）；plot 在 local scope 不擋（CE10188）+ sparse sink buf 時間軸錯位。
+  - **覆蓋率缺口**: ScriptingEngine contract 完全無測試；e2e 全是 smoke count 無 golden values；security_lower_tf 零測試（plan T12 要求有）；zz*.test.ts 是無 assert 的 probe 計入通過數。
+  - **對抗性**: int/int、%、na 比較已列；另 `nz`/`math.sum`/liftNums 回傳 raw Series → bindDeclared 存 wrapper → plots 輸出 `{kind:'series'}`；`"str"+na` 回傳 na 而非 "strNaN"。
+- 2026-10-06 12:20 FIX-ROUND-2 (verification agents: LingEngine engine contract 32/37 pass): fixes landed —
+  * interpreter.ts: `varip` decls emit warn-once (realtime-bar persistence not implemented, v1 scope)
+  * color.ts: rgbaOf unwraps series-wrapped color Values (evalArg wraps scalars → color.new(colour=series-color) was returning na)
+  * plot.ts/engine.ts/contracts.ts/util.ts: bgcolor/barcolor → per-callsite layers Map<bar,Map<site,color>>; na clears own layer only (TV: each bgcolor() = separate layer); engine flattens last-wins; output.test +1 layer regression
+  * ta.ts: ta.wad/ta.pvt/ta.nvi/ta.pvi bare-variable lazy constants (TV: these are variables, not fns) — shared vstate accumulators via 'bare' key; probe_bare_ta.test.ts added
+  * engine.ts: alignOf/valignOf strip align_/valign_ prefix (textAlign/hAlign/vAlign were always left/center); display.none gates hline/bar/candle/line-like branches; buildModel inputOverrides param → inputValues reflects session.update(); plotarrow sign → position aboveBar/belowBar
+  * plot.ts: plotarrow pushes signed condition value (was anchor price → all arrows rendered arrowUp/belowBar)
+  * strategy.ts + contracts.ts + interpreter.ts + engine.ts: ExecRec ledger in Sim → RunResult.execs → IndicatorModel.trades (TradeExecution: time/price/side/kind/label/qty/tradeId) — strategy executions now reach the model (was P1: zero markers/trades)
+  * draw.ts: line.new color=na → props.color undefined → invisible flag works (was default blue)
+  Pending: LingAdversarial MTF probes still running (found close[1]-inside-security anomaly under investigation)
+- 12:30 VERIFICATION ROUND: LingEngine 32/37 probes pass → 6 findings fixed: display.none 全 branch gate（fill anchor 保留 series id）、plotarrow signed value→方向+位置、inputValues update() 生效、align_/valign_ enum 解析、line.new color=na invisible、strategy execs→model.trades。engine.test +4 regression（fill anchor/arrow/trades/inputValues）；381→382 全套綠。
+- 12:55 ADVERSARIAL + REVIEW ROUND done (LingAdversarial 15/15 B probes, R2Review 5 findings):
+  * interpreter.ts: time("60") builtin dispatch — bare ident falls through to BUILTINS when scope binding isn't a function value (scope-bound time BarSeries was shadowing the builtin → na + 'call target is not a function' warn)
+  * interpreter.ts: CowSeries persisted per (callsite,param) via run.paramCows + rebind() — UDF `x := e` history now carries across bars (x[1] sees previous bar's reassigned value; TV semantics)
+  * mtf.ts: tfAnchor restricted — tfOwned (spec OHLC series) + tfDirty (series written during tf eval) WeakSets; caller-scope chart series keep chart-bar index in get/cur/atOffset → `f(p) => security(.., p)` and UDF params inside security read the live chart value
+  * strategy.ts: OCA reduce-to-zero → cancelledAt (resolveQty would refill default qty); exec ledger moved after match guard; reversal entries bump curTrade + record traded qty (|position|+qty) — tradeId round-trips correctly
+  * plot.ts: plotchar default location.abovebar (TV); engine routes plotchar through markerPosOf (top→aboveBar consistent w/ plotshape)
+  * engine.ts: fill() on hline plots emits warning instead of silent drop; barColors sorted by bar index (negative offsets could insert out of order)
+  * probe files: probe_timefn.test.ts kept (time(tf) regression); scripts/verify_adv_*.test.ts = throwaway (vitest.probe.config.ts)
+  Pending: LingAdversarial noted no module-level state pollution — dbg6 279 was its own probe's tfMsOf bug (regex empty-string ??), interpreter MTF mapping confirmed correct

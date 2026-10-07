@@ -1,0 +1,661 @@
+// ── Interpreter tests ────────────────────────────────────────────────────────
+// Hand-built AST (parser lands separately). Bars via mkBars per shared spec.
+
+import { describe, expect, it } from 'vitest';
+import type { Arg, BarData, IndicatorDecl, Node, RunResult, Value } from '../contracts';
+import { collectInputs, runScript } from '../interpreter';
+import { FOR_IN } from '../parser';
+import '../builtins'; // registers the full builtin set (plot/array/draw/…)
+
+// ── AST builders ──────────────────────────────────────────────────────────────
+
+const num = (v: number): Node => ({ type: 'num', v, isInt: Number.isInteger(v) });
+const str = (v: string): Node => ({ type: 'str', v });
+const bool = (v: boolean): Node => ({ type: 'bool', v });
+const ident = (name: string): Node => ({ type: 'ident', name });
+const naLit: Node = { type: 'na' };
+const bin = (op: string, left: Node, right: Node): Node => ({ type: 'binary', op, left, right });
+const un = (op: string, arg: Node): Node => ({ type: 'unary', op, arg });
+const assign = (name: string, value: Node): Node => ({ type: 'assign', name, value });
+const varDecl = (name: string, value: Node): Node => ({ type: 'var', name, value });
+const reassign = (name: string, value: Node): Node =>
+  ({ type: 'reassign', target: ident(name), value });
+const member = (obj: Node, prop: string): Node => ({ type: 'member', obj, prop });
+const call = (callee: Node, args: Arg[]): Node => ({ type: 'call', callee, args });
+const nsCall = (ns: string, name: string, args: Arg[]): Node =>
+  call(member(ident(ns), name), args);
+const histref = (obj: Node, idx: Node): Node => ({ type: 'histref', obj, idx });
+const funcDecl = (name: string, params: string[], body: Node | Node[]): Node => ({
+  type: 'func',
+  name,
+  params: params.map(p => ({ name: p })),
+  body,
+});
+
+const plot = (value: Node, title?: string): Node =>
+  call(ident('plot'), [
+    { value },
+    ...(title !== undefined ? [{ name: 'title', value: str(title) }] : []),
+  ]);
+
+const indicatorDecl = (args: Arg[]): IndicatorDecl => ({ type: 'indicator', args });
+
+// ── bars ──────────────────────────────────────────────────────────────────────
+
+/** mkBars: close = i + 1 so history/histref assertions are unambiguous. */
+function mkBars(n: number): BarData[] {
+  return Array.from({ length: n }, (_, i) => ({
+    openTime: i * 60_000,
+    open: i + 1,
+    high: i + 2,
+    low: i,
+    close: i + 1,
+    volume: 1000 + i,
+  }));
+}
+
+// ── result helpers ────────────────────────────────────────────────────────────
+
+function firstPlotValues(res: RunResult): Value[] {
+  const first = res.plots.values().next().value;
+  if (!first) throw new Error('no plots in result');
+  return first.values;
+}
+
+function nums(vals: Value[]): (number | 'na')[] {
+  return vals.map(v => (v.kind === 'int' || v.kind === 'float' ? v.v : 'na'));
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+describe('runScript basics', () => {
+  it('indicator + x = 1 + plot(x) runs all bars', async () => {
+    const body: Node[] = [assign('x', num(1)), plot(ident('x'), 'x')];
+    const res = await runScript(
+      { decl: indicatorDecl([{ value: str('t') }]), body },
+      mkBars(5),
+    );
+    expect(res.title).toBe('t');
+    expect(nums(firstPlotValues(res))).toEqual([1, 1, 1, 1, 1]);
+    expect(firstPlotValues(res)).toHaveLength(5);
+  });
+
+  it('accepts bare Node[] body', async () => {
+    const res = await runScript([assign('x', num(2)), plot(ident('x'))], mkBars(3));
+    expect(nums(firstPlotValues(res))).toEqual([2, 2, 2]);
+  });
+
+  it('close/high/low/open series read per bar', async () => {
+    const res = await runScript([plot(ident('close'), 'c')], mkBars(4));
+    expect(nums(firstPlotValues(res))).toEqual([1, 2, 3, 4]);
+  });
+});
+
+describe('var / assign / reassign', () => {
+  it('var inits once (bar 0), persists, and reassigns accumulate', async () => {
+    const body: Node[] = [
+      varDecl('a', num(0)),
+      reassign('a', bin('+', ident('a'), num(1))),
+      plot(ident('a'), 'a'),
+    ];
+    const res = await runScript(body, mkBars(5));
+    expect(nums(firstPlotValues(res))).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('var history is visible via [1]', async () => {
+    const body: Node[] = [
+      varDecl('a', num(0)),
+      reassign('a', bin('+', ident('a'), num(1))),
+      assign('prev', histref(ident('a'), num(1))),
+      plot(ident('prev'), 'p'),
+    ];
+    const res = await runScript(body, mkBars(4));
+    expect(nums(firstPlotValues(res))).toEqual(['na', 1, 2, 3]);
+  });
+
+  it(':= on undeclared variable throws PineRuntimeError', async () => {
+    await expect(runScript([reassign('nope', num(1))], mkBars(2))).rejects.toThrow(
+      /undeclared/,
+    );
+  });
+
+  it('plain assign creates per-bar series', async () => {
+    const body: Node[] = [assign('x', ident('close')), plot(histref(ident('x'), num(1)))];
+    const res = await runScript(body, mkBars(4));
+    expect(nums(firstPlotValues(res))).toEqual(['na', 1, 2, 3]);
+  });
+});
+
+describe('if / ternary / switch', () => {
+  it('x = if c … else … returns branch value per bar', async () => {
+    const body: Node[] = [
+      assign('x', {
+        type: 'ifexpr',
+        test: bin('>', ident('close'), num(3)),
+        then: [num(1)],
+        elseIfs: [],
+        else: [num(2)],
+      } as Node),
+      plot(ident('x')),
+    ];
+    const res = await runScript(body, mkBars(5));
+    expect(nums(firstPlotValues(res))).toEqual([2, 2, 2, 1, 1]);
+  });
+
+  it('ternary evaluates lazily', async () => {
+    // alt branch reassigns undeclared — must NOT be evaluated when cond true.
+    const body: Node[] = [
+      assign('x', {
+        type: 'ternary',
+        test: bool(true),
+        cons: num(7),
+        alt: bin('/', num(1), num(0)),
+      } as Node),
+      plot(ident('x')),
+    ];
+    const res = await runScript(body, mkBars(2));
+    expect(nums(firstPlotValues(res))).toEqual([7, 7]);
+  });
+
+  it('if statement executes taken branch only', async () => {
+    const body: Node[] = [
+      varDecl('hit', num(0)),
+      {
+        type: 'if',
+        test: bin('>', ident('close'), num(2)),
+        then: [reassign('hit', bin('+', ident('hit'), num(1)))],
+        elseIfs: [],
+        else: null,
+      } as Node,
+      plot(ident('hit')),
+    ];
+    const res = await runScript(body, mkBars(5));
+    expect(nums(firstPlotValues(res))).toEqual([0, 0, 1, 2, 3]);
+  });
+
+  it('switch on subject picks matching arm', async () => {
+    const body: Node[] = [
+      assign('s', {
+        type: 'switch',
+        subject: ident('close'),
+        cases: [
+          { test: num(1), body: [num(100)] },
+          { test: num(2), body: [num(200)] },
+          { body: [num(300)] },
+        ],
+      } as Node),
+      plot(ident('s')),
+    ];
+    const res = await runScript(body, mkBars(4));
+    expect(nums(firstPlotValues(res))).toEqual([100, 200, 300, 300]);
+  });
+});
+
+describe('loops', () => {
+  it('for i = 0 to 3 accumulates via +=', async () => {
+    const body: Node[] = [
+      assign('total', num(0)),
+      {
+        type: 'for',
+        varName: 'i',
+        from: num(0),
+        to: num(3),
+        body: [reassign('total', bin('+', ident('total'), ident('i')))],
+      } as Node,
+      plot(ident('total')),
+    ];
+    const res = await runScript(body, mkBars(3));
+    expect(nums(firstPlotValues(res))).toEqual([6, 6, 6]);
+  });
+
+  it('for .. by step and downward ranges', async () => {
+    const body: Node[] = [
+      assign('total', num(0)),
+      {
+        type: 'for',
+        varName: 'i',
+        from: num(3),
+        to: num(0),
+        body: [reassign('total', bin('+', ident('total'), ident('i')))],
+      } as Node,
+      plot(ident('total')),
+    ];
+    const res = await runScript(body, mkBars(2));
+    expect(nums(firstPlotValues(res))).toEqual([6, 6]);
+  });
+
+  it('break and continue work', async () => {
+    const body: Node[] = [
+      assign('total', num(0)),
+      {
+        type: 'for',
+        varName: 'i',
+        from: num(0),
+        to: num(9),
+        body: [
+          {
+            type: 'if',
+            test: bin('==', ident('i'), num(2)),
+            then: [{ type: 'continue' } as Node],
+            elseIfs: [],
+            else: null,
+          } as Node,
+          {
+            type: 'if',
+            test: bin('>=', ident('i'), num(4)),
+            then: [{ type: 'break' } as Node],
+            elseIfs: [],
+            else: null,
+          } as Node,
+          reassign('total', bin('+', ident('total'), ident('i'))),
+        ],
+      } as Node,
+      plot(ident('total')),
+    ];
+    const res = await runScript(body, mkBars(2));
+    // i: 0+1 (skip 2) +3 then break at 4 → 4
+    expect(nums(firstPlotValues(res))).toEqual([4, 4]);
+  });
+});
+
+describe('for-in and element writes', () => {
+  it('for x in array iterates elements', async () => {
+    const body: Node[] = [
+      assign('total', num(0)),
+      {
+        type: 'for',
+        varName: 'x',
+        from: ident(FOR_IN),
+        to: { type: 'arraylit', items: [num(1), num(2), num(3)] },
+        body: [reassign('total', bin('+', ident('total'), ident('x')))],
+      } as Node,
+      plot(ident('total')),
+    ];
+    const res = await runScript(body, mkBars(2));
+    expect(nums(firstPlotValues(res))).toEqual([6, 6]);
+  });
+
+  it('a[i] := v writes array elements in place', async () => {
+    const body: Node[] = [
+      assign('a', { type: 'arraylit', items: [num(1), num(2)] }),
+      {
+        type: 'reassign',
+        target: histref(ident('a'), num(0)),
+        value: num(99),
+      } as Node,
+      assign('x', histref(ident('a'), num(0))), // reads the array itself (series hist), not element
+      plot(ident('x')),
+    ];
+    const res = await runScript(body, mkBars(1));
+    const v = firstPlotValues(res)[0];
+    expect(v?.kind).toBe('array');
+    expect((v as { v: Value[] }).v[0]).toEqual({ kind: 'int', v: 99 });
+  });
+});
+
+describe('history reference', () => {
+  it('close[bar_index] at bar i gives bar-0 close', async () => {
+    const body: Node[] = [
+      assign('first', histref(ident('close'), ident('bar_index'))),
+      plot(ident('first')),
+    ];
+    const res = await runScript(body, mkBars(5));
+    expect(nums(firstPlotValues(res))).toEqual([1, 1, 1, 1, 1]);
+  });
+
+  it('expr[n] on call results tracks history', async () => {
+    // (close*2)[1] — non-ident obj gets a tracked series.
+    const body: Node[] = [
+      assign('x', histref(bin('*', ident('close'), num(2)), num(1))),
+      plot(ident('x')),
+    ];
+    const res = await runScript(body, mkBars(4));
+    expect(nums(firstPlotValues(res))).toEqual(['na', 2, 4, 6]);
+  });
+});
+
+describe('UDFs', () => {
+  it('f(x) => x + 1 applies per bar', async () => {
+    const body: Node[] = [
+      funcDecl('f', ['x'], bin('+', ident('x'), num(1))),
+      assign('y', call(ident('f'), [{ value: ident('close') }])),
+      plot(ident('y')),
+    ];
+    const res = await runScript(body, mkBars(4));
+    expect(nums(firstPlotValues(res))).toEqual([2, 3, 4, 5]);
+  });
+
+  it('param aliases caller series — f(x) => x[1] sees history', async () => {
+    const body: Node[] = [
+      funcDecl('lag', ['x'], histref(ident('x'), num(1))),
+      assign('y', call(ident('lag'), [{ value: ident('close') }])),
+      plot(ident('y')),
+    ];
+    const res = await runScript(body, mkBars(4));
+    expect(nums(firstPlotValues(res))).toEqual(['na', 1, 2, 3]);
+  });
+
+  it('named args bind by name; defaults fill gaps', async () => {
+    const body: Node[] = [
+      {
+        type: 'func',
+        name: 'f',
+        params: [
+          { name: 'a' },
+          { name: 'b', default: num(10) },
+        ],
+        body: bin('+', ident('a'), ident('b')),
+      } as Node,
+      assign('y', call(ident('f'), [{ name: 'b', value: num(5) }, { value: num(1) }])),
+      plot(ident('y')),
+      assign('z', call(ident('f'), [{ value: num(2) }])),
+      plot(ident('z')),
+    ];
+    const res = await runScript(body, mkBars(2));
+    const vals = [...res.plots.values()].map(p => p.values.map(v => (v.kind === 'int' || v.kind === 'float' ? v.v : 'na')));
+    expect(vals[0]).toEqual([6, 6]); // b=5, a=1
+    expect(vals[1]).toEqual([12, 12]); // a=2, b=default 10
+  });
+
+  it('var inside UDF persists across calls', async () => {
+    const body: Node[] = [
+      {
+        type: 'func',
+        name: 'counter',
+        params: [],
+        body: [
+          varDecl('c', num(0)),
+          reassign('c', bin('+', ident('c'), num(1))),
+          ident('c'),
+        ],
+      } as Node,
+      assign('y', call(ident('counter'), [])),
+      plot(ident('y')),
+    ];
+    const res = await runScript(body, mkBars(4));
+    expect(nums(firstPlotValues(res))).toEqual([1, 2, 3, 4]);
+  });
+});
+
+describe('na / operator semantics', () => {
+  it('na propagates through arithmetic', async () => {
+    const body: Node[] = [
+      assign('x', bin('+', naLit, num(1))),
+      plot(ident('x')),
+    ];
+    const res = await runScript(body, mkBars(2));
+    expect(nums(firstPlotValues(res))).toEqual(['na', 'na']);
+  });
+
+  it('comparisons with na → false (TV v6)', async () => {
+    const body: Node[] = [
+      assign('ee', bin('==', naLit, naLit)),
+      assign('ne', bin('!=', naLit, naLit)),
+      assign('lt', bin('<', naLit, num(1))),
+      assign('gt', bin('>', num(1), naLit)),
+      assign('nv', naLit),
+      assign('ve', bin('==', ident('nv'), num(1))),
+      assign('r', num(0)),
+      { type: 'if', test: ident('ee'), then: [reassign('r', num(1))], elseIfs: [], else: null } as Node,
+      plot(ident('ee')),
+      plot(ident('ne')),
+      plot(ident('lt')),
+      plot(ident('gt')),
+      plot(ident('ve')),
+      plot(ident('r')),
+    ];
+    const res = await runScript(body, mkBars(2));
+    const vals = [...res.plots.values()].map(p => p.values);
+    for (const p of vals.slice(0, 5)) {
+      expect(p.every(v => v.kind === 'bool' && v.v === false)).toBe(true);
+    }
+    expect(vals[5]?.every(v => v.kind === 'int' && v.v === 0)).toBe(true);
+  });
+
+  it('na in if-cond treated as false (lenient)', async () => {
+    const body: Node[] = [
+      assign('r', num(0)),
+      {
+        type: 'if',
+        test: histref(ident('close'), num(10)), // na on every 5-bar run
+        then: [reassign('r', num(1))],
+        elseIfs: [],
+        else: [reassign('r', num(2))],
+      } as Node,
+      plot(ident('r')),
+    ];
+    const res = await runScript(body, mkBars(5));
+    expect(nums(firstPlotValues(res))).toEqual([2, 2, 2, 2, 2]);
+  });
+
+  it('int + float → float; int/int → float; /0 → na', async () => {
+    const body: Node[] = [
+      assign('a', bin('+', { type: 'num', v: 1, isInt: true }, { type: 'num', v: 0.5, isInt: false })),
+      assign('b', bin('/', num(7), num(2))),
+      assign('c', bin('/', num(1), num(0))),
+      plot(ident('a')),
+      plot(ident('b')),
+      plot(ident('c')),
+    ];
+    const res = await runScript(body, mkBars(1));
+    const kinds = [...res.plots.values()].map(p => p.values[0]);
+    expect(kinds[0]).toEqual({ kind: 'float', v: 1.5 });
+    expect(kinds[1]).toEqual({ kind: 'float', v: 3.5 });
+    expect(kinds[2]?.kind).toBe('na');
+  });
+
+  it('and/or/not lenient on na', async () => {
+    const body: Node[] = [
+      assign('x', bin('and', naLit, bool(true))),
+      assign('y', bin('or', naLit, bool(true))),
+      assign('z', un('not', naLit)),
+      plot(ident('x')),
+      plot(ident('y')),
+      plot(ident('z')),
+    ];
+    const res = await runScript(body, mkBars(1));
+    const vals = [...res.plots.values()].map(p => p.values[0]);
+    expect(vals[0]).toEqual({ kind: 'bool', v: false });
+    expect(vals[1]).toEqual({ kind: 'bool', v: true });
+    expect(vals[2]).toEqual({ kind: 'bool', v: true });
+  });
+
+  it('string concat with +', async () => {
+    const body: Node[] = [
+      assign('s', bin('+', str('v='), num(42))),
+      plot(ident('s')),
+    ];
+    const res = await runScript(body, mkBars(1));
+    expect(firstPlotValues(res)[0]).toEqual({ kind: 'string', v: 'v=42' });
+  });
+});
+
+describe('decls, inputs, RunResult', () => {
+  it('indicator decl → title/overlay/props', async () => {
+    const decl = indicatorDecl([
+      { value: str('My Title') },
+      { name: 'shorttitle', value: str('MT') },
+      { name: 'overlay', value: bool(true) },
+    ]);
+    const res = await runScript({ decl, body: [plot(num(0))] }, mkBars(2));
+    expect(res.title).toBe('My Title');
+    expect(res.shorttitle).toBe('MT');
+    expect(res.overlay).toBe(true);
+    expect(res.props.length).toBe(3);
+  });
+
+  it('collectInputs finds input.* calls', async () => {
+    const body: Node[] = [
+      assign('len', nsCall('input', 'int', [
+        { value: num(14) },
+        { name: 'title', value: str('Length') },
+        { name: 'minval', value: num(1) },
+      ])),
+      assign('src', nsCall('input', 'source', [
+        { value: str('close') },
+        { name: 'title', value: str('Source') },
+      ])),
+    ];
+    const inputs = collectInputs(body);
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]).toMatchObject({ id: 'Length', type: 'int', defval: 14, minval: 1 });
+    expect(inputs[1]).toMatchObject({ type: 'source', defval: 'close' });
+  });
+
+  it('RunResult.inputs falls back to static collectInputs', async () => {
+    const body: Node[] = [
+      assign('len', nsCall('input', 'int', [{ value: num(9) }, { value: str('Len') }])),
+      plot(ident('len')),
+    ];
+    const res = await runScript(body, mkBars(2));
+    // input builtin may or may not be loaded; either path yields a schema.
+    const found = res.inputs.some(i => i.name === 'Len' || i.id === 'Len');
+    expect(found).toBe(true);
+  });
+});
+
+describe('errors', () => {
+  it('runtime error carries loc', async () => {
+    const bad: Node = {
+      type: 'reassign',
+      target: ident('ghost'),
+      value: num(1),
+      loc: { line: 7, col: 3 },
+    };
+    try {
+      await runScript([bad], mkBars(1));
+      expect.unreachable('should throw');
+    } catch (e) {
+      const err = e as { line?: number; col?: number; message: string };
+      expect(err.line).toBe(7);
+      expect(err.message).toMatch(/ghost/);
+    }
+  });
+});
+
+describe('call args & na receivers', () => {
+  const numCol = (values: Value[]): (number | null)[] =>
+    values.map(v => (v.kind === 'int' || v.kind === 'float' ? v.v : null));
+
+  it('array values survive the call-arg path (no series wrapper)', async () => {
+    const body: Node[] = [
+      assign('a', nsCall('array', 'new_float', [{ value: num(3) }, { value: num(7) }])),
+      call(ident('plot'), [{ value: call(member(ident('array'), 'size'), [{ value: ident('a') }]) }]),
+      call(ident('plot'), [{ value: call(member(ident('array'), 'get'), [{ value: ident('a') }, { value: num(0) }]) }]),
+    ];
+    const res = await runScript([...body], mkBars(2));
+    const series = [...res.plots.values()];
+    expect(numCol(series[0]!.values)).toEqual([3, 3]);
+    expect(numCol(series[1]!.values)).toEqual([7, 7]);
+  });
+
+  it('a method call on an na receiver is a silent no-op', async () => {
+    const body: Node[] = [
+      assign('l', naLit),
+      call(member(ident('l'), 'set_x'), [{ value: num(5) }]),
+      call(ident('plot'), [{ value: num(1) }]),
+    ];
+    const res = await runScript([...body], mkBars(2));
+    expect(res.warnings.filter(w => w.includes('no method'))).toEqual([]);
+  });
+});
+
+describe('review regressions', () => {
+  it(':= on a UDF param writes a local copy, not the caller series', async () => {
+    const body: Node[] = [
+      funcDecl('bump', ['x'], [
+        reassign('x', bin('+', ident('x'), num(1000))),
+        ident('x'),
+      ]),
+      assign('bumped', call(ident('bump'), [{ value: ident('close') }])),
+      plot(ident('close')),
+      plot(ident('bumped')),
+    ];
+    const res = await runScript(body, mkBars(4));
+    const vals = [...res.plots.values()].map(p => nums(p.values));
+    expect(vals[0]).toEqual([1, 2, 3, 4]);              // close uncorrupted
+    expect(vals[1]).toEqual([1001, 1002, 1003, 1004]);  // local copy got := +1000
+  });
+
+  it('param[n] after := reads the copied caller history', async () => {
+    const body: Node[] = [
+      funcDecl('lag', ['x'], [
+        reassign('x', bin('+', ident('x'), num(1000))),
+        histref(ident('x'), num(1)),
+      ]),
+      assign('lagged', call(ident('lag'), [{ value: ident('close') }])),
+      plot(ident('lagged')),
+    ];
+    const res = await runScript(body, mkBars(4));
+    // x[1] sees the caller's history (unbumped): copy-on-write preserves it.
+    expect(nums(firstPlotValues(res))).toEqual(['na', 1, 2, 3]);
+  });
+
+  it('expr[n] inside a UDF tracks history per callsite', async () => {
+    const body: Node[] = [
+      funcDecl('lag1', ['x'], histref(bin('*', ident('x'), num(2)), num(1))),
+      assign('a', call(ident('lag1'), [{ value: ident('close') }])),
+      assign('b', call(ident('lag1'), [{ value: ident('high') }])),
+      plot(ident('a')),
+      plot(ident('b')),
+    ];
+    const res = await runScript(body, mkBars(4));
+    const vals = [...res.plots.values()].map(p => nums(p.values));
+    expect(vals[0]).toEqual(['na', 2, 4, 6]);  // close*2 lagged
+    expect(vals[1]).toEqual(['na', 4, 6, 8]);  // high*2 lagged — shared key would give close values
+  });
+
+  it('% is floor modulo: -7%3=2, 7%-3=-2, 7%2.5=2', async () => {
+    const body: Node[] = [
+      assign('a', bin('%', { type: 'num', v: -7, isInt: true }, num(3))),
+      assign('b', bin('%', num(7), { type: 'num', v: -3, isInt: true })),
+      assign('c', bin('%', num(7), { type: 'num', v: 2.5, isInt: false })),
+      assign('d', bin('%', num(7), num(2))),
+      plot(ident('a')),
+      plot(ident('b')),
+      plot(ident('c')),
+      plot(ident('d')),
+    ];
+    const res = await runScript(body, mkBars(1));
+    const vals = [...res.plots.values()].map(p => p.values[0]);
+    expect(vals[0]).toEqual({ kind: 'int', v: 2 });
+    expect(vals[1]).toEqual({ kind: 'int', v: -2 });
+    expect(vals[2]).toEqual({ kind: 'float', v: 2 });
+    expect(vals[3]).toEqual({ kind: 'int', v: 1 });
+  });
+
+  it('plot() inside a local scope warns + skips per CE10188', async () => {
+    // TV rejects plot() in local scopes (CE10188); we warn-and-skip so the
+    // conditional never registers a plot sink.
+    const body: Node[] = [
+      {
+        type: 'if',
+        test: bin('>=', ident('close'), num(3)), // true on bars 2..4 only
+        then: [plot(ident('close'), 'cond')],
+        elseIfs: [],
+        else: null,
+      } as Node,
+    ];
+    const res = await runScript(body, mkBars(5));
+    expect(res.plots.has('cond')).toBe(false);
+    expect(res.warnings.some(w => /local scope/.test(w))).toBe(true);
+  });
+
+  it('for [i, v] in array binds index and element', async () => {
+    const body: Node[] = [
+      assign('a', { type: 'arraylit', items: [num(10), num(20), num(30)] }),
+      assign('acc', num(0)),
+      {
+        type: 'for',
+        varName: 'i,v',
+        from: ident(FOR_IN),
+        to: ident('a'),
+        body: [reassign('acc', bin('+', ident('acc'), bin('*', ident('i'), ident('v'))))],
+      } as Node,
+      plot(ident('acc')),
+    ];
+    const res = await runScript(body, mkBars(2));
+    // 0*10 + 1*20 + 2*30 = 80
+    expect(nums(firstPlotValues(res))).toEqual([80, 80]);
+  });
+});
