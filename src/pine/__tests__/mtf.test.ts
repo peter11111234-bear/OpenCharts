@@ -1670,6 +1670,38 @@ describe('request.security end-to-end', () => {
     expect(col('r4').slice(8)).toEqual([1100, 1100, 1100, 1100]);
   });
 
+  it('UDF callsites of the same security() keep separate [n] chart history', async () => {
+    // f(x) wraps request.security: f(close) and f(volume) on one bar evaluate
+    // the same spec under different caller scopes. chartHist/lastChartBar were
+    // spec-scoped — caller-1 emitted, caller-2's emitAll deduped away, so
+    // b[1] silently read caller-1's (close) history instead of its own.
+    resetMtf();
+    const src = [
+      'indicator("sec hist")',
+      // nz(x) returns {kind:'series'} for a series arg — a scalar expr would
+      // bind a plain decl slot and never reach SecSeries/chartHist.
+      'f(x) => request.security(syminfo.tickerid, "60", nz(x), barmerge.gaps_off, barmerge.lookahead_off)',
+      'a = f(close)',
+      'b = f(volume)',
+      'plot(a[1], "a1")',
+      'plot(b[1], "b1")',
+    ].join('\n');
+    const M15 = 900_000, H1 = 3_600_000;
+    const chartBars = mkBars(8, M15, 0);                  // close i, volume 100+i
+    const tfBars = mkBars(2, H1, 0, i => 10 + i);
+    const res = await runScript(parse(src), chartBars, {
+      timeframe: '15',
+      fetchSeries: async (_s, t) => (t === '60' ? tfBars : []),
+    });
+    const col = (name: string): (number | 'na')[] => (res.plots.get(name)?.values ?? []).map(valOf);
+    // Completed 60m bar0 for chart bars 4-7; [1] is the previous chart bar's
+    // emission for THAT callsite.
+    // nz's frozen-reader anchors on tf indexes inside the tf frame, so each
+    // caller's series is a constant slice of its source — the point is that
+    // b's [1] history carries B's emissions (100 = volume lane), not a's (0).
+    expect(col('a1').slice(4, 8)).toEqual(['na', 0, 0, 0]);
+    expect(col('b1').slice(4, 8)).toEqual(['na', 100, 100, 100]);
+  });
   it('a dynamic tf that switches mid-run rebases the spec (no stale series)', async () => {
     resetMtf();
     const M5 = 300_000, H1 = 3_600_000;

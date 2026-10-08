@@ -31,7 +31,7 @@
 import type { Arg, BarData, BuiltinCtx, Call, Node, Param, PineType, UdfDecl, Value } from './contracts';
 import { BREAK, CONTINUE, NA, ReturnSignal, Scope, Series } from './contracts';
 import { PineRuntimeError } from './errors';
-import { astChildren, evalBlock, evalExpr, registerMtf } from './interpreter';
+import { astChildren, callsiteKey, evalBlock, evalExpr, registerMtf } from './interpreter';
 import { BarSeries, ForwardingSeries, histGetAt, seriesHooks } from './series';
 import { FOR_IN } from './parser';
 import { BUILTINS, CONSTANTS } from './builtins/registry';
@@ -151,6 +151,10 @@ interface SecuritySpec {
   scope: Scope | null;            // persistent tf scope (parent = caller pivot)
   pivot: Scope | null;            // delegates to the live caller scope
   callerScope: Scope | null;      // scope that invoked security this bar
+  /** Callsite-composed caller identity (chartHist/lastChartBar key): the same
+   *  security node reached through different UDF callsites keeps separate
+   *  chart-domain histories. Rebound per call alongside callerScope. */
+  callerKey: object | null;
   durableCache: Map<Node, WeakMap<Scope, Map<number, Value>>> | null; // eval cache for the stable root scope
   seenCallers: WeakSet<Scope>;        // caller scopes seen before — recurring ⇒ durable cache
   ctx: BuiltinCtx | null;         // child ctx with tf series
@@ -171,9 +175,9 @@ interface SecuritySpec {
   warmed?: boolean;
   /** Chart-domain emit history per expr node — `security(...)[n]` on the chart
    *  reads the previous CHART bar's mapped value, not the previous tf bar. */
-  chartHist?: Map<Node, BarSeries>;
-  /** Latest chart bar this spec emitted on (chartHist write guard). */
-  lastChartBar?: number;
+  chartHist?: Map<Node, Map<object, BarSeries>>;
+  /** Latest chart bar each caller callsite emitted on (emit dedup guard). */
+  lastChartBar?: Map<object, number>;
 }
 
 interface MtfStore {
@@ -456,7 +460,7 @@ export function prepareSecurity(body: Node[], _frame0?: unknown): void {
       gaps: constFlag(gapsNode, 'gaps_on'),
       lookahead: constFlag(laNode, 'lookahead_on'),
       isLtf,
-      bars: null, scope: null, pivot: null, callerScope: null, durableCache: null, seenCallers: new WeakSet(), ctx: null,
+      bars: null, scope: null, pivot: null, callerScope: null, callerKey: null, durableCache: null, seenCallers: new WeakSet(), ctx: null,
       series: {}, loaded: 0,
       nodeCache: new Map(), lastEmit: -1,
       agnosticCache: null, agnosticSafe: null, prodVerdicts: null,
@@ -875,6 +879,9 @@ class SecSeries extends BarSeries {
     private srcLen: number,
     /** The security() expression node this series came from (chartHist key). */
     private exprNode: Node,
+    /** Callsite-composed caller identity — same node reached via two UDF
+     *  callsites keeps separate chart histories (emit writes per callerKey). */
+    private callerKey: object,
   ) { super(8); }
   /** Scalar the chart should see for absolute tf bar `k` (na before tf bar 0). */
   private atTf(k: number): Value {
@@ -883,9 +890,9 @@ class SecSeries extends BarSeries {
     if (s instanceof BarSeries) return s.atOffset(k, 0);
     return this.srcLen > 0 ? s.get(this.srcLen - 1 - k) : NA; // non-absolute fallback
   }
-  /** Chart-domain emit history for this expr — populated by tryEvalSecurity. */
+  /** Chart-domain emit history for this (expr, caller callsite) — populated by tryEvalSecurity. */
   private chartHist(): BarSeries | undefined {
-    return this.spec.chartHist?.get(this.exprNode);
+    return this.spec.chartHist?.get(this.exprNode)?.get(this.callerKey);
   }
   override atOffset(bar: number, n: number): Value {
     const h = this.chartHist();
@@ -914,6 +921,12 @@ class SecSeries extends BarSeries {
     this.setAt(this.j, v);
   }
   override ensureBar(_bar: number): void { /* reads anchored on tf indexes; nothing to materialize */ }
+  /** Shared-payload re-key: the caller-agnostic cache may hand one SecSeries
+   *  to several callers — clone it anchored on the CURRENT caller's callsite
+   *  so `[n]` reads that callsite's own chart history. */
+  forCaller(callerKey: object): SecSeries {
+    return new SecSeries(this.spec, this.src, this.j, this.srcLen, this.exprNode, callerKey);
+  }
 }
 
 /**
@@ -937,7 +950,7 @@ function alignToChart(spec: SecuritySpec, node: Node, v: Value, j: number): Valu
       for (let k = Math.max(0, j - len + 1); k <= j; k++) snap.setAt(k, src.get(len - 1 - k));
       src = snap;
     }
-    return { kind: 'series', v: new SecSeries(spec, src, j, src.size(), node) };
+    return { kind: 'series', v: new SecSeries(spec, src, j, src.size(), node, spec.callerKey ?? spec.node) };
   }
   if (v.kind === 'array') return { kind: 'array', v: v.v.map(e => alignToChart(spec, node, e, j)) };
   return v;
@@ -1593,7 +1606,16 @@ function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
   if (agnostic) {
     const m = spec.agnosticCache ??= new Map();
     const hit = m.get(node)?.get(j);
-    if (hit !== undefined) { __mtfStats.hits++; __mtfStats.agHits++; return hit; }
+    if (hit !== undefined) {
+      __mtfStats.hits++; __mtfStats.agHits++;
+      // A shared SecSeries anchors its [n] reads on the callsite it was built
+      // under — re-key to the live caller before returning (the payload itself
+      // is write-proof: SecSeries.setAt drops mutations, so sharing is safe).
+      if (hit.kind === 'series' && hit.v instanceof SecSeries) {
+        return { kind: 'series', v: hit.v.forCaller(spec.callerKey ?? spec.node) };
+      }
+      return hit;
+    }
     // Mutable results can't go into the shared cache — check the per-caller
     // entry first: a prior compute may already be cached under this caller.
     const pc = spec.nodeCache.get(node)?.get(caller)?.get(j);
@@ -1701,6 +1723,7 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   // call node may be evaluated inside different UDF call scopes, and the
   // expression must resolve params/locals against the live caller.
   spec.callerScope = frame.scope;
+  spec.callerKey = callsiteKey(ctx, spec.node);
   ensureTfFrame(spec, frame);
   // Caller-agnostic caches live outside nodeCache so the seenCallers routing
   // swap below can't orphan them. They lazy-init at their consumers
@@ -1789,20 +1812,26 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   // on the chart reads the previous chart bar's mapped value (Pine semantics)
   // instead of reaching back into tf bars. gaps_on skipped bars emit NA — the
   // value TV produces there.
+  // Per-callsite key computed above — UDF callsites of the same node each
+  // keep their own emit history and dedup slot.
+  const callerKey = spec.callerKey ?? spec.node;
   const emit = (e: Node, v: Value): void => {
     const hist = (spec.chartHist ??= new Map());
-    let s = hist.get(e);
-    if (!s) { s = new BarSeries(); hist.set(e, s); }
+    let by = hist.get(e);
+    if (!by) { by = new Map(); hist.set(e, by); }
+    let s = by.get(callerKey);
+    if (!s) { s = new BarSeries(); by.set(callerKey, s); }
     s.setAt(ctx.barIndex, v.kind === 'series' ? v.v.cur() : v);
   };
   const emitAll = (v: Value): void => {
-    if (spec.lastChartBar === ctx.barIndex) return;   // dedup same-bar re-entry
+    const last = (spec.lastChartBar ??= new Map());
+    if (last.get(callerKey) === ctx.barIndex) return;   // dedup same-bar re-entry
     if (spec.exprs.length === 1) emit(spec.exprs[0]!, v);
     else {
       const arr = v.kind === 'array' ? v.v : [];
       spec.exprs.forEach((e, i) => emit(e, arr[i] ?? NA));
     }
-    spec.lastChartBar = ctx.barIndex;
+    last.set(callerKey, ctx.barIndex);
   };
 
   if (spec.gaps === 'on' && spec.lastEmit === j) {
