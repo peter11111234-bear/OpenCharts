@@ -296,15 +296,6 @@ export class LiftedSeries extends BarSeries {
   }
 }
 
-/**
- * Series that a builtin's `seriesId`-keyed state (ta.* memo, vstate) should
- * treat as one logical series across bars. A pointwise expression evaluated at
- * the same call site every bar (e.g. `ta.ema(math.abs(src - src[1]), n)`)
- * yields a fresh series object per bar; without a shared identity each bar
- * restarted the ta state and recomputed the whole history (O(bars²)).
- * Keys are callsite-path strings minted by the interpreter.
- */
-export const SERIES_IDENTITY = new WeakMap<Series, string>();
 
 /**
  * Base for wrappers whose reads forward to another series (copy-on-write UDF
