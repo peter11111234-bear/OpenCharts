@@ -4,7 +4,7 @@
 // compare both RunResults bit-for-bit.
 import { describe, expect, it, beforeEach } from 'vitest';
 import { parse } from '../parser';
-import { runScript, __compileCalls, PineRuntimeError } from '../interpreter';
+import { runScript, __compileCalls, __compiledKinds, PineRuntimeError } from '../interpreter';
 import '../builtins';
 import '../mtf';
 import { mkBars, fetchTf, snapshot } from './golden';
@@ -248,5 +248,12 @@ plot(x)`;
     delete g.__pineCompiled;
     // 2 top-level stmts (assign + call; indicator() lives in decl) + children.
     expect(__compileCalls - before).toBeGreaterThanOrEqual(2);
+  });
+
+  it('call stmts compile to direct closures', async () => {
+    g.__pineCompiled = true;
+    await runScript(parse('indicator("t")\nplot(close * 2 + open / 3)'), mkBars(5), OPTS());
+    delete g.__pineCompiled;
+    expect(__compiledKinds.get('call')).toBe('direct');
   });
 });

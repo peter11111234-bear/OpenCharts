@@ -6,6 +6,7 @@ const repo = 'C:/Users/bear9/OpenCharts';
 const { parse } = await import(pathToFileURL(repo + '/src/pine/parser.ts'));
 const { runScript } = await import(pathToFileURL(repo + '/src/pine/interpreter.ts'));
 await import(pathToFileURL(repo + '/src/pine/builtins/index.ts'));
+if (process.env.PINE_COMPILED === '1') globalThis.__pineCompiled = true;
 
 function mkBars(n, startMs = 0, stepMs = 60_000) {
   const bars = [];

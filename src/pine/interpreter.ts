@@ -1611,6 +1611,44 @@ function compile(stmt: Node): CompiledStmt {
 
 function compileStmt(stmt: Node): CompiledStmt {
   switch (stmt.type) {
+    case 'num': { const v = stmt.isInt; const n = stmt.v;
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => numVal(n, v)) }; }
+    case 'str': { const s = stmt.v;
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => ({ kind: 'string', v: s })) }; }
+    case 'bool': { const b = !!stmt.v;
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => (b ? VTRUE : VFALSE)) }; }
+    case 'color': { const c = stmt.v;
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => ({ kind: 'color', v: c })) }; }
+    case 'na':
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => NA) };
+    case 'ident': { const name = stmt.name;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalIdent(name, frame)) }; }
+    case 'unary': { const op = stmt.op; const arg = compileChild(stmt.arg);
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) =>
+        evalUnary(op, unseries(arg(frame, run)))) }; }
+    case 'binary': { const op = stmt.op;
+      const L = compileChild(stmt.left), R = compileChild(stmt.right);
+      if (op === 'and') return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
+        const l = unseriesTruth(L(frame, run));
+        return l && unseriesTruth(R(frame, run)) ? VTRUE : VFALSE; }) };
+      if (op === 'or') return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
+        const l = unseriesTruth(L(frame, run));
+        return l || unseriesTruth(R(frame, run)) ? VTRUE : VFALSE; }) };
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) =>
+        evalBinary(op, unseries(L(frame, run)), unseries(R(frame, run)), run, frame.ctx)) }; }
+    case 'ternary': { const T = compileChild(stmt.test),
+        C = compileChild(stmt.cons), A = compileChild(stmt.alt);
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) =>
+        unseriesTruth(T(frame, run)) ? C(frame, run) : A(frame, run)) }; }
+    case 'arraylit': { const items = stmt.items.map(compileChild);
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) =>
+        ({ kind: 'array', v: items.map(f => f(frame, run)) })) }; }
+    case 'member':
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalMember(stmt as Member, frame)) };
+    case 'histref':
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalHistref(stmt as HistRef, frame)) };
+    case 'call':
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalCall(stmt as Call, frame)) };
     // for/while/switch stay fallback — per-iter blockFrame + loopVar BarSeries
     // + BREAK/CONTINUE absorb (evalFor/evalWhile) and switch's matched-arm
     // BREAK→void vs default-arm propagate distinction are risky to duplicate.
