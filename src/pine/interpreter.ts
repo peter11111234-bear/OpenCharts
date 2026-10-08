@@ -1744,6 +1744,71 @@ function compileStmt(stmt: Node): CompiledStmt {
     }
     case 'export':
       return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalExpr(stmt.decl, frame)) };
+    case 'var': {
+      if (!stmt.multi || stmt.multi.length === 0) {
+        // single-name var/varip → twoPhase: init-eval is unreachable after
+        // the first write; later bars rebind the persistent slot only.
+        const it = stmt;
+        const init = compileChild(it.value);
+        const name = it.name;
+        const varip = !!stmt.varip;
+        const isFresh = (run: RunState) => !run.declSlots.has(siteKey(run, it));
+        const fresh: Compiled = wrapCompiled(stmt, (frame, run) => {
+          if (varip) warn(run, frame.ctx, `varip treated as var (realtime-bar persistence not implemented)`);
+          const v = init(frame, run);
+          bindDeclared(run, siteKey(run, it), frame.scope, name, v, frame.ctx.barIndex, /*persistent*/ true);
+          return v.kind === 'series' ? v.v.cur() : v;
+        });
+        const later: Compiled = wrapCompiled(stmt, (frame, run) => {
+          const s = run.declSlots.get(siteKey(run, it))!;
+          frame.scope.define(name, s);
+          return valueAt(s, frame.ctx.barIndex);
+        });
+        return { kind: 'twoPhase', isFresh, fresh, later };
+      }
+      // multi-item: verbatim per-item dispatch (freshness is per item).
+      const items = stmt.multi;
+      const inits = items.map(it => compileChild(it.value));
+      const varip = !!stmt.varip;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
+        const scope = frame.scope, bar = frame.ctx.barIndex;
+        if (varip) warn(run, frame.ctx, `varip treated as var (realtime-bar persistence not implemented)`);
+        let last: Value = NA;
+        items.forEach((it, i) => {
+          const dk = siteKey(run, it);
+          const fresh = !run.declSlots.has(dk);
+          if (fresh) {
+            const v = inits[i]!(frame, run);
+            bindDeclared(run, dk, scope, it.name, v, bar, /*persistent*/ true);
+            last = v.kind === 'series' ? v.v.cur() : v;
+          } else {
+            const s = run.declSlots.get(dk)!;
+            scope.define(it.name, s);
+            last = valueAt(s, bar);
+          }
+        });
+        return last;
+      }) };
+    }
+    case 'if': case 'ifexpr': {
+      const test = compileChild(stmt.test);
+      const elseIfs = stmt.elseIfs.map(e => ({ test: compileChild(e.test), body: e.body }));
+      const thenB = stmt.then, elseB = stmt.else;
+      const isExpr = stmt.type === 'ifexpr';
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
+        let branch: Node[] | null = null;
+        if (unseriesTruth(test(frame, run))) {
+          branch = thenB;
+        } else {
+          for (const e of elseIfs) {
+            if (unseriesTruth(e.test(frame, run))) { branch = e.body; break; }
+          }
+          if (branch === null) branch = elseB;
+        }
+        if (branch === null) return isExpr ? NA : { kind: 'void' };
+        return evalBlock(branch, blockFrame(frame)); // verbatim: fresh child scope + scopeDepth/topLevelBody bookkeeping
+      }) };
+    }
     // for/while/switch stay fallback — per-iter blockFrame + loopVar BarSeries
     // + BREAK/CONTINUE absorb (evalFor/evalWhile) and switch's matched-arm
     // BREAK→void vs default-arm propagate distinction are risky to duplicate.
