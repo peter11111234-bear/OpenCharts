@@ -1199,6 +1199,8 @@ const EMPTY_SCOPE = new Scope();
 /** Perf-probe counters (baseline probe + bench test): evalAt cache miss/hit
  *  + agnostic gate verdicts (per expr node). */
 export const __mtfStats = { evals: 0, hits: 0, gatePass: 0, gateFail: 0, agHits: 0, prodWalks: 0 };
+// Browser QA reads these via window.__mtfStats (exposed once at module load).
+try { (globalThis as Record<string, unknown>).__mtfStats = __mtfStats; } catch { /* non-DOM */ }
 
 // ── caller-agnostic cache gate ──────────────────────────────────────────────
 // A security expression is caller-agnostic only when every name it can reach

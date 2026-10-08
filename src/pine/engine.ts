@@ -285,6 +285,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
             // Snapshot inputs at run start — a mid-run update() must not let the
             // stale emit advertise input values the curves weren't computed with.
             const runInputs = { ...inputs };
+            const __t0 = performance.now();
             const result: RunResult = await runScript(parse(token.source), barData, {
               symbol: req.market.symbol,
               timeframe: req.market.timeframe,
@@ -297,6 +298,13 @@ export class PineInterpreterEngine implements ScriptingEngine {
               // emit is one frame of lag, not a wrong final state.
               shouldAbort: () => stopped,
             });
+            // Dev-only run timing: window.__pineRunLog collects {bars, ms} per
+            // run so browser QA can split prefetch vs eval cost without a
+            // profiler. Zero cost when nobody reads it.
+            try {
+              const w = globalThis as unknown as { __pineRunLog?: Array<{ bars: number; ms: number }> };
+              (w.__pineRunLog ??= []).push({ bars: barData.length, ms: Math.round(performance.now() - __t0) });
+            } catch { /* headless */ }
             if (stopped || myRun !== runId) continue;
             handlers.onModel(buildModel(token.modelId, req, result, barTimes, runInputs));
             for (const w of result.warnings) handlers.onWarning?.({ message: w, bar: bars.length - 1 });
