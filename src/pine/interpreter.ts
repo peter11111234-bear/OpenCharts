@@ -1649,6 +1649,101 @@ function compileStmt(stmt: Node): CompiledStmt {
       return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalHistref(stmt as HistRef, frame)) };
     case 'call':
       return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalCall(stmt as Call, frame)) };
+    case 'assign': case 'let': case 'const': {
+      const val = compileChild(stmt.value);
+      const name = stmt.name;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
+        const v = val(frame, run);
+        bindDeclared(run, siteKey(run, stmt), frame.scope, name, v, frame.ctx.barIndex);
+        return v.kind === 'series' ? v.v.cur() : v;
+      }) };
+    }
+    case 'typed': {
+      const val = stmt.value !== undefined ? compileChild(stmt.value) : null;
+      const name = stmt.name;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
+        const bar = frame.ctx.barIndex;
+        if (!val) {
+          slotFor(run, siteKey(run, stmt), frame.scope, name).setAt(bar, NA);
+          return NA;
+        }
+        const v = val(frame, run);
+        bindDeclared(run, siteKey(run, stmt), frame.scope, name, v, bar);
+        return v.kind === 'series' ? v.v.cur() : v;
+      }) };
+    }
+    case 'tuple': {
+      // var tuple → verbatim body (per-name freshness; see Task 4 decision D2).
+      // non-var: value child compiled; keys map stays in run.tupleKeys.
+      const val = compileChild(stmt.value);
+      const isVar = !!stmt.var; const names = stmt.names;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
+        const scope = frame.scope, bar = frame.ctx.barIndex;
+        let keys = run.tupleKeys.get(siteKey(run, stmt) as Node);
+        if (!keys) { keys = new Map(); run.tupleKeys.set(siteKey(run, stmt) as Node, keys); }
+        if (isVar) {
+          const fresh = names.some(n => {
+            const k = keys!.get(n);
+            return k === undefined || !run.declSlots.has(k);
+          });
+          if (!fresh) {
+            const carried: Value[] = [];
+            for (const name of names) {
+              const s = run.declSlots.get(keys!.get(name)!);
+              if (s) { scope.define(name, s); carried.push(valueAt(s, bar)); }
+              else carried.push(NA);
+            }
+            return { kind: 'array', v: carried };
+          }
+        }
+        const v = val(frame, run);
+        const items = v.kind === 'array' ? v.v : v.kind === 'matrix' ? v.v.flat() : [v];
+        names.forEach((name, i) => {
+          let k = keys!.get(name);
+          if (!k) { k = {}; keys!.set(name, k); }
+          slotFor(run, k, scope, name, /*persistent*/ isVar).setAt(bar, items[i] ?? NA);
+        });
+        return v;
+      }) };
+    }
+    case 'reassign':
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalReassign(stmt as Reassign, frame)) };
+    case 'seq':
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalBlock(stmt.stmts, frame)) };
+    case 'break':
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => { throw BREAK; }) };
+    case 'continue':
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => { throw CONTINUE; }) };
+    case 'return': {
+      const val = stmt.value ? compileChild(stmt.value) : null;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
+        throw new ReturnSignal(val ? unseries(val(frame, run)) : { kind: 'void' });
+      }) };
+    }
+    case 'func': { const name = stmt.name, params = stmt.params, body = stmt.body;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => {
+        const decl: UdfDecl = { name, params, body, closure: frame.scope }; // live scope — never bake
+        frame.scope.define(name, { kind: 'function', v: decl });
+        return { kind: 'void' };
+      }) };
+    }
+    case 'arrow': { const params = stmt.params, body = stmt.body;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => ({
+        kind: 'function',
+        v: { name: '<anonymous>', params, body, closure: frame.scope },
+      })) };
+    }
+    case 'method':
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => { registerMethod(stmt); return { kind: 'void' }; }) };
+    case 'typedecl':
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => { registerType(stmt); return { kind: 'void' }; }) };
+    case 'field':
+      return { kind: 'direct', fn: wrapCompiled(stmt, () => ({ kind: 'void' })) };
+    case 'import': { const msg = `import '${stmt.ns}.${stmt.name}' ignored (libraries not supported)`;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => { warn(run, frame.ctx, msg); return { kind: 'void' }; }) };
+    }
+    case 'export':
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalExpr(stmt.decl, frame)) };
     // for/while/switch stay fallback — per-iter blockFrame + loopVar BarSeries
     // + BREAK/CONTINUE absorb (evalFor/evalWhile) and switch's matched-arm
     // BREAK→void vs default-arm propagate distinction are risky to duplicate.
