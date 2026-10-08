@@ -32,6 +32,7 @@ import {
   pineLibMigrateLegacyHist, pineLibSubscribe,
 } from "../pine/lib/pineLib.ts";
 import { openScriptsDialog } from "./velaPineScriptsDialog.ts";
+import { combinedManifestEntries } from "../pineScripts.ts";
 
 // ── Modal styles ── the vela-pine-* classes are ours; nothing ships them.
 // Without these the overlay renders as a static <div> under #root and pushes
@@ -107,8 +108,15 @@ type SavedScript = { name: string; script: string; id?: string; hidden?: boolean
 
 function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined {
   const out: SavedScript[] = [];
+  // Manifest indicators (picker adds, incl. "My scripts" library entries) are
+  // persisted by vela's own ledger by NAME — serializing them here re-adds a
+  // second copy on every restore (the compounding EMA20×N bug). Match on the
+  // exact script text; a user-edited copy keeps its own identity and still
+  // round-trips through this ext bag.
+  const manifestScripts = new Set(combinedManifestEntries().map((e) => e.script));
   for (const handle of ctx.chart.indicators()) {
     if (!handle.source) continue; // native (core) indicator — not ours
+    if (manifestScripts.has(handle.source)) continue; // ledger-owned — see above
     const values = handle.inputValues();
     const defaults: Record<string, string | number | boolean> = {};
     for (const s of handle.inputs) defaults[s.key] = s.defval;
@@ -128,10 +136,15 @@ function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined 
 
 function restoreCellScripts(payload: unknown, ctx: CellStateContext): void {
   if (!Array.isArray(payload)) return;
+  // Legacy blobs may still carry manifest-owned entries (the dup bug wrote
+  // them in). Skipping them here is the one-shot migration: vela's ledger
+  // already re-adds those by name, so nothing user-visible is lost.
+  const manifestScripts = new Set(combinedManifestEntries().map((e) => e.script));
   for (const entry of payload) {
     if (typeof entry !== "object" || entry === null) continue;
     const e = entry as Partial<SavedScript>;
     if (typeof e.name !== "string" || typeof e.script !== "string") continue;
+    if (manifestScripts.has(e.script)) continue;
     try {
       ctx.addIndicator({
         name: e.name,
