@@ -566,6 +566,102 @@ describe('caller-agnostic eval cache', () => {
     expect(valOf(values[5]!)).toBe(40);    // switched to 15m → recompute j=4
     expect(valOf(values[6]!)).toBe(50);
   });
+  it(':= on a var-declared name inside a UDF body rejects — shared slot', async () => {
+    // ctr() => var c = -1; c := c + 1 (QA11): `var` names used to land in
+    // `bound` like ordinary locals, so the reassign passed — but var slots
+    // are persistent callsite-keyed RunState slots whose mutation count
+    // differs by how often the node evaluated. The agnostic cache would
+    // dedupe what must stay per-caller (divergence.mjs T2).
+    const f0 = __mtfStats.gateFail;
+    const ctr = {
+      type: 'func', name: 'ctr', params: [],
+      body: [
+        { type: 'var', name: 'c', value: num(-1) } as Node,
+        { type: 'reassign', target: ident('c'), value: binary('+', ident('c'), num(1)) } as Node,
+        ident('c'),
+      ],
+    } as Node;
+    const body = [
+      ctr,
+      assign('x', security(str(''), str('60'), call(ident('ctr')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('read-only var inside a UDF body still passes — slot reads are caller-independent', async () => {
+    // var v = close; v: the init evaluates once and every caller sees the
+    // same slot at tf bar j — only var MUTATION count differs by caller,
+    // so a read-only var body is agnostic-safe.
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const rd = {
+      type: 'func', name: 'rd', params: [],
+      body: [
+        { type: 'var', name: 'v', value: ident('close') } as Node,
+        ident('v'),
+      ],
+    } as Node;
+    const body = [
+      rd,
+      assign('x', security(str(''), str('60'), call(ident('rd')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('var + := inside an if-arm block still rejects', async () => {
+    // Var decls are legal inside if/switch/seq arm blocks; the varBound
+    // set must thread into arm walks the same way bound does.
+    const f0 = __mtfStats.gateFail;
+    const f = {
+      type: 'func', name: 'f', params: [],
+      body: [
+        {
+          type: 'if', test: { type: 'bool', v: true } as Node,
+          then: [
+            { type: 'var', name: 'c', value: num(0) } as Node,
+            { type: 'reassign', target: ident('c'), value: binary('+', ident('c'), num(1)) } as Node,
+            ident('c'),
+          ],
+          elseIfs: [], else: null,
+        } as Node,
+      ],
+    } as Node;
+    const body = [
+      f,
+      assign('x', security(str(''), str('60'), call(ident('f')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('UDF param default reaching a var-mutating callee rejects', async () => {
+    // f = (x = ctr()) => x: the default walks with the call-site bound;
+    // ctr's body mutates a var slot → reject through the default edge.
+    const f0 = __mtfStats.gateFail;
+    const ctr = {
+      type: 'func', name: 'ctr', params: [],
+      body: [
+        { type: 'var', name: 'c', value: num(-1) } as Node,
+        { type: 'reassign', target: ident('c'), value: binary('+', ident('c'), num(1)) } as Node,
+        ident('c'),
+      ],
+    } as Node;
+    const fDecl = {
+      type: 'func', name: 'f',
+      params: [{ name: 'x', default: call(ident('ctr')) }],
+      body: ident('x'),
+    } as Node;
+    const body = [
+      ctr, fDecl,
+      assign('x', security(str(''), str('60'), call(ident('f')))),
+    ];
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+    expect(values).toHaveLength(12); // rejected → per-caller path still evaluates
+  });
+
 });
 
 describe('request.security regression fixes', () => {

@@ -1202,16 +1202,29 @@ function builtinNames(): Set<string> {
 
 /** Names a decl statement binds locally (sequential scoping: visible to later
  *  stmts in the same block only). */
-function addDeclNames(node: Node, out: Set<string>): void {
+function addDeclNames(node: Node, out: Set<string>, varOut?: Set<string>): void {
   const n = node as {
-    type: string; name?: string; names?: string[];
+    type: string; name?: string; names?: string[]; var?: boolean;
     multi?: { name: string }[];
   };
   if (n.type === 'func' || n.type === 'method') { if (n.name) out.add(n.name); return; }
+  // Tuple destructure (checked before isDeclType — 'tuple' isn't in that set):
+  // `var [a,b] = …` names are persistent slots like any other var decl.
+  if (n.type === 'tuple' && n.names) {
+    for (const nm of n.names) { out.add(nm); if (n.var) varOut?.add(nm); }
+    return;
+  }
   if (!isDeclType(n.type)) return;
-  if (n.type === 'tuple' && n.names) { for (const nm of n.names) out.add(nm); return; }
-  if (n.type === 'var' && n.multi) { for (const m of n.multi) out.add(m.name); return; }
-  if (n.name) out.add(n.name);
+  if (n.type === 'var' && n.multi) {
+    for (const m of n.multi) { out.add(m.name); varOut?.add(m.name); }
+    return;
+  }
+  if (!n.name) return;
+  out.add(n.name);
+  // `var` names join BOTH sets: reads resolve to the callsite-keyed persistent
+  // slot (caller-independent → agnostic-safe) while `:=` on them is shared
+  // non-idempotent state and must reject (QA11).
+  if (n.type === 'var' && varOut) varOut.add(n.name);
 }
 
 /** Child expression/stmt nodes (Arg/case/Param wrappers unwrapped). */
@@ -1254,11 +1267,13 @@ function childNodes(node: Node): Node[] {
  * path → genuine cycles reject) while finished producer verdicts memo
  * into `spec.prodVerdicts` (shared across the spec's gated exprs) so DAG
  * sharing (`q() + q()`, `outer = inner`) never false-rejects. `reassign`
- * to a non-bound name writes caller or
- * tf-visible state (order-dependent) → unsafe. Decl-level constructs
- * inside an expression (typedecl/import/indicator/strategy) are rejected
- * outright. Memoized per node into spec.agnosticSafe — the verdict is
- * AST-level and survives tf rebuilds.
+ * to a non-bound name writes caller or tf-visible state (order-dependent)
+ * → unsafe; `:=` on a var-bound name mutates a persistent callsite-keyed
+ * slot shared by all callers → unsafe (var names still join `bound` —
+ * reads of the slot are caller-independent, only the count differs).
+ * Decl-level constructs inside an expression (typedecl/import/indicator/
+ * strategy) are rejected outright. Memoized per node into
+ * spec.agnosticSafe — the verdict is AST-level and survives tf rebuilds.
  */
 function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
   const memo = spec.agnosticSafe ??= new Map();
@@ -1277,11 +1292,11 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
   // Producer bodies bind nothing from the gated subtree — one shared set.
   const NO_BOUND = new Set<string>();
 
-  const walkBlock = (stmts: Node[] | Node, bound: Set<string>): boolean => {
-    if (!Array.isArray(stmts)) return walk(stmts, bound);
+  const walkBlock = (stmts: Node[] | Node, bound: Set<string>, varBound: Set<string>): boolean => {
+    if (!Array.isArray(stmts)) return walk(stmts, bound, varBound);
     for (const s of stmts) {
-      if (!walk(s, bound)) return false;
-      addDeclNames(s, bound); // sequential: earlier decls bind for later stmts
+      if (!walk(s, bound, varBound)) return false;
+      addDeclNames(s, bound, varBound); // sequential: earlier decls bind for later stmts
     }
     return true;
   };
@@ -1290,18 +1305,18 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
    *  `inStack` keyed on the decl node cuts recursion — pushed BEFORE the
    *  defaults walk so `f = (x = f) => x` and `f ↔ g` default ping-pong
    *  terminate (reject) instead of overflowing the stack. */
-  const udfSafe = (decl: Node, bound: Set<string>): boolean => {
+  const udfSafe = (decl: Node, bound: Set<string>, varBound: Set<string>): boolean => {
     if (inStack.has(decl)) return false;
     inStack.add(decl);
     try {
       const d = decl as { params?: Param[]; body?: Node | Node[] };
       for (const p of d.params ?? []) {
-        if (p.default && !walk(p.default, bound)) return false;
+        if (p.default && !walk(p.default, bound, varBound)) return false;
       }
       if (!d.body) return true;
-      const b2 = new Set<string>();
+      const b2 = new Set<string>(), vb2 = new Set<string>();
       for (const p of d.params ?? []) b2.add(p.name);
-      return walkBlock(d.body, b2);
+      return walkBlock(d.body, b2, vb2);
     } finally {
       inStack.delete(decl);
     }
@@ -1320,7 +1335,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
     if (inStack.has(def.node)) return false;
     inStack.add(def.node);
     try {
-      const ok = walk(def.node, NO_BOUND);
+      const ok = walk(def.node, NO_BOUND, NO_BOUND);
       prodVerdicts.set(def.node, ok);
       return ok;
     } finally {
@@ -1328,7 +1343,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
     }
   };
 
-  const walk = (n: Node, bound: Set<string>): boolean => {
+  const walk = (n: Node, bound: Set<string>, varBound: Set<string>): boolean => {
     switch (n.type) {
       case 'ident': {
         if (bound.has(n.name)) return true;
@@ -1336,7 +1351,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
         // `outer = inner` chains can't auto-pass on S0 membership alone.
         if (store.globals.has(n.name)) return producerSafe(n.name);
         // UDF name (callee or function value): scan defaults + body.
-        if (store.funcs.has(n.name)) return udfSafe(store.funcs.get(n.name)!, bound);
+        if (store.funcs.has(n.name)) return udfSafe(store.funcs.get(n.name)!, bound, varBound);
         return s0.has(n.name) || known.has(n.name);
       }
       case 'call': {
@@ -1352,66 +1367,69 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
             && bound.has(n.callee.obj.name)) return false;
         // The callee resolves via the ident case: funcs → UDF walk,
         // globals → producer-chain walk (aliases never bare-pass).
-        if (!walk(n.callee, bound)) return false;
-        for (const a of n.args) if (!walk(a.value, bound)) return false;
+        if (!walk(n.callee, bound, varBound)) return false;
+        for (const a of n.args) if (!walk(a.value, bound, varBound)) return false;
         return true;
       }
       case 'func': case 'method': case 'arrow': {
-        const b2 = new Set(bound);
+        const b2 = new Set(bound), vb2 = new Set(varBound);
         for (const p of n.params) b2.add(p.name);
-        for (const p of n.params) if (p.default && !walk(p.default, bound)) return false;
-        return walkBlock(n.body, b2);
+        for (const p of n.params) if (p.default && !walk(p.default, bound, varBound)) return false;
+        return walkBlock(n.body, b2, vb2);
       }
       case 'reassign': {
+        // `:=` on a var-bound name mutates a persistent callsite-keyed slot —
+        // shared under the agnostic cache, non-idempotent per eval (QA11).
         // `:=` on a name not bound inside the gated subtree writes through the
         // caller pivot (or mutates a shared tf/global slot) → order-dependent.
-        if (n.target.type === 'ident' && !bound.has(n.target.name)) return false;
-        if (n.target.type !== 'ident' && !walk(n.target, bound)) return false;
-        return walk(n.value, bound);
+        if (n.target.type === 'ident'
+            && (varBound.has(n.target.name) || !bound.has(n.target.name))) return false;
+        if (n.target.type !== 'ident' && !walk(n.target, bound, varBound)) return false;
+        return walk(n.value, bound, varBound);
       }
       case 'if': case 'ifexpr': {
-        if (!walk(n.test, bound)) return false;
-        if (!walkBlock(n.then, new Set(bound))) return false;
+        if (!walk(n.test, bound, varBound)) return false;
+        if (!walkBlock(n.then, new Set(bound), new Set(varBound))) return false;
         for (const e of n.elseIfs) {
-          if (!walk(e.test, bound)) return false;
-          if (!walkBlock(e.body, new Set(bound))) return false;
+          if (!walk(e.test, bound, varBound)) return false;
+          if (!walkBlock(e.body, new Set(bound), new Set(varBound))) return false;
         }
-        if (n.else && !walkBlock(n.else, new Set(bound))) return false;
+        if (n.else && !walkBlock(n.else, new Set(bound), new Set(varBound))) return false;
         return true;
       }
       case 'for': {
         const from = n.from;
         // `for x in e` parses as from = Ident FOR_IN (a sentinel, not a name).
-        if (!(from.type === 'ident' && from.name === FOR_IN) && !walk(from, bound)) return false;
-        if (!walk(n.to, bound)) return false;
-        if (n.step && !walk(n.step, bound)) return false;
-        const inner = new Set(bound);
+        if (!(from.type === 'ident' && from.name === FOR_IN) && !walk(from, bound, varBound)) return false;
+        if (!walk(n.to, bound, varBound)) return false;
+        if (n.step && !walk(n.step, bound, varBound)) return false;
+        const inner = new Set(bound), vInner = new Set(varBound);
         for (const nm of n.varName.split(',')) if (nm) inner.add(nm); // `[a,b]` tuple loops
-        return walkBlock(n.body, inner);
+        return walkBlock(n.body, inner, vInner);
       }
       case 'while':
-        if (!walk(n.test, bound)) return false;
-        return walkBlock(n.body, new Set(bound));
+        if (!walk(n.test, bound, varBound)) return false;
+        return walkBlock(n.body, new Set(bound), new Set(varBound));
       case 'switch': {
-        if (n.subject && !walk(n.subject, bound)) return false;
+        if (n.subject && !walk(n.subject, bound, varBound)) return false;
         for (const c of n.cases) {
-          if (c.test && !walk(c.test, bound)) return false;
-          if (!walkBlock(c.body, new Set(bound))) return false;
+          if (c.test && !walk(c.test, bound, varBound)) return false;
+          if (!walkBlock(c.body, new Set(bound), new Set(varBound))) return false;
         }
         return true;
       }
       case 'seq':
-        return walkBlock(n.stmts, new Set(bound));
+        return walkBlock(n.stmts, new Set(bound), new Set(varBound));
       case 'typedecl': case 'import': case 'indicator': case 'strategy':
         return false;
       default: {
-        for (const c of childNodes(n)) if (!walk(c, bound)) return false;
+        for (const c of childNodes(n)) if (!walk(c, bound, varBound)) return false;
         return true;
       }
     }
   };
 
-  const safe = walk(node, new Set());
+  const safe = walk(node, new Set(), new Set());
   memo.set(node, safe);
   if (safe) __mtfStats.gatePass++; else __mtfStats.gateFail++;
   return safe;
