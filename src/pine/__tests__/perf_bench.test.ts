@@ -93,7 +93,11 @@ const PARAM_SRC = [
   'indicator("perf bench param")',
   'f(p) => request.security(syminfo.tickerid, "60", p)',
   'a = f(close)',
+  'a2 = f(open)',
+  'b = f(close)',
   'plot(a, "a")',
+  'plot(a2, "a2")',
+  'plot(b, "b")',
 ].join('\n');
 
 const ARR_SRC = [
@@ -155,7 +159,19 @@ describe('MTF caller-agnostic cache (Task 2)', () => {
     // Transient caller + no agnostic cache → nodeCache wiped per bar →
     // recompute nearly every chart bar (~6k evals vs ~1k agnostic).
     expect(d.evals).toBeGreaterThan(5000);
+    // Rejected expr must still serve the PASSED series: f(close) at two
+    // callsites agrees bar-for-bar; f(open) differs by exactly the
+    // open-vs-close delta — a wrongly-shared/stale cache can't satisfy both.
+    const a = res.plots.get('a')!.values, a2 = res.plots.get('a2')!.values;
+    const b = res.plots.get('b')!.values;
+    expect(a.map(v => 'v' in v ? v.v : 'na')).toEqual(b.map(v => 'v' in v ? v.v : 'na'));
+    const diffs = a.map((v, i) => ('v' in v && 'v' in a2[i]!) ? (v.v as number) - (a2[i]!.v as number) : null);
+    // f(open) must serve the chart open at bar i — expected delta is the
+    // chart's own close−open (0.4 + cos(i/15)*0.3 from golden.mkBars).
+    expect(diffs.every((d, i) =>
+      d === null || Math.abs(d - (CHART_BARS[i]!.close - CHART_BARS[i]!.open)) < 1e-9)).toBe(true);
   }, 120_000);
+
 
   it('array-valued expr skips the agnostic cache but still caches per-caller', async () => {
     const { res, d } = await runSrc(ARR_SRC);
@@ -167,6 +183,11 @@ describe('MTF caller-agnostic cache (Task 2)', () => {
     expect(d.agHits).toBe(0);
     expect(d.hits).toBeGreaterThan(4000);  // per-caller hits across chart bars
     expect(d.evals).toBeLessThanOrEqual(1500); // ~tfBars, not ~chartBars
+    // x is the tf close element of [close, open]: real once tf history
+    // fills, constant within each 12-bar tf window.
+    const x = res.plots.get('x')!.values;
+    expect(x[2000]!.kind).not.toBe('na');
+    expect(x[104]).toEqual(x[100]);
   }, 120_000);
 
   it('dynamic tf switch clears agnosticCache → values recomputed', async () => {
