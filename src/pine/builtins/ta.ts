@@ -32,38 +32,40 @@ const num = (v: Value | undefined): number | undefined => {
 // A wrapped literal/constant (or input.* series) has a single finite value for
 // its whole history → treat it as the numeric arg, memoized per Series.
 
-interface ConstMemo { checkedTo: number; val: number | null }
+interface ConstMemo { size: number; v: number | undefined; bad: boolean }
 const CONST_SERIES = new WeakMap<Series, ConstMemo>();
 
 /** If every defined slot of `s`'s history is one finite number, return it;
  *  else undefined. na slots are gaps (carry-forward fill / late first call),
- *  not evidence of variance — a scalar wrapped by evalArg stays constant. */
+ *  not evidence of variance — a scalar wrapped by evalArg stays constant.
+ *  Series.get(i) is i-bars-ago: when size grows N→N+k the new bars occupy
+ *  offsets 0..k-1 (all older offsets shift +k), so a memo hit scans ONLY the
+ *  newest `size - lastSize` offsets. A same-size hit re-checks offset 0
+ *  (defensive: covers same-bar rewrite / cap-trim shift). `bad` is a separate
+ *  tri-state flag so an all-na history is not confused with proven variance. */
 function constSeriesNum(s: Series): number | undefined {
   const size = s.size();
   if (size === 0) return undefined;
-  const m0 = CONST_SERIES.get(s);
-  let v: number | undefined;
-  let i = 0;
-  let m: ConstMemo;
-  if (m0) {
-    if (m0.val === null || m0.checkedTo >= size) return m0.val ?? undefined;
-    v = m0.val; i = m0.checkedTo; m = m0;
-  } else {
-    m = { checkedTo: 0, val: null };
+  let m = CONST_SERIES.get(s);
+  if (m === undefined) {
+    m = { size: 0, v: undefined, bad: false };
     CONST_SERIES.set(s, m);
   }
-  for (; i < size; i++) {
+  if (m.bad) return undefined;
+  let v = m.v;
+  const n = size - m.size;
+  const end = n > 0 ? n : 1; // new bars are offsets 0..n-1; same size → head check
+  for (let i = 0; i < end; i++) {
     const h = s.get(i);
     if (h.kind === 'na') continue; // gap, not variance
     if ((h.kind !== 'int' && h.kind !== 'float') || (v !== undefined && h.v !== v)) {
-      m.val = null; m.checkedTo = Math.max(m.checkedTo, 1); // proven non-constant
+      m.bad = true; // proven non-constant
       return undefined;
     }
     v = h.v;
-    m.checkedTo = i + 1;
   }
-  m.val = v ?? null;
-  m.checkedTo = size;
+  m.v = v;
+  m.size = size;
   return v;
 }
 

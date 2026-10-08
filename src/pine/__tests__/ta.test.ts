@@ -6,10 +6,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import '../builtins/ta';
 import { BUILTINS, getConstant } from '../builtins/registry';
-import { Series } from '../contracts';
+import { NA, Series } from '../contracts';
 import { BarSeries } from '../series';
 import type { BarData, BuiltinCtx, Value } from '../contracts';
 import { truthy } from '../builtins/util';
+import type { RtCtx } from '../builtins/util';
 
 const mkBars = (n: number, gen?: (i: number) => Partial<BarData>): BarData[] =>
   Array.from({ length: n }, (_, i) => ({
@@ -680,14 +681,70 @@ describe('fix regressions', () => {
     expect(numv(r[9]!)).toBeLessThan(expectApprox + 2);
   });
 
-  it('ema/rma/cum state isolates per callsite+series (post nested-Map)', () => {
+  it('ema/rma/cum state isolates per callsite+series within one run (post nested-Map)', () => {
     const bars = mkBars(30);
-    // Two call sites each call ema(close, 5) — must NOT share state.
-    const a = runBars(bars, (c) => call('ema', c, [ser(c.close), fv(5)]));
-    const b = runBars(bars, (c) => call('ema', c, [ser(c.close), fv(5)]));
-    expect(numv(a[29]!)).toBeCloseTo(numv(b[29]!), 6);
-    // Different length → different series.
-    const c5 = runBars(bars, (c) => call('ema', c, [ser(c.close), fv(10)]));
-    expect(numv(c5[29]!)).not.toBeCloseTo(numv(a[29]!), 6);
+    // Interleave multiple call sites in ONE runBars pass: any nested-Map key
+    // collision (same callsite, wrong length; same args, different callsite)
+    // corrupts at least one result vs the dedicated reference runs.
+    const up = new Series();
+    const interleaved = runBars(bars, (c) => {
+      up.set(iv(1));
+      const rt = c as RtCtx;
+      rt.callsite = '#0';
+      const ema5 = call('ema', c, [ser(c.close), fv(5)]);
+      rt.callsite = '#1';
+      const ema10 = call('ema', c, [ser(c.close), fv(10)]);
+      const cumUp = call('cum', c, [ser(up)]);
+      rt.callsite = '#2';
+      const ema5b = call('ema', c, [ser(c.close), fv(5)]);
+      const rma3 = call('rma', c, [ser(c.close), fv(3)]);
+      rt.callsite = '#3';
+      const cumClose = call('cum', c, [ser(c.close)]);
+      return { kind: 'array', v: [ema5, ema10, cumUp, ema5b, rma3, cumClose] };
+    });
+    const refEma5 = runBars(bars, (c) => call('ema', c, [ser(c.close), fv(5)]));
+    const refEma10 = runBars(bars, (c) => call('ema', c, [ser(c.close), fv(10)]));
+    const refRma3 = runBars(bars, (c) => call('rma', c, [ser(c.close), fv(3)]));
+    const upRef = new Series();
+    const refCumUp = runBars(bars, (c) => { upRef.set(iv(1)); return call('cum', c, [ser(upRef)]); });
+    const refCumClose = runBars(bars, (c) => call('cum', c, [ser(c.close)]));
+    for (let i = 0; i < 30; i++) {
+      const v = arrv(interleaved[i]!);
+      expect(v[0], `bar ${i} ema5#0`).toEqual(refEma5[i]);
+      expect(v[1], `bar ${i} ema10#1`).toEqual(refEma10[i]);
+      expect(v[2], `bar ${i} cum up#1`).toEqual(refCumUp[i]);
+      expect(v[3], `bar ${i} ema5#2`).toEqual(refEma5[i]);
+      expect(v[4], `bar ${i} rma3#2`).toEqual(refRma3[i]);
+      expect(v[5], `bar ${i} cum close#3`).toEqual(refCumClose[i]);
+    }
+  });
+
+  it('wrapped scalar turning non-constant flips constSeriesNum memo (newest-end rescan)', () => {
+    // evalArg-wrapped scalar: constant 2 for 3 bars, then 9. The memo must
+    // detect the new bar (it lands at get(0), shifting old offsets +1) →
+    // highest falls out of the numeric-arg overload and returns na.
+    const bars = mkBars(5);
+    const wrapped = new Series();
+    const r = runBars(bars, (c) => {
+      wrapped.set(c.barIndex < 3 ? fv(2) : fv(9));
+      return call('highest', c, [ser(wrapped)]);
+    });
+    expect(numv(r[2]!)).toBe(104); // highest(high, 2) at bar 2
+    expect(r[3]!.kind).toBe('na');
+    expect(r[4]!.kind).toBe('na');
+  });
+
+  it('all-na wrapped scalar that later turns constant still resolves', () => {
+    // na slots are gaps, not proof of variance: the memo must adopt the first
+    // defined value instead of latching the all-na scan as 'non-constant'.
+    const bars = mkBars(5);
+    const wrapped = new Series();
+    const r = runBars(bars, (c) => {
+      wrapped.set(c.barIndex < 3 ? NA : fv(2));
+      return call('highest', c, [ser(wrapped)]);
+    });
+    expect(r[2]!.kind).toBe('na');
+    expect(numv(r[3]!)).toBe(105); // highest(high, 2) at bar 3
+    expect(numv(r[4]!)).toBe(106);
   });
 });
