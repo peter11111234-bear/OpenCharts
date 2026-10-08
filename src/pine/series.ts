@@ -148,6 +148,76 @@ export class BarSeries extends Series {
     return this.rLen();
   }
 }
+/**
+ * Constant-history series for literal call args (`ta.sma(close, 20)`'s `20`).
+ * A callHist BarSeries written the same literal every bar is observably just
+ * `[lit, lit, lit, …]` — every reader (get/cur/peek/atOffset/size) sees `lit`
+ * within [firstBar, lastBar] and `na` outside. LitSeries answers those reads
+ * from the window bounds instead of a per-bar buffer write: `bump`/`setAt` of
+ * the same literal only advance `lastBar`, `ensureBar` densifies in O(1).
+ *
+ * Only callers that write ONE fixed literal may use it (evalArg's num/bool
+ * literal path goes through `bump`). A foreign-value `setAt`/`set`
+ * (e.g. `x := v` on a name aliased to a LitSeries) materializes real storage
+ * first — LiftedSeries pattern — so the slot degrades to plain BarSeries.
+ */
+export class LitSeries extends BarSeries {
+  private lit: Value;
+  private firstBar: number;
+  /** false after materialize() — reads fall back to real buffer storage. */
+  private virtual = true;
+
+  constructor(lit: Value, bar: number, cap = 5000) {
+    super(cap);
+    this.lit = lit;
+    this.firstBar = bar;
+    this.lastBar = bar;
+    seriesHooks.touch(this);
+  }
+
+  /** Same-literal touch (one call site, one literal): extend the window. */
+  bump(bar: number): void {
+    if (!this.virtual) { super.setAt(bar, this.lit); return; }
+    if (bar > this.lastBar) this.lastBar = bar;
+  }
+
+  /** Virtual history length: one entry per bar in [firstBar, lastBar], capped. */
+  protected override rLen(): number {
+    if (!this.virtual) return super.rLen();
+    return Math.min(this.lastBar - this.firstBar + 1, this.capN);
+  }
+
+  /** Every recorded slot holds the literal; outside the window → undefined. */
+  protected override rAt(k: number): Value | undefined {
+    if (!this.virtual) return super.rAt(k);
+    return k >= 0 && k < this.rLen() ? this.lit : undefined;
+  }
+
+  /** Copy the virtual window into real storage, then plain BarSeries rules. */
+  private materialize(): void {
+    const n = this.rLen();
+    const out = new Array<Value>(n);
+    for (let k = 0; k < n; k++) out[n - 1 - k] = this.lit;
+    this.buf = out;
+    this.head = 0;
+    this.virtual = false;
+  }
+
+  override setAt(bar: number, v: Value): void {
+    if (this.virtual) {
+      if (v === this.lit) { this.bump(bar); return; }
+      this.materialize();
+    }
+    super.setAt(bar, v);
+  }
+
+  override ensureBar(bar: number): void {
+    if (this.virtual) { this.bump(bar); return; }
+    super.ensureBar(bar);
+  }
+}
+
+
 
 /**
  * Lazily-evaluated result of a pointwise series kernel (nz, math.max, …).
@@ -254,7 +324,7 @@ export function freezeReader(s: Series): ((i: number) => Value) | null {
   let t: Series = s;
   for (let hop = 0; hop < 8 && t instanceof ForwardingSeries; hop++) t = t.readTarget();
   if (!(t instanceof BarSeries)) return null;
-  if (t.constructor !== BarSeries && !(t instanceof LiftedSeries)) return null;
+  if (t.constructor !== BarSeries && !(t instanceof LiftedSeries) && !(t instanceof LitSeries)) return null;
   const bs = t;
   const a = seriesHooks.anchor(bs);
   return (i) => bs.peek(a, i);

@@ -3,8 +3,8 @@
 
 import { describe, expect, it } from 'vitest';
 import type { Arg, BarData, IndicatorDecl, Node, RunResult, Value } from '../contracts';
-import { collectInputs, runScript } from '../interpreter';
-import { FOR_IN } from '../parser';
+import { collectInputs, runScript, __callHistWrites } from '../interpreter';
+import { FOR_IN, parse } from '../parser';
 import '../builtins'; // registers the full builtin set (plot/array/draw/…)
 import { BarSeries } from '../series';
 
@@ -1098,4 +1098,34 @@ describe('trackedSlots membership pruning (ensureBar list)', () => {
     expect(dflt.size).toBe(matched.size + 1); // y registered only for default
   });
 
+});
+
+// ── evalArg literal fast-path (Slice C-2) ─────────────────────────────────────
+// Literal num/bool args in *builtin* calls skip the callHist BarSeries wrap;
+// UDF args keep it so `x[1]` inside a UDF body reads seeded param history.
+
+describe('evalArg literal fast-path', () => {
+  it('literal scalar arg bypasses callHist in builtin args', async () => {
+    const writes0 = __callHistWrites;
+    const r = await runScript(
+      parse('indicator("t")\nx = ta.sma(close, 20)\nplot(x)'),
+      mkBars(10),
+      { symbol: 'X', timeframe: '1' },
+    );
+    expect(r.warnings).toHaveLength(0);
+    // `close` is an ident→series (no wrap write); `20` literal must skip callHist.
+    expect(__callHistWrites - writes0).toBe(0);
+  });
+
+  it('UDF literal arg keeps history — f(20) with x[1] unchanged', async () => {
+    // HEAD baseline (scratch/_udf_pin.mjs): [na, 40, 40] — bar0 x[1] is na,
+    // bars 1-2 read the seeded callHist BarSeries (20) → x[1]+x = 40.
+    const r = await runScript(
+      parse('indicator("t")\nf(x) => x[1] + x\nplot(f(20))'),
+      mkBars(3),
+      { symbol: 'X', timeframe: '1' },
+    );
+    expect(r.warnings).toHaveLength(0);
+    expect(nums(firstPlotValues(r))).toEqual(['na', 40, 40]);
+  });
 });

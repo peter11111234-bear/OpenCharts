@@ -53,7 +53,7 @@ import {
 } from './contracts';
 import { PineRuntimeError, pineErr, wrapPineError } from './errors';
 import { FOR_IN } from './parser';
-import { BarSeries, ForwardingSeries, histGetAt, valueAt } from './series';
+import { BarSeries, ForwardingSeries, LitSeries, histGetAt, valueAt } from './series';
 import { Scope, blockFrame, seriesOf, type Frame } from './scope';
 import { BarCtx, MemoryDrawSink } from './context';
 import { BUILTINS, getConstant, registerConstant } from './builtins/registry';
@@ -1056,7 +1056,7 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
         const args: Value[] = [obj];
         const named: Record<string, Value> = {};
         for (const a of node.args) {
-          const v = evalArg(a, frame);
+          const v = evalArg(a, frame, true);
           if (a.name) named[a.name] = v;
           else args.push(v);
         }
@@ -1109,7 +1109,7 @@ function invokeBuiltin(b: BuiltinFn, node: Call, frame: Frame): Value {
   const args: Value[] = [];
   const named: Record<string, Value> = {};
   for (const a of node.args) {
-    const v = evalArg(a, frame);
+    const v = evalArg(a, frame, true);
     if (a.name) named[a.name] = v;
     else args.push(v);
   }
@@ -1137,16 +1137,41 @@ function callBuiltin(
   }
 }
 
+export let __callHistWrites = 0; // test instrumentation
+
 /**
  * Arg evaluation: a bare identifier bound to a Series passes `{kind:'series'}`
  * so builtins/UDF params can read history; anything else evaluates normally.
+ *
+ * litFastPath=true is ONLY for builtin-call args: a literal num/bool gets a
+ * LitSeries (virtual constant history — no per-bar buffer writes) instead of
+ * a real callHist BarSeries. UDF/UDT-method args MUST keep the BarSeries —
+ * callUdfValue seeds param history from it and CowSeries rebinds onto it;
+ * `f(20)` bodies may legitimately read `x[1]` AND mutate `x`.
  */
-function evalArg(a: Arg, frame: Frame): Value {
+function evalArg(a: Arg, frame: Frame, litFastPath = false): Value {
   const { scope, ctx } = frame;
   const run = runOf(ctx);
   if (a.value.type === 'ident') {
     const s = seriesOf(scope, a.value.name) ?? ctxSeries(ctx, a.value.name);
     if (s) return { kind: 'series', v: s };
+  }
+  const lit = a.value.type;
+  if (litFastPath && (lit === 'num' || lit === 'bool')) {
+    // Literal builtin args keep a series wrapper (builtins may stash the arg
+    // Value — array.new/fill — or return it verbatim — nz — and every reader
+    // must still see per-bar history), but a literal's history is constant:
+    // LitSeries virtualizes the buffer — no siteKey writes or per-bar pushes.
+    const key = siteKey(run, a.value);
+    let ls = run.callHist.get(key as Node) as LitSeries | undefined;
+    if (!ls) {
+      ls = new LitSeries(evalExpr(a.value, frame), ctx.barIndex);
+      run.callHist.set(key as Node, ls);
+      trackSeries(run, ls);
+    } else {
+      ls.bump(ctx.barIndex);
+    }
+    return { kind: 'series', v: ls };
   }
   const v = evalExpr(a.value, frame);
   if (v.kind === 'series') return v;
@@ -1164,6 +1189,7 @@ function evalArg(a: Arg, frame: Frame): Value {
     trackSeries(run, s);
   }
   s.setAt(ctx.barIndex, v);
+  __callHistWrites++;
   return { kind: 'series', v: s };
 }
 
