@@ -662,7 +662,104 @@ describe('caller-agnostic eval cache', () => {
     expect(values).toHaveLength(12); // rejected → per-caller path still evaluates
   });
 
-});
+  it(':= through a member target on a var-bound root rejects — shared slot object', async () => {
+    // `var t = …; t.v := v` — the member target used to take the plain
+    // read-safety walk (t is bound → pass), but the write mutates the object
+    // held by the persistent var slot — same non-idempotence as `t :=` (QA13).
+    const f0 = __mtfStats.gateFail;
+    const f = {
+      type: 'func', name: 'wrt', params: [],
+      body: [
+        { type: 'var', name: 't', value: arraylit([num(0)]) } as Node,
+        { type: 'reassign', target: member(ident('t'), 'v'),
+          value: binary('+', member(ident('t'), 'v'), num(1)) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      f,
+      assign('x', security(str(''), str('60'), call(ident('wrt')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it(':= through an index target on a var-bound root rejects — shared slot object', async () => {
+    // `var a = [0]; a[0] := a[0] + 1` — index-write on the var slot's array
+    // is shared across callers under the agnostic cache (QA13).
+    const f0 = __mtfStats.gateFail;
+    const f = {
+      type: 'func', name: 'wri', params: [],
+      body: [
+        { type: 'var', name: 'a', value: arraylit([num(0)]) } as Node,
+        { type: 'reassign', target: histref(ident('a'), num(0)),
+          value: binary('+', histref(ident('a'), num(0)), num(1)) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      f,
+      assign('x', security(str(''), str('60'), call(ident('wri')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it(':= through an index target on an expr-local binding still passes', async () => {
+    // `a = [0]; a[0] := …` — `a` binds inside the gated subtree (non-var),
+    // so the mutated object is created fresh per eval: caller-independent
+    // → agnostic-safe (the member/index pass branch of QA13). Reads use
+    // array.get — `a[0]` on a series-held array is series-history syntax.
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const f = {
+      type: 'func', name: 'locw', params: [],
+      body: [
+        assign('a', arraylit([num(0)])),
+        { type: 'reassign', target: histref(ident('a'), num(0)),
+          value: binary('+',
+            call(member(ident('array'), 'get'), ident('a'), num(0)), num(1)) } as Node,
+        call(member(ident('array'), 'get'), ident('a'), num(0)),
+      ],
+    } as Node;
+    const body = [
+      f,
+      assign('x', security(str(''), str('60'), call(ident('locw')))),
+    ];
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+    expect(values.map(valOf).slice(4, 8)).toEqual([1, 1, 1, 1]); // a[0]=0 → 1
+  });
+
+  it('loop var re-bound over an outer var name un-shadows varBound', async () => {
+    // `var c = 0; for c = 0 to 5 { c := c+1 }` — the loop-local c is a
+    // non-var binding that shadows the outer var slot, so `c :=` inside
+    // the body writes a per-eval slot → agnostic-safe (QA13 P3).
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const f = {
+      type: 'func', name: 'shad', params: [],
+      body: [
+        { type: 'var', name: 'c', value: num(0) } as Node,
+        {
+          type: 'for', varName: 'c', from: num(0), to: num(5),
+          body: [
+            { type: 'reassign', target: ident('c'),
+              value: binary('+', ident('c'), num(1)) } as Node,
+          ],
+        } as Node,
+        ident('c'),
+      ],
+    } as Node;
+    const body = [
+      f,
+      assign('x', security(str(''), str('60'), call(ident('shad')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+  });
+
+ });
 
 describe('request.security regression fixes', () => {
   beforeEach(resetMtf);
@@ -757,6 +854,33 @@ describe('request.security regression fixes', () => {
       values[i]!.kind === 'array' ? values[i]!.v.map(valOf) : [];
     expect(warnings).toEqual([]);
     for (let i = 4; i < 8; i++) expect(cell(i)).toEqual([11, 10]); // bumped copy, pristine close
+  });
+
+  it('break inside a ctx.callUdf UDF errors — no silent truncation of an enclosing loop', async () => {
+    // QA13: a method dispatched through spec.ctx.callUdf (invokeUdf) whose
+    // body contains an escaping `break` used to rethrow the raw BREAK symbol.
+    // Inside a `for` in the same security expr the enclosing evalFor would
+    // ABSORB it as a normal break — silently truncating the loop. invokeUdf
+    // now converts it to PineRuntimeError like callUdfValue (QA10/QA11).
+    registerMethod({
+      type: 'method', name: 'boomP3', selfType: 'int',
+      params: [{ name: 'self', typeAnn: 'int' }],
+      body: [{ type: 'break' } as Node, num(0)],
+    });
+    const chartBars = mkBars(8, M15, 0);
+    const tf60 = mkBars(2, H1, 0, i => 10 + i);
+    const loop: Node = {
+      type: 'for', varName: 'i', from: num(0), to: num(3),
+      body: [call(member(num(1), 'boomP3'))],
+    };
+    const body = [
+      assign('x', security(str(''), str('60'), loop)),
+    ];
+    const { values, warnings } = await runSecurity(body, chartBars, '15', { '|60': tf60 });
+    // The converted error surfaces via evalAt's warn-and-na — the loop is
+    // NOT silently truncated by absorbing the raw signal.
+    expect(warnings.some(w => /'break' outside loop in function 'int\.boomP3'/.test(w))).toBe(true);
+    expect(values.every(v => v.kind === 'na')).toBe(true);
   });
 
   it('security() inside a UDF stays consistent across bars (transient cache, no thrash)', async () => {

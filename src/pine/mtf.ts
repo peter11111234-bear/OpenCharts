@@ -30,6 +30,7 @@
 
 import type { Arg, BarData, BuiltinCtx, Call, Node, Param, PineType, UdfDecl, Value } from './contracts';
 import { NA, Scope, Series } from './contracts';
+import { PineRuntimeError } from './errors';
 import { evalBlock, evalExpr, registerMtf } from './interpreter';
 import { BarSeries, ForwardingSeries, histGetAt, seriesHooks } from './series';
 import { FOR_IN } from './parser';
@@ -1114,7 +1115,11 @@ class CowSeries extends ForwardingSeries {
  * interpreter's private ReturnSignal. That class isn't importable here (mtf
  * is injected through registerMtf, not statically imported), so it's
  * duck-typed: ReturnSignal is the only non-Error object the evaluator throws
- * carrying `.value`.
+ * carrying `.value`. Escaping BREAK/CONTINUE are converted to
+ * PineRuntimeError like callUdfValue — the symbols are equally unimportable
+ * and duck-typed on their 'pine.break'/'pine.continue' descriptions; left
+ * raw, one would be absorbed as a break by an enclosing `for` inside the
+ * same security expr and silently truncate it (QA13).
  */
 function invokeUdf(spec: SecuritySpec, fn: UdfDecl, args: Value[]): Value {
   const ctx = spec.ctx!;
@@ -1137,6 +1142,15 @@ function invokeUdf(spec: SecuritySpec, fn: UdfDecl, args: Value[]): Value {
     if (e && typeof e === 'object' && !(e instanceof Error) && 'value' in e) {
       const sig = e as { value: Value }; // interpreter-internal ReturnSignal
       return sig.value;
+    }
+    // Loop-internal breaks are absorbed by evalFor/evalWhile/evalSwitch
+    // before they reach here — a symbol escaping the whole body is invalid
+    // Pine (mirrors interpreter.ts callUdfValue, QA10/QA11/QA13).
+    if (typeof e === 'symbol'
+        && (e.description === 'pine.break' || e.description === 'pine.continue')) {
+      throw new PineRuntimeError(
+        `'${e.description === 'pine.break' ? 'break' : 'continue'}' outside loop in function '${fn.name}'`,
+      );
     }
     throw e;
   }
@@ -1271,6 +1285,9 @@ function childNodes(node: Node): Node[] {
  * → unsafe; `:=` on a var-bound name mutates a persistent callsite-keyed
  * slot shared by all callers → unsafe (var names still join `bound` —
  * reads of the slot are caller-independent, only the count differs).
+ * Member/index targets (`t.f := v`, `a[i] := v`) judge by their ROOT
+ * ident — they mutate the object held by that binding, not the name:
+ * pass only when the root is an expr-local non-var binding (QA13).
  * Decl-level constructs inside an expression (typedecl/import/indicator/
  * strategy) are rejected outright. Memoized per node into
  * spec.agnosticSafe — the verdict is AST-level and survives tf rebuilds.
@@ -1384,6 +1401,21 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
         // caller pivot (or mutates a shared tf/global slot) → order-dependent.
         if (n.target.type === 'ident'
             && (varBound.has(n.target.name) || !bound.has(n.target.name))) return false;
+        if (n.target.type === 'member' || n.target.type === 'histref') {
+          // `t.f := v` / `a[i] := v` mutate the OBJECT held by the root
+          // binding, so the root — not the target chain — decides the
+          // verdict (QA13; member/index targets used to take only the
+          // read-safety walk). Rule choice: reject unless the root is an
+          // expr-local non-var binding. A var-bound root mutates the
+          // persistent slot's object (same non-idempotence as `x :=`); a
+          // global or caller-visible root mutates an object shared across
+          // callers; a bound root (local decl / param) owns an object
+          // created inside this eval → mutation is per-eval.
+          let root: Node = n.target;
+          while (root.type === 'member' || root.type === 'histref') root = root.obj;
+          if (root.type !== 'ident'
+              || varBound.has(root.name) || !bound.has(root.name)) return false;
+        }
         if (n.target.type !== 'ident' && !walk(n.target, bound, varBound)) return false;
         return walk(n.value, bound, varBound);
       }
@@ -1404,7 +1436,14 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
         if (!walk(n.to, bound, varBound)) return false;
         if (n.step && !walk(n.step, bound, varBound)) return false;
         const inner = new Set(bound), vInner = new Set(varBound);
-        for (const nm of n.varName.split(',')) if (nm) inner.add(nm); // `[a,b]` tuple loops
+        // A loop var re-bound as a non-var local shadows an outer `var`
+        // name — `c :=` inside the loop writes the loop slot, not the var
+        // slot, so it leaves varBound for this body (QA13 P3).
+        for (const nm of n.varName.split(',')) {
+          if (!nm) continue;
+          inner.add(nm);    // `[a,b]` tuple loops
+          vInner.delete(nm);
+        }
         return walkBlock(n.body, inner, vInner);
       }
       case 'while':
