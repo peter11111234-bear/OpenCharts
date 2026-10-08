@@ -256,4 +256,33 @@ plot(x)`;
     delete g.__pineCompiled;
     expect(__compiledKinds.get('call')).toBe('direct');
   });
+
+  it('kind coverage: every seen type resolves per the fallback table', async () => {
+    // Dispositions pinned by the plan's fallback table; types absent from the
+    // map after a corpus run are unobserved, not unexpected.
+    const EXPECTED: Record<string, 'direct' | 'twoPhase' | 'fallback'> = {
+      num: 'direct', str: 'direct', bool: 'direct', color: 'direct', na: 'direct',
+      ident: 'direct', unary: 'direct', binary: 'direct', ternary: 'direct',
+      arraylit: 'direct', member: 'direct', histref: 'direct', call: 'direct',
+      assign: 'direct', let: 'direct', const: 'direct', typed: 'direct',
+      var: 'twoPhase', 'var[multi]': 'direct', tuple: 'direct',
+      reassign: 'direct', if: 'direct', ifexpr: 'direct',
+      break: 'direct', continue: 'direct', return: 'direct',
+      seq: 'direct', func: 'direct', arrow: 'direct',
+      method: 'direct', typedecl: 'direct', field: 'direct',
+      import: 'direct', export: 'direct',
+      for: 'fallback', while: 'fallback', switch: 'fallback',
+      indicator: 'fallback', strategy: 'fallback',
+    };
+    g.__pineCompiled = true;
+    for (const c of CORPUS) await runScript(parse(c.src), mkBars(10), OPTS());
+    delete g.__pineCompiled;
+    for (const [type, kind] of __compiledKinds) {
+      expect(EXPECTED[type], `unexpected compiled kind for '${type}'`).toBe(kind);
+    }
+    // Fallback kinds stay fallback (loop/switch exception semantics).
+    expect(__compiledKinds.get('for')).toBe('fallback');
+    expect(__compiledKinds.get('switch')).toBe('fallback');
+    expect(__compiledKinds.get('while')).toBe('fallback');
+  });
 });
