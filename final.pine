@@ -1,0 +1,27 @@
+// Synthetic dynamic-security fixture (F-class regression coverage).
+// Original final.pine was a user script exercising three conditional
+// request.security branches gated on barstate.islast (PROGRESS.md R4);
+// it was never committed and is lost. This reconstruction covers the same
+// path: on the LAST bar only, three security legs resolve (1m chart →
+// 1m/15m/60m fetches), while earlier bars take the else branch.
+//@version=6
+indicator("final — dynamic security mainline", overlay = true)
+
+// Three conditional security legs — each evaluates only on the last bar,
+// matching the original fixture's coverage of dynamic prefetch resolution.
+float leg1 = na
+float leg15 = na
+float leg60 = na
+
+if barstate.islast
+    leg1 := request.security(syminfo.tickerid, "1", close)
+    leg15 := request.security(syminfo.tickerid, "15", close)
+    leg60 := request.security(syminfo.tickerid, "60", close)
+else
+    leg1 := close
+    leg15 := close
+    leg60 := close
+
+plot(leg1, "leg1")
+plot(leg15, "leg15")
+plot(leg60, "leg60")
