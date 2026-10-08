@@ -307,10 +307,27 @@ export function VelaPage() {
         if (Array.isArray(p)) parked = p;
       } catch { /* corrupt */ }
       if (!parked.length || !ws) return;
+      // The parked list can carry the same script twice (a polluted ext blob
+      // re-strips every boot). Dedup by id when present, else by script text —
+      // same entry restoring twice = a second duplicate row.
+      const seen = new Set<string>();
+      parked = parked.filter(({ entry }) => {
+        const k = typeof entry.id === "string" ? `id:${entry.id}` : `src:${String(entry.script)}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
       const cells = ws.cells();
       const remaining = (await Promise.all(parked.map(async ({ chartIndex, entry }) => {
         const cell = cells[chartIndex] ?? cells[0];
         if (!cell || typeof entry.script !== "string") return { chartIndex, entry };
+        // Idempotence guard: this callback can fire twice in one session
+        // (StrictMode remount, double schedule). Same id already live → skip.
+        // Same SOURCE already running → the ext-side restore (or a prior parked
+        // pass) already owns this script; re-running mints a duplicate row.
+        const live = cell.chart.indicators();
+        if ((entry.id && live.some((h) => h.id === entry.id)) ||
+            live.some((h) => h.source === entry.script)) return null;
         const r = await cell.chart.runIndicator(entry.script, {
           id: entry.id, language: "pine", title: entry.name, inputs: entry.inputs,
         });

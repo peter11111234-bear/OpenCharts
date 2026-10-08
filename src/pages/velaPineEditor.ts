@@ -145,6 +145,10 @@ function restoreCellScripts(payload: unknown, ctx: CellStateContext): void {
     const e = entry as Partial<SavedScript>;
     if (typeof e.name !== "string" || typeof e.script !== "string") continue;
     if (manifestScripts.has(e.script)) continue;
+    // Idempotence guard: a restore can fire twice (StrictMode remount, boot +
+    // applyState). An id already live on the chart means this entry is already
+    // running — re-adding would mint a duplicate row.
+    if (e.id && ctx.chart.indicators().some((h) => h.id === e.id)) continue;
     try {
       ctx.addIndicator({
         name: e.name,
