@@ -994,7 +994,10 @@ function evalCall(node: Call, frame: Frame): Value {
     rt.callsite = prevSite;
   }
 }
-/** Call node → memoized `ns.fn` builtin resolution (permanent — see below). */
+// Call node → memoized `ns.fn` builtin resolution. Permanent per Call node:
+// safe ONLY because all registerBuiltin calls run at import time
+// (builtins/*.ts self-register via registry.ts) — a builtin can never appear
+// after the first dispatch of a given callsite.
 const RESOLVED_BUILTIN = new WeakMap<Call, { headName: string; fn: BuiltinFn | undefined }>();
 
 
@@ -1032,8 +1035,6 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
   // Deeper chains (chart.point.new, request.security_lower_tf, …) flatten to
   // a dotted key; a scope-bound receiver stops the flattening (it's a real
   // object method, not a namespace path).
-/** Call node → memoized `ns.fn` builtin resolution (permanent — see below). */
-const RESOLVED_BUILTIN = new WeakMap<Call, { headName: string; fn: BuiltinFn | undefined }>();
 
   if (callee.type === 'member' && !callee.computed) {
     // Per-Call memoized resolution: the callee-chain walk + BUILTINS lookup
