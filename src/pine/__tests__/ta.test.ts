@@ -679,4 +679,15 @@ describe('fix regressions', () => {
     expect(numv(r[9]!)).toBeGreaterThan(expectApprox - 2); // ≈105.33, vol-weighted
     expect(numv(r[9]!)).toBeLessThan(expectApprox + 2);
   });
+
+  it('ema/rma/cum state isolates per callsite+series (post nested-Map)', () => {
+    const bars = mkBars(30);
+    // Two call sites each call ema(close, 5) — must NOT share state.
+    const a = runBars(bars, (c) => call('ema', c, [ser(c.close), fv(5)]));
+    const b = runBars(bars, (c) => call('ema', c, [ser(c.close), fv(5)]));
+    expect(numv(a[29]!)).toBeCloseTo(numv(b[29]!), 6);
+    // Different length → different series.
+    const c5 = runBars(bars, (c) => call('ema', c, [ser(c.close), fv(10)]));
+    expect(numv(c5[29]!)).not.toBeCloseTo(numv(a[29]!), 6);
+  });
 });

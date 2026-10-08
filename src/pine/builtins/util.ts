@@ -47,9 +47,10 @@ export interface RtCtx extends BuiltinCtx {
   /** Internal counter for generated input ids / fill ids. */
   miscSeq?: number;
   /** Per-run persistent state for stateful builtins (ta.rma/ema chains, supertrend…).
-   *  Keyed by callsite+signature inside each builtin module; created once per run
-   *  by the interpreter (or lazily by the builtin itself when absent). */
-  state?: Map<string, unknown>;
+   *  ta.ts keys it as a nested-Map chain (parts = string|number|bool|undefined);
+   *  strategy.* uses flat 'strategy|*' string keys on the same map. Created once
+   *  per run by the interpreter (or lazily by the builtin itself when absent). */
+  state?: Map<unknown, unknown>;
   /** Block/UDF nesting depth of the currently evaluating code (0 = global
    *  scope). Maintained by the interpreter's evalBlock/callUdfValue; builtins
    *  restricted to global scope (plot family, CE10188) warn-and-skip when >0. */

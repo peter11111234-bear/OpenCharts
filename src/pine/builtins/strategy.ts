@@ -158,7 +158,7 @@ function stateOf(ctx: BuiltinCtx | undefined): Map<string, unknown> | undefined 
   if (!ctx) return undefined;
   const rt = ctx as RtCtx;
   rt.state ??= new Map();
-  return rt.state;
+  return rt.state as Map<string, unknown>;
 }
 
 function ordersOf(ctx: BuiltinCtx | undefined): StratOrder[] {

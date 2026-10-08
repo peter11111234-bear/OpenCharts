@@ -97,21 +97,39 @@ const seriesId = (s: Series): number => {
   return id;
 };
 
-const CTX_STATE = new WeakMap<BuiltinCtx, Map<string, unknown>>();
+// State-key parts: strings/numbers only (never objects → avoids
+// WeakMap-of-WeakMap at leaves). undefined/NaN pass as-is — Map SameValueZero
+// keeps both distinct from every string key.
+type KPart = string | number | boolean | undefined;
+type Key = KPart | readonly KPart[];
+const kparts = (k: Key): readonly KPart[] => (typeof k === 'object' ? k : [k]);
 
-function stateMap(ctx: BuiltinCtx): Map<string, unknown> {
+const CTX_STATE = new WeakMap<BuiltinCtx, Map<unknown, unknown>>();
+
+function stateMap(ctx: BuiltinCtx): Map<unknown, unknown> {
   const rt = ctx as RtCtx;
   if (!rt.state) {
     rt.state = CTX_STATE.get(ctx) ?? new Map();
     CTX_STATE.set(ctx, rt.state);
   }
-  return rt.state;
+  return rt.state as Map<unknown, unknown>;
 }
 
-function stateFor<T>(ctx: BuiltinCtx, key: string, make: () => T): T {
-  const m = stateMap(ctx);
-  let s = m.get(key) as T | undefined;
-  if (s === undefined) { s = make(); m.set(key, s); }
+// Deep-path get-or-create: walks parts[0..n-2] as nested Maps, leaf = parts[n-1].
+// Zero string allocation per lookup (was a `a|b|c` template per call site
+// per bar). First-level parts live on rt.state beside strategy.*'s flat
+// 'strategy|*' keys — no part here may equal a 'strategy|*' literal.
+function stateFor<T>(ctx: BuiltinCtx, parts: readonly KPart[], make: () => T): T {
+  let m = stateMap(ctx);
+  for (let i = 0; i < parts.length - 1; i++) {
+    const k = parts[i]!;
+    let next = m.get(k) as Map<unknown, unknown> | undefined;
+    if (next === undefined) { next = new Map(); m.set(k, next); }
+    m = next;
+  }
+  const leaf = parts[parts.length - 1]!;
+  let s = m.get(leaf) as T | undefined;
+  if (s === undefined) { s = make(); m.set(leaf, s); }
   return s;
 }
 
@@ -121,7 +139,7 @@ function vsOf(ctx: BuiltinCtx, v: Value | undefined, sig: string): VS {
   const site = rt.callsite ?? 'g';
   if (v !== undefined && v.kind === 'series') {
     const s = v.v;
-    return stateFor<VS>(ctx, `vs|${site}|series#${seriesId(s)}`, () => ({
+    return stateFor<VS>(ctx, ['vs', site, 'series', seriesId(s)], () => ({
       last: -1,
       get(b: number): number | undefined {
         if (b > this.last) this.last = b;
@@ -130,7 +148,7 @@ function vsOf(ctx: BuiltinCtx, v: Value | undefined, sig: string): VS {
     }));
   }
   const c = v === undefined ? undefined : num(v);
-  return stateFor<VS>(ctx, `vs|${site}|const|${sig}|${c}`, () => ({
+  return stateFor<VS>(ctx, ['vs', site, 'const', sig, c], () => ({
     last: -1,
     get(b: number): number | undefined {
       if (b > this.last) this.last = b;
@@ -140,8 +158,8 @@ function vsOf(ctx: BuiltinCtx, v: Value | undefined, sig: string): VS {
 }
 
 /** Memoized derived series. fn(b) may recurse via other VS (bar args ≤ b). */
-function vseries(ctx: BuiltinCtx, key: string, fn: (b: number) => number | undefined): VS {
-  return stateFor<VS>(ctx, `dvs|${key}`, () => {
+function vseries(ctx: BuiltinCtx, key: Key, fn: (b: number) => number | undefined): VS {
+  return stateFor<VS>(ctx, ['dvs', ...kparts(key)], () => {
     const memo = new Map<number, number | undefined>();
     return {
       last: -1,
@@ -158,8 +176,8 @@ function vseries(ctx: BuiltinCtx, key: string, fn: (b: number) => number | undef
 
 /** Stateful per-bar machine: step(b) runs once per bar in ascending order,
  *  replaying any gap. Result memoized per bar. */
-function vstate(ctx: BuiltinCtx, key: string, step: (b: number) => number | undefined): VS {
-  return stateFor<VS>(ctx, `stv|${key}`, () => {
+function vstate(ctx: BuiltinCtx, key: Key, step: (b: number) => number | undefined): VS {
+  return stateFor<VS>(ctx, ['stv', ...kparts(key)], () => {
     const memo = new Map<number, number | undefined>();
     const self: VS = {
       last: -1,
@@ -255,13 +273,13 @@ function stdevWin(vs: VS, b: number, L: number, biased: boolean): number | undef
 
 // ── ta.* building blocks shared by several builtins ──────────────────────────
 
-function emaVs(ctx: BuiltinCtx, src: VS, len: number, tag: string): VS {
+function emaVs(ctx: BuiltinCtx, src: VS, len: number, tag: Key): VS {
   const a = 2 / (len + 1);
   // Same recurrence as before (ema(b) seeds from ema(b-1), na source → na),
   // but resolved iteratively against this VS's own memo: the recursive form
   // re-built the state key and re-walked the state map for every historical
   // bar, so a fresh source series made each bar O(bar) map lookups.
-  return stateFor<VS>(ctx, `dvs|ema|${tag}|${len}`, () => {
+  return stateFor<VS>(ctx, ['dvs', 'ema', ...kparts(tag), len], () => {
     const memo = new Map<number, number | undefined>();
     const self: VS = {
       last: -1,
@@ -285,9 +303,9 @@ function emaVs(ctx: BuiltinCtx, src: VS, len: number, tag: string): VS {
 }
 
 /** Wilder RMA: seeded with SMA of the first `len` bars → na until bar len-1. */
-function rmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: string): VS {
+function rmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: Key): VS {
   const a = 1 / len;
-  return vstate(ctx, `rma|${tag}|${len}`, (b) => {
+  return vstate(ctx, ['rma', ...kparts(tag), len], (b) => {
     const x = src.get(b);
     if (x === undefined) return undefined;
     if (b < len - 1) return undefined;
@@ -297,7 +315,7 @@ function rmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: string): VS {
     return a * x + (1 - a) * p;
   });
 }
-function rmaVsGet(ctx: BuiltinCtx, src: VS, len: number, tag: string, b: number): number | undefined {
+function rmaVsGet(ctx: BuiltinCtx, src: VS, len: number, tag: Key, b: number): number | undefined {
   return rmaVs(ctx, src, len, tag).get(b);
 }
 
@@ -312,16 +330,16 @@ function trVs(ctx: BuiltinCtx): VS {
   });
 }
 
-function hmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: string): VS {
+function hmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: Key): VS {
   const half = Math.max(1, Math.floor(len / 2));
   const root = Math.max(1, Math.round(Math.sqrt(len)));
-  const inner = vseries(ctx, `hma-in|${tag}|${len}`, (b) => {
+  const inner = vseries(ctx, ['hma-in', ...kparts(tag), len], (b) => {
     const f = wmaWin(src, b, half);
     const s = wmaWin(src, b, len);
     if (f === undefined || s === undefined) return undefined;
     return 2 * f - s;
   });
-  return vseries(ctx, `hma|${tag}|${len}`, (b) => wmaWin(inner, b, root));
+  return vseries(ctx, ['hma', ...kparts(tag), len], (b) => wmaWin(inner, b, root));
 }
 
 // ── arg plumbing ─────────────────────────────────────────────────────────────
@@ -330,7 +348,7 @@ function hmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: string): VS {
 function srcOf(ctx: BuiltinCtx, bound: Map<string, Value>, name = 'source'): VS | undefined {
   const v = bound.get(name);
   if (v === undefined) return undefined;
-  return vsOf(ctx, v, `${name}`);
+  return vsOf(ctx, v, name);
 }
 
 /** (source, length) overload handling used by highest/lowest/highestbars/
@@ -436,20 +454,20 @@ reg('rsi', (ctx, args, named) => {
   const src = srcOf(ctx, b); const L = lenOf(b);
   if (!src || L === undefined) return NA;
   const tag = emaTag(ctx, b);
-  const gains = vseries(ctx, `rsi-g|${tag}`, (bb) => {
+  const gains = vseries(ctx, ['rsi-g', tag], (bb) => {
     if (bb <= 0) return undefined;
     const c = src.get(bb), p = src.get(bb - 1);
     if (c === undefined || p === undefined) return undefined;
     return Math.max(c - p, 0);
   });
-  const losses = vseries(ctx, `rsi-l|${tag}`, (bb) => {
+  const losses = vseries(ctx, ['rsi-l', tag], (bb) => {
     if (bb <= 0) return undefined;
     const c = src.get(bb), p = src.get(bb - 1);
     if (c === undefined || p === undefined) return undefined;
     return Math.max(p - c, 0);
   });
-  const g = rmaVs(ctx, gains, L, `rg|${tag}`).get(ctx.barIndex);
-  const l = rmaVs(ctx, losses, L, `rl|${tag}`).get(ctx.barIndex);
+  const g = rmaVs(ctx, gains, L, ['rg', tag]).get(ctx.barIndex);
+  const l = rmaVs(ctx, losses, L, ['rl', tag]).get(ctx.barIndex);
   if (g === undefined || l === undefined) return NA;
   if (l === 0) return g === 0 ? NA : fl(100); // flat window → na (TV), not 50
   return fl(100 - 100 / (1 + g / l));
@@ -609,8 +627,8 @@ reg('cum', (ctx, args, named) => {
   if (!src) return NA;
   const rt = ctx as RtCtx;
   const sv = b.get('source');
-  const srcTag = sv !== undefined && sv.kind === 'series' ? `s${seriesId(sv.v)}` : `c${num(sv)}`;
-  const cum = vstate(ctx, `cum|${rt.callsite ?? 'g'}|${srcTag}`, (bb) => {
+  const srcParts: readonly KPart[] = sv !== undefined && sv.kind === 'series' ? ['s', seriesId(sv.v)] : ['c', num(sv)];
+  const cum = vstate(ctx, ['cum', rt.callsite ?? 'g', ...srcParts], (bb) => {
     const x = src.get(bb);
     if (x === undefined) return undefined;
     const p = cum.get(bb - 1);
@@ -771,11 +789,11 @@ reg('supertrend', (ctx, args, named) => {
   const L = lenOf(b, 'atrPeriod') ?? lenOf(b, 'length');
   if (!Number.isFinite(factor) || L === undefined) return arr(NA, NA);
   const rt = ctx as RtCtx;
-  const key = `st|${rt.callsite ?? 'g'}|${factor}|${L}`;
-  const atr = rmaVs(ctx, trVs(ctx), L, `st-atr|${key}`);
-  const st = stateFor<StState>(ctx, `stv-x|${key}`, () => ({}));
-  const lastBar = stateFor<{ n: number }>(ctx, `stv-b|${key}`, () => ({ n: -1 }));
-  const memo = stateFor<Map<number, [number, number] | undefined>>(ctx, `stv-m|${key}`, () => new Map());
+  const key = ['st', rt.callsite ?? 'g', factor, L] as const;
+  const atr = rmaVs(ctx, trVs(ctx), L, ['st-atr', ...key]);
+  const st = stateFor<StState>(ctx, ['stv-x', ...key], () => ({}));
+  const lastBar = stateFor<{ n: number }>(ctx, ['stv-b', ...key], () => ({ n: -1 }));
+  const memo = stateFor<Map<number, [number, number] | undefined>>(ctx, ['stv-m', ...key], () => new Map());
   const bar = ctx.barIndex;
   if (memo.has(bar)) {
     const m = memo.get(bar);
@@ -823,13 +841,13 @@ reg('macd', (ctx, args, named) => {
   const fast = lenOf(b, 'fastlen'), slow = lenOf(b, 'slowlen'), sig = lenOf(b, 'siglen');
   if (!src || fast === undefined || slow === undefined || sig === undefined) return arr(NA, NA, NA);
   const tag = emaTag(ctx, b);
-  const fastE = emaVs(ctx, src, fast, `macd-f|${tag}`);
-  const slowE = emaVs(ctx, src, slow, `macd-s|${tag}`);
-  const macdL = vseries(ctx, `macd-l|${tag}|${fast}|${slow}`, (bb) => {
+  const fastE = emaVs(ctx, src, fast, ['macd-f', tag]);
+  const slowE = emaVs(ctx, src, slow, ['macd-s', tag]);
+  const macdL = vseries(ctx, ['macd-l', tag, fast, slow], (bb) => {
     const f = fastE.get(bb), s = slowE.get(bb);
     return f === undefined || s === undefined ? undefined : f - s;
   });
-  const sigL = emaVs(ctx, macdL, sig, `macd-g|${tag}`);
+  const sigL = emaVs(ctx, macdL, sig, ['macd-g', tag]);
   const bar = ctx.barIndex;
   const m = macdL.get(bar), s = sigL.get(bar);
   const h = m === undefined || s === undefined ? undefined : m - s;
@@ -838,7 +856,7 @@ reg('macd', (ctx, args, named) => {
 
 // ── accumulation / volume statefuls ──────────────────────────────────────────
 
-function wadVs(ctx: BuiltinCtx, key: string) {
+function wadVs(ctx: BuiltinCtx, key: Key) {
   const acc = vstate(ctx, key, (bb) => {
     // TV: accumulators hold their last value when a step input is na
     // (cum(prev) carry), rather than emitting na and resetting the chain.
@@ -865,14 +883,14 @@ function wadVs(ctx: BuiltinCtx, key: string) {
 reg('wad', (ctx, args, named) => {
   bindArgs(args, named, []);
   const rt = ctx as RtCtx;
-  return fl(wadVs(ctx, `wad|${rt.callsite ?? 'g'}`).get(ctx.barIndex));
+  return fl(wadVs(ctx, ['wad', rt.callsite ?? 'g']).get(ctx.barIndex));
 });
 
 reg('obv', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source']);
   const src = srcOf(ctx, b) ?? vsOf(ctx, { kind: 'series', v: ctx.close }, 'close');
   const rt = ctx as RtCtx;
-  const obv = vstate(ctx, `obv|${rt.callsite ?? 'g'}|${emaTag(ctx, b)}`, (bb) => {
+  const obv = vstate(ctx, ['obv', rt.callsite ?? 'g', emaTag(ctx, b)], (bb) => {
     const prev = obv.get(bb - 1);
     const c = src.get(bb), p = src.get(bb - 1), vol = num(ctx.volume.get(ctx.barIndex - bb));
     if (c === undefined || p === undefined || vol === undefined) return prev;
@@ -882,7 +900,7 @@ reg('obv', (ctx, args, named) => {
   return fl(obv.get(ctx.barIndex));
 });
 
-function pvtVs(ctx: BuiltinCtx, key: string) {
+function pvtVs(ctx: BuiltinCtx, key: Key) {
   const acc = vstate(ctx, key, (bb) => {
     const prev = acc.get(bb - 1);
     const c = num(ctx.close.get(ctx.barIndex - bb));
@@ -897,10 +915,10 @@ function pvtVs(ctx: BuiltinCtx, key: string) {
 reg('pvt', (ctx, args, named) => {
   bindArgs(args, named, []);
   const rt = ctx as RtCtx;
-  return fl(pvtVs(ctx, `pvt|${rt.callsite ?? 'g'}`).get(ctx.barIndex));
+  return fl(pvtVs(ctx, ['pvt', rt.callsite ?? 'g']).get(ctx.barIndex));
 });
 
-function nviPviVs(ctx: BuiltinCtx, useVolumeDown: boolean, key: string) {
+function nviPviVs(ctx: BuiltinCtx, useVolumeDown: boolean, key: Key) {
   const acc = vstate(ctx, key, (bb) => {
     const prev = acc.get(bb - 1);
     const c = num(ctx.close.get(ctx.barIndex - bb));
@@ -918,7 +936,7 @@ function nviPviVs(ctx: BuiltinCtx, useVolumeDown: boolean, key: string) {
 function nviPvi(ctx: BuiltinCtx, useVolumeDown: boolean): Value {
   const rt = ctx as RtCtx;
   const name = useVolumeDown ? 'nvi' : 'pvi';
-  return fl(nviPviVs(ctx, useVolumeDown, `${name}|${rt.callsite ?? 'g'}`).get(ctx.barIndex));
+  return fl(nviPviVs(ctx, useVolumeDown, [name, rt.callsite ?? 'g']).get(ctx.barIndex));
 }
 reg('nvi', (ctx) => nviPvi(ctx, true));
 reg('pvi', (ctx) => nviPvi(ctx, false));
@@ -1029,8 +1047,8 @@ reg('dmi', (ctx, args, named) => {
   const adxL = lenOf(b, 'adxSmoothing') ?? lenOf(b, 'adxsmoothing') ?? diL;
   if (diL === undefined || adxL === undefined) return arr(NA, NA, NA);
   const rt = ctx as RtCtx;
-  const tag = `${rt.callsite ?? 'g'}|${diL}|${adxL}`;
-  const plusDM = vseries(ctx, `dmi+p|${tag}`, (bb) => {
+  const tag = [rt.callsite ?? 'g', diL, adxL] as const;
+  const plusDM = vseries(ctx, ['dmi+p', ...tag], (bb) => {
     const off = ctx.barIndex - bb;
     const h = num(ctx.high.get(off)), hp = num(ctx.high.get(off + 1));
     const l = num(ctx.low.get(off)), lp = num(ctx.low.get(off + 1));
@@ -1038,7 +1056,7 @@ reg('dmi', (ctx, args, named) => {
     const up = h - hp, dn = lp - l;
     return up > dn && up > 0 ? up : 0;
   });
-  const minusDM = vseries(ctx, `dmi-m|${tag}`, (bb) => {
+  const minusDM = vseries(ctx, ['dmi-m', ...tag], (bb) => {
     const off = ctx.barIndex - bb;
     const h = num(ctx.high.get(off)), hp = num(ctx.high.get(off + 1));
     const l = num(ctx.low.get(off)), lp = num(ctx.low.get(off + 1));
@@ -1047,10 +1065,10 @@ reg('dmi', (ctx, args, named) => {
     return dn > up && dn > 0 ? dn : 0;
   });
   const tr = trVs(ctx);
-  const trS = rmaVs(ctx, tr, diL, `dmi-tr|${tag}`);
-  const pS = rmaVs(ctx, plusDM, diL, `dmi-pr|${tag}`);
-  const mS = rmaVs(ctx, minusDM, diL, `dmi-mr|${tag}`);
-  const dx = vseries(ctx, `dmi-dx|${tag}`, (bb) => {
+  const trS = rmaVs(ctx, tr, diL, ['dmi-tr', ...tag]);
+  const pS = rmaVs(ctx, plusDM, diL, ['dmi-pr', ...tag]);
+  const mS = rmaVs(ctx, minusDM, diL, ['dmi-mr', ...tag]);
+  const dx = vseries(ctx, ['dmi-dx', ...tag], (bb) => {
     const t = trS.get(bb), p = pS.get(bb), m = mS.get(bb);
     if (t === undefined || p === undefined || m === undefined) return undefined;
     // TV fixnan(): 0/na tr smooth → +di/-di read as 0, not na.
@@ -1058,7 +1076,7 @@ reg('dmi', (ctx, args, named) => {
     const s = pdi + mdi;
     return s === 0 ? 0 : 100 * Math.abs(pdi - mdi) / s;
   });
-  const adx = rmaVs(ctx, dx, adxL, `dmi-adx|${tag}`);
+  const adx = rmaVs(ctx, dx, adxL, ['dmi-adx', ...tag]);
   const bar = ctx.barIndex;
   const t = trS.get(bar);
   const p = t === undefined ? undefined : (pS.get(bar) === undefined ? undefined : (t === 0 ? 0 : 100 * pS.get(bar)! / t));
@@ -1077,19 +1095,19 @@ function kcImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>, us
   const mult = numArg(b, 'mult', 2);
   const useTr = boolArg(b, 'useTrueRange', true);
   const rt = ctx as RtCtx;
-  const tag = `${rt.callsite ?? 'g'}|${useWma ? 'w' : 'e'}|${L}|${mult}|${useTr}`;
+  const tag = [rt.callsite ?? 'g', useWma ? 'w' : 'e', L, mult, useTr] as const;
   const rngSrc = useTr
     ? trVs(ctx)
-    : vseries(ctx, `hl-r|${tag}`, (bb) => {
+    : vseries(ctx, ['hl-r', ...tag], (bb) => {
         const h = num(ctx.high.get(ctx.barIndex - bb)), l = num(ctx.low.get(ctx.barIndex - bb));
         return h === undefined || l === undefined ? undefined : h - l;
       });
   const basis = useWma
-    ? vseries(ctx, `kc-b|${tag}`, (bb) => wmaWin(src, bb, L))
-    : emaVs(ctx, src, L, `kc-b|${tag}`);
+    ? vseries(ctx, ['kc-b', ...tag], (bb) => wmaWin(src, bb, L))
+    : emaVs(ctx, src, L, ['kc-b', ...tag]);
   const rng = useWma
-    ? vseries(ctx, `kc-r|${tag}`, (bb) => wmaWin(rngSrc, bb, L))
-    : emaVs(ctx, rngSrc, L, `kc-r|${tag}`);
+    ? vseries(ctx, ['kc-r', ...tag], (bb) => wmaWin(rngSrc, bb, L))
+    : emaVs(ctx, rngSrc, L, ['kc-r', ...tag]);
   const bar = ctx.barIndex;
   const base = basis.get(bar), r = rng.get(bar);
   if (base === undefined || r === undefined) return arr(NA, NA, NA);
@@ -1110,10 +1128,10 @@ reg('fisher', (ctx, args, named) => {
   const src = srcOf(ctx, b) ?? vsOf(ctx, { kind: 'series', v: ctx.hlc3 }, 'hlc3');
   const L = lenOf(b) ?? 9;
   const rt = ctx as RtCtx;
-  const key = `fisher|${rt.callsite ?? 'g'}|${emaTag(ctx, b)}|${L}`;
-  const st = stateFor<FisherState>(ctx, `stv-x|${key}`, () => ({}));
-  const lastBar = stateFor<{ n: number }>(ctx, `stv-b|${key}`, () => ({ n: -1 }));
-  const memo = stateFor<Map<number, [number, number] | undefined>>(ctx, `stv-m|${key}`, () => new Map());
+  const key = ['fisher', rt.callsite ?? 'g', emaTag(ctx, b), L] as const;
+  const st = stateFor<FisherState>(ctx, ['stv-x', ...key], () => ({}));
+  const lastBar = stateFor<{ n: number }>(ctx, ['stv-b', ...key], () => ({ n: -1 }));
+  const memo = stateFor<Map<number, [number, number] | undefined>>(ctx, ['stv-m', ...key], () => new Map());
   const bar = ctx.barIndex;
   if (memo.has(bar)) {
     const m = memo.get(bar);
@@ -1183,10 +1201,10 @@ reg('sar', (ctx, args, named) => {
   const inc = numArg(b, 'inc', 0.02);
   const max = numArg(b, 'max', 0.2);
   const rt = ctx as RtCtx;
-  const key = `sar|${rt.callsite ?? 'g'}|${start}|${inc}|${max}`;
-  const st = stateFor<SarState>(ctx, `stv-x|${key}`, () => ({}));
-  const lastBar = stateFor<{ n: number }>(ctx, `stv-b|${key}`, () => ({ n: -1 }));
-  const memo = stateFor<Map<number, number | undefined>>(ctx, `stv-m|${key}`, () => new Map());
+  const key = ['sar', rt.callsite ?? 'g', start, inc, max] as const;
+  const st = stateFor<SarState>(ctx, ['stv-x', ...key], () => ({}));
+  const lastBar = stateFor<{ n: number }>(ctx, ['stv-b', ...key], () => ({ n: -1 }));
+  const memo = stateFor<Map<number, number | undefined>>(ctx, ['stv-m', ...key], () => new Map());
   const bar = ctx.barIndex;
   if (memo.has(bar)) return fl(memo.get(bar));
   let out: number | undefined;
@@ -1237,20 +1255,20 @@ reg('tsi', (ctx, args, named) => {
   const longL = lenOf(b, 'long_length') ?? lenOf(b, 'longlen') ?? 25;
   if (!src) return NA;
   const tag = emaTag(ctx, b);
-  const mo = vseries(ctx, `tsi-m|${tag}`, (bb) => {
+  const mo = vseries(ctx, ['tsi-m', tag], (bb) => {
     const c = src.get(bb), p = src.get(bb - 1);
     return c === undefined || p === undefined ? undefined : c - p;
   });
-  const amo = vseries(ctx, `tsi-am|${tag}`, (bb) => {
+  const amo = vseries(ctx, ['tsi-am', tag], (bb) => {
     const c = src.get(bb), p = src.get(bb - 1);
     return c === undefined || p === undefined ? undefined : Math.abs(c - p);
   });
-  const ds = (s: VS, t: string) => {
-    const e1 = emaVs(ctx, s, longL, `tsi1|${t}`);
-    return emaVs(ctx, e1, shortL, `tsi2|${t}`);
+  const ds = (s: VS, t: readonly KPart[]) => {
+    const e1 = emaVs(ctx, s, longL, ['tsi1', ...t]);
+    return emaVs(ctx, e1, shortL, ['tsi2', ...t]);
   };
-  const numS = ds(mo, `n${tag}`);
-  const denS = ds(amo, `d${tag}`);
+  const numS = ds(mo, ['n', tag]);
+  const denS = ds(amo, ['d', tag]);
   const bar = ctx.barIndex;
   const n = numS.get(bar), d = denS.get(bar);
   if (n === undefined || d === undefined || d === 0) return NA;
@@ -1274,10 +1292,10 @@ reg('vwap', (ctx, args, named) => {
   const aTag = anchorV === undefined ? 'none'
     : anchorV.kind === 'series' && anchorUnw0?.kind !== 'string' ? `s${seriesId(anchorV.v)}`
     : `v${anchorUnw0 !== undefined && anchorUnw0.kind === 'string' ? anchorUnw0.v : anchorV.kind}`;
-  const key = `vwap|${rt.callsite ?? 'g'}|${emaTag(ctx, b)}|${aTag}|${hasSd ? sdMult : ''}`;
-  const st = stateFor<{ sv?: number; spv?: number; svv?: number }>(ctx, `stv-x|${key}`, () => ({}));
-  const lastBar = stateFor<{ n: number }>(ctx, `stv-b|${key}`, () => ({ n: -1 }));
-  const memo = stateFor<Map<number, [number | undefined, number | undefined] | undefined>>(ctx, `stv-m|${key}`, () => new Map());
+  const key = ['vwap', rt.callsite ?? 'g', emaTag(ctx, b), aTag, hasSd ? sdMult : ''] as const;
+  const st = stateFor<{ sv?: number; spv?: number; svv?: number }>(ctx, ['stv-x', ...key], () => ({}));
+  const lastBar = stateFor<{ n: number }>(ctx, ['stv-b', ...key], () => ({ n: -1 }));
+  const memo = stateFor<Map<number, [number | undefined, number | undefined] | undefined>>(ctx, ['stv-m', ...key], () => new Map());
 
   // Anchor test at absolute bar bb: bool-series truthy, tf-string boundary,
   // or a truthy scalar (reset every bar — degenerate but consistent).
@@ -1417,7 +1435,7 @@ registerLazyConstant('ta', 'obv', (c) => {
   if (c === undefined) return NA;
   const ctx = c as BuiltinCtx;
   const closes = vsOf(ctx, { kind: 'series', v: ctx.close }, 'close');
-  const obv = vstate(ctx, 'obv|bare', (bb) => {
+  const obv = vstate(ctx, ['obv', 'bare'], (bb) => {
     const cc = closes.get(bb), p = closes.get(bb - 1), vol = num(ctx.volume.get(ctx.barIndex - bb));
     if (cc === undefined || p === undefined || vol === undefined) return undefined;
     const prev = obv.get(bb - 1) ?? 0;
@@ -1429,7 +1447,7 @@ registerLazyConstant('ta', 'obv', (c) => {
 // Bare-variable forms — TV defines these as variables, not functions:
 // `plot(ta.wad)` is legal; `ta.wad()` is not. The lazy constant drives the
 // same vstate accumulator (separate 'bare' key → independent memo, identical math).
-const bareAccum: Record<string, (ctx: BuiltinCtx, key: string) => VS> = {
+const bareAccum: Record<string, (ctx: BuiltinCtx, key: Key) => VS> = {
   wad: wadVs,
   pvt: pvtVs,
   nvi: (c, k) => nviPviVs(c, true, k),
@@ -1439,7 +1457,7 @@ for (const name of ['wad', 'pvt', 'nvi', 'pvi'] as const) {
   registerLazyConstant('ta', name, (c) => {
     if (c === undefined) return NA;
     const ctx = c as BuiltinCtx;
-    const acc = bareAccum[name]!(ctx, `ta.${name}|bare`);
+    const acc = bareAccum[name]!(ctx, [`ta.${name}`, 'bare']);
     return { kind: 'series', v: new FnSeries(ctx, (off) => fl(acc.get(ctx.barIndex - off))) };
   });
 }
