@@ -1702,6 +1702,41 @@ describe('request.security end-to-end', () => {
     expect(col('a1').slice(4, 8)).toEqual(['na', 0, 0, 0]);
     expect(col('b1').slice(4, 8)).toEqual(['na', 100, 100, 100]);
   });
+
+  it('gaps_on: two UDF callsites of the same security() each get the mapped value', async () => {
+    // lastEmit was spec-scoped: on every emit bar caller A ran first and set
+    // lastEmit=j, so caller B's same-bar call hit the dedup → emitAll(NA) →
+    // B returned na FOREVER (and its chart history filled with na). Pine
+    // gives each callsite the mapped value; only the FOLLOWING chart bars
+    // inside the tf bar emit na.
+    resetMtf();
+    const src = [
+      'indicator("gaps_on callsites")',
+      'f(x) => request.security(syminfo.tickerid, "60", nz(x), barmerge.gaps_on, barmerge.lookahead_off)',
+      'a = f(close)',
+      'b = f(volume)',
+      'plot(a[1], "a1")',
+      'plot(b, "b")',
+      'plot(b[1], "b1")',
+    ].join('\n');
+    const M15 = 900_000, H1 = 3_600_000;
+    const chartBars = mkBars(12, M15, 0);                 // close i, volume 100+i
+    const tfBars = mkBars(2, H1, 0, i => 10 + i);
+    const res = await runScript(parse(src), chartBars, {
+      timeframe: '15',
+      fetchSeries: async (_s, t) => (t === '60' ? tfBars : []),
+    });
+    const col = (name: string): (number | 'na')[] => (res.plots.get(name)?.values ?? []).map(valOf);
+    // Completed 60m bar0 covers chart bars 4-7, bar1 covers 8-11. nz anchors
+    // on tf indexes: tf bar j maps to chart[j] — B's lane is volume → 100/101,
+    // not A's close lane (0/1) and not na (the pre-fix bug).
+    // A bound security() result aliases the SecSeries whose cur() reads atTf
+    // directly, so `b` forward-fills; the gaps_on na's land in the emit
+    // history — visible through [1]: value only on the bar after an emit bar.
+    expect(col('b')).toEqual(['na', 'na', 'na', 'na', 100, 100, 100, 100, 101, 101, 101, 101]);
+    expect(col('a1')).toEqual(['na', 'na', 'na', 'na', 'na', 0, 'na', 'na', 'na', 1, 'na', 'na']);
+    expect(col('b1')).toEqual(['na', 'na', 'na', 'na', 'na', 100, 'na', 'na', 'na', 101, 'na', 'na']);
+  });
   it('a dynamic tf that switches mid-run rebases the spec (no stale series)', async () => {
     resetMtf();
     const M5 = 300_000, H1 = 3_600_000;

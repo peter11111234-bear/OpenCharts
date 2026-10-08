@@ -164,7 +164,7 @@ interface SecuritySpec {
   agnosticCache: Map<Node, Map<number, Value>> | null; // caller-agnostic evals: node → tfBarIndex → value
   agnosticSafe: Map<Node, boolean> | null;            // gate verdict per expr node (survives tf rebuilds)
   prodVerdicts: Map<Node, boolean> | null;            // producer-walk verdicts shared across the spec's gated exprs
-  lastEmit: number;               // gaps_on: last tfIdx that emitted
+  lastEmit?: Map<object, number>; // gaps_on: last tfIdx that emitted, per caller callsite
   warned: Set<string>;
   varScope: Scope | null;         // sibling scope holding mutated-global slots
   varProg: Node[];                // ordered top-level stmts writing mutated globals
@@ -462,7 +462,7 @@ export function prepareSecurity(body: Node[], _frame0?: unknown): void {
       isLtf,
       bars: null, scope: null, pivot: null, callerScope: null, callerKey: null, durableCache: null, seenCallers: new WeakSet(), ctx: null,
       series: {}, loaded: 0,
-      nodeCache: new Map(), lastEmit: -1,
+      nodeCache: new Map(),
       agnosticCache: null, agnosticSafe: null, prodVerdicts: null,
       warned: new Set(),
       varScope: null, varProg: [], varUpto: -1, varInited: new Set(),
@@ -925,6 +925,9 @@ class SecSeries extends BarSeries {
    *  to several callers — clone it anchored on the CURRENT caller's callsite
    *  so `[n]` reads that callsite's own chart history. */
   forCaller(callerKey: object): SecSeries {
+    // Same-caller re-entry on a cached hit: this series already reads the live
+    // callsite's chart history — skip the clone (keeps identity-keyed caches hot).
+    if (callerKey === this.callerKey) return this;
     return new SecSeries(this.spec, this.src, this.j, this.srcLen, this.exprNode, callerKey);
   }
 }
@@ -968,7 +971,7 @@ function resetTfFrame(spec: SecuritySpec): void {
   spec.agnosticCache?.clear();        // agnosticSafe survives: gate verdicts are AST-level
   spec.durableCache = null;
   spec.seenCallers = new WeakSet();
-  spec.lastEmit = -1;
+  spec.lastEmit = undefined;
   spec.varProg = [];
   spec.varUpto = -1;
   spec.varInited.clear();
@@ -1834,11 +1837,17 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     last.set(callerKey, ctx.barIndex);
   };
 
-  if (spec.gaps === 'on' && spec.lastEmit === j) {
-    emitAll(NA);
-    return NA;                                      // only first chart bar per tf bar emits
+  if (spec.gaps === 'on') {
+    // Per-callsite like lastChartBar: two UDF callsites of this node on the same
+    // chart bar each own an emit slot — B must see the mapped value, not the na
+    // that a spec-scoped dedup would force after A emitted.
+    const emitted = (spec.lastEmit ??= new Map());
+    if (emitted.get(callerKey) === j) {
+      emitAll(NA);
+      return NA;                                // only first chart bar per tf bar emits
+    }
+    emitted.set(callerKey, j);
   }
-  if (spec.gaps === 'on') spec.lastEmit = j;
 
   // Same warm-up on the non-ltf path: replay tf bars 0..j on first hit.
   if (!spec.warmed) {
