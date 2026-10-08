@@ -157,6 +157,7 @@ interface SecuritySpec {
   nodeCache: Map<Node, WeakMap<Scope, Map<number, Value>>>; // node → caller scope → tfBarIndex → value
   agnosticCache: Map<Node, Map<number, Value>> | null; // caller-agnostic evals: node → tfBarIndex → value
   agnosticSafe: Map<Node, boolean> | null;            // gate verdict per expr node (survives tf rebuilds)
+  prodVerdicts: Map<Node, boolean> | null;            // producer-walk verdicts shared across the spec's gated exprs
   lastEmit: number;               // gaps_on: last tfIdx that emitted
   warned: Set<string>;
   varScope: Scope | null;         // sibling scope holding mutated-global slots
@@ -461,7 +462,7 @@ export function prepareSecurity(body: Node[], _frame0?: unknown): void {
       bars: null, scope: null, pivot: null, callerScope: null, durableCache: null, seenCallers: new WeakSet(), ctx: null,
       series: {}, loaded: 0,
       nodeCache: new Map(), lastEmit: -1,
-      agnosticCache: null, agnosticSafe: null,
+      agnosticCache: null, agnosticSafe: null, prodVerdicts: null,
       warned: new Set(),
       varScope: null, varProg: [], varUpto: -1, varInited: new Set(),
     });
@@ -1251,8 +1252,9 @@ function childNodes(node: Node): Node[] {
  *
  * Producer/UDF walks share `inStack` (nodes on the current recursion
  * path → genuine cycles reject) while finished producer verdicts memo
- * into `prodVerdicts` so DAG sharing (`q() + q()`, `outer = inner`)
- * never false-rejects. `reassign` to a non-bound name writes caller or
+ * into `spec.prodVerdicts` (shared across the spec's gated exprs) so DAG
+ * sharing (`q() + q()`, `outer = inner`) never false-rejects. `reassign`
+ * to a non-bound name writes caller or
  * tf-visible state (order-dependent) → unsafe. Decl-level constructs
  * inside an expression (typedecl/import/indicator/strategy) are rejected
  * outright. Memoized per node into spec.agnosticSafe — the verdict is
@@ -1267,10 +1269,11 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
   // Recursion-stack keys for cycle detection (a second visit via DAG
   // sharing must NOT reject — only a node still being walked is a cycle).
   const inStack = new Set<object>();
-  // Producer walks are path-independent (bound = ∅) — memoize the verdict
-  // per producer node so shared decls (`q() + q()`, tuple components on
-  // the same value node) don't re-walk or false-reject.
-  const prodVerdicts = new Map<Node, boolean>();
+  // Producer walks are path-independent (bound = ∅) — verdicts memo on the
+  // SPEC so exprs of one security call share them (`q() + q()` splits into
+  // two gated exprs reaching the same producer node). inStack stays
+  // per-call: it is the live recursion stack.
+  const prodVerdicts = spec.prodVerdicts ??= new Map<Node, boolean>();
   // Producer bodies bind nothing from the gated subtree — one shared set.
   const NO_BOUND = new Set<string>();
 
@@ -1284,16 +1287,18 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
   };
   /** Walk a store.funcs UDF: param DEFAULTS evaluate at the call site
    *  (caller bound set), while the body binds only its own params/decls.
-   *  `inStack` keyed on the decl node cuts `f = () => f()` recursion. */
+   *  `inStack` keyed on the decl node cuts recursion — pushed BEFORE the
+   *  defaults walk so `f = (x = f) => x` and `f ↔ g` default ping-pong
+   *  terminate (reject) instead of overflowing the stack. */
   const udfSafe = (decl: Node, bound: Set<string>): boolean => {
-    const d = decl as { params?: Param[]; body?: Node | Node[] };
-    for (const p of d.params ?? []) {
-      if (p.default && !walk(p.default, bound)) return false;
-    }
-    if (!d.body) return true;
     if (inStack.has(decl)) return false;
     inStack.add(decl);
     try {
+      const d = decl as { params?: Param[]; body?: Node | Node[] };
+      for (const p of d.params ?? []) {
+        if (p.default && !walk(p.default, bound)) return false;
+      }
+      if (!d.body) return true;
       const b2 = new Set<string>();
       for (const p of d.params ?? []) b2.add(p.name);
       return walkBlock(d.body, b2);

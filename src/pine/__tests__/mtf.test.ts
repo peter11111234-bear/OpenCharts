@@ -459,6 +459,69 @@ describe('caller-agnostic eval cache', () => {
     expect(__mtfStats.evals - e0).toBeLessThanOrEqual(6);
   });
 
+  it('self-recursive param default f = (x = f) => x terminates — no stack overflow', async () => {
+    // inStack must mark the UDF decl BEFORE its param defaults walk (QA7
+    // P1): the default `f` re-enters udfSafe(f) and used to recurse
+    // forever. Now the on-stack decl rejects → gateFail, finite. The call
+    // passes x explicitly so the RUNTIME never evaluates the default.
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const fDecl = {
+      type: 'func', name: 'f',
+      params: [{ name: 'x', default: ident('f') }],
+      body: ident('x'),
+    } as Node;
+    const body = [
+      fDecl,
+      assign('x', security(str(''), str('60'), call(ident('f'), num(0)))),
+    ];
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(1); // one gated node, one verdict
+    expect(__mtfStats.gatePass - p0).toBe(0); // verdict consistent: always reject
+    expect(values).toHaveLength(12);          // run completed — no overflow
+  });
+
+  it('mutual param defaults f ↔ g ping-pong terminates — no stack overflow', async () => {
+    // f = (x = g()) => x; g = (y = f()) => y: f's default enters g, whose
+    // default re-enters f — the shared inStack cuts the ping-pong on the
+    // second visit instead of overflowing (QA7 P1).
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const fDecl = {
+      type: 'func', name: 'f',
+      params: [{ name: 'x', default: call(ident('g')) }],
+      body: ident('x'),
+    } as Node;
+    const gDecl = {
+      type: 'func', name: 'g',
+      params: [{ name: 'y', default: call(ident('f')) }],
+      body: ident('y'),
+    } as Node;
+    const body = [
+      fDecl, gDecl,
+      assign('x', security(str(''), str('60'), call(ident('f'), num(0)))),
+    ];
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(1);
+    expect(__mtfStats.gatePass - p0).toBe(0); // consistent reject, no overflow
+    expect(values).toHaveLength(12);
+  });
+
+  it('two gated exprs sharing one producer dedup via spec prodVerdicts', async () => {
+    // security's arraylit expr splits into TWO gated nodes; both reach q's
+    // producer. prodVerdicts now lives on the spec (QA7 P3) so the second
+    // gate walk reuses the first's verdict — both must still pass.
+    const e0 = __mtfStats.evals, a0 = __mtfStats.agHits, f0 = __mtfStats.gateFail;
+    const arrow: Node = { type: 'arrow', params: [], body: ident('close') };
+    const body = [
+      assign('q', arrow),
+      assign('x', security(str(''), str('60'),
+        { type: 'arraylit', items: [call(ident('q')), call(ident('q'))] } as Node)),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.agHits - a0).toBeGreaterThanOrEqual(6);
+    expect(__mtfStats.evals - e0).toBeLessThanOrEqual(12);
+  });
+
   it('array-returning agnostic expr still caches via the per-caller path', async () => {
     // Mutable-kind results skip only the SHARED agnostic write (QA6 P3):
     // the per-caller (node, caller, j) entry must still be written and
