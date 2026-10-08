@@ -28,10 +28,12 @@
 // tf frame), bare `name` referencing a top-level global → the global's
 // producer expression is re-evaluated in the tf context.
 
-import type { Arg, BarData, BuiltinCtx, Call, Node, Param, UdfDecl, Value } from './contracts';
+import type { Arg, BarData, BuiltinCtx, Call, Node, Param, PineType, UdfDecl, Value } from './contracts';
 import { NA, Scope, Series } from './contracts';
 import { evalBlock, evalExpr, registerMtf } from './interpreter';
 import { BarSeries, ForwardingSeries, histGetAt, seriesHooks } from './series';
+import { FOR_IN } from './parser';
+import { BUILTINS, CONSTANTS } from './builtins/registry';
 import type { Frame } from './scope';
 
 // ── evaluator hooks ─────────────────────────────────────────────────────────
@@ -153,6 +155,8 @@ interface SecuritySpec {
   series: Record<string, BarSeries>;
   loaded: number;                 // tf bars pushed into series so far
   nodeCache: Map<Node, WeakMap<Scope, Map<number, Value>>>; // node → caller scope → tfBarIndex → value
+  agnosticCache: Map<Node, Map<number, Value>> | null; // caller-agnostic evals: node → tfBarIndex → value
+  agnosticSafe: Map<Node, boolean> | null;            // gate verdict per expr node (survives tf rebuilds)
   lastEmit: number;               // gaps_on: last tfIdx that emitted
   warned: Set<string>;
   varScope: Scope | null;         // sibling scope holding mutated-global slots
@@ -457,6 +461,7 @@ export function prepareSecurity(body: Node[], _frame0?: unknown): void {
       bars: null, scope: null, pivot: null, callerScope: null, durableCache: null, seenCallers: new WeakSet(), ctx: null,
       series: {}, loaded: 0,
       nodeCache: new Map(), lastEmit: -1,
+      agnosticCache: null, agnosticSafe: null,
       warned: new Set(),
       varScope: null, varProg: [], varUpto: -1, varInited: new Set(),
     });
@@ -943,6 +948,7 @@ function resetTfFrame(spec: SecuritySpec): void {
   spec.series = {};
   spec.loaded = 0;
   spec.nodeCache.clear();
+  spec.agnosticCache?.clear();        // agnosticSafe survives: gate verdicts are AST-level
   spec.durableCache = null;
   spec.seenCallers = new WeakSet();
   spec.lastEmit = -1;
@@ -1146,20 +1152,256 @@ function warnOnce(spec: SecuritySpec, ctx: BuiltinCtx, msg: string): void {
 /** Cache-key sentinel for evals that ran with no caller scope (shouldn't happen post-fix). */
 const EMPTY_SCOPE = new Scope();
 
-/** Perf-probe counters (baseline probe + bench test): evalAt cache miss/hit. */
-export const __mtfStats = { evals: 0, hits: 0 };
+/** Perf-probe counters (baseline probe + bench test): evalAt cache miss/hit
+ *  + agnostic gate verdicts (per expr node). */
+export const __mtfStats = { evals: 0, hits: 0, gatePass: 0, gateFail: 0, agHits: 0 };
 
-/** Evaluate `node` at tf bar `j` inside spec's tf frame. Cached per (node, caller scope, j). */
+// ── caller-agnostic cache gate ──────────────────────────────────────────────
+// A security expression is caller-agnostic only when every name it can reach
+// resolves to a binding the tf frame owns: tf series shadows (SERIES_NAMES),
+// shadowed file-level globals/UDFs (spec.scope via store.globals/store.funcs),
+// local bindings (UDF params / block decls), or — STRICT_NAMESPACES off —
+// builtin/context namespaces. `evalIdent` runs scope.lookup BEFORE the builtin
+// fallback, so a caller-bound name (UDF param, block local) silently wins over
+// both: any free ident reaching a caller binding makes the cache wrong.
+
+/** Builtin shadowing is pathological; ON = refuse all non-S0/bound names. */
+const STRICT_NAMESPACES = false;
+
+/** Kinds that must never enter the caller-agnostic cache: sharing one mutable
+ *  payload across callers lets one caller's writes leak into another's view.
+ *  They still flow through per-caller/transient paths; only the shared write
+ *  is skipped. */
+const MUTABLE_KINDS: Partial<Record<PineType, true>> = {
+  array: true, udt: true, map: true, matrix: true,
+  line: true, label: true, box: true, table: true, polyline: true,
+  linefill: true, function: true, void: true,
+};
+
+/** Names an ident may resolve to without consulting the caller scope: builtin
+ *  namespaces + bare builtins + ctx-provided names. Populated lazily — mtf.ts
+ *  is imported (as a registration side effect) before builtin modules finish
+ *  registering, so reading the registries at module init would see them empty. */
+let KNOWN_NAMES: Set<string> | null = null;
+function builtinNames(): Set<string> {
+  if (KNOWN_NAMES) return KNOWN_NAMES;
+  const s = new Set<string>();
+  for (const k of BUILTINS.keys()) s.add(k.split('.')[0]!);
+  for (const k of CONSTANTS.keys()) s.add(k.split('.')[0]!);
+  // evalIdent ctx specials + bare lazy constants (calendar vars like `hour`
+  // register under '' which the dotted-key scan misses).
+  for (const n of [
+    'bar_index', 'last_bar_index', 'barstate', 'syminfo', 'timeframe',
+    'hour', 'minute', 'second', 'dayofmonth', 'dayofweek', 'month', 'year',
+    'barmerge', 'format', 'order', 'display', 'currency', 'location',
+    'position', 'shape', 'extend', 'adjustment', 'data', 'session',
+  ]) s.add(n);
+  return (KNOWN_NAMES = s);
+}
+
+/** Names a decl statement binds locally (sequential scoping: visible to later
+ *  stmts in the same block only). */
+function addDeclNames(node: Node, out: Set<string>): void {
+  const n = node as {
+    type: string; name?: string; names?: string[];
+    multi?: { name: string }[];
+  };
+  if (n.type === 'func' || n.type === 'method') { if (n.name) out.add(n.name); return; }
+  if (!isDeclType(n.type)) return;
+  if (n.type === 'tuple' && n.names) { for (const nm of n.names) out.add(nm); return; }
+  if (n.type === 'var' && n.multi) { for (const m of n.multi) out.add(m.name); return; }
+  if (n.name) out.add(n.name);
+}
+
+/** Child expression/stmt nodes (Arg/case/Param wrappers unwrapped). */
+function childNodes(node: Node): Node[] {
+  const out: Node[] = [];
+  const n = node as unknown as Record<string, unknown>;
+  for (const k of Object.keys(n)) {
+    if (k === 'loc' || k === 'type') continue;
+    const v = n[k];
+    if (Array.isArray(v)) {
+      for (const item of v as unknown[]) {
+        if (!item || typeof item !== 'object') continue;
+        if ('type' in (item as object)) { out.push(item as Node); continue; }
+        const w = item as Record<string, unknown>;
+        for (const kk of ['value', 'test', 'default'] as const) {
+          const x = w[kk];
+          if (x && typeof x === 'object' && 'type' in (x as object)) out.push(x as Node);
+        }
+        if (Array.isArray(w.body)) for (const b of w.body as Node[]) out.push(b);
+      }
+    } else if (v && typeof v === 'object' && 'type' in (v as object)) {
+      out.push(v as Node);
+    }
+  }
+  return out;
+}
+
+/**
+ * Gate: may this expr's (node, j) result be shared across caller scopes?
+ * S0 = SERIES_NAMES ∪ store.globals ∪ store.funcs — names the tf scope shadows,
+ * so their bindings are caller-independent. Ident → bound ∪ S0 ∪ known builtin
+ * names; a bare call into a file-level UDF (callee ident ∈ store.funcs)
+ * recurses into the UDF body with bound = params ∪ body decls (`seen` prevents
+ * recursion cycles) — a free ident inside the body still resolves through
+ * PivotScope → callerScope. `reassign` to a non-bound name writes caller or
+ * tf-visible state (order-dependent) → unsafe. Decl-level constructs inside an
+ * expression (typedecl/import/indicator/strategy) are rejected outright.
+ * Memoized per node into spec.agnosticSafe — the verdict is AST-level and
+ * survives tf rebuilds (S0 is store-level, not frame-level).
+ */
+function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
+  const memo = spec.agnosticSafe ??= new Map();
+  const hit = memo.get(node);
+  if (hit !== undefined) return hit;
+  const s0 = new Set<string>(SERIES_NAMES);
+  for (const k of store.globals.keys()) s0.add(k);
+  for (const k of store.funcs.keys()) s0.add(k);
+  const known = STRICT_NAMESPACES ? new Set<string>() : builtinNames();
+  const seen = new Set<Node>();
+
+  const walkBlock = (stmts: Node[] | Node, bound: Set<string>): boolean => {
+    if (!Array.isArray(stmts)) return walk(stmts, bound);
+    for (const s of stmts) {
+      if (!walk(s, bound)) return false;
+      addDeclNames(s, bound); // sequential: earlier decls bind for later stmts
+    }
+    return true;
+  };
+
+  const walk = (n: Node, bound: Set<string>): boolean => {
+    switch (n.type) {
+      case 'ident':
+        return bound.has(n.name) || s0.has(n.name) || known.has(n.name);
+      case 'call': {
+        // Nested request.* calls evaluate in the caller's chart scope — their
+        // specs/caches are caller-keyed, so the result is caller-dependent.
+        if (n.callee.type === 'member'
+            && n.callee.obj.type === 'ident' && n.callee.obj.name === 'request') return false;
+        // A bound callee (param/local holding a function) runs with ITS OWN
+        // closure — captured caller bindings make the result caller-dependent.
+        if (n.callee.type === 'ident' && bound.has(n.callee.name)) return false;
+        // Calling a method on a bound object reads caller-owned state.
+        if (n.callee.type === 'member' && n.callee.obj.type === 'ident'
+            && bound.has(n.callee.obj.name)) return false;
+        if (n.callee.type === 'ident' && store.funcs.has(n.callee.name)) {
+          const decl = store.funcs.get(n.callee.name)! as { params?: Param[]; body?: Node | Node[] };
+          for (const p of decl.params ?? []) {
+            if (p.default && !walk(p.default, bound)) return false;
+          }
+          if (decl.body && !seen.has(n.callee)) {
+            seen.add(n.callee);
+            const b2 = new Set(bound);
+            for (const p of decl.params ?? []) b2.add(p.name);
+            if (!walkBlock(decl.body, b2)) return false;
+          }
+        } else if (!walk(n.callee, bound)) {
+          return false;
+        }
+        for (const a of n.args) if (!walk(a.value, bound)) return false;
+        return true;
+      }
+      case 'func': case 'method': case 'arrow': {
+        const b2 = new Set(bound);
+        for (const p of n.params) b2.add(p.name);
+        for (const p of n.params) if (p.default && !walk(p.default, bound)) return false;
+        return walkBlock(n.body, b2);
+      }
+      case 'reassign': {
+        // `:=` on a name not bound inside the gated subtree writes through the
+        // caller pivot (or mutates a shared tf/global slot) → order-dependent.
+        if (n.target.type === 'ident' && !bound.has(n.target.name)) return false;
+        if (n.target.type !== 'ident' && !walk(n.target, bound)) return false;
+        return walk(n.value, bound);
+      }
+      case 'if': case 'ifexpr': {
+        if (!walk(n.test, bound)) return false;
+        if (!walkBlock(n.then, new Set(bound))) return false;
+        for (const e of n.elseIfs) {
+          if (!walk(e.test, bound)) return false;
+          if (!walkBlock(e.body, new Set(bound))) return false;
+        }
+        if (n.else && !walkBlock(n.else, new Set(bound))) return false;
+        return true;
+      }
+      case 'for': {
+        const from = n.from;
+        // `for x in e` parses as from = Ident FOR_IN (a sentinel, not a name).
+        if (!(from.type === 'ident' && from.name === FOR_IN) && !walk(from, bound)) return false;
+        if (!walk(n.to, bound)) return false;
+        if (n.step && !walk(n.step, bound)) return false;
+        const inner = new Set(bound);
+        for (const nm of n.varName.split(',')) if (nm) inner.add(nm); // `[a,b]` tuple loops
+        return walkBlock(n.body, inner);
+      }
+      case 'while':
+        if (!walk(n.test, bound)) return false;
+        return walkBlock(n.body, new Set(bound));
+      case 'switch': {
+        if (n.subject && !walk(n.subject, bound)) return false;
+        for (const c of n.cases) {
+          if (c.test && !walk(c.test, bound)) return false;
+          if (!walkBlock(c.body, new Set(bound))) return false;
+        }
+        return true;
+      }
+      case 'seq':
+        return walkBlock(n.stmts, new Set(bound));
+      case 'typedecl': case 'import': case 'indicator': case 'strategy':
+        return false;
+      default: {
+        for (const c of childNodes(n)) if (!walk(c, bound)) return false;
+        return true;
+      }
+    }
+  };
+
+  const safe = walk(node, new Set());
+  memo.set(node, safe);
+  if (safe) __mtfStats.gatePass++; else __mtfStats.gateFail++;
+  return safe;
+}
+
+/** Evaluate `node` at tf bar `j` inside spec's tf frame. Caller-agnostic exprs
+ *  share one cache keyed (node, j); caller-dependent exprs keep the
+ *  (node, caller scope, j) path — an ephemeral UDF frame can bind different
+ *  params per invocation, so two callers must never share an entry. */
 function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
   // History before the first tf bar is na — never evaluate at a negative index
   // (advanceTo is a no-op there, leaving the ctx pointed at a stale bar).
   if (j < 0) return NA;
-  // The cache key includes the caller scope: the same call node evaluated from
-  // different UDF frames can resolve params to different bindings.
+  const agnostic = exprSafeForAgnostic(spec, node);
+  if (agnostic) {
+    const m = spec.agnosticCache ??= new Map();
+    const hit = m.get(node)?.get(j);
+    if (hit !== undefined) { __mtfStats.hits++; __mtfStats.agHits++; return hit; }
+    const v = computeAt(spec, node, j);
+    if (!(v.kind in MUTABLE_KINDS)) {
+      let by = m.get(node);
+      if (!by) { by = new Map(); m.set(node, by); }
+      by.set(j, v);
+    }
+    return v;
+  }
   const caller = spec.callerScope ?? EMPTY_SCOPE;
-  let m = spec.nodeCache.get(node);
+  const m = spec.nodeCache.get(node);
   const hit = m?.get(caller)?.get(j);
   if (hit !== undefined) { __mtfStats.hits++; return hit; }
+  const v = computeAt(spec, node, j);
+  let byCaller = m?.get(caller);
+  if (!byCaller) {
+    byCaller = new Map();
+    let m2 = m;
+    if (!m2) { m2 = new Map(); spec.nodeCache.set(node, m2); }
+    m2.set(caller, byCaller);
+  }
+  byCaller.set(j, v);
+  return v;
+}
+
+/** Uncached eval of `node` at tf bar `j` (both cache paths share this). */
+function computeAt(spec: SecuritySpec, node: Node, j: number): Value {
   __mtfStats.evals++;
   advanceTo(spec, j);
   const prevBar = spec.ctx!.barIndex;
@@ -1183,10 +1425,6 @@ function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
     spec.ctx!.barIndex = prevBar;
     tfAnchor = prevAnchor;
   }
-  if (!m) { m = new Map(); spec.nodeCache.set(node, m); }
-  let byCaller = m.get(caller);
-  if (!byCaller) { byCaller = new Map(); m.set(caller, byCaller); }
-  byCaller.set(j, v);
   return v;
 }
 
@@ -1238,6 +1476,10 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   // expression must resolve params/locals against the live caller.
   spec.callerScope = frame.scope;
   ensureTfFrame(spec, frame);
+  // Caller-agnostic caches live outside nodeCache so the seenCallers routing
+  // swap below can't orphan them.
+  spec.agnosticCache ??= new Map();
+  spec.agnosticSafe ??= new Map();
   // nodeCache routing: evalAt caches per (expr node, caller scope, tf bar).
   // The caller scope is the right key — an ephemeral UDF call scope binds
   // different params per invocation, so two callers must never share an

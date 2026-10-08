@@ -62,3 +62,128 @@ describe('MTF evalAt perf bench', () => {
     expect(b.hits).toBe(a.hits);
   }, 120_000);
 });
+
+/** Deterministic bars with exact closes (golden.mkBars has no closeFn). */
+function mkFlat(n: number, stepMs: number, closeFn: (i: number) => number): BarData[] {
+  const bars: BarData[] = [];
+  for (let i = 0; i < n; i++) {
+    const c = closeFn(i);
+    bars.push({ openTime: i * stepMs, open: c - 0.5, high: c + 1, low: c - 1, close: c, volume: 100 + i });
+  }
+  return bars;
+}
+
+// ── Task 2: caller-agnostic cache ───────────────────────────────────────────
+// `f() => security(...)` calls security() from a fresh UDF scope every chart
+// bar — the seenCallers transient path would wipe nodeCache each bar, so any
+// cross-bar reuse must come from the agnostic cache.
+
+const UDF_SRC = [
+  '//@version=6',
+  'indicator("perf bench agnostic")',
+  'f() => request.security(syminfo.tickerid, "60", ta.ema(close, 20))',
+  'e = f()',
+  'c = request.security(syminfo.tickerid, "60", close)',
+  'plot(e, "e")',
+  'plot(c, "c")',
+].join('\n');
+
+const PARAM_SRC = [
+  '//@version=6',
+  'indicator("perf bench param")',
+  'f(p) => request.security(syminfo.tickerid, "60", p)',
+  'a = f(close)',
+  'plot(a, "a")',
+].join('\n');
+
+const ARR_SRC = [
+  '//@version=6',
+  'indicator("perf bench arr")',
+  'mk() => [close, open]',
+  '[x, y] = request.security(syminfo.tickerid, "60", mk())',
+  'plot(x, "x")',
+].join('\n');
+
+// Dynamic tf: chart is 15m; bar_index>4 switches "60"→"15" mid-run. The "15"
+// key is prefetched via the static spec on line `b`.
+const DYN_SRC = [
+  '//@version=6',
+  'indicator("perf bench dyn")',
+  'tf = bar_index > 4 ? "15" : "60"',
+  'a = request.security(syminfo.tickerid, tf, close)',
+  'b = request.security(syminfo.tickerid, "15", close)',
+  'plot(a, "a")',
+].join('\n');
+
+async function runSrc(src: string, chartBars: BarData[] = CHART_BARS) {
+  const s0 = { ...__mtfStats };
+  const res = await runScript(parse(src), chartBars, {
+    symbol: 'TEST',
+    timeframe: '5',
+    fetchSeries: (_s: string, tf: string) => Promise.resolve(resampleTf(BASE_1M, tf)),
+  });
+  const d = {
+    evals: __mtfStats.evals - s0.evals,
+    hits: __mtfStats.hits - s0.hits,
+    agHits: __mtfStats.agHits - s0.agHits,
+    gatePass: __mtfStats.gatePass - s0.gatePass,
+    gateFail: __mtfStats.gateFail - s0.gateFail,
+  };
+  return { res, d };
+}
+
+describe('MTF caller-agnostic cache (Task 2)', () => {
+  it('safe expr inside a per-bar UDF hits the agnostic cache (evals cut >50%)', async () => {
+    const { res, d } = await runSrc(UDF_SRC);
+    expect(res.warnings).toEqual([]);
+    // Unsafe path would recompute every chart bar (~6000+ evals: transient
+    // nodeCache wipe + O(j) warmup replay). Agnostic: ~2×tfBars.
+    expect(d.evals).toBeLessThanOrEqual(1300);
+    expect(d.agHits).toBeGreaterThan(4000);
+    expect(d.gatePass).toBeGreaterThanOrEqual(2);
+    expect(d.gateFail).toBe(0);
+    // Same (node,j) ⇒ same value: all 12 chart bars inside tf bar0 read it.
+    const vals = res.plots.get('e')!.values;
+    expect(vals[5]).toEqual(vals[11]);        // same tf bar → same cached value
+    expect(vals[5000]!.kind).not.toBe('na');  // ema(20) real once tf history fills
+  }, 120_000);
+
+  it('f(p) => security(..., p) stays per-caller (gate rejects param idents)', async () => {
+    const { res, d } = await runSrc(PARAM_SRC);
+    expect(res.warnings).toEqual([]);
+    expect(d.gateFail).toBeGreaterThanOrEqual(1);
+    // Transient caller + no agnostic cache → nodeCache wiped per bar →
+    // recompute nearly every chart bar (~6k evals vs ~1k agnostic).
+    expect(d.evals).toBeGreaterThan(5000);
+  }, 120_000);
+
+  it('array-valued expr is never written to the agnostic cache', async () => {
+    const { res, d } = await runSrc(ARR_SRC);
+    expect(res.warnings).toEqual([]);
+    expect(d.gatePass).toBeGreaterThanOrEqual(1); // gate accepts mk() — the
+    // mutable-kind guard (not the gate) is what skips the cache write, so the
+    // expr recomputes on every chart bar instead of hitting at most tfBars.
+    expect(d.evals).toBeGreaterThan(4000);
+    expect(d.agHits).toBe(0);
+  }, 120_000);
+
+  it('dynamic tf switch clears agnosticCache → values recomputed', async () => {
+    // 10 × 15m chart bars (2.5h); tf = "60" on bars 0-4, "15" after. tf15
+    // closes are distinct (i*10) so a stale post-switch read can't pass.
+    const chart = mkFlat(10, 900_000, i => 50 + i);
+    const tf60 = mkFlat(3, 3_600_000, i => 1000 + i);
+    const tf15 = mkFlat(10, 900_000, i => i * 10);
+    const res = await runScript(parse(DYN_SRC), chart, {
+      symbol: 'TEST',
+      timeframe: '15',
+      fetchSeries: (_s: string, tf: string) =>
+        Promise.resolve(tf === '15' ? tf15 : tf60),
+    });
+    expect(res.warnings).toEqual([]);
+    const vals = res.plots.get('a')!.values.map(v => (v.kind === 'int' || v.kind === 'float' ? v.v : NaN));
+    expect(vals[3]).toBeNaN();   // 60m bar0 still open (na)
+    expect(vals[4]).toBe(1000);
+    expect(vals[5]).toBe(40);    // tf switch → recomputed on 15m bars (j=4)
+    expect(vals[6]).toBe(50);
+  }, 120_000);
+});

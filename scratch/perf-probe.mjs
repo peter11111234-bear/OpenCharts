@@ -80,6 +80,9 @@ const tfBars60 = resampleTf(base1m, '60').length;
 const out = {
   evals: __mtfStats.evals,
   hits: __mtfStats.hits,
+  gatePass: __mtfStats.gatePass,
+  gateFail: __mtfStats.gateFail,
+  agHits: __mtfStats.agHits,
   setAtCalls: counts.setAt,
   ensureBarCalls: counts.ensureBar,
   wallMs,

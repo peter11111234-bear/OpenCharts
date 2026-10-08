@@ -7,15 +7,17 @@
   "chartBars": 6000,
   "tfBars": 500,
   "warnings": 0,
-  "post-task3": {
+  "post-task2": {
     "evals": 998,
     "hits": 10980,
+    "gatePass": 2,
+    "gateFail": 0,
+    "agHits": 10980,
     "setAtCalls": 94455,
     "ensureBarCalls": 60000,
-    "wallMs": 672,
+    "wallMs": 858,
     "chartBars": 6000,
     "tfBars": 500,
-    "warnings": 0,
-    "note": "allSeries membership pruning: 12 -> 10 registered series/bar (2 top-level non-var decl slots skipped); ensureBarCalls -12000 (-16.7%). evals/hits/setAt unchanged — semantic-neutral. wallMs noisy, not a regression signal."
+    "warnings": 0
   }
 }

@@ -8,7 +8,7 @@ import type { BarData, BuiltinCtx, Node, Scope as ScopeT, UdfDecl, Value } from 
 import { NA, Scope, Series } from '../contracts';
 import { BarSeries } from '../series';
 import {
-  prepareSecurity, prefetchSecurity, resetMtf, tfFloor, tfNext, tfToMs, tryEvalSecurity,
+  prepareSecurity, prefetchSecurity, resetMtf, tfFloor, tfNext, tfToMs, tryEvalSecurity, __mtfStats,
 } from '../mtf';
 import { parse } from '../parser';
 import { evalExpr, runScript } from '../interpreter';
@@ -284,6 +284,92 @@ describe('request.security alignment', () => {
     const { values, warnings } = await runSecurity(body, chart, '15', {});
     expect(values.every(v => v.kind === 'na')).toBe(true);
     expect(warnings.filter(w => w.includes('not prefetched'))).toHaveLength(1);
+  });
+});
+
+describe('caller-agnostic eval cache', () => {
+  beforeEach(resetMtf);
+  const M15 = 900_000, H1 = 3_600_000;
+  const chart = mkBars(12, M15, 0);
+  const tf60 = mkBars(3, H1, 0, i => 100 + i * 100);
+
+  /** Like runSecurity but each bar calls with a FRESH child scope — the same
+   *  transient shape a UDF invocation produces (fresh callScope per bar). */
+  async function runTransient(
+    body: Node[], chartBars: BarData[], chartTf: string,
+    fetchMap: Record<string, BarData[]>, extra?: (scope: ScopeT) => void,
+  ): Promise<{ values: Value[]; warnings: string[] }> {
+    resetMtf();
+    const scope = new Scope();
+    extra?.(scope);
+    prepareSecurity(body);
+    const warnings: string[] = [];
+    const fetchSeries = async (s: string, t: string): Promise<BarData[]> =>
+      fetchMap[`${s}|${t}`] ?? fetchMap[`|${t}`] ?? [];
+    await prefetchSecurity(mkCtx(chartBars, 0, chartTf, { fetchSeries, warnings }));
+    const values: Value[] = [];
+    const callNode = findSecurityCall(body)!;
+    for (let i = 0; i < chartBars.length; i++) {
+      values.push(tryEvalSecurity(callNode,
+        { scope: new Scope(scope), ctx: mkCtx(chartBars, i, chartTf, { fetchSeries, warnings }) }) ?? NA);
+    }
+    return { values, warnings };
+  }
+
+  it('caller-agnostic expr survives transient caller scopes (node,j cache)', async () => {
+    // Before the agnostic cache every fresh scope looked unseen → nodeCache was
+    // reset per bar → warmup replayed O(j) evals each bar. With the gate the
+    // `close` expr caches per (node, j) and only j=0..1 ever compute.
+    const e0 = __mtfStats.evals, h0 = __mtfStats.hits, a0 = __mtfStats.agHits;
+    const body = [assign('x', security(str(''), str('60'), ident('close')))];
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(values.map(valOf).slice(4, 8)).toEqual([100, 100, 100, 100]);
+    expect(values.map(valOf).slice(8, 12)).toEqual([200, 200, 200, 200]);
+    expect(__mtfStats.evals - e0).toBeLessThanOrEqual(3);
+    expect(__mtfStats.hits - h0).toBeGreaterThanOrEqual(6);
+    expect(__mtfStats.agHits - a0).toBeGreaterThanOrEqual(6);
+  });
+
+  it('expr referencing a caller binding stays per-caller (gate rejects)', async () => {
+    const e0 = __mtfStats.evals, f0 = __mtfStats.gateFail;
+    const body = [assign('x', security(str(''), str('60'), ident('p')))];
+    const a = await runTransient(body, chart, '15', { '|60': tf60 },
+      scope => scope.define('p', mkVal(7)));
+    const b = await runTransient(body, chart, '15', { '|60': tf60 },
+      scope => scope.define('p', mkVal(9)));
+    expect(valOf(a.values[4]!)).toBe(7);
+    expect(valOf(b.values[4]!)).toBe(9);
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(2); // rejected in both runs
+    // Per-caller path under a transient scope still recomputes (no agnostic).
+    expect(__mtfStats.evals - e0).toBeGreaterThanOrEqual(12);
+  });
+
+  it('dynamic tf switch drops agnostic values — recomputed on the new tf', async () => {
+    const tf15 = mkBars(12, M15, 0, i => i * 10);
+    const aCall = security(str(''), ident('tf'), ident('close'));
+    const body = [
+      assign('tf', { type: 'ternary', test: binary('>', ident('bar_index'), num(4)), cons: str('15'), alt: str('60') }),
+      assign('a', aCall),
+      assign('b', security(str(''), str('15'), ident('close'))), // prefetches '|15'
+    ];
+    resetMtf();
+    const scope = new Scope();
+    prepareSecurity(body);
+    const warnings: string[] = [];
+    const fetchSeries = async (_s: string, t: string): Promise<BarData[]> =>
+      Promise.resolve(t === '15' ? tf15 : tf60);
+    const ctx0 = mkCtx(chart, 0, '15', { fetchSeries, warnings });
+    await prefetchSecurity(ctx0, { scope, ctx: ctx0 });
+    const values: Value[] = [];
+    for (let i = 0; i < chart.length; i++) {
+      values.push(tryEvalSecurity(aCall,
+        { scope: new Scope(scope), ctx: mkCtx(chart, i, '15', { fetchSeries, warnings }) }) ?? NA);
+    }
+    expect(warnings).toEqual([]);
+    expect(valOf(values[3]!)).toBe('na');  // 60m bar0 still open at t0=2.7M
+    expect(valOf(values[4]!)).toBe(100);   // 60m bar0 completes at t0=3.6M
+    expect(valOf(values[5]!)).toBe(40);    // switched to 15m → recompute j=4
+    expect(valOf(values[6]!)).toBe(50);
   });
 });
 
