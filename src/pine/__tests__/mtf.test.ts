@@ -759,6 +759,126 @@ describe('caller-agnostic eval cache', () => {
     expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
   });
 
+  it('index := through a non-var ALIAS of shared state rejects — u=a', async () => {
+    // `var a=[0]; u=a; u[0]:=…` — `u` is bound non-var, but its initializer
+    // is an ident so the binding ALIASES the persistent var slot's array.
+    // 'bound non-var root is safe' was wrong here; only provably fresh
+    // roots pass now (QA15 P2).
+    const f0 = __mtfStats.gateFail;
+    const f = {
+      type: 'func', name: 'aliasw', params: [],
+      body: [
+        { type: 'var', name: 'a', value: arraylit([num(0)]) } as Node,
+        assign('u', ident('a')),
+        { type: 'reassign', target: histref(ident('u'), num(0)),
+          value: binary('+',
+            call(member(ident('array'), 'get'), ident('u'), num(0)), num(1)) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      f,
+      assign('x', security(str(''), str('60'), call(ident('aliasw')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('index := on a UDF PARAM rejects — the param aliases the caller argument', async () => {
+    // `g(x) => x[0] := x[0]+1` called as g(a) mutates the array the CALLER
+    // passed in — a param root is bound-but-never-fresh (QA15 P2).
+    const f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'g',
+      params: [{ name: 'x' }],
+      body: [
+        { type: 'reassign', target: histref(ident('x'), num(0)),
+          value: binary('+',
+            call(member(ident('array'), 'get'), ident('x'), num(0)), num(1)) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      { type: 'var', name: 'a', value: arraylit([num(0)]) } as Node,
+      g,
+      assign('x', security(str(''), str('60'), call(ident('g'), ident('a')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('index := on a fresh arraylit binding still passes — expr-local object', async () => {
+    // `u = [0]; u[0] := …` — u is bound by a provably fresh initializer in
+    // the same subtree, so the mutated array is created per eval (QA15 P2).
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const f = {
+      type: 'func', name: 'freshw', params: [],
+      body: [
+        assign('u', arraylit([num(0)])),
+        { type: 'reassign', target: histref(ident('u'), num(0)),
+          value: binary('+',
+            call(member(ident('array'), 'get'), ident('u'), num(0)), num(1)) } as Node,
+        call(member(ident('array'), 'get'), ident('u'), num(0)),
+      ],
+    } as Node;
+    const body = [
+      f,
+      assign('x', security(str(''), str('60'), call(ident('freshw')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('param shadowing an outer var name un-shadows varBound — := writes the param slot', async () => {
+    // `var c = 0; h = (c) => c := c + 1` — inside the arrow `c` is the
+    // param, a fresh local slot, so `:=` writes it not the persistent var
+    // slot (QA15 P3: params delete from the copied varBound).
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const body = [
+      { type: 'var', name: 'c', value: num(0) } as Node,
+      assign('h', {
+        type: 'arrow', params: [{ name: 'c' }],
+        body: { type: 'reassign', target: ident('c'),
+                value: binary('+', ident('c'), num(1)) } as Node,
+      } as Node),
+      assign('x', security(str(''), str('60'), call(ident('h'), num(1)))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('non-var decl inside an if arm shadows the outer var — := writes the local slot', async () => {
+    // `var c = 0; if ok → c = 9; c := c + 1` — the inner non-var decl
+    // rebinds `c`, so it must leave varBound for the rest of that block
+    // (QA15 P3).
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const f = {
+      type: 'func', name: 'shdecl', params: [],
+      body: [
+        { type: 'var', name: 'c', value: num(0) } as Node,
+        {
+          type: 'if', test: { type: 'bool', v: true } as Node,
+          then: [
+            assign('c', num(9)),
+            { type: 'reassign', target: ident('c'),
+              value: binary('+', ident('c'), num(1)) } as Node,
+          ],
+          elseIfs: [], else: null,
+        } as Node,
+        ident('c'),
+      ],
+    } as Node;
+    const body = [
+      f,
+      assign('x', security(str(''), str('60'), call(ident('shdecl')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+  });
+
  });
 
 describe('request.security regression fixes', () => {
