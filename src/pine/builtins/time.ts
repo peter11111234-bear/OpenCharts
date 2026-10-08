@@ -39,7 +39,7 @@ export function tzOf(ctx: BuiltinCtx): string {
 
 // Intl parts cache per timezone
 const partCache = new Map<string, Intl.DateTimeFormat>();
-export const partsOf = (ms: number, tz: string): Intl.DateTimeFormatPart[] => {
+const partsFmt = (tz: string): Intl.DateTimeFormat => {
   let f = partCache.get(tz);
   if (!f) {
     try {
@@ -49,13 +49,73 @@ export const partsOf = (ms: number, tz: string): Intl.DateTimeFormatPart[] => {
     }
     partCache.set(tz, f);
   }
-  return f.formatToParts(new Date(ms));
+  return f;
+};
+
+// (ms, tz) → calendar fields; each entry holds all 7 fields read by part().
+// One formatToParts per unique (ms,tz) — was 6+ per field-access per bar.
+interface DateParts {
+  year: number; month: number; day: number;
+  hour: number; minute: number; second: number;
+  weekday: number; // 1=Sun..7=Sat (TV dayofweek); 0 = unknown
+}
+// Test instrumentation: counts actual Intl.formatToParts calls.
+export let __partsOfCalls = 0;
+// Bounded: per (tz, ms) — tz count is small (≤ ~3/run), ms count ≤ bars.
+const partsMemo = new Map<string, Map<number, DateParts>>();
+// numPart preserves the old semantics: a missing part yields NaN
+// (old code did Number(undefined) → NaN; Number('') would be 0 — WRONG).
+const numPart = (v: string | undefined): number => (v === undefined ? NaN : Number(v));
+const partsRec = (ms: number, tz: string): DateParts => {
+  let perMs = partsMemo.get(tz);
+  if (!perMs) { perMs = new Map(); partsMemo.set(tz, perMs); }
+  let r = perMs.get(ms);
+  if (r !== undefined) return r;
+  __partsOfCalls++;
+  const parts = partsFmt(tz).formatToParts(new Date(ms));
+  const get = (t: Intl.DateTimeFormatPartTypes): string | undefined =>
+    parts.find((x) => x.type === t)?.value;
+  const wdStr = (get('weekday') ?? '').toLowerCase();
+  const hourRaw = numPart(get('hour'));
+  r = {
+    year: numPart(get('year')),
+    month: numPart(get('month')),
+    day: numPart(get('day')),
+    hour: hourRaw === 24 ? 0 : hourRaw, // preserves existing 24→0 quirk
+    minute: numPart(get('minute')),
+    second: numPart(get('second')),
+    weekday: ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(wdStr) + 1,
+  };
+  perMs.set(ms, r);
+  return r;
+};
+
+export const partsOf = (ms: number, tz: string): Intl.DateTimeFormatPart[] => {
+  // Backward-compat shim for external callers (isTfBoundary/tests) that want
+  // the raw parts array. Not on the hot path — hot callers use partsRec.
+  const r = partsRec(ms, tz);
+  return [
+    { type: 'year', value: String(r.year) },
+    { type: 'month', value: String(r.month).padStart(2, '0') },
+    { type: 'day', value: String(r.day).padStart(2, '0') },
+    { type: 'hour', value: String(r.hour).padStart(2, '0') },
+    { type: 'minute', value: String(r.minute).padStart(2, '0') },
+    { type: 'second', value: String(r.second).padStart(2, '0') },
+    { type: 'weekday', value: ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][r.weekday - 1]! },
+  ] as Intl.DateTimeFormatPart[];
 };
 const part = (ms: number, tz: string, t: Intl.DateTimeFormatPartTypes): number => {
-  const p = partsOf(ms, tz).find((x) => x.type === t)?.value;
-  if (t === 'weekday') return ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf((p ?? '').toLowerCase()) + 1;
-  const n = Number(p);
-  return t === 'hour' && n === 24 ? 0 : n;
+  const r = partsRec(ms, tz);
+  switch (t) {
+    case 'year': return r.year;
+    case 'month': return r.month;
+    case 'day': return r.day;
+    case 'hour': return r.hour;
+    case 'minute': return r.minute;
+    case 'second': return r.second;
+    case 'weekday': return r.weekday;
+    default: return NaN;
+  }
 };
 
 /** tzOffsetMs(ms) = instant − wall-clock-UTC for the zone `tz` at instant ms.
