@@ -121,3 +121,14 @@
   * Span-aware toFetch landed: tfFloor/tfNext calendar-aware span count + FETCH_WARMUP 500 + FETCH_CAP 20000. Bench (fixed tfMs): 300×15 = 6.3s, 100×15 = 4.69s. Per-tf limits on 300×15m chart: 15m→800, 60m→576, 4H→520, D→505, W→502, M→502 (was flat 1200 for all).
   * Known-not-fixed (deferred, all documented by QA/CR): nested runScript via fetchSeries would self-deadlock the mutex (embedder contract, not reachable today); Pine-level while(true) still wedges all sessions behind mutex (widened blast radius of already-fatal case); shioaji getBars ignores BarRange.to when chart is historical (provider-level defect, separate ticket); restore-path legend title stays 'Indicator' (vela-side naming gap, pre-existing); superseded-run stale emit = one frame lag by design; E2 parse-per-run sync cost on tick storms (cache AST on PineToken candidate).
   * Verified: 23 test files / 473 tests green incl. golden 10/10; QA test files qa_yield_c560c0f (13) + qa_errorpath_c560c0f (9) kept as regression coverage.
+
+- 2026-10-08 MTF METHOD-2 (caller-agnostic evalAt cache) — CONVERGED, 15 commits (1e4a902→8823278):
+  * Landed: agnostic (node,j) cache with exprSafeForAgnostic gate (bound/varBound/fresh/rebound tracking, producerSafe transitive walk, udfSafe inStack); trackedSlots/ensureBar membership pruning (ensureBar 72000→60000); TRIS390 gate 73 pass/21 fail, evals 5988→1879; golden TRIS390 deterministic PASS.
+  * QA/CR fixes folded in: global-callee bypass, transitive producer leak, param defaults, UDF break 3 escape paths, var := shared mutation, member/index aliases, := rebind taint, nested index, merge-order hole (CR3 probe-verified).
+  * Test hardening commit 8823278: value assertions on reject/pass paths, gate coverage gaps (var-multi, writes>0 producer, switch-in-expr, nested request.*), promoted scratch sweeps → mtf_invariance.test.ts (T1-T8/N1-N6), alias_repro.test.ts.
+  * 代辦事項 (next rounds):
+    - input.source alias write-through (PROGRESS R2 P1): `x = input.source(close); x := 999` corrupts ctx.close — pinned as it.fails in src/pine/__tests__/alias_repro.test.ts; UDF-alias variant already fixed (regular it regression guard).
+    - golden e2e `final`/`norm2` fixture ENOENT — pre-existing, unrelated to cache work; regenerate or restore scripts/golden fixtures.
+    - Method 1 (transpile) — planned in a separate session; agnostic cache layer stays useful either way.
+    - scratch/ kept tools: gate-rate.mjs (TRIS390 gate tuning), perf-probe.mjs (setAt/ensureBar counters), scratch_probe.test.ts (untracked CPU-profile harness, machine-local).
+  * Suite state: 552 pass / 2 fail (the two golden fixture ENOENTs above).
