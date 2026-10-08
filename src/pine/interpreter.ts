@@ -1570,9 +1570,8 @@ function compiledEnabled(): boolean {
   const g = globalThis as Record<string, unknown>;
   if (g.__pineInterp === true) return false;
   if (typeof process !== 'undefined' && process.env?.PINE_INTERP === '1') return false;
-  // Default-on lands in Task 6 (`return true`); until then the compiled path
-  // is opt-in via `globalThis.__pineCompiled = true` so tests can A/B it.
-  return g.__pineCompiled === true;
+  // Compiled path is the default; opt out via `__pineInterp`/`PINE_INTERP=1`.
+  return true;
 }
 
 /** Wraps a raw per-kind body so it carries evalExpr's error contract. */
