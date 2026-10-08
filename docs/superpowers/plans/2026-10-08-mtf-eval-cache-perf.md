@@ -221,3 +221,14 @@ Run: `node --experimental-strip-types scratch/perf-probe.mjs | tee scratch/perf-
 ## Review Ledger
 
 （執行時填）
+
+## Measured deltas (2026-10-08 closeout)
+
+| Stage | 見高K4.55 | 高量1.46 |
+|---|---|---|
+| Baseline (pre-A/B/C) | 10.2s | 4.2s |
+| Post A+B+C + fixes | 5.1s | 2.1s |
+| Post slice-D (compile-to-closures, default-on) | ~5.4s | ~2.14s |
+| Real Chromium runIndicator (TSE:2330 5m ×1045 bars) | ~11.3s wall (eval ~11s / fetch 0.28s) | n/a |
+
+Slice-D hit its correctness bar (bit-identical, 627 tests green, 99.5% body compiled) but perf landed +2-7% — evalNode dispatch was only ~4% of runtime. Remaining cost: BarSeries.setAt / bindArgs / ensureBar / evalArg machinery.
