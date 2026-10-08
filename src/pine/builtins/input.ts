@@ -70,10 +70,11 @@ function rawDefval(v: Value): unknown {
   }
 }
 
-// Per-callsite memo of {id,title,schema,resolver}. schema.push is one-shot per
-// run (ctx.inputSchemas is []-reset at run start). `resolver` is the function
-// that derives the coerced return value from (defval, override) — bound once
-// per callsite, called per bar with the fresh override.
+// Per-callsite memo of {id,title,coercedDefval}. schema.push is one-shot per
+// run (ctx.inputSchemas is []-reset at run start); `coercedDefval` is the
+// defval normalized to the declared kind, captured once per callsite — the
+// ctx.inputs override is re-read EVERY bar (never baked in), so mid-run
+// deletion/addition of ctx.inputs[title|id] takes effect on the next call.
 //
 // Cache lifetime: WeakMap<RtCtx> so each run's memo is dropped with the ctx.
 // Cache key: ctx.callsite — already stable `#N` per Call node, and already
@@ -81,9 +82,8 @@ function rawDefval(v: Value): unknown {
 interface InputMemo {
   id: string;
   title: string;
-  schemaPushed: boolean;
-  // rawDefval-captured value — constant per run (input-qualified).
-  resolved: Value;
+  /** defval normalized to the declared kind — the no-override value. */
+  coercedDefval: Value;
 }
 let __inputSchemaBuilds = 0;
 export { __inputSchemaBuilds }; // test instrumentation only
@@ -102,46 +102,43 @@ function recordAndOverride(
   defval: unknown,
   coerce: (defval: unknown, override: unknown) => Value,
 ): { id: string; title: string; value: Value } {
-  const site = ctx.callsite ?? `g${ctx.miscSeq ?? 0}`;
-  const memo = inputMemoOf(ctx).get(site);
-  if (memo !== undefined) {
-    // Re-read the override per bar — one dict lookup, correct if ctx.inputs
-    // is ever injected mid-run. Fresh {...} wrapper — callers may mutate the
-    // returned Value, so the memoized object must never escape.
-    const override = ctx.inputs?.[memo.title] ?? ctx.inputs?.[memo.id];
-    const v = override !== undefined ? coerce(memo.resolved, override) : memo.resolved;
-    return { id: memo.id, title: memo.title, value: { ...v } };
+  const site = ctx.callsite ?? `g${(ctx.miscSeq = (ctx.miscSeq ?? 0) + 1)}`;
+  let memo = inputMemoOf(ctx).get(site);
+  if (memo === undefined) {
+    __inputSchemaBuilds++;
+    const title = strArg(bound, 'title', 'input');
+    // Fallback id must be stable per call site: CJK titles slug to '' and a
+    // per-bar id would mint a fresh name every bar, defeating schema dedup.
+    const id = slugify(title, `input_${site}`);
+
+    const schema: InputSchemaLite = { id, name: title, type, defval };
+    const minval = bound.get('minval');
+    if (minval !== undefined && minval.kind !== 'na') schema.minval = asNum(minval);
+    const maxval = bound.get('maxval');
+    if (maxval !== undefined && maxval.kind !== 'na') schema.maxval = asNum(maxval);
+    const step = bound.get('step');
+    if (step !== undefined && step.kind !== 'na') schema.step = asNum(step);
+    const options = bound.get('options');
+    if (options?.kind === 'array') schema.options = options.v.map(rawDefval);
+    const group = bound.get('group');
+    if (group !== undefined && group.kind !== 'na') schema.group = asStr(group);
+    const inline = bound.get('inline');
+    if (inline !== undefined && inline.kind !== 'na') schema.inline = asStr(inline);
+    const tooltip = bound.get('tooltip');
+    if (tooltip !== undefined && tooltip.kind !== 'na') schema.tooltip = asStr(tooltip);
+
+    ctx.inputSchemas ??= [];
+    if (!ctx.inputSchemas.some(s => s.id === schema.id)) ctx.inputSchemas.push(schema);
+
+    memo = { id, title, coercedDefval: coerce(defval, undefined) };
+    inputMemoOf(ctx).set(site, memo);
   }
-  __inputSchemaBuilds++;
-  const title = strArg(bound, 'title', 'input');
-  // Fallback id must be stable per call site: CJK titles slug to '' and a
-  // per-call counter would mint a fresh id every bar, defeating the schema dedup.
-  const id = slugify(title, `input_${site}`);
-
-  const schema: InputSchemaLite = { id, name: title, type, defval };
-  const minval = bound.get('minval');
-  if (minval !== undefined && minval.kind !== 'na') schema.minval = asNum(minval);
-  const maxval = bound.get('maxval');
-  if (maxval !== undefined && maxval.kind !== 'na') schema.maxval = asNum(maxval);
-  const step = bound.get('step');
-  if (step !== undefined && step.kind !== 'na') schema.step = asNum(step);
-  const options = bound.get('options');
-  if (options?.kind === 'array') schema.options = options.v.map(rawDefval);
-  const group = bound.get('group');
-  if (group !== undefined && group.kind !== 'na') schema.group = asStr(group);
-  const inline = bound.get('inline');
-  if (inline !== undefined && inline.kind !== 'na') schema.inline = asStr(inline);
-  const tooltip = bound.get('tooltip');
-  if (tooltip !== undefined && tooltip.kind !== 'na') schema.tooltip = asStr(tooltip);
-
-  ctx.inputSchemas ??= [];
-  if (!ctx.inputSchemas.some(s => s.id === schema.id)) ctx.inputSchemas.push(schema);
-
-  const resolved = coerce(defval, ctx.inputs?.[title] ?? ctx.inputs?.[id]);
-  const entry: InputMemo = { id, title, schemaPushed: true, resolved };
-  inputMemoOf(ctx).set(site, entry);
-  // Fresh wrapper here too — memo.resolved must stay untouched by callers.
-  return { id, title, value: { ...resolved } };
+  // Re-read the override per bar — one dict lookup, correct whether ctx.inputs
+  // is injected or deleted mid-run. Fresh {...} wrapper — callers may mutate
+  // the returned Value, so the memoized object must never escape.
+  const override = ctx.inputs?.[memo.title] ?? ctx.inputs?.[memo.id];
+  const v = override !== undefined ? coerce(memo.coercedDefval, override) : memo.coercedDefval;
+  return { id: memo.id, title: memo.title, value: { ...v } };
 }
 
 function scalarInput(

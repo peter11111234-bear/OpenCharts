@@ -61,7 +61,12 @@ interface DateParts {
 }
 // Test instrumentation: counts actual Intl.formatToParts calls.
 export let __partsOfCalls = 0;
-// Bounded: per (tz, ms) — tz count is small (≤ ~3/run), ms count ≤ bars.
+// Bounded: outer map is per tz (tz count is small, ≤ ~3/run); each inner map
+// is capped at 4096 (ms,DateParts) entries — it survives across runs, so
+// without a cap a long session of many distinct bars would grow it forever.
+// On overflow we clear and keep going: entries are a pure cache, correctness
+// is unaffected (the evicted ms is just recomputed via formatToParts).
+const PARTS_MEMO_CAP = 4096;
 const partsMemo = new Map<string, Map<number, DateParts>>();
 // numPart preserves the old semantics: a missing part yields NaN
 // (old code did Number(undefined) → NaN; Number('') would be 0 — WRONG).
@@ -86,13 +91,17 @@ const partsRec = (ms: number, tz: string): DateParts => {
     second: numPart(get('second')),
     weekday: ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(wdStr) + 1,
   };
+  if (perMs.size >= PARTS_MEMO_CAP) perMs.clear();
   perMs.set(ms, r);
   return r;
 };
 
 export const partsOf = (ms: number, tz: string): Intl.DateTimeFormatPart[] => {
-  // Backward-compat shim for external callers (isTfBoundary/tests) that want
-  // the raw parts array. Not on the hot path — hot callers use partsRec.
+  // Backward-compat shim for external callers (str.ts fmtTime, tests) that want
+  // the raw parts array. Synthesizes only the 7 part types partsRec stores —
+  // other Intl part types (literal, dayPeriod, era, …) are NOT present; callers
+  // needing them must call partsFmt(tz).formatToParts directly. Not on the hot
+  // path — hot calendar callers use partsRec.
   const r = partsRec(ms, tz);
   return [
     { type: 'year', value: String(r.year) },

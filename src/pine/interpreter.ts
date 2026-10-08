@@ -323,6 +323,16 @@ function siteKey(run: RunState, node: object): object {
   return leaf;
 }
 
+/** Callsite-composed identity for `node` — mtf.ts uses it to key chart-domain
+ *  security() emit history per caller callSITE: a UDF body's shared AST node
+ *  reached through different invocation sites must keep separate histories.
+ *  (The caller Scope itself can't be the key — UDF call scopes are ephemeral,
+ *  allocated fresh per invocation, so history under them would never survive
+ *  to the next bar.) */
+export function callsiteKey(ctx: BuiltinCtx, node: object): object {
+  return siteKey(runOf(ctx), node);
+}
+
 /** Register a slot for bar-end densification (deduped via trackedSlots). */
 function trackSeries(run: RunState, s: BarSeries): void {
   if (!run.trackedSlots.has(s)) {
@@ -1153,16 +1163,18 @@ function callBuiltin(
   node: Call,
 ): Value {
   try {
-    const r = b(ctx, args, named);
-    // Flush arg-binding warnings (e.g. `source=`+`series=` both given) now
-    // that a ctx is reachable; dedup so a per-bar builtin warns once.
-    for (const w of drainBindWarnings()) {
-      if (!ctx.warnings.includes(w)) ctx.warnings.push(w);
-    }
-    return r;
+    return b(ctx, args, named);
   } catch (e) {
     if (e === BREAK || e === CONTINUE || e instanceof ReturnSignal) throw e;
     throw wrapPineError(e, node);
+  } finally {
+    // Flush arg-binding warnings (e.g. `source=`+`series=` both given) now
+    // that a ctx is reachable; dedup so a per-bar builtin warns once. Must run
+    // in `finally` — on a thrown builtin the queue is module-global, so an
+    // undrained warning would leak onto the NEXT call's ctx.
+    for (const w of drainBindWarnings()) {
+      if (!ctx.warnings.includes(w)) ctx.warnings.push(w);
+    }
   }
 }
 
