@@ -29,6 +29,17 @@ export const NA: Value = { kind: 'na' };
 export const VTRUE: Value = { kind: 'bool', v: true };
 export const VFALSE: Value = { kind: 'bool', v: false };
 
+// ── control-flow signals (thrown by the evaluator; not errors) ──────────────
+// Shared here so mtf.ts (injected via registerMtf, no interpreter import) can
+// identity-check them instead of duck-typing symbol descriptions.
+export const BREAK: unique symbol = Symbol('pine.break');
+export const CONTINUE: unique symbol = Symbol('pine.continue');
+
+/** Unwinds a UDF `return` to its callsite. */
+export class ReturnSignal {
+  constructor(readonly value: Value) {}
+}
+
 export interface DrawObj {
   id: number;
   // union of line/label/box/table fields; runtime narrows by `kind`

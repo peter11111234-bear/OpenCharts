@@ -830,19 +830,29 @@ describe('caller-agnostic eval cache', () => {
     expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
   });
 
-  it('param shadowing an outer var name un-shadows varBound — := writes the param slot', async () => {
-    // `var c = 0; h = (c) => c := c + 1` — inside the arrow `c` is the
-    // param, a fresh local slot, so `:=` writes it not the persistent var
-    // slot (QA15 P3: params delete from the copied varBound).
+  it('param shadowing a var name un-shadows varBound — := writes the param slot', async () => {
+    // `var c = 0; h = (c) => c := c + 1` INSIDE a gated UDF — the arrow's
+    // param c deletes c from the copied varBound, so `c :=` writes the
+    // param slot, not the persistent var slot (QA15 P3). Declaring (not
+    // calling) the arrow exercises this: the gate walks decl bodies, and
+    // a bound callee would reject under the closure rule. (The var decl
+    // must be inside the gated body — at top level the producerSafe walk
+    // would see varBound = ∅ and exercise nothing.)
     const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'pshadow', params: [],
+      body: [
+        { type: 'var', name: 'c', value: num(0) } as Node,
+        assign('h', {
+          type: 'arrow', params: [{ name: 'c' }],
+          body: { type: 'reassign', target: ident('c'),
+                  value: binary('+', ident('c'), num(1)) } as Node,
+        } as Node),
+      ],
+    } as Node;
     const body = [
-      { type: 'var', name: 'c', value: num(0) } as Node,
-      assign('h', {
-        type: 'arrow', params: [{ name: 'c' }],
-        body: { type: 'reassign', target: ident('c'),
-                value: binary('+', ident('c'), num(1)) } as Node,
-      } as Node),
-      assign('x', security(str(''), str('60'), call(ident('h'), num(1)))),
+      g,
+      assign('x', security(str(''), str('60'), call(ident('pshadow')))),
     ];
     await runTransient(body, chart, '15', { '|60': tf60 });
     expect(__mtfStats.gateFail - f0).toBe(0);
@@ -956,6 +966,38 @@ describe('caller-agnostic eval cache', () => {
       { type: 'var', name: 'a', value: arraylit([num(0)]) } as Node,
       g,
       assign('x', security(str(''), str('60'), call(ident('armw'), ident('a')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('rebound before an arm-local shadow still escapes — u[0] := after rejects', async () => {
+    // `u = [0]; if c → u := p; u = [9]; … u[0] :=` — the `=` re-decl shadows
+    // for POST-decl marks, but the `u := p` BEFORE it wrote through to the
+    // outer slot, so parent's u stays bound to p after the arm. A merge that
+    // swallows pre-shadow rebound marks leaves u `fresh` → u[0] := passes
+    // and mutates the caller's `a` under the agnostic cache (CR3 hole).
+    const f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'shrebind', params: [{ name: 'p' }],
+      body: [
+        assign('u', arraylit([num(0)])),
+        {
+          type: 'if', test: { type: 'bool', v: true } as Node,
+          then: [
+            { type: 'reassign', target: ident('u'), value: ident('p') } as Node,
+            assign('u', arraylit([num(9)])),
+          ],
+          elseIfs: [], else: null,
+        } as Node,
+        { type: 'reassign', target: histref(ident('u'), num(0)), value: num(99) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      { type: 'var', name: 'a', value: arraylit([num(0)]) } as Node,
+      g,
+      assign('x', security(str(''), str('60'), call(ident('shrebind'), ident('a')))),
     ];
     await runTransient(body, chart, '15', { '|60': tf60 });
     expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);

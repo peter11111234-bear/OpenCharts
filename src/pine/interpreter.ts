@@ -23,7 +23,10 @@
 //                            prefetchSecurity}) — injected, no static import.
 
 import {
+  BREAK,
+  CONTINUE,
   NA,
+  ReturnSignal,
   Series,
   VFALSE,
   VTRUE,
@@ -73,15 +76,6 @@ import {
 export type { Frame } from './scope';
 export { PineRuntimeError } from './errors';
 
-// ── control-flow signals (internal, not errors) ──────────────────────────────
-
-const BREAK = Symbol('pine.break');
-const CONTINUE = Symbol('pine.continue');
-
-class ReturnSignal {
-  constructor(readonly value: Value) {}
-}
-
 // ── MTF injection seam ────────────────────────────────────────────────────────
 
 export interface MtfHooks {
@@ -110,8 +104,9 @@ export function registerMtf(h: MtfHooks): void {
 interface RunState {
   /** Declaring node → the variable's BarSeries (stable across bars/scopes). */
   declSlots: Map<object, BarSeries>;
-  /** Every registered persistent slot — dedup for ensureList. */
-  allSeries: Set<BarSeries>;
+  /** Slots registered for bar-end densification — dedup for ensureList
+   *  (post-pruning this holds ONLY slots that still need ensureBar). */
+  trackedSlots: Set<BarSeries>;
   /** Registered slots in registration order — the bar-end densify list. */
   ensureList: BarSeries[];
   /** True only while the top-level `for (const stmt of body)` loop runs —
@@ -158,7 +153,7 @@ function runOf(ctx: BuiltinCtx): RunState {
   if (!r) {
     r = {
       declSlots: new Map(),
-      allSeries: new Set(),
+      trackedSlots: new Set(),
       ensureList: [],
       topLevelBody: false,
       topStmtIdx: -1,
@@ -321,10 +316,10 @@ function siteKey(run: RunState, node: object): object {
   return key;
 }
 
-/** Register a slot for bar-end densification (deduped via allSeries). */
+/** Register a slot for bar-end densification (deduped via trackedSlots). */
 function trackSeries(run: RunState, s: BarSeries): void {
-  if (!run.allSeries.has(s)) {
-    run.allSeries.add(s);
+  if (!run.trackedSlots.has(s)) {
+    run.trackedSlots.add(s);
     run.ensureList.push(s);
   }
 }
@@ -478,14 +473,14 @@ export function evalBlock(stmts: Node[], frame: Frame): Value {
   // Nested bodies may run conditionally — decl slots created here are NOT
   // provably written every bar, so they must register for ensureBar.
   const run = runOf(frame.ctx);
-  const wasTop = run.topLevelBody;
-  run.topLevelBody = false;
+  const wasTop = run.topLevelBody, wasIdx = run.topStmtIdx;
+  run.topLevelBody = false; run.topStmtIdx = -1;
   try {
     let last: Value = { kind: 'void' };
     for (const s of stmts) last = evalExpr(s, frame);
     return last;
   } finally {
-    run.topLevelBody = wasTop;
+    run.topLevelBody = wasTop; run.topStmtIdx = wasIdx;
     rt.scopeDepth!--;
   }
 }
@@ -1252,8 +1247,8 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
   // UDF bodies run conditionally — a single-expression body evaluated via
   // evalExpr would otherwise inherit the top-level flag and wrongly prune
   // a decl slot it creates.
-  const wasTop = run.topLevelBody;
-  run.topLevelBody = false;
+  const wasTop = run.topLevelBody, wasIdx = run.topStmtIdx;
+  run.topLevelBody = false; run.topStmtIdx = -1;
   try {
     if (Array.isArray(fn.body)) return evalBlock(fn.body, callFr);
     return evalExpr(fn.body, callFr);
@@ -1272,7 +1267,7 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
     }
     throw e;
   } finally {
-    run.topLevelBody = wasTop;
+    run.topLevelBody = wasTop; run.topStmtIdx = wasIdx;
     rt.scopeDepth!--;
   }
 }
@@ -1666,7 +1661,7 @@ async function runScriptInner(
   // of the body (bare or if/switch-arm break/continue/return) caps pruning —
   // decls at or after it aren't provably written every bar, so their slots
   // must stay in ensureList or `x[1]` misaligns on skipped bars.
-  run.pruneCutoff = body.length;
+  run.pruneCutoff = Infinity; // default: no early exit in body (matches runOf init)
   for (let i = 0; i < body.length; i++) {
     if (stmtMayExitTop(body[i]!, false, false)) { run.pruneCutoff = i; break; }
   }
@@ -1880,7 +1875,11 @@ export function collectInputs(body: Node[]): InputSchemaLite[] {
   return out;
 }
 
-/** Generic recursive AST walker (Arg / case / elseIf wrappers handled). */
+/** Generic recursive AST walker (Arg / case / elseIf wrappers handled).
+ *  Kept separate from astChildren: this one VISITS each node (callback)
+ *  and recurses pre-order, while astChildren only COLLECTS one level of
+ *  children — stmtMayExitTop needs that two-phase shape. Unifying them
+ *  isn't worth the flag-parameter complexity (CR2). */
 function walkNodes(nodes: Node | Node[] | undefined | null, fn: (n: Node) => void): void {
   if (!nodes) return;
   if (Array.isArray(nodes)) {

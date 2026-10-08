@@ -854,7 +854,7 @@ describe('review regressions', () => {
   });
 });
 
-describe('allSeries membership pruning (ensureBar list)', () => {
+describe('trackedSlots membership pruning (ensureBar list)', () => {
   /** Unique series the bar-end densify loop touched during one run. */
   async function densified(body: Node[], nBars = 4): Promise<Set<BarSeries>> {
     const seen = new Set<BarSeries>();

@@ -29,7 +29,7 @@
 // producer expression is re-evaluated in the tf context.
 
 import type { Arg, BarData, BuiltinCtx, Call, Node, Param, PineType, UdfDecl, Value } from './contracts';
-import { NA, Scope, Series } from './contracts';
+import { BREAK, CONTINUE, NA, ReturnSignal, Scope, Series } from './contracts';
 import { PineRuntimeError } from './errors';
 import { evalBlock, evalExpr, registerMtf } from './interpreter';
 import { BarSeries, ForwardingSeries, histGetAt, seriesHooks } from './series';
@@ -1045,8 +1045,8 @@ function advanceTo(spec: SecuritySpec, j: number): void {
 
 /**
  * Copy-on-write param series — local mirror of the interpreter's private
- * CowSeries (it isn't exported; mtf mirrors interpreter internals here the same
- * way ReturnSignal is duck-typed below). Reads/`x[n]` see the caller's
+ * CowSeries (it isn't exported; unlike ReturnSignal/BREAK/CONTINUE, which
+ * moved to contracts.ts, it has no shared seam). Reads/`x[n]` see the caller's
  * history; the first `x := …` materializes a private BarSeries so the write
  * stays local to this call instead of mutating the caller's slot.
  */
@@ -1111,15 +1111,12 @@ class CowSeries extends ForwardingSeries {
  * through a CowSeries — reads (incl. `p[1]` history) see the caller's real
  * series, while `p := …` inside the body materializes a private copy so the
  * write can't mutate the caller's slot. Scalars seed a fresh param slot at
- * the current tf bar, and a `return` in the body unwinds via the
- * interpreter's private ReturnSignal. That class isn't importable here (mtf
- * is injected through registerMtf, not statically imported), so it's
- * duck-typed: ReturnSignal is the only non-Error object the evaluator throws
- * carrying `.value`. Escaping BREAK/CONTINUE are converted to
- * PineRuntimeError like callUdfValue — the symbols are equally unimportable
- * and duck-typed on their 'pine.break'/'pine.continue' descriptions; left
- * raw, one would be absorbed as a break by an enclosing `for` inside the
- * same security expr and silently truncate it (QA13).
+ * the current tf bar, and a `return` in the body unwinds via ReturnSignal
+ * (imported from contracts — shared so this injected module can
+ * identity-check it). Escaping BREAK/CONTINUE are converted to
+ * PineRuntimeError like callUdfValue; left raw, one would be absorbed as a
+ * break by an enclosing `for` inside the same security expr and silently
+ * truncate it (QA13).
  */
 function invokeUdf(spec: SecuritySpec, fn: UdfDecl, args: Value[]): Value {
   const ctx = spec.ctx!;
@@ -1139,17 +1136,13 @@ function invokeUdf(spec: SecuritySpec, fn: UdfDecl, args: Value[]): Value {
       ? blockHook(fn.body, callScope, ctx)
       : evalHook(fn.body, callScope, ctx);
   } catch (e) {
-    if (e && typeof e === 'object' && !(e instanceof Error) && 'value' in e) {
-      const sig = e as { value: Value }; // interpreter-internal ReturnSignal
-      return sig.value;
-    }
+    if (e instanceof ReturnSignal) return e.value;
     // Loop-internal breaks are absorbed by evalFor/evalWhile/evalSwitch
-    // before they reach here — a symbol escaping the whole body is invalid
+    // before they reach here — a signal escaping the whole body is invalid
     // Pine (mirrors interpreter.ts callUdfValue, QA10/QA11/QA13).
-    if (typeof e === 'symbol'
-        && (e.description === 'pine.break' || e.description === 'pine.continue')) {
+    if (e === BREAK || e === CONTINUE) {
       throw new PineRuntimeError(
-        `'${e.description === 'pine.break' ? 'break' : 'continue'}' outside loop in function '${fn.name}'`,
+        `'${e === BREAK ? 'break' : 'continue'}' outside loop in function '${fn.name}'`,
       );
     }
     throw e;
@@ -1239,7 +1232,7 @@ function freshInit(v: Node | undefined, bound: Set<string>): boolean {
  *  name → it leaves varBound (P3); every binding drops stale freshness and
  *  re-earns it from its initializer. */
 function addDeclNames(node: Node, out: Set<string>, varOut?: Set<string>, fresh?: Set<string>,
-  rebound?: Set<string>, local?: Set<string>): void {
+  rebound?: Set<string>, local?: Set<string>, escaped?: Set<string>): void {
   const n = node as {
     type: string; name?: string; names?: string[]; var?: boolean; value?: Node;
     multi?: { name: string; value?: Node }[];
@@ -1254,8 +1247,13 @@ function addDeclNames(node: Node, out: Set<string>, varOut?: Set<string>, fresh?
     }
     // `=` re-decl is scope.define — a NEW local slot. A stale rebound mark
     // (from an earlier `u := …` reaching this slot) no longer applies to the
-    // shadowing binding; `local` records the name so a child-scope copy can
-    // skip it when merging rebound marks upward (QA17).
+    // shadowing binding — but it DID write through to the outer slot, so it
+    // moves to `escaped`: the child-scope merge must NOT let the shadow
+    // swallow a rebound made before the re-decl (CR3 merge hole). `local`
+    // records the name so the merge skips POST-shadow rebound marks (QA17).
+    // A rebound made while the name already resolved scope-local (seed or
+    // earlier shadow) dies with the slot — it does not escape.
+    if (rebound?.has(nm) && !local?.has(nm)) escaped?.add(nm);
     rebound?.delete(nm);
     local?.add(nm);
   };
@@ -1345,7 +1343,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
   const memo = spec.agnosticSafe ??= new Map();
   const hit = memo.get(node);
   if (hit !== undefined) return hit;
-  const s0 = new Set<string>(SERIES_NAMES);
+  const tfNames = new Set<string>(SERIES_NAMES);
   const known = STRICT_NAMESPACES ? new Set<string>() : builtinNames();
   // Recursion-stack keys for cycle detection (a second visit via DAG
   // sharing must NOT reject — only a node still being walked is a cycle).
@@ -1355,15 +1353,43 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
   // two gated exprs reaching the same producer node). inStack stays
   // per-call: it is the live recursion stack.
   const prodVerdicts = spec.prodVerdicts ??= new Map<Node, boolean>();
-  // Producer bodies bind nothing from the gated subtree — one shared set.
+  // Producer bodies bind nothing from the gated subtree. bound/varBound/
+  // fresh stay empty for the whole walk (decls always bind into copies via
+  // walkScoped/udfSafe/arrow), so ONE shared set is safe — but `rebound`
+  // is mutated in place (reassign marks, addDeclNames deletes), so each
+  // walk gets a fresh one or it would corrupt bound/varBound/fresh (CR1).
   const NO_BOUND = new Set<string>();
 
+  /** Verdict for a member/index `:=` target (`t.f := v`, `a[i] := v`):
+   *  the write mutates the OBJECT held by the root binding, so the root
+   *  ident and the chain depth — not the target node itself — decide.
+   *  Pass ONLY when the root is fresh: bound in this same subtree by a
+   *  provably fresh initializer (`[…]`, `array.new*`, `T.new`). Every
+   *  other binding may hold an object shared with the caller — a param is
+   *  its argument, `u = a` aliases whatever `a` held, a `for c in arr`
+   *  var is an element of arr — so member/index writes through them
+   *  mutate shared state (QA15 P2). A fresh root that was `:=`-rebound
+   *  may now hold a shared object (QA17). DEPTH LIMIT: single-level
+   *  targets only — a fresh container's ELEMENTS may alias shared state
+   *  (`u = [p]` — u fresh, element p caller-owned), so `u[i] :=` mutates
+   *  only the container's own slot while `u[0][0] :=`/`a.b.c :=` can
+   *  reach shared interior objects (H2). */
+  const memberTargetSafe = (target: Node, fresh: Set<string>,
+    rebound: Set<string>): boolean => {
+    let root: Node = target, depth = 0;
+    while (root.type === 'member' || root.type === 'histref') { root = root.obj; depth++; }
+    return root.type === 'ident' && depth <= 1
+      && fresh.has(root.name) && !rebound.has(root.name);
+  };
+
   const walkBlock = (stmts: Node[] | Node, bound: Set<string>, varBound: Set<string>,
-    fresh: Set<string>, rebound: Set<string>, local?: Set<string>): boolean => {
+    fresh: Set<string>, rebound: Set<string>, local?: Set<string>,
+    escaped?: Set<string>): boolean => {
     if (!Array.isArray(stmts)) return walk(stmts, bound, varBound, fresh, rebound);
     for (const s of stmts) {
       if (!walk(s, bound, varBound, fresh, rebound)) return false;
-      addDeclNames(s, bound, varBound, fresh, rebound, local); // sequential: earlier decls bind for later stmts
+      // sequential: earlier decls bind for later stmts
+      addDeclNames(s, bound, varBound, fresh, rebound, local, escaped);
     }
     return true;
   };
@@ -1371,18 +1397,30 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
    *  scope is a CHILD of the current one, so `:=` on a name bound in the
    *  parent writes through to the parent's slot — the rebind persists after
    *  the block. On exit the child's rebound names merge upward, skipping
-   *  names the child re-declared (`=` is scope.define → arm-local slot, the
-   *  rebind died with it). Params/loop vars seed `loc` for the same reason.
-   *  Rebound marks are never dropped from a fresh set: a rebound root can
-   *  only re-earn freshness via a `=` re-decl (QA17). */
+   *  names the child re-declared (`=` is scope.define → arm-local slot)
+   *  and the seed names (params/loop vars shadow for the same reason) —
+   *  EXCEPT rebound marks made BEFORE the shadowing decl: those wrote the
+   *  parent slot and escape via `esc` (CR3). Rebound marks are never
+   *  dropped from a fresh set: a rebound root can only re-earn freshness
+   *  via a `=` re-decl (QA17). */
   const walkScoped = (stmts: Node[] | Node, bound: Set<string>, varBound: Set<string>,
     fresh: Set<string>, rebound: Set<string>, seed?: Iterable<string>): boolean => {
     const b2 = new Set(bound), v2 = new Set(varBound), f2 = new Set(fresh), r2 = new Set(rebound);
     const loc = new Set<string>(seed);
+    const esc = new Set<string>();
     if (seed) for (const nm of seed) { v2.delete(nm); f2.delete(nm); r2.delete(nm); }
-    const ok = walkBlock(stmts, b2, v2, f2, r2, loc);
+    const ok = walkBlock(stmts, b2, v2, f2, r2, loc, esc);
     for (const nm of r2) if (!loc.has(nm)) rebound.add(nm);
+    for (const nm of esc) rebound.add(nm);
     return ok;
+  };
+  /** Seed a callee/param scope: each param binds in the body copy and
+   *  shadows any outer var/fresh/rebound mark of the same name (QA15 P3,
+   *  QA17) — a param is per-eval storage aliasing the caller's argument,
+   *  so `p :=` writes the param slot and `p[i] :=` mutates shared state. */
+  const seedParams = (params: Param[], b: Set<string>, vb: Set<string>,
+    f: Set<string>, r: Set<string>): void => {
+    for (const p of params) { b.add(p.name); vb.delete(p.name); f.delete(p.name); r.delete(p.name); }
   };
   /** Walk a store.funcs UDF: param DEFAULTS evaluate at the call site
    *  (caller bound set), while the body binds only its own params/decls.
@@ -1401,14 +1439,10 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
       if (!d.body) return true;
       const b2 = new Set<string>(), vb2 = new Set<string>(), f2 = new Set<string>(),
         r2 = new Set(rebound);
-      // Params are bound-but-never-fresh: they alias the caller's argument
-      // object, so `p[i] :=` mutates shared state (QA15 P2). A param shadowing
-      // an outer rebound name clears the mark — the param is per-eval storage
-      // (QA17). UDF bodies bind isolated scopes, so their rebound marks never
-      // merge to the caller.
-      const loc = new Set<string>();
-      for (const p of d.params ?? []) { b2.add(p.name); r2.delete(p.name); loc.add(p.name); }
-      return walkBlock(d.body, b2, vb2, f2, r2, loc);
+      // Params are bound-but-never-fresh (seedParams). UDF bodies bind
+      // isolated scopes, so their rebound marks never merge to the caller.
+      seedParams(d.params ?? [], b2, vb2, f2, r2);
+      return walkBlock(d.body, b2, vb2, f2, r2);
     } finally {
       inStack.delete(decl);
     }
@@ -1427,7 +1461,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
     if (inStack.has(def.node)) return false;
     inStack.add(def.node);
     try {
-      const ok = walk(def.node, NO_BOUND, NO_BOUND, NO_BOUND, NO_BOUND);
+      const ok = walk(def.node, NO_BOUND, NO_BOUND, NO_BOUND, new Set());
       prodVerdicts.set(def.node, ok);
       return ok;
     } finally {
@@ -1445,7 +1479,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
         if (store.globals.has(n.name)) return producerSafe(n.name);
         // UDF name (callee or function value): scan defaults + body.
         if (store.funcs.has(n.name)) return udfSafe(store.funcs.get(n.name)!, bound, varBound, fresh, rebound);
-        return s0.has(n.name) || known.has(n.name);
+        return tfNames.has(n.name) || known.has(n.name);
       }
       case 'call': {
         // Nested request.* calls evaluate in the caller's chart scope — their
@@ -1467,18 +1501,11 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
       case 'func': case 'method': case 'arrow': {
         const b2 = new Set(bound), vb2 = new Set(varBound), f2 = new Set(fresh),
           r2 = new Set(rebound);
-        // Params shadow any outer var/fresh binding of the same name (QA15
-        // P3): `p :=` inside writes the param slot, and `p[i] :=` mutates
-        // the ARGUMENT object — never provably fresh. A param shadowing an
-        // outer rebound name clears the mark for the body copy, and `loc`
-        // keeps the name out of any upward merge (QA17).
-        const loc = new Set<string>();
-        for (const p of n.params) {
-          b2.add(p.name); vb2.delete(p.name); f2.delete(p.name); r2.delete(p.name);
-          loc.add(p.name);
-        }
+        // The body binds an isolated scope — rebound marks never merge
+        // upward (walkBlock gets no local/escaped sets).
+        seedParams(n.params, b2, vb2, f2, r2);
         for (const p of n.params) if (p.default && !walk(p.default, bound, varBound, fresh, rebound)) return false;
-        return walkBlock(n.body, b2, vb2, f2, r2, loc);
+        return walkBlock(n.body, b2, vb2, f2, r2);
       }
       case 'reassign': {
         // `:=` on a var-bound name mutates a persistent callsite-keyed slot —
@@ -1487,29 +1514,9 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
         // caller pivot (or mutates a shared tf/global slot) → order-dependent.
         if (n.target.type === 'ident'
             && (varBound.has(n.target.name) || !bound.has(n.target.name))) return false;
-        if (n.target.type === 'member' || n.target.type === 'histref') {
-          // `t.f := v` / `a[i] := v` mutate the OBJECT held by the root
-          // binding, so the root ident and the chain depth — not the
-          // target node itself — decide the verdict. Pass ONLY when the
-          // root is fresh: bound in this same subtree by a provably fresh
-          // initializer (`[…]`, `array.new*`,
-          // `T.new`). Every other binding may hold an object shared with
-          // the caller — a param is its argument, `u = a` aliases whatever
-          // `a` held, a `for c in arr` var is an element of arr — so
-          // member/index writes through them mutate shared state (QA15 P2).
-          let root: Node = n.target, depth = 0;
-          while (root.type === 'member' || root.type === 'histref') { root = root.obj; depth++; }
-          // A fresh root that was `:=`-rebound may now hold a shared object
-          // (QA17) — the write-through put an unproven value in its slot.
-          // DEPTH LIMIT: only single-level targets (`u[i] :=`, `u.f :=`)
-          // pass. A fresh container's ELEMENTS may alias shared state
-          // (`u = [p]` — u fresh, element p caller-owned), so a single-level
-          // write mutates only the container's own slot while any deeper
-          // chain (`u[0][0] :=`, `a.b.c :=`) can reach shared interior
-          // objects — reject until element-freshness tracking exists.
-          if (root.type !== 'ident' || depth > 1
-              || !fresh.has(root.name) || rebound.has(root.name)) return false;
-        } else if (n.target.type === 'ident') {
+        if ((n.target.type === 'member' || n.target.type === 'histref')
+            && !memberTargetSafe(n.target, fresh, rebound)) return false;
+        if (n.target.type === 'ident') {
           // Ident `:=` passed the gate, but the write-through rebinds the
           // name to an unproven value: mark it rebound so later member/index
           // targets on this root reject, and arm copies merge the mark upward
@@ -1698,9 +1705,8 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   spec.callerScope = frame.scope;
   ensureTfFrame(spec, frame);
   // Caller-agnostic caches live outside nodeCache so the seenCallers routing
-  // swap below can't orphan them.
-  spec.agnosticCache ??= new Map();
-  spec.agnosticSafe ??= new Map();
+  // swap below can't orphan them. They lazy-init at their consumers
+  // (evalAt / exprSafeForAgnostic) — one owner each (CR1).
   // nodeCache routing: evalAt caches per (expr node, caller scope, tf bar).
   // The caller scope is the right key — an ephemeral UDF call scope binds
   // different params per invocation, so two callers must never share an
