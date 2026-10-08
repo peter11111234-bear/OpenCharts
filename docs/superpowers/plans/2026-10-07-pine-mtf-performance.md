@@ -94,3 +94,24 @@ TradingView 同一腳本：肉眼即時（<1s）。我們的目標應是 **<2s @
 - `src/pine/builtins/math.ts`：`LiftedSeries`/`readOff`/`refBar`/`seriesFromOffsets(sources)`（已落地）
 - 未動：`mtf.ts`（evalAt cache key）、`ta.ts`（stateFor/vsOf）、`siteKey`、`evalCallDispatch`、`evalArg`
 - `npm test` 尚未跑（改動後第一次跑）
+
+---
+
+## 7. 結案紀錄（2026-10-08）
+
+| Task | 狀態 |
+|---|---|
+| Task 3（siteKey trie / stateFor map / evalCallDispatch WeakMap / evalArg LitSeries） | ✅ landed：`4ad5ca7`,`05a9f5c`,`6e1ddd9`,`4a798b3` |
+| Task 4（compile-to-closures） | ✅ landed：`8edce9e`..`11fc4e9`（plan: `2026-10-08-compile-to-closures.md`);99.5% of 見高K body compiled,default-on,`__pineInterp`/`PINE_INTERP=1` opt-out。實測 +2~7% — 預估 −30~50% 沒達成：evalNode dispatch 只佔 ~4% runtime，熱點散在 setAt/bindArgs/ensureBar/evalArg |
+| Task 5（LiveLiftedSeries） | ⏸ 未做 — slice-D 後 ta.* 對 lifted arg 的重算仍在，但已不是最大塊 |
+| Task 6（Web Worker） | ⏸ 未做 — 主執行緒凍結仍在，改層級需要 marshal RunResult，ROI 目前不如先把 dup 指標關掉 |
+
+**最終量測**
+- synthetic pipeline(`_prof_high.mjs`)：見高K 10.2s→5.4s，高量 4.2s→2.1s
+- 真實瀏覽器 runIndicator(TSE:2330 5m,1045 bars):~11.3s wall——其中 ~11s interpreter、0.28s fetch;evalAt 908 次 ~12ms each。
+- 殘餘耗時分散在 BarSeries.setAt / bindArgs / ensureBar / evalArg，非單一熱點。
+
+**其他一併修掉**
+- EMA20/FVG/見高K 每 reload 翻倍的 dup bug:`serializeCellScripts` 把 manifest-owned 指標也寫進 ext;`8007347`+`d2fe77a`。
+- security prefetch 對 1m/15m/60m 各打同一支 kbars HTTP:`1f91c68` in-flight dedup + 15s TTL。
+- 瀏覽器 QA probe:`fc3089d`(`__pineRunLog`/`__mtfStats`)。
