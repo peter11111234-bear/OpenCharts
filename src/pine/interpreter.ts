@@ -332,13 +332,23 @@ function trackSeries(run: RunState, s: BarSeries): void {
 /** Child nodes of an AST node (skips scalars like loc/type/name). */
 function astChildren(node: object): Node[] {
   const out: Node[] = [];
-  for (const v of Object.values(node)) {
+  const collect = (v: unknown): void => {
+    if (!v || typeof v !== 'object') return;
     if (Array.isArray(v)) {
-      for (const it of v) if (it && typeof it === 'object' && 'type' in it) out.push(it as Node);
-    } else if (v && typeof v === 'object' && 'type' in (v as object)) {
+      for (const it of v) collect(it);
+    } else if ('type' in v) {
       out.push(v as Node);
+    } else {
+      // Wrapper objects without a `type` field — elseIfs entries
+      // ({test, body}), call args ({name?, value}), var-multi items
+      // ({name, typeAnn?, value}), switch cases — transparently expose
+      // their Node-valued fields. No visited set needed: the parser
+      // emits trees, and an (impossible) shared subtree would only
+      // rescan nodes, never corrupt the result.
+      for (const inner of Object.values(v)) collect(inner);
     }
-  }
+  };
+  for (const v of Object.values(node)) collect(v);
   return out;
 }
 
@@ -373,9 +383,15 @@ function stmtMayExitTop(n: Node, absorbBreak: boolean, absorbCont: boolean): boo
       if (sw.subject && stmtMayExitTop(sw.subject, absorbBreak, absorbCont)) return true;
       for (const c of sw.cases ?? []) {
         if (c.test && stmtMayExitTop(c.test, absorbBreak, absorbCont)) return true;
-        // Matched-case bodies run inside a try that absorbs BREAK (the
-        // default arm does not — flagging it anyway is conservative).
-        for (const s of c.body ?? []) if (stmtMayExitTop(s, true, absorbCont)) return true;
+        // Only matched arms (c.test !== undefined) run inside a try that
+        // absorbs BREAK — evalSwitch catches BREAK around c.test arms
+        // only; the default arm propagates break/continue out, so its
+        // body scans with the outer absorbBreak. CONTINUE escapes every
+        // arm either way (absorbCont unchanged).
+        const armAbsorb = c.test !== undefined ? true : absorbBreak;
+        for (const s of c.body ?? []) {
+          if (stmtMayExitTop(s, armAbsorb, absorbCont)) return true;
+        }
       }
       return false;
     }

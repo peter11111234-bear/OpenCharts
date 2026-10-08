@@ -917,4 +917,107 @@ describe('allSeries membership pruning (ensureBar list)', () => {
     );
     expect(nums(firstPlotValues(res))).toEqual([0, 0, 10, 10]);
   });
+  it('scanner sees breaks inside non-type wrapper objects (elseIfs, call args)', async () => {
+    // elseIfs entries are {test, body} objects with no `type` field — the
+    // scanner must recurse INTO the wrapper so this break still marks the
+    // stmt as a possible early exit. Conditions are constant-false so the
+    // break is structural-only and never fires at runtime (mirroring the
+    // `close > 1000` pattern above).
+    const baseline = await densified([plot(ident('close'), 'c')]);
+
+    const elseIf = await densified([
+      {
+        type: 'if',
+        test: bin('>', ident('close'), num(1000)),
+        then: [num(0)],
+        elseIfs: [
+          { test: bool(false), body: [{ type: 'break', loc: undefined } as Node] },
+        ],
+        else: null,
+      } as Node,
+      assign('y', bin('+', ident('close'), num(1))),
+    ]);
+    expect(elseIf.size).toBe(baseline.size + 1); // y stays registered
+
+    // Same wrapper hole one level deeper: an ifexpr with a break buried
+    // inside a call arg ({name?, value} — also no `type` field). evalArg
+    // wraps non-ident scalar args in a tracked BarSeries, so compare
+    // against a break-free control run: the only difference should be
+    // y's slot staying registered.
+    const ifexpr = (withBreak: boolean): Node => ({
+      type: 'ifexpr',
+      test: bin('>', ident('close'), num(1000)),
+      then: [num(0)],
+      elseIfs: [
+        {
+          test: bool(false),
+          body: withBreak ? [{ type: 'break', loc: undefined } as Node] : [num(0)],
+        },
+      ],
+      else: [num(1)],
+    }) as Node;
+    const noBreak = await densified([
+      nsCall('math', 'abs', [{ value: ifexpr(false) }]),
+      assign('y', bin('+', ident('close'), num(1))),
+    ]);
+    const callArg = await densified([
+      nsCall('math', 'abs', [{ value: ifexpr(true) }]),
+      assign('y', bin('+', ident('close'), num(1))),
+    ]);
+    expect(callArg.size).toBe(noBreak.size + 1); // y stays registered
+  });
+
+  it('loop absorbs a break in its body; switch default arm does not', async () => {
+    const baseline = await densified([plot(ident('close'), 'c')]);
+
+    // for-bodies absorb break/continue → a decl after the loop still
+    // prunes (pins the no-false-positive direction).
+    const looped = await densified([
+      {
+        type: 'for',
+        varName: 'i',
+        from: num(0),
+        to: num(10),
+        body: [{
+          type: 'if',
+          test: bool(true),
+          then: [{ type: 'break', loc: undefined } as Node],
+          elseIfs: [],
+          else: null,
+        } as Node],
+      } as Node,
+      assign('y', bin('+', ident('close'), num(1))),
+    ]);
+    expect(looped.size).toBe(baseline.size); // y pruned
+
+    // evalSwitch only catches BREAK around MATCHED arms (c.test set) —
+    // a break in the default arm escapes the switch, so a decl after it
+    // must keep registering. Matched arm `1` fires on bar 0 (close=1) so
+    // y evaluates at least once and registers; the default arm runs the
+    // remaining bars.
+    const matched = await densified([
+      {
+        type: 'switch',
+        subject: ident('close'),
+        cases: [
+          { test: num(1), body: [{ type: 'break', loc: undefined } as Node] },
+          { body: [num(0)] },
+        ],
+      } as Node,
+      assign('y', bin('+', ident('close'), num(1))),
+    ]);
+    const dflt = await densified([
+      {
+        type: 'switch',
+        subject: ident('close'),
+        cases: [
+          { test: num(1), body: [num(0)] },
+          { body: [{ type: 'break', loc: undefined } as Node] },
+        ],
+      } as Node,
+      assign('y', bin('+', ident('close'), num(1))),
+    ]);
+    expect(dflt.size).toBe(matched.size + 1); // y registered only for default
+  });
+
 });
