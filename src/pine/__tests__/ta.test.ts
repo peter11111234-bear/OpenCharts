@@ -734,6 +734,44 @@ describe('fix regressions', () => {
     expect(r[4]!.kind).toBe('na');
   });
 
+  it('capped arg series: multi-push gap between calls rescans past offset 0', () => {
+    // BarSeries capped at 3, written every bar, but consumed by `highest`
+    // only at bars 0, 2 and ≥6 (conditional consumer / shared wrapped arg —
+    // evalArg keeps writing the arg series while the call is skipped).
+    // Between the bar-2 and bar-6 calls the cap trims twice: size stays 3,
+    // so a size-delta memo would recheck only offset 0 (value 2) and
+    // stale-latch 'constant'. The bar watermark rescans all 3 live offsets
+    // and finds the 9s → falls out of the numeric overload → na.
+    const bars = mkBars(8);
+    const capped = new BarSeries(3);
+    const r = runBars(bars, (c) => {
+      const i = c.barIndex;
+      capped.setAt(i, fv(i === 3 || i === 4 ? 9 : 2));
+      return i === 0 || i === 2 || i >= 6 ? call('highest', c, [ser(capped)]) : NA;
+    });
+    expect(r[0]!.kind).toBe('na'); // len-2 window not full yet; memo anchors bar 0
+    expect(numv(r[2]!)).toBe(104); // highest(high, 2) at bar 2
+    expect(r[6]!.kind).toBe('na'); // live history [2,2,9] — not a scalar arg
+    expect(r[7]!.kind).toBe('na'); // proven non-constant latches
+  });
+
+  it('same-bar rewrite of the newest slot is caught by the head recheck', () => {
+    // bar advances by 1 but setAt overwrote the previous bar's value before
+    // pushing the new bar (rewrite-then-push ordering). bar - lastBar + 1 = 2
+    // offsets must be verified: offset 1 holds the rewritten 9.
+    const bars = mkBars(4);
+    const s = new BarSeries(5);
+    const r = runBars(bars, (c) => {
+      const i = c.barIndex;
+      s.setAt(i, fv(2));
+      if (i === 2) s.setAt(1, fv(9)); // retro-rewrite bar 1 after bar 2 lands
+      return call('highest', c, [ser(s)]);
+    });
+    expect(numv(r[1]!)).toBe(103); // still constant through bar 1's own call
+    expect(r[2]!.kind).toBe('na'); // rewritten slot enters the rescan window
+    expect(r[3]!.kind).toBe('na');
+  });
+
   it('all-na wrapped scalar that later turns constant still resolves', () => {
     // na slots are gaps, not proof of variance: the memo must adopt the first
     // defined value instead of latching the all-na scan as 'non-constant'.

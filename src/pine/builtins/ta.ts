@@ -32,29 +32,37 @@ const num = (v: Value | undefined): number | undefined => {
 // A wrapped literal/constant (or input.* series) has a single finite value for
 // its whole history → treat it as the numeric arg, memoized per Series.
 
-interface ConstMemo { size: number; v: number | undefined; bad: boolean }
+interface ConstMemo { bar: number; size: number; v: number | undefined; bad: boolean }
 const CONST_SERIES = new WeakMap<Series, ConstMemo>();
 
 /** If every defined slot of `s`'s history is one finite number, return it;
  *  else undefined. na slots are gaps (carry-forward fill / late first call),
  *  not evidence of variance — a scalar wrapped by evalArg stays constant.
- *  Series.get(i) is i-bars-ago: when size grows N→N+k the new bars occupy
- *  offsets 0..k-1 (all older offsets shift +k), so a memo hit scans ONLY the
- *  newest `size - lastSize` offsets. A same-size hit re-checks offset 0
- *  (defensive: covers same-bar rewrite / cap-trim shift). `bad` is a separate
- *  tri-state flag so an all-na history is not confused with proven variance. */
-function constSeriesNum(s: Series): number | undefined {
+ *  Series.get(i) is i-bars-ago: new bars land at offsets 0..k-1 and shift all
+ *  older offsets +k, so the memo rescans ONLY the newest offsets. `bar`
+ *  (ctx.barIndex) is the absolute-bar watermark: calls happen at most once
+ *  per bar per callsite, so `bar - lastBar` upper-bounds pushes since the
+ *  last check — this catches ≥2 push+trims at capN where `size` is unchanged
+ *  (a size-delta anchor would rescan nothing and stale-latch). One extra
+ *  offset re-verifies the previously-checked head (same-bar rewrite /
+ *  rewrite-then-push ordering). Uncapped multi-push-per-bar still falls back
+ *  to the size delta. A non-monotonic `bar` (foreign ctx / replay) rescans
+ *  everything. `bad` is a separate tri-state flag so an all-na history is not
+ *  confused with proven variance. */
+function constSeriesNum(s: Series, bar: number): number | undefined {
   const size = s.size();
   if (size === 0) return undefined;
   let m = CONST_SERIES.get(s);
   if (m === undefined) {
-    m = { size: 0, v: undefined, bad: false };
+    m = { bar: -1, size: 0, v: undefined, bad: false };
     CONST_SERIES.set(s, m);
   }
   if (m.bad) return undefined;
   let v = m.v;
-  const n = size - m.size;
-  const end = n > 0 ? n : 1; // new bars are offsets 0..n-1; same size → head check
+  const end =
+    m.size === 0 || bar < m.bar
+      ? size // first scan / rewound bar clock: verify all recorded history
+      : Math.min(size, Math.max(bar - m.bar + 1, size - m.size));
   for (let i = 0; i < end; i++) {
     const h = s.get(i);
     if (h.kind === 'na') continue; // gap, not variance
@@ -66,13 +74,14 @@ function constSeriesNum(s: Series): number | undefined {
   }
   m.v = v;
   m.size = size;
+  m.bar = bar;
   return v;
 }
 
 /** Scalar-or-constant-series numeric read (scalar args that may arrive wrapped). */
-const constNum = (v: Value | undefined): number | undefined => {
+const constNum = (ctx: BuiltinCtx, v: Value | undefined): number | undefined => {
   if (v === undefined) return undefined;
-  if (v.kind === 'series') return constSeriesNum(v.v);
+  if (v.kind === 'series') return constSeriesNum(v.v, ctx.barIndex);
   return v.kind === 'int' || v.kind === 'float' ? v.v : undefined;
 };
 
@@ -360,7 +369,7 @@ function srcLen(ctx: BuiltinCtx, bound: Map<string, Value>, defSrc: Series, defN
   const sv = bound.get('source');
   const lv = bound.get('length');
   if (lv === undefined) {
-    const sc = constNum(sv); // ta.highest(10) — arg0 bound to 'source' slot
+    const sc = constNum(ctx, sv); // ta.highest(10) — arg0 bound to 'source' slot
     if (sc !== undefined) {
       return { src: vsOf(ctx, { kind: 'series', v: defSrc }, defName), len: sc > 0 ? Math.floor(sc) : undefined };
     }
@@ -761,11 +770,11 @@ function pivotImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>,
   const b = bindArgs(args, named, ['source', 'leftbars', 'rightbars']);
   const sv = b.get('source'), lb = b.get('leftbars'), rb = b.get('rightbars');
   let src: VS | undefined; let left: number | undefined; let right: number | undefined;
-  const sc = constNum(sv);
+  const sc = constNum(ctx, sv);
   if (sc !== undefined && rb === undefined) {
     // ta.pivothigh(3, 3) — arg0 bound to 'source'; default source = high/low
     left = Math.floor(sc);
-    const r = constNum(lb);
+    const r = constNum(ctx, lb);
     right = r === undefined ? left : Math.floor(r);
     src = vsOf(ctx, { kind: 'series', v: high ? ctx.high : ctx.low }, high ? 'high' : 'low');
   } else {
