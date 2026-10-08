@@ -1146,6 +1146,9 @@ function warnOnce(spec: SecuritySpec, ctx: BuiltinCtx, msg: string): void {
 /** Cache-key sentinel for evals that ran with no caller scope (shouldn't happen post-fix). */
 const EMPTY_SCOPE = new Scope();
 
+/** Perf-probe counters (baseline probe + bench test): evalAt cache miss/hit. */
+export const __mtfStats = { evals: 0, hits: 0 };
+
 /** Evaluate `node` at tf bar `j` inside spec's tf frame. Cached per (node, caller scope, j). */
 function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
   // History before the first tf bar is na — never evaluate at a negative index
@@ -1156,7 +1159,8 @@ function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
   const caller = spec.callerScope ?? EMPTY_SCOPE;
   let m = spec.nodeCache.get(node);
   const hit = m?.get(caller)?.get(j);
-  if (hit !== undefined) return hit;
+  if (hit !== undefined) { __mtfStats.hits++; return hit; }
+  __mtfStats.evals++;
   advanceTo(spec, j);
   const prevBar = spec.ctx!.barIndex;
   const prevAnchor = tfAnchor;

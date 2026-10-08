@@ -1,0 +1,10 @@
+{
+  "evals": 998,
+  "hits": 10980,
+  "setAtCalls": 94455,
+  "ensureBarCalls": 72000,
+  "wallMs": 493,
+  "chartBars": 6000,
+  "tfBars": 500,
+  "warnings": 0
+}
