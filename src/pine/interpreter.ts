@@ -56,7 +56,7 @@ import { FOR_IN } from './parser';
 import { BarSeries, ForwardingSeries, LitSeries, histGetAt, valueAt } from './series';
 import { Scope, blockFrame, seriesOf, type Frame } from './scope';
 import { BarCtx, MemoryDrawSink } from './context';
-import { BUILTINS, getConstant, registerConstant } from './builtins/registry';
+import { BUILTINS, getConstant, kindBuiltin, registerConstant } from './builtins/registry';
 import { truthy, drainBindWarnings, type RtCtx } from './builtins/util';
 import { declDrawQuotas, INDICATOR_DECL_ORDER } from './builtins/draw';
 import { strategyDecl, execsAt } from './builtins/strategy';
@@ -131,10 +131,11 @@ interface RunState {
   siteStack: string[];
   nodeIds: Map<object, number>;
   nodeSeq: number;
-  /** `nodeId|sitePath` → stable key object for declSlots/callHist/tupleKeys. */
-  keyCache: Map<string, object>;
-  /** Stack-path object ids — siteKey composes them without string building. */
-  siteIds: Map<string, object>;
+  /** Site-path trie: callsite string → … → nodeId number → stable key object
+   *  for declSlots/callHist/tupleKeys. Replaces join('|') string keys —
+   *  callsite strings ('#N') and nodeId numbers live in separate key spaces,
+   *  so a leaf map can mix both without collision. */
+  siteTrie: Map<unknown, unknown>;
   warned: Set<string>;
   /** Top-level frame of the current bar (ctx.callUdf re-enters here). */
   topFrame: Frame | null;
@@ -164,8 +165,7 @@ function runOf(ctx: BuiltinCtx): RunState {
       siteStack: [],
       nodeIds: new Map(),
       nodeSeq: 0,
-      keyCache: new Map(),
-      siteIds: new Map(),
+      siteTrie: new Map(),
       warned: new Set(),
       topFrame: null,
       misc: new Map(),
@@ -305,15 +305,22 @@ export function pineStr(v: Value): string {
  * same AST node is shared across callsites, so compose with the site path.
  */
 function siteKey(run: RunState, node: object): object {
-  if (run.siteStack.length === 0) return node;
+  const stack = run.siteStack;
+  if (stack.length === 0) return node;
   let id = run.nodeIds.get(node);
   if (id === undefined) { id = run.nodeSeq++; run.nodeIds.set(node, id); }
-  const sp = run.siteStack.join('|');
-  let path = run.siteIds.get(sp) as Map<number, object> | undefined;
-  if (path === undefined) { path = new Map(); run.siteIds.set(sp, path); }
-  let key = path.get(id);
-  if (!key) { key = {}; path.set(id, key); }
-  return key;
+  // Walk/create the trie: root → site1 → site2 → … → leaf nodeId → object.
+  // Callsite keys are '#N' strings, nodeIds are numbers — no key-space
+  // collision at the leaf level.
+  let m: Map<unknown, unknown> = run.siteTrie;
+  for (const s of stack) {
+    let next = m.get(s) as Map<unknown, unknown> | undefined;
+    if (next === undefined) { next = new Map(); m.set(s, next); }
+    m = next;
+  }
+  let leaf = m.get(id) as object | undefined;
+  if (leaf === undefined) { leaf = {}; m.set(id, leaf); }
+  return leaf;
 }
 
 /** Register a slot for bar-end densification (deduped via trackedSlots). */
@@ -987,6 +994,9 @@ function evalCall(node: Call, frame: Frame): Value {
     rt.callsite = prevSite;
   }
 }
+/** Call node → memoized `ns.fn` builtin resolution (permanent — see below). */
+const RESOLVED_BUILTIN = new WeakMap<Call, { headName: string; fn: BuiltinFn | undefined }>();
+
 
 function evalCallDispatch(node: Call, frame: Frame): Value {
   const { scope, ctx } = frame;
@@ -1022,18 +1032,36 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
   // Deeper chains (chart.point.new, request.security_lower_tf, …) flatten to
   // a dotted key; a scope-bound receiver stops the flattening (it's a real
   // object method, not a namespace path).
+/** Call node → memoized `ns.fn` builtin resolution (permanent — see below). */
+const RESOLVED_BUILTIN = new WeakMap<Call, { headName: string; fn: BuiltinFn | undefined }>();
+
   if (callee.type === 'member' && !callee.computed) {
-    const parts: string[] = [callee.prop];
-    let head: Node = callee.obj;
-    while (head.type === 'member' && !head.computed) {
-      parts.unshift(head.prop);
-      head = head.obj;
+    // Per-Call memoized resolution: the callee-chain walk + BUILTINS lookup
+    // run once per Call node. `headName` is cached so the per-bar re-check of
+    // `scope.lookup(head.name)` is just a hash read — scope rebinds mid-run
+    // runs at import time (builtins/*.ts self-register via registry.ts) — no
+    // builtin can appear after first dispatch of a given callsite.
+    let hit = RESOLVED_BUILTIN.get(node);
+    if (hit === undefined) {
+      const parts: string[] = [callee.prop];
+      let head: Node = callee.obj;
+      while (head.type === 'member' && !head.computed) {
+        parts.unshift(head.prop);
+        head = head.obj;
+      }
+      if (head.type === 'ident') {
+        parts.unshift(head.name);
+        const b = BUILTINS.get(parts.join('.'));
+        hit = { headName: head.name, fn: b };
+      } else {
+        hit = { headName: '', fn: undefined };
+      }
+      RESOLVED_BUILTIN.set(node, hit);
     }
-    if (head.type === 'ident' && scope.lookup(head.name) === undefined) {
-      parts.unshift(head.name);
-      const b = BUILTINS.get(parts.join('.'));
-      if (b) return invokeBuiltin(b, node, frame);
+    if (hit.fn !== undefined && scope.lookup(hit.headName) === undefined) {
+      return invokeBuiltin(hit.fn, node, frame);
     }
+    // fall through — scope-bound head or non-builtin callee.
   }
 
   // `obj.method(...)` — UDT receivers own their type, so user
@@ -1051,7 +1079,7 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
         return callUdtMethod(obj.v, prop, bound, ctx);
       }
     } else {
-      const b = BUILTINS.get(`${obj.kind}.${prop}`);
+      const b = kindBuiltin(obj.kind, prop);
       if (b) {
         const args: Value[] = [obj];
         const named: Record<string, Value> = {};

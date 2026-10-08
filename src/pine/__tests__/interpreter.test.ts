@@ -1129,3 +1129,54 @@ describe('evalArg literal fast-path', () => {
     expect(nums(firstPlotValues(r))).toEqual(['na', 40, 40]);
   });
 });
+
+// ── Slice C-3: siteKey trie + dispatch WeakMap ────────────────────────────────
+// Regression guards for the dispatch refactor: callsite-keyed state must stay
+// isolated across UDF callsites (trie composes without join), `ns.fn` builtins
+// keep working through the WeakMap memo, and a user-declared `type`/`method`
+// still outranks a builtin on a UDT receiver.
+
+describe('Slice C-3 dispatch + siteKey trie', () => {
+  it('siteKey: nested UDF callsite composes without string join', async () => {
+    // A UDF called from two sites must produce distinct `var` slots.
+    const r = await runScript(
+      parse('indicator("t")\nf() =>\n  var x = 0\n  x := x + 1\n  x\na = f()\nb = f()\nplot(a + b)'),
+      mkBars(3),
+      { symbol: 'X', timeframe: '1' },
+    );
+    expect(r.warnings).toHaveLength(0);
+    // a ends at 3, b ends at 3 → a+b at bar 2 = 6 (shared slot would give 6,9,…).
+    expect(nums(firstPlotValues(r))).toEqual([2, 4, 6]);
+  });
+
+  it('ns.fn builtin still dispatches through the memoized path', async () => {
+    const r = await runScript(
+      parse('indicator("t")\nx = ta.sma(close, 2)\nplot(x)'),
+      mkBars(4),
+      { symbol: 'X', timeframe: '1' },
+    );
+    expect(r.warnings).toHaveLength(0);
+    // sma(close,2): [na,(1+2)/2,(2+3)/2,(3+4)/2] = [na,1.5,2.5,3.5]
+    expect(nums(firstPlotValues(r))).toEqual(['na', 1.5, 2.5, 3.5]);
+  });
+
+  it('UDT method beats builtin on a user type; builtin still works on real kinds', async () => {
+    const r = await runScript(
+      parse(
+        'indicator("t")\n' +
+        'type Foo\n    int v\n' +
+        'method get(Foo self) => self.v * 10\n' +
+        'f = Foo.new(7)\n' +
+        'arr = array.new<int>(3, 5)\n' +
+        'plot(f.get())\n' +
+        'plot(array.get(arr, 0))',
+      ),
+      mkBars(2),
+      { symbol: 'X', timeframe: '1' },
+    );
+    expect(r.warnings).toHaveLength(0);
+    const vals = [...r.plots.values()].map(p => nums(p.values));
+    expect(vals[0]).toEqual([70, 70]);  // UDT method ran, not a builtin
+    expect(vals[1]).toEqual([5, 5]);    // array.get builtin via kindBuiltin
+  });
+});

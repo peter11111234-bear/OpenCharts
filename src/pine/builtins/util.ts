@@ -153,8 +153,12 @@ export function asColor(v: Value): string {
  *  the interpreter's callBuiltin funnel. */
 const bindWarnQ: string[] = [];
 
+const EMPTY_WARNINGS: readonly string[] = Object.freeze([]);
+
 /** Pop all queued bind-time warnings (empties the queue). */
 export function drainBindWarnings(): string[] {
+  // Fast path: empty queue → shared frozen array (no alloc per builtin call).
+  if (bindWarnQ.length === 0) return EMPTY_WARNINGS as unknown as string[];
   return bindWarnQ.splice(0, bindWarnQ.length);
 }
 
@@ -175,6 +179,13 @@ export function bindArgs(
   // when its alias target is — otherwise `ta.bb(series=…)` silently binds
   // nothing and returns na (observed: TD_BB Basis/Upper/Lower all-na).
   const out = new Map<string, Value>();
+  // All-positional fast path: no named args → skip the named-merge loop.
+  if (Object.keys(named).length === 0) {
+    for (let i = 0; i < Math.min(args.length, order.length); i++) {
+      out.set(order[i]!, args[i]!);
+    }
+    return out;
+  }
   for (const [k, v] of Object.entries(named)) {
     const canon = !order.includes(k) && k === 'series' && order.includes('source') ? 'source' : k;
     if (out.has(canon)) bindWarnQ.push(

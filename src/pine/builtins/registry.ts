@@ -8,6 +8,15 @@
 import type { BuiltinFn, Value } from '../contracts';
 
 export const BUILTINS: Map<string, BuiltinFn> = new Map();
+/** Two-level mirror of BUILTINS for `<value.kind>.<prop>` dispatch
+ *  (e.g. `arr.push` on an array receiver → kindBuiltin('array','push')).
+ *  Populated by registerBuiltin — same namespacing, no string concat at
+ *  dispatch time. */
+const KIND_BUILTIN = new Map<string, Map<string, BuiltinFn>>();
+
+export function kindBuiltin(kind: string, prop: string): BuiltinFn | undefined {
+  return KIND_BUILTIN.get(kind)?.get(prop);
+}
 export const CONSTANTS: Map<string, Value> = new Map();
 const LAZY_CONSTANTS = new Map<string, (ctx?: unknown) => Value>();
 
@@ -15,6 +24,12 @@ const LAZY_CONSTANTS = new Map<string, (ctx?: unknown) => Value>();
  *  Pass `ns === ''` for top-level functions (e.g. 'plot'). */
 export function registerBuiltin(ns: string, name: string, fn: BuiltinFn): void {
   BUILTINS.set(ns ? `${ns}.${name}` : name, fn);
+  let perKind = KIND_BUILTIN.get(ns);
+  if (perKind === undefined) {
+    perKind = new Map();
+    KIND_BUILTIN.set(ns, perKind);
+  }
+  perKind.set(name, fn);
 }
 
 /** Register a constant Value under `ns.name` (e.g. 'shape','triangleup'). */
