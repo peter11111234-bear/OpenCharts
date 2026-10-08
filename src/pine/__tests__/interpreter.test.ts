@@ -6,6 +6,7 @@ import type { Arg, BarData, IndicatorDecl, Node, RunResult, Value } from '../con
 import { collectInputs, runScript } from '../interpreter';
 import { FOR_IN } from '../parser';
 import '../builtins'; // registers the full builtin set (plot/array/draw/…)
+import { BarSeries } from '../series';
 
 // ── AST builders ──────────────────────────────────────────────────────────────
 
@@ -772,5 +773,86 @@ describe('review regressions', () => {
     const res = await runScript(body, mkBars(2));
     // 0*10 + 1*20 + 2*30 = 80
     expect(nums(firstPlotValues(res))).toEqual([80, 80]);
+  });
+});
+
+describe('allSeries membership pruning (ensureBar list)', () => {
+  /** Unique series the bar-end densify loop touched during one run. */
+  async function densified(body: Node[], nBars = 4): Promise<Set<BarSeries>> {
+    const seen = new Set<BarSeries>();
+    const orig = BarSeries.prototype.ensureBar;
+    BarSeries.prototype.ensureBar = function (bar: number) {
+      seen.add(this);
+      return orig.call(this, bar);
+    };
+    try {
+      await runScript(body, mkBars(nBars));
+    } finally {
+      BarSeries.prototype.ensureBar = orig;
+    }
+    return seen;
+  }
+
+  it('top-level decl slot is skipped; if-branch and var slots stay', async () => {
+    const baseline = await densified([plot(ident('close'), 'c')]);
+
+    // Top-level `x = e` writes its slot every bar → its ensureBar is a
+    // guaranteed no-op → slot must NOT join the densify list.
+    const top = await densified([
+      assign('x', bin('+', ident('close'), num(1))),
+      plot(ident('x'), 'x'),
+    ]);
+    expect(top.size).toBe(baseline.size);
+
+    // An if-branch decl only writes when the arm runs → slot MUST stay
+    // registered even when the condition is constant-true (structural gate).
+    const cond = await densified([
+      {
+        type: 'if',
+        test: bool(true),
+        then: [assign('y', bin('+', ident('close'), num(1)))],
+        elseIfs: [],
+        else: null,
+      } as Node,
+      plot(ident('close'), 'c'),
+    ]);
+    expect(cond.size).toBe(baseline.size + 1);
+
+    // `var` inits once then relies on ensureBar carry-forward → stays.
+    const varb = await densified([
+      varDecl('v', num(1)),
+      plot(ident('v'), 'v'),
+    ]);
+    expect(varb.size).toBe(baseline.size + 1);
+  });
+
+  it('x[1] on a pruned top-level slot still carries forward', async () => {
+    const res = await runScript(
+      [
+        assign('x', bin('+', ident('close'), num(1))),
+        assign('prev', histref(ident('x'), num(1))),
+        plot(ident('prev'), 'p'),
+      ],
+      mkBars(4),
+    );
+    expect(nums(firstPlotValues(res))).toEqual(['na', 2, 3, 4]);
+  });
+
+  it('top-level decl + conditional := keeps write semantics', async () => {
+    const res = await runScript(
+      [
+        assign('x', num(0)),
+        {
+          type: 'if',
+          test: bin('>=', ident('close'), num(3)),
+          then: [reassign('x', bin('+', ident('x'), num(10)))],
+          elseIfs: [],
+          else: null,
+        } as Node,
+        plot(ident('x'), 'x'),
+      ],
+      mkBars(4),
+    );
+    expect(nums(firstPlotValues(res))).toEqual([0, 0, 10, 10]);
   });
 });

@@ -110,8 +110,14 @@ export function registerMtf(h: MtfHooks): void {
 interface RunState {
   /** Declaring node → the variable's BarSeries (stable across bars/scopes). */
   declSlots: Map<object, BarSeries>;
-  /** Every persistent slot — densified via ensureBar at bar end. */
+  /** Every registered persistent slot — dedup for ensureList. */
   allSeries: Set<BarSeries>;
+  /** Registered slots in registration order — the bar-end densify list. */
+  ensureList: BarSeries[];
+  /** True only while the top-level `for (const stmt of body)` loop runs —
+   *  decl slots created here are written every bar, so their ensureBar is a
+   *  guaranteed no-op and they stay out of ensureList. */
+  topLevelBody: boolean;
   /** `expr[n]` on non-Ident obj → lazily tracked BarSeries. */
   callHist: Map<Node, BarSeries>;
   /** Call node → stable callsite id for plot/alert routing. */
@@ -144,6 +150,8 @@ function runOf(ctx: BuiltinCtx): RunState {
     r = {
       declSlots: new Map(),
       allSeries: new Set(),
+      ensureList: [],
+      topLevelBody: false,
       callHist: new Map(),
       callsites: new Map(),
       callsiteSeq: 0,
@@ -302,12 +310,34 @@ function siteKey(run: RunState, node: object): object {
   return key;
 }
 
-function slotFor(run: RunState, key: object, scope: Scope, name: string): BarSeries {
+/** Register a slot for bar-end densification (deduped via allSeries). */
+function trackSeries(run: RunState, s: BarSeries): void {
+  if (!run.allSeries.has(s)) {
+    run.allSeries.add(s);
+    run.ensureList.push(s);
+  }
+}
+
+/**
+ * The BarSeries backing a declaration. `persistent` slots (var decls —
+ * written once then carried) and slots created outside the top-level body
+ * (if/for/while/switch arms, seq, UDF bodies — conditionally executed) must
+ * be densified at every bar end, so they join ensureList. Top-level non-var
+ * decl slots are setAt every bar, which makes ensureBar a guaranteed no-op;
+ * skipping their registration is a pure perf win with identical semantics.
+ */
+function slotFor(
+  run: RunState,
+  key: object,
+  scope: Scope,
+  name: string,
+  persistent = false,
+): BarSeries {
   let s = run.declSlots.get(key);
   if (!s) {
     s = new BarSeries();
     run.declSlots.set(key, s);
-    run.allSeries.add(s);
+    if (persistent || !run.topLevelBody) trackSeries(run, s);
   }
   scope.define(name, s);
   return s;
@@ -321,14 +351,17 @@ function bindDeclared(
   name: string,
   v: Value,
   bar: number,
+  persistent = false,
 ): BarSeries {
   if (v.kind === 'series' && v.v instanceof BarSeries) {
-    run.allSeries.add(v.v);
+    // Aliased decl (x = y): registration stays unconditional — the alias
+    // target's own write cadence is unknown, and add is deduped anyway.
+    trackSeries(run, v.v);
     scope.define(name, v.v);
     run.declSlots.set(key, v.v);
     return v.v;
   }
-  const s = slotFor(run, key, scope, name);
+  const s = slotFor(run, key, scope, name, persistent);
   s.setAt(bar, v);
   return s;
 }
@@ -350,11 +383,17 @@ export function evalBlock(stmts: Node[], frame: Frame): Value {
   // CE10188) can warn-and-skip.
   const rt = frame.ctx as RtCtx;
   rt.scopeDepth = (rt.scopeDepth ?? 0) + 1;
+  // Nested bodies may run conditionally — decl slots created here are NOT
+  // provably written every bar, so they must register for ensureBar.
+  const run = runOf(frame.ctx);
+  const wasTop = run.topLevelBody;
+  run.topLevelBody = false;
   try {
     let last: Value = { kind: 'void' };
     for (const s of stmts) last = evalExpr(s, frame);
     return last;
   } finally {
+    run.topLevelBody = wasTop;
     rt.scopeDepth!--;
   }
 }
@@ -456,7 +495,7 @@ function evalNode(node: Node, frame: Frame): Value {
         const fresh = !run.declSlots.has(dk);
         if (fresh) {
           const v = evalExpr(it.value, frame);
-          bindDeclared(run, dk, scope, it.name, v, bar);
+          bindDeclared(run, dk, scope, it.name, v, bar, /*persistent*/ true);
           last = v.kind === 'series' ? v.v.cur() : v;
         } else {
           const s = run.declSlots.get(dk)!;
@@ -505,7 +544,7 @@ function evalNode(node: Node, frame: Frame): Value {
           k = {};
           keys!.set(name, k);
         }
-        slotFor(run, k, scope, name).setAt(bar, items[i] ?? NA);
+        slotFor(run, k, scope, name, /*persistent*/ !!node.var).setAt(bar, items[i] ?? NA);
       });
       return v;
     }
@@ -629,7 +668,7 @@ function barIndexSeries(run: RunState, ctx: BuiltinCtx): BarSeries {
   if (!s) {
     s = new BarSeries();
     run.misc.set('bar_index', s);
-    run.allSeries.add(s);
+    trackSeries(run, s);
   }
   for (let i = s.currentBar + 1; i <= ctx.barIndex; i++) s.setAt(i, { kind: 'int', v: i });
   return s;
@@ -781,7 +820,7 @@ function evalHistref(node: HistRef, frame: Frame): Value {
       if (!tracked) {
         tracked = new BarSeries();
         run.callHist.set(key as Node, tracked);
-        run.allSeries.add(tracked);
+        trackSeries(run, tracked);
       }
       tracked.setAt(bar, v);
       s = tracked;
@@ -1034,7 +1073,7 @@ function evalArg(a: Arg, frame: Frame): Value {
   if (!s) {
     s = new BarSeries();
     run.callHist.set(key as Node, s);
-    run.allSeries.add(s);
+    trackSeries(run, s);
   }
   s.setAt(ctx.barIndex, v);
   return { kind: 'series', v: s };
@@ -1118,6 +1157,11 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
   const callFr: Frame = { scope: callScope, ctx };
   const rt = ctx as RtCtx;
   rt.scopeDepth = (rt.scopeDepth ?? 0) + 1;
+  // UDF bodies run conditionally — a single-expression body evaluated via
+  // evalExpr would otherwise inherit the top-level flag and wrongly prune
+  // a decl slot it creates.
+  const wasTop = run.topLevelBody;
+  run.topLevelBody = false;
   try {
     if (Array.isArray(fn.body)) return evalBlock(fn.body, callFr);
     return evalExpr(fn.body, callFr);
@@ -1125,6 +1169,7 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
     if (e instanceof ReturnSignal) return e.value;
     throw e;
   } finally {
+    run.topLevelBody = wasTop;
     rt.scopeDepth!--;
   }
 }
@@ -1483,7 +1528,7 @@ async function runScriptInner(
   for (const name of Object.keys(bound)) {
     const s = bound[name]!;
     scope.define(name, s);
-    if (s instanceof BarSeries) run.allSeries.add(s);
+    if (s instanceof BarSeries) trackSeries(run, s);
   }
 
   // Pre-register type/method/func decls so dispatch works regardless of decl
@@ -1519,7 +1564,14 @@ async function runScriptInner(
   for (let bar = 0; bar < bars.length; bar++) {
     if (bar > 0) barCtx.seek(bar);
     try {
-      for (const stmt of body) evalExpr(stmt, frame0);
+      // Decl slots created while topLevelBody is set are written every bar —
+      // their ensureBar is a no-op, so slotFor keeps them out of ensureList.
+      run.topLevelBody = true;
+      try {
+        for (const stmt of body) evalExpr(stmt, frame0);
+      } finally {
+        run.topLevelBody = false;
+      }
     } catch (e) {
       if (e === BREAK || e === CONTINUE) {
         warn(run, ctx, 'break/continue outside loop');
@@ -1531,7 +1583,7 @@ async function runScriptInner(
       }
     }
     // Densify every slot to `bar` (carry-forward for skipped statements).
-    for (const s of run.allSeries) s.ensureBar(bar);
+    for (let i = 0; i < run.ensureList.length; i++) run.ensureList[i]!.ensureBar(bar);
     // Yield to the event loop when one bar batch has hogged >16ms so input,
     // paint, and pending fetch callbacks can run. Fast bars (most scripts)
     // amortize this to a near-zero-cost time check.
