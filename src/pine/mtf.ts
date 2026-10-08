@@ -1245,7 +1245,10 @@ function childNodes(node: Node): Node[] {
  * names; a bare call into a file-level UDF (callee ident ∈ store.funcs)
  * recurses into the UDF body with bound = params ∪ body decls (`seen` prevents
  * recursion cycles) — a free ident inside the body still resolves through
- * PivotScope → callerScope. `reassign` to a non-bound name writes caller or
+ * PivotScope → callerScope. A callee ident ∈ store.globals may hold a
+ * FUNCTION VALUE (`q = () => p`) whose body has the same caller-leak, so the
+ * producer is walked with an empty bound (a `:=`-rewritten global fails
+ * closed). `reassign` to a non-bound name writes caller or
  * tf-visible state (order-dependent) → unsafe. Decl-level constructs inside an
  * expression (typedecl/import/indicator/strategy) are rejected outright.
  * Memoized per node into spec.agnosticSafe — the verdict is AST-level and
@@ -1296,6 +1299,26 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
             for (const p of decl.params ?? []) b2.add(p.name);
             if (!walkBlock(decl.body, b2)) return false;
           }
+        } else if (n.callee.type === 'ident' && store.globals.has(n.callee.name)) {
+          // Callee is a file-level global: `q = () => p` stores a FUNCTION VALUE
+          // whose body was never scanned — free idents inside it resolve through
+          // PivotScope → live callerScope, so the call result is caller-dependent.
+          // Walk the global's producer with an EMPTY bound (locals of the gated
+          // expr aren't in scope where the producer was written); `seen` keyed
+          // on the producer node cuts `g = () => h(); h = () => g()` cycles.
+          // A `:=`-rewritten global can't be proven stable → conservative false.
+          const def = store.globals.get(n.callee.name)!;
+          if (def.writes.length > 0 || !def.node || seen.has(def.node)) return false;
+          seen.add(def.node);
+          // `q = f` aliasing a UDF: scan the UDF body too, exactly as if f
+          // were the callee (params + top-level bound only).
+          if (def.node.type === 'ident' && store.funcs.has(def.node.name)) {
+            const decl = store.funcs.get(def.node.name)! as { params?: Param[]; body?: Node | Node[] };
+            const b2 = new Set<string>();
+            for (const p of decl.params ?? []) b2.add(p.name);
+            if (decl.body && !walkBlock(decl.body, b2)) return false;
+          }
+          if (!walk(def.node, new Set())) return false;
         } else if (!walk(n.callee, bound)) {
           return false;
         }

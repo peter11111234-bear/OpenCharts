@@ -344,6 +344,51 @@ describe('caller-agnostic eval cache', () => {
     expect(__mtfStats.evals - e0).toBeGreaterThanOrEqual(12);
   });
 
+  it('function-valued global callee scans the producer — free caller ident rejects', async () => {
+    // q_fn = () => p: the callee ident is a file-level global holding a
+    // function VALUE. Its body `p` resolves through PivotScope → callerScope,
+    // so the gate must walk the producer and reject (QA1 finding — previously
+    // the callee passed via S0 membership without scanning the body).
+    const e0 = __mtfStats.evals, f0 = __mtfStats.gateFail;
+    const arrow: Node = { type: 'arrow', params: [], body: ident('p') };
+    const body = [
+      assign('q_fn', arrow),
+      assign('x', security(str(''), str('60'), call(ident('q_fn')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 },
+      scope => scope.define('p', mkVal(7)));
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+    // Rejected → per-caller path under transient scopes recomputes every bar.
+    expect(__mtfStats.evals - e0).toBeGreaterThanOrEqual(12);
+  });
+
+  it('function-valued global with no free idents still passes (producer walk)', async () => {
+    // g = () => close: producer body's only ident is a chart series name —
+    // caller-independent, so the gate walks it and passes (agnostic path).
+    const e0 = __mtfStats.evals, a0 = __mtfStats.agHits;
+    const arrow: Node = { type: 'arrow', params: [], body: ident('close') };
+    const body = [
+      assign('g', arrow),
+      assign('x', security(str(''), str('60'), call(ident('g')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.agHits - a0).toBeGreaterThanOrEqual(6);
+    // Outer call node + producer arrow both gated → ≤ 2 evals per tf bar.
+    expect(__mtfStats.evals - e0).toBeLessThanOrEqual(6);
+  });
+
+  it('call through an expr-bound function param rejects', async () => {
+    // (f => f()): the callee ident is bound inside the gated subtree as an
+    // arrow param — its closure captures caller bindings → unsafe.
+    const f0 = __mtfStats.gateFail;
+    const arrow: Node = {
+      type: 'arrow', params: [{ name: 'f' }], body: call(ident('f')),
+    };
+    const body = [assign('x', security(str(''), str('60'), arrow))];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
   it('dynamic tf switch drops agnostic values — recomputed on the new tf', async () => {
     const tf15 = mkBars(12, M15, 0, i => i * 10);
     const aCall = security(str(''), ident('tf'), ident('close'));
