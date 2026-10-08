@@ -1,5 +1,5 @@
 import type { Candle } from "../schemas.ts";
-import { getKbars } from "./server.ts";
+import { getKbars, type KbarsResponse } from "./server.ts";
 import { getTwInstrument } from "./instruments.ts";
 
 /**
@@ -81,6 +81,35 @@ export interface HistoryRange {
   toMs: number;
 }
 
+/**
+ * In-flight dedup for identical kbars requests. request.security prefetch fans
+ * out one fetchSeries per TIMEFRAME (1m/15m/60m), but every timeframe resolves
+ * to the same server call — only the local resample differs. Three concurrent
+ * identical POSTs were the dominant chunk of a ~20s indicator run. Same-shape
+ * in-flight requests share the promise; a tiny TTL cache absorbs the immediate
+ * re-request after a run completes (the kbars payload for the same window
+ * can't change inside that window — the server's data is minute-bucketed).
+ */
+const KBARS_TTL_MS = 15_000;
+const kbarsInflight = new Map<string, Promise<KbarsResponse>>();
+const kbarsCache = new Map<string, { at: number; res: KbarsResponse }>();
+
+async function getKbarsDedup(contract: Parameters<typeof getKbars>[0], start: string, end: string): Promise<KbarsResponse> {
+  const key = JSON.stringify([contract, start, end]);
+  const hit = kbarsCache.get(key);
+  if (hit && Date.now() - hit.at < KBARS_TTL_MS) return hit.res;
+  let p = kbarsInflight.get(key);
+  if (!p) {
+    p = getKbars(contract, start, end);
+    kbarsInflight.set(key, p);
+    p.then(
+      (res) => { kbarsInflight.delete(key); kbarsCache.set(key, { at: Date.now(), res }); },
+      () => { kbarsInflight.delete(key); },
+    );
+  }
+  return p;
+}
+
 export async function getShioajiHistory(
   symbol: string,
   timeframe: string,
@@ -107,7 +136,7 @@ export async function getShioajiHistory(
     end = new Date();
     start = new Date(end.getTime() - 29 * 86400 * 1000);
   }
-  const res = await getKbars(inst.contract, toDateStr(start), toDateStr(end));
+  const res = await getKbarsDedup(inst.contract, toDateStr(start), toDateStr(end));
 
   const n = res.datetime.length;
   const bars: Candle[] = [];
