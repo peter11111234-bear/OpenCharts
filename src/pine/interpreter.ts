@@ -1546,6 +1546,80 @@ function evalSwitch(node: SwitchStmt, frame: Frame): Value {
   if (defaultBody) return evalBlock(defaultBody, blockFrame(frame));
   return NA;
 }
+// ── compile-to-closures ─────────────────────────────────────────────────────
+// Top-level stmt → closure. Compiled fns embed evalExpr's exact error
+// contract: rethrow BREAK/CONTINUE/ReturnSignal, else wrapPineError(e, node).
+// Every read of scope/ctx.barIndex/run.* happens inside the closure — nothing
+// per-run is baked at compile time.
+
+/** Per-bar stmt closure — drop-in for evalExpr(node, frame) semantics. */
+type Compiled = (frame: Frame, run: RunState) => Value;
+
+type CompiledStmt =
+  | { kind: 'direct'; fn: Compiled }
+  | { kind: 'twoPhase'; isFresh: (run: RunState) => boolean; fresh: Compiled; later: Compiled }
+  | { kind: 'fallback'; node: Node };
+
+export let __compileCalls = 0; // test instrumentation
+/** stmt.type → last compilation disposition (test/bench instrumentation). */
+export const __compiledKinds = new Map<string, 'direct' | 'twoPhase' | 'fallback'>();
+
+/** Compiled path enabled unless explicitly opted out (env or global).
+ *  Evaluated once per runScriptInner — a mid-run flip never interleaves paths. */
+function compiledEnabled(): boolean {
+  const g = globalThis as Record<string, unknown>;
+  if (g.__pineInterp === true) return false;
+  if (typeof process !== 'undefined' && process.env?.PINE_INTERP === '1') return false;
+  // Default-on lands in Task 6 (`return true`); until then the compiled path
+  // is opt-in via `globalThis.__pineCompiled = true` so tests can A/B it.
+  return g.__pineCompiled === true;
+}
+
+/** Wraps a raw per-kind body so it carries evalExpr's error contract. */
+const wrapCompiled = (node: Node, body: Compiled): Compiled =>
+  (frame, run) => {
+    try {
+      return body(frame, run);
+    } catch (e) {
+      if (e === BREAK || e === CONTINUE || e instanceof ReturnSignal) throw e;
+      throw wrapPineError(e, node);
+    }
+  };
+
+/** Child-node compiler: compilable kinds get closures; everything else
+ *  delegates to evalExpr (which keeps its own error wrap for that node). */
+function compileChild(node: Node): Compiled {
+  const c = compile(node);
+  if (c.kind === 'fallback') {
+    return (frame) => evalExpr(node, frame);
+  }
+  if (c.kind === 'twoPhase') {
+    return (frame, run) => (c.isFresh(run) ? c.fresh : c.later)(frame, run);
+  }
+  return c.fn;
+}
+
+function compile(stmt: Node): CompiledStmt {
+  __compileCalls++;
+  const out = compileStmt(stmt);
+  __compiledKinds.set(
+    stmt.type === 'var' && stmt.multi && stmt.multi.length > 0 ? 'var[multi]' : stmt.type,
+    out.kind,
+  );
+  return out;
+}
+
+function compileStmt(stmt: Node): CompiledStmt {
+  switch (stmt.type) {
+    // for/while/switch stay fallback — per-iter blockFrame + loopVar BarSeries
+    // + BREAK/CONTINUE absorb (evalFor/evalWhile) and switch's matched-arm
+    // BREAK→void vs default-arm propagate distinction are risky to duplicate.
+    // indicator/strategy stay fallback — declDrawQuotas/strategyDecl per-bar
+    // idempotence is unverified (conservative per boundary matrix).
+    default:
+      return { kind: 'fallback', node: stmt };
+  }
+}
 
 // ── runScript ────────────────────────────────────────────────────────────────
 
@@ -1735,6 +1809,10 @@ async function runScriptInner(
   }
   let barErr: PineRuntimeError | null = null;
   let sliceStart = nowMs();
+  // Slice-D: compile the top-level body once per run. Fallback stmts keep
+  // evalExpr; topStmtIdx bookkeeping is identical either way.
+  const compiledBody: CompiledStmt[] | null =
+    compiledEnabled() ? body.map(compile) : null;
   for (let bar = 0; bar < bars.length; bar++) {
     if (bar > 0) barCtx.seek(bar);
     try {
@@ -1743,9 +1821,20 @@ async function runScriptInner(
       // (topStmtIdx < pruneCutoff only; see the scan above).
       run.topLevelBody = true;
       try {
-        for (let i = 0; i < body.length; i++) {
-          run.topStmtIdx = i;
-          evalExpr(body[i]!, frame0);
+        if (compiledBody) {
+          for (let i = 0; i < body.length; i++) {
+            run.topStmtIdx = i;
+            const c = compiledBody[i]!;
+            if (c.kind === 'fallback') evalExpr(c.node, frame0);
+            else if (c.kind === 'twoPhase')
+              (c.isFresh(run) ? c.fresh : c.later)(frame0, run);
+            else c.fn(frame0, run);
+          }
+        } else {
+          for (let i = 0; i < body.length; i++) {
+            run.topStmtIdx = i;
+            evalExpr(body[i]!, frame0);
+          }
         }
       } finally {
         run.topStmtIdx = -1;
