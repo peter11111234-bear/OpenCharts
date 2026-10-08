@@ -31,11 +31,12 @@
 import type { Arg, BarData, BuiltinCtx, Call, Node, Param, PineType, UdfDecl, Value } from './contracts';
 import { BREAK, CONTINUE, NA, ReturnSignal, Scope, Series } from './contracts';
 import { PineRuntimeError } from './errors';
-import { evalBlock, evalExpr, registerMtf } from './interpreter';
+import { astChildren, evalBlock, evalExpr, registerMtf } from './interpreter';
 import { BarSeries, ForwardingSeries, histGetAt, seriesHooks } from './series';
 import { FOR_IN } from './parser';
 import { BUILTINS, CONSTANTS } from './builtins/registry';
 import type { Frame } from './scope';
+import { buildSyminfo } from './context';
 
 // ── evaluator hooks ─────────────────────────────────────────────────────────
 // Real interpreter evaluation, adapted to the (node, scope, ctx) triple so tf
@@ -323,13 +324,8 @@ function scanTopLevel(body: Node[], st: MtfStore): void {
             inBranch: inBranch || prev?.inBranch,
           });
           declStmt.set(d.name, top);
-          if (d.value.type === 'call') {
-            const m = memberOf(d.value.callee);
-            if (m?.ns === 'input' && (m.name === 'timeframe' || m.name === 'string' || m.name === 'symbol')) {
-              const def = pickArg(d.value.args, 0, 'defval');
-              if (def?.type === 'str') st.staticEnv.set(d.name, def.v);
-            }
-          }
+          // input.* defaults deliberately NOT captured into staticEnv — the
+          // ctx.inputs override must win at runConst time (F4).
         } else if (d.type === 'var' && d.multi) {
           for (const mi of d.multi) {
             if (!mi.name || !mi.value) continue;
@@ -494,10 +490,12 @@ export async function prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, allBars?:
   const chartBars = ctx.fetchSeries ? null : allBars ?? chartBarsFromCtx(ctx);
   // Resolve bar0-constant dynamic specs (e.g. input.timeframe, ternary of consts)
   // before fetching so they hit the static (sym, tf) prefetch path.
-  if (frame) {
+  {
     // Prebind statically-resolvable globals into a prefetch scope so runConst
-    // can evaluate ternaries/idents like `useCurrentTF ? "60" : "15"`.
-    const pfScope = new Scope(frame.scope);
+    // can evaluate ternaries/idents like `useCurrentTF ? "60" : "15"`. With no
+    // caller frame (prepare-only tests) an empty scope still resolves
+    // input.*-only producers — they read ctx.inputs, not scope (F4).
+    const pfScope = frame ? new Scope(frame.scope) : new Scope();
     for (const [name, v] of store.staticEnv) {
       pfScope.define(name, { kind: 'string', v });
     }
@@ -543,7 +541,7 @@ export async function prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, allBars?:
     } finally {
       ctx.warnings = realWarnings;
     }
-    const pfFrame: Frame = { scope: pfScope, ctx: frame.ctx };
+    const pfFrame: Frame = { scope: pfScope, ctx: frame?.ctx ?? ctx };
     for (const spec of store.byNode.values()) {
       if (spec.sym === DYNAMIC && spec.symNode) {
         const s = runConst(spec.symNode, pfFrame); if (s) spec.symResolved = s;
@@ -559,14 +557,18 @@ export async function prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, allBars?:
   // degrade a failed security() to na, so do the same via an empty series.
   const PREFETCH_TIMEOUT_MS = 30_000;
   const jobs = new Map<string, Promise<BarData[]>>();
+  // CHART_SYM ('' = syminfo.tickerid) must resolve to the real ticker for
+  // fetchSeries — the provider can't route an empty symbol (F3).
+  const chartTicker = ctx.syminfo?.tickerid?.kind === 'string' ? ctx.syminfo.tickerid.v : CHART_SYM;
   for (const spec of store.byNode.values()) {
-    const sym = resolvedSym(spec), tf = resolvedTf(spec);
+    const sym = resolvedSym(spec) === CHART_SYM ? chartTicker : resolvedSym(spec);
+    const tf = resolvedTf(spec);
     if (sym === DYNAMIC || tf === DYNAMIC) continue;
     const key = `${sym}\n${tf}`;
     if (store.fetched.has(key) || jobs.has(key)) continue;
-    const job = (ctx.fetchSeries
-      ? ctx.fetchSeries(sym, tf)
-      : Promise.resolve(chartBars!));
+    const job = ctx.fetchSeries
+      ? Promise.resolve().then(() => ctx.fetchSeries!(sym, tf)) // sync throws land in the race/catch (F9)
+      : Promise.resolve(chartBars!);
     jobs.set(key, Promise.race([
       job,
       (() => {
@@ -583,7 +585,7 @@ export async function prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, allBars?:
   const results = await Promise.all(keys.map(k => jobs.get(k)!));
   keys.forEach((k, i) => store.fetched.set(k, results[i]!));
   for (const spec of store.byNode.values()) {
-    const sym = resolvedSym(spec), tf = resolvedTf(spec);
+    const sym = resolvedSym(spec) === CHART_SYM ? chartTicker : resolvedSym(spec), tf = resolvedTf(spec);
     if (sym === DYNAMIC || tf === DYNAMIC) continue;
     spec.bars = store.fetched.get(`${sym}\n${tf}`) ?? [];
   }
@@ -962,6 +964,15 @@ function resetTfFrame(spec: SecuritySpec): void {
   spec.lastChartBar = undefined;
 }
 
+/** Provider syminfo minus identity fields — those must reflect the
+ *  requested symbol, not the chart's. */
+const SYMINFO_IDENTITY = new Set(['ticker', 'tickerid', 'prefix', 'description']);
+function syminfoSansIdentity(src: Record<string, Value>): Record<string, Value> {
+  const out: Record<string, Value> = {};
+  for (const [k, v] of Object.entries(src)) if (!SYMINFO_IDENTITY.has(k)) out[k] = v;
+  return out;
+}
+
 function ensureTfFrame(spec: SecuritySpec, frame: { scope: Scope; ctx: BuiltinCtx }): void {
   if (spec.ctx) return;
   const bars = spec.bars ?? [];
@@ -997,6 +1008,10 @@ function ensureTfFrame(spec: SecuritySpec, frame: { scope: Scope; ctx: BuiltinCt
   const parent = frame.ctx;
   const rt = resolvedTf(spec);
   const tf = rt === DYNAMIC ? parent.timeframe.period : rt;
+  const reqSym = resolvedSym(spec);
+  const tfSym = reqSym === DYNAMIC || reqSym === CHART_SYM
+    ? (parent.syminfo.tickerid?.kind === 'string' ? parent.syminfo.tickerid.v : '')
+    : reqSym;
   const { n: mult, unit } = tfParts(tf);
   const calendar = unit === 'D' || unit === 'W' || unit === 'M';
   spec.ctx = {
@@ -1010,7 +1025,12 @@ function ensureTfFrame(spec: SecuritySpec, frame: { scope: Scope; ctx: BuiltinCt
     drawings: [],
     warnings: parent.warnings,
     alerts: parent.alerts,
-    syminfo: parent.syminfo,
+    // syminfo.* inside security() refers to the REQUESTED symbol per TV
+    // semantics — build it from resolved tf sym (F5). Carry parent's
+    // provider overrides EXCEPT identity fields — context.ts:85 merges
+    // overrides verbatim, so passing parent.syminfo wholesale would re-stamp
+    // the chart's ticker/tickerid/prefix over the requested symbol's.
+    syminfo: buildSyminfo(tfSym, syminfoSansIdentity(parent.syminfo)),
     timeframe: {
       period: tf, multiplier: mult,
       isseconds: unit === 'S',
@@ -1162,7 +1182,7 @@ const EMPTY_SCOPE = new Scope();
 
 /** Perf-probe counters (baseline probe + bench test): evalAt cache miss/hit
  *  + agnostic gate verdicts (per expr node). */
-export const __mtfStats = { evals: 0, hits: 0, gatePass: 0, gateFail: 0, agHits: 0 };
+export const __mtfStats = { evals: 0, hits: 0, gatePass: 0, gateFail: 0, agHits: 0, prodWalks: 0 };
 
 // ── caller-agnostic cache gate ──────────────────────────────────────────────
 // A security expression is caller-agnostic only when every name it can reach
@@ -1277,30 +1297,6 @@ function addDeclNames(node: Node, out: Set<string>, varOut?: Set<string>, fresh?
   bind(n.name, n.type === 'var', n.value);
 }
 
-/** Child expression/stmt nodes (Arg/case/Param wrappers unwrapped). */
-function childNodes(node: Node): Node[] {
-  const out: Node[] = [];
-  const n = node as unknown as Record<string, unknown>;
-  for (const k of Object.keys(n)) {
-    if (k === 'loc' || k === 'type') continue;
-    const v = n[k];
-    if (Array.isArray(v)) {
-      for (const item of v as unknown[]) {
-        if (!item || typeof item !== 'object') continue;
-        if ('type' in (item as object)) { out.push(item as Node); continue; }
-        const w = item as Record<string, unknown>;
-        for (const kk of ['value', 'test', 'default'] as const) {
-          const x = w[kk];
-          if (x && typeof x === 'object' && 'type' in (x as object)) out.push(x as Node);
-        }
-        if (Array.isArray(w.body)) for (const b of w.body as Node[]) out.push(b);
-      }
-    } else if (v && typeof v === 'object' && 'type' in (v as object)) {
-      out.push(v as Node);
-    }
-  }
-  return out;
-}
 
 /**
  * Gate: may this expr's (node, j) result be shared across caller scopes?
@@ -1461,6 +1457,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
     if (inStack.has(def.node)) return false;
     inStack.add(def.node);
     try {
+      __mtfStats.prodWalks++;
       const ok = walk(def.node, NO_BOUND, NO_BOUND, NO_BOUND, new Set());
       prodVerdicts.set(def.node, ok);
       return ok;
@@ -1570,7 +1567,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
       case 'typedecl': case 'import': case 'indicator': case 'strategy':
         return false;
       default: {
-        for (const c of childNodes(n)) if (!walk(c, bound, varBound, fresh, rebound)) return false;
+        for (const c of astChildren(n)) if (!walk(c, bound, varBound, fresh, rebound)) return false;
         return true;
       }
     }
@@ -1681,6 +1678,7 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   let sym = spec.sym, tf = spec.tf;
   if (sym === DYNAMIC || tf === DYNAMIC) {
     if (sym === DYNAMIC && spec.symNode) sym = runConst(spec.symNode, frame) ?? CHART_SYM;
+    if (sym === CHART_SYM && ctx.syminfo?.tickerid?.kind === 'string') sym = ctx.syminfo.tickerid.v;
     if (tf === DYNAMIC && spec.tfNode) tf = runConst(spec.tfNode, frame) ?? ctx.timeframe.period;
     const bars = store.fetched.get(`${sym}\n${tf}`);
     if (!bars) {

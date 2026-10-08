@@ -225,7 +225,7 @@ describe('request.security alignment', () => {
     const tfVar = assign('mytf', call(member(ident('input'), 'timeframe'), str('60')));
     const body = [tfVar, assign('x', security(str(''), ident('mytf'), ident('close')))];
     const { values, fetched, warnings } = await runSecurity(body, chart, '15', { '|60': tf60 });
-    expect(fetched).toEqual(['|60']);
+    expect(fetched).toEqual(['TEST|60']); // CHART_SYM resolves to ctx.syminfo.tickerid (F3)
     expect(warnings).toEqual([]);
     expect(values.map(valOf).slice(4, 8)).toEqual([100, 100, 100, 100]);
   });
@@ -280,10 +280,30 @@ describe('request.security alignment', () => {
   });
 
   it('dynamic tf that was not prefetched warns once and returns na', async () => {
-    const body = [assign('x', security(str(''), member(ident('timeframe'), 'period'), ident('close')))];
-    const { values, warnings } = await runSecurity(body, chart, '15', {});
+    // tf arg is a scope-only ident — the frameless prefetch can't resolve it,
+    // so it stays dynamic and the eval-time (sym, tf) pair has no fetched bars.
+    const body = [assign('x', security(str(''), ident('dyn_tf'), ident('close')))];
+    const { values, warnings } = await runSecurity(body, chart, '15', {},
+      scope => scope.define('dyn_tf', { kind: 'string', v: '120' }));
     expect(values.every(v => v.kind === 'na')).toBe(true);
     expect(warnings.filter(w => w.includes('not prefetched'))).toHaveLength(1);
+  });
+
+  it('sync-throw fetchSeries degrades to na instead of rejecting prefetch (F9)', async () => {
+    resetMtf();
+    const body = [assign('x', security(str('AAA'), str('60'), ident('close')))];
+    prepareSecurity(body);
+    const warnings: string[] = [];
+    const syncThrow = (_s: string, _t: string): Promise<BarData[]> => { throw new Error('sync'); };
+    const bars = mkBars(12, 900_000, 0);
+    // Pre-fix: the throw escaped prefetchSecurity's await → whole call rejects.
+    await expect(
+      prefetchSecurity(mkCtx(bars, 0, '15', { fetchSeries: syncThrow, warnings })),
+    ).resolves.toBeUndefined();
+    const callNode = findSecurityCall(body)!;
+    const scope = new Scope();
+    const v = tryEvalSecurity(callNode, { scope, ctx: mkCtx(bars, 5, '15', { fetchSeries: syncThrow, warnings }) });
+    expect(v?.kind).toBe('na');
   });
 });
 
@@ -371,10 +391,12 @@ describe('caller-agnostic eval cache', () => {
       assign('g', arrow),
       assign('x', security(str(''), str('60'), call(ident('g')))),
     ];
-    await runTransient(body, chart, '15', { '|60': tf60 });
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
     expect(__mtfStats.agHits - a0).toBeGreaterThanOrEqual(6);
     // Outer call node + producer arrow both gated → ≤ 2 evals per tf bar.
     expect(__mtfStats.evals - e0).toBeLessThanOrEqual(6);
+    // Pin the served value: tf60 closes are 100/200/300.
+    expect(values.map(valOf).slice(4, 8)).toEqual([100, 100, 100, 100]);
   });
 
   it('call through an expr-bound function param rejects', async () => {
@@ -400,10 +422,12 @@ describe('caller-agnostic eval cache', () => {
       assign('q', arrow),
       assign('x', security(str(''), str('60'), call(ident('q')))),
     ];
-    await runTransient(body, chart, '15', { '|60': tf60 },
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 },
       scope => scope.define('p', mkVal(7)));
     expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
     expect(__mtfStats.evals - e0).toBeGreaterThanOrEqual(12); // per-caller path
+    // Rejected → per-caller eval still resolves p from the caller scope.
+    expect(values.map(valOf).slice(4, 8)).toEqual([7, 7, 7, 7]);
   });
 
   it('global-alias chain q2 = q1 resolves transitively — rejects', async () => {
@@ -416,9 +440,10 @@ describe('caller-agnostic eval cache', () => {
       assign('q2', ident('q1')),
       assign('x', security(str(''), str('60'), call(ident('q2')))),
     ];
-    await runTransient(body, chart, '15', { '|60': tf60 },
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 },
       scope => scope.define('p', mkVal(7)));
     expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+    expect(values.map(valOf).slice(4, 8)).toEqual([7, 7, 7, 7]);
   });
 
   it('UDF-alias param defaults walk the call-site bound — rejects', async () => {
@@ -436,10 +461,12 @@ describe('caller-agnostic eval cache', () => {
       assign('q', ident('f')),
       assign('x', security(str(''), str('60'), call(ident('q')))),
     ];
-    await runTransient(body, chart, '15', { '|60': tf60 },
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 },
       scope => scope.define('p', mkVal(7)));
     expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
     expect(__mtfStats.evals - e0).toBeGreaterThanOrEqual(12);
+    // Omitted arg → default p=7 evaluated per caller.
+    expect(values.map(valOf).slice(4, 8)).toEqual([7, 7, 7, 7]);
   });
 
   it('q() + q() shared producer passes — DAG dedup, no false cycle', async () => {
@@ -453,10 +480,12 @@ describe('caller-agnostic eval cache', () => {
       assign('x', security(str(''), str('60'),
         binary('+', call(ident('q')), call(ident('q'))))),
     ];
-    await runTransient(body, chart, '15', { '|60': tf60 });
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
     expect(__mtfStats.gateFail - f0).toBe(0);
     expect(__mtfStats.agHits - a0).toBeGreaterThanOrEqual(6);
     expect(__mtfStats.evals - e0).toBeLessThanOrEqual(6);
+    // q()+q() = 2*close → 200 on completed tf bar0.
+    expect(values.map(valOf).slice(4, 8)).toEqual([200, 200, 200, 200]);
   });
 
   it('self-recursive param default f = (x = f) => x terminates — no stack overflow', async () => {
@@ -509,7 +538,7 @@ describe('caller-agnostic eval cache', () => {
     // security's arraylit expr splits into TWO gated nodes; both reach q's
     // producer. prodVerdicts now lives on the spec (QA7 P3) so the second
     // gate walk reuses the first's verdict — both must still pass.
-    const e0 = __mtfStats.evals, a0 = __mtfStats.agHits, f0 = __mtfStats.gateFail;
+    const e0 = __mtfStats.evals, a0 = __mtfStats.agHits, f0 = __mtfStats.gateFail, w0 = __mtfStats.prodWalks;
     const arrow: Node = { type: 'arrow', params: [], body: ident('close') };
     const body = [
       assign('q', arrow),
@@ -520,6 +549,7 @@ describe('caller-agnostic eval cache', () => {
     expect(__mtfStats.gateFail - f0).toBe(0);
     expect(__mtfStats.agHits - a0).toBeGreaterThanOrEqual(6);
     expect(__mtfStats.evals - e0).toBeLessThanOrEqual(12);
+    expect(__mtfStats.prodWalks - w0).toBe(1); // two gated exprs → one producer walk (spec hoist)
   });
 
   it('array-returning agnostic expr still caches via the per-caller path', async () => {
@@ -585,8 +615,12 @@ describe('caller-agnostic eval cache', () => {
       ctr,
       assign('x', security(str(''), str('60'), call(ident('ctr')))),
     ];
-    await runTransient(body, chart, '15', { '|60': tf60 });
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
     expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+    // Rejected → each per-caller eval draws the next counter value; a
+    // shared agnostic entry would pin every chart bar of a tf bar to the
+    // same draw (≤3 distinct over the run). Per-caller draws differ.
+    expect(new Set(values.slice(4).map(valOf)).size).toBeGreaterThanOrEqual(4);
   });
 
   it('read-only var inside a UDF body still passes — slot reads are caller-independent', async () => {
@@ -605,9 +639,11 @@ describe('caller-agnostic eval cache', () => {
       rd,
       assign('x', security(str(''), str('60'), call(ident('rd')))),
     ];
-    await runTransient(body, chart, '15', { '|60': tf60 });
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
     expect(__mtfStats.gateFail - f0).toBe(0);
     expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+    // var v = close inits once → constant 100 (tf60 bar0 close) everywhere.
+    expect(values.map(valOf).slice(4, 8)).toEqual([100, 100, 100, 100]);
   });
 
   it('var + := inside an if-arm block still rejects', async () => {
@@ -632,8 +668,10 @@ describe('caller-agnostic eval cache', () => {
       f,
       assign('x', security(str(''), str('60'), call(ident('f')))),
     ];
-    await runTransient(body, chart, '15', { '|60': tf60 });
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
     expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+    // Same escape channel as the flat-body case: per-caller draws differ.
+    expect(new Set(values.slice(4).map(valOf)).size).toBeGreaterThanOrEqual(4);
   });
 
   it('UDF param default reaching a var-mutating callee rejects', async () => {
@@ -1114,9 +1152,91 @@ describe('caller-agnostic eval cache', () => {
       g,
       assign('x', security(str(''), str('60'), call(ident('memw')))),
     ];
-    await runTransient(body, chart, '15', { '|60': tf60 });
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
     expect(__mtfStats.gateFail - f0).toBe(0);
     expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+    // Runtime can't evaluate u.f on an arraylit → warns and serves na; the
+    // gate verdict itself is structural (field validity is irrelevant to it).
+    expect(values.map(valOf).slice(4, 8)).toEqual(['na', 'na', 'na', 'na']);
+  });
+
+  it('var multi-decl components bind as var — read passes, := rejects', async () => {
+    // `var a = 1, b = 2` (VarDecl.multi): every component must land in
+    // varBound — a missed component reads unbound → reject; a missed var
+    // mark lets `b :=` pass while mutating the persistent slot.
+    const f = {
+      type: 'func', name: 'vm', params: [],
+      body: [
+        { type: 'var', name: 'a', value: num(1),
+          multi: [{ name: 'a', value: num(1) }, { name: 'b', value: num(2) }] } as Node,
+        ident('b'),
+      ],
+    } as Node;
+    const body = [
+      f,
+      assign('x', security(str(''), str('60'), call(ident('vm')))),
+    ];
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const { values } = await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+    expect(values.map(valOf).slice(4, 8)).toEqual([2, 2, 2, 2]);
+
+    const wr = {
+      type: 'func', name: 'vmw', params: [],
+      body: [
+        { type: 'var', name: 'a', value: num(1),
+          multi: [{ name: 'a', value: num(1) }, { name: 'b', value: num(2) }] } as Node,
+        { type: 'reassign', target: ident('b'), value: num(9) } as Node,
+        ident('b'),
+      ],
+    } as Node;
+    const f1 = __mtfStats.gateFail;
+    await runTransient([wr, assign('x', security(str(''), str('60'), call(ident('vmw'))))],
+      chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f1).toBeGreaterThanOrEqual(1);
+  });
+
+  it('global producer with := writes is unsafe — producerSafe rejects', async () => {
+    // g read at top level then rewritten with := — writes.length>0 means
+    // the producer's value depends on evaluation order → reject (R38).
+    const f0 = __mtfStats.gateFail;
+    const body = [
+      assign('g', num(1)),
+      { type: 'reassign', target: ident('g'), value: binary('+', ident('g'), num(1)) } as Node,
+      assign('x', security(str(''), str('60'), ident('g'))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('switch inside a gated expr walks every arm — caller ident arm rejects', async () => {
+    // R21: subject + case tests + arms all walk. An arm referencing a
+    // caller binding must fail the whole expr.
+    const f0 = __mtfStats.gateFail;
+    const sw: Node = {
+      type: 'switch', subject: num(1),
+      cases: [
+        { test: num(1), body: [ident('p')] },
+        { body: [ident('close')] },
+      ],
+    } as Node;
+    const body = [assign('x', security(str(''), str('60'), sw))];
+    await runTransient(body, chart, '15', { '|60': tf60 },
+      scope => scope.define('p', mkVal(7)));
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('nested request.* call inside the gated expr rejects — direct form', async () => {
+    // R7: a request.* member callee anywhere in the expr rejects. The
+    // producer-side variant lives in mtf_invariance (N4/divergence T4).
+    const f0 = __mtfStats.gateFail;
+    const body = [
+      assign('x', security(str(''), str('60'),
+        binary('+', security(str(''), str('15'), ident('close')), num(1)))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
   });
 
  });
@@ -1463,6 +1583,46 @@ describe('request.security end-to-end', () => {
     expect(got.slice(0, 4)).toEqual(['na', 'na', 'na', 'na']);
     expect(got.slice(4, 8)).toEqual([100, 100, 100, 100]);
     expect(got.slice(8, 12)).toEqual([200, 200, 200, 200]);
+  });
+
+  it('input.timeframe override flows into security tf arg (F4)', async () => {
+    resetMtf();
+    const src = [
+      'indicator("t")',
+      'tfIn = input.timeframe("60", "Timeframe")',
+      'x = request.security("AAA", tfIn, close)',
+      'plot(x)',
+    ].join('\n');
+    const fetched: string[] = [];
+    await runScript(parse(src), mkBars(12, 900_000, 0), {
+      timeframe: '15',
+      fetchSeries: async (s, t) => { fetched.push(`${s}|${t}`); return []; },
+      inputValues: { Timeframe: '15' },
+    });
+    expect(fetched).toContain('AAA|15'); // override wins, not the "60" defval
+    expect(fetched).not.toContain('AAA|60');
+  });
+
+  it('security(syminfo.tickerid, tf, expr) fetches the chart ticker, not "" (F3)', async () => {
+    const body = [
+      assign('x', security(member(ident('syminfo'), 'tickerid'), str('60'), ident('close'))),
+    ];
+    const { values, fetched } = await runSecurity(body, mkBars(12, 900_000, 0), '15', { 'TEST|60': mkBars(3, 3_600_000, 0, i => 100 + i * 100) });
+    expect(fetched).toContain('TEST|60');
+    expect(fetched.every(s => !s.startsWith('|'))).toBe(true);
+    expect(values.map(valOf).some(v => v !== 'na')).toBe(true);
+  });
+
+  it('security expr syminfo.tickerid resolves to the requested symbol (F5)', async () => {
+    const body = [
+      assign('x', security(str('OTHER'), str('60'), member(ident('syminfo'), 'tickerid'))),
+    ];
+    const { values } = await runSecurity(body, mkBars(12, 900_000, 0), '15',
+      { 'OTHER|60': mkBars(3, 3_600_000, 0, i => 100 + i * 100) });
+    // tf frame's syminfo is built from 'OTHER', not the chart's 'TEST'.
+    const strs = values.filter((v): v is Extract<typeof v, { kind: 'string' }> => v.kind === 'string');
+    expect(strs.map(v => v.v).includes('OTHER')).toBe(true);
+    expect(strs.every(v => v.v !== 'TEST')).toBe(true);
   });
 
   it('UDF bodies and nested global refs evaluate against the tf context, not the chart', async () => {

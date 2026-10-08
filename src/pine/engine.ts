@@ -514,9 +514,24 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
     }
 
     // Default: line-like series. na → null gap.
-    // display.none → no rendered series, but keep the sink→series-id mapping
-    // so fill(p1, p2) anchors still resolve.
-    if (opts.display === 'display.none') { plotSeriesId.set(plot.index, id); continue; }
+    // display.none → no rendered series. When a fill references this plot,
+    // emit a visible:false anchor like the hline path so the band has
+    // geometry (F2 — previously the fill resolved to a dangling id).
+    if (opts.display === 'display.none') {
+      plotSeriesId.set(plot.index, id);
+      if (fillRefs.has(plot.index)) {
+        const points = plot.values.map((v, i) => ({
+          time: plot.time[i] ?? barTimes[i] ?? 0,
+          value: numOf(v),
+        }));
+        series.push({
+          id, title, paneId: '', kind: 'line',
+          points, style: { color: opts.color ?? '#2962FF', width: opts.linewidth ?? 1, lineStyle: 'solid' as const },
+          visible: false,
+        });
+      }
+      continue;
+    }
     const points = plot.values.map((v, i) => ({
       time: plot.time[i] ?? barTimes[i] ?? 0,
       value: numOf(v),

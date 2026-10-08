@@ -165,8 +165,13 @@ describe('regressions — R2 verification findings', () => {
       `//@version=6\nindicator("d")\np1 = plot(close, display=display.none)\np2 = plot(open)\nfill(p1, p2)\n`,
       mkBars(5));
     // Only p2 renders; the hidden p1 series id still resolves the fill anchor.
-    expect(m.series).toHaveLength(1);
+    expect(m.series).toHaveLength(2); // p2 + hidden anchor for p1 (F2)
     expect(m.fills).toHaveLength(1);
+    const fill = m.fills[0]!;
+    expect(m.series.some(s => s.id === fill.fromSeriesId)).toBe(true);
+    expect(m.series.some(s => s.id === fill.toSeriesId)).toBe(true);
+    const anchor = m.series.find(s => s.id === fill.fromSeriesId)!;
+    expect(anchor.visible).toBe(false);
   });
 
   it('plotarrow maps sign → arrowUp/belowBar vs arrowDown/aboveBar', async () => {

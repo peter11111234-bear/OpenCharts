@@ -59,7 +59,7 @@ export interface BarCtxOpts {
   callUdf?: BuiltinCtx['callUdf'];
 }
 
-function buildSyminfo(symbol: string, overrides?: Record<string, Value>): Record<string, Value> {
+export function buildSyminfo(symbol: string, overrides?: Record<string, Value>): Record<string, Value> {
   const colon = symbol.indexOf(':');
   const hasPrefix = colon > 0;
   const prefix = hasPrefix ? symbol.slice(0, colon) : '';

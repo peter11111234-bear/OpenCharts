@@ -324,8 +324,9 @@ function trackSeries(run: RunState, s: BarSeries): void {
   }
 }
 
-/** Child nodes of an AST node (skips scalars like loc/type/name). */
-function astChildren(node: object): Node[] {
+/** Child nodes of an AST node (skips scalars like loc/type/name). Shared
+ *  with mtf.ts's gate walker via this export (F11). */
+export function astChildren(node: object): Node[] {
   const out: Node[] = [];
   const collect = (v: unknown): void => {
     if (!v || typeof v !== 'object') return;
