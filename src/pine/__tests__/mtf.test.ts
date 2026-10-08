@@ -389,6 +389,93 @@ describe('caller-agnostic eval cache', () => {
     expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
   });
 
+  it('producer referencing a global walks THAT producer — y = p rejects', async () => {
+    // q = () => y; y = p: the producer walk used to pass `y`
+    // via plain S0 membership (QA4 P1 #1 / QA6 P1) — a global inside a
+    // producer chain must recurse into ITS producer, bound = ∅.
+    const e0 = __mtfStats.evals, f0 = __mtfStats.gateFail;
+    const arrow: Node = { type: 'arrow', params: [], body: ident('y') };
+    const body = [
+      assign('y', ident('p')),
+      assign('q', arrow),
+      assign('x', security(str(''), str('60'), call(ident('q')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 },
+      scope => scope.define('p', mkVal(7)));
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+    expect(__mtfStats.evals - e0).toBeGreaterThanOrEqual(12); // per-caller path
+  });
+
+  it('global-alias chain q2 = q1 resolves transitively — rejects', async () => {
+    // q2 = q1; q1 = () => p: a bare `ident` producer node used to pass via
+    // S0 without resolving the chain (QA6 P1).
+    const f0 = __mtfStats.gateFail;
+    const arrow: Node = { type: 'arrow', params: [], body: ident('p') };
+    const body = [
+      assign('q1', arrow),
+      assign('q2', ident('q1')),
+      assign('x', security(str(''), str('60'), call(ident('q2')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 },
+      scope => scope.define('p', mkVal(7)));
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('UDF-alias param defaults walk the call-site bound — rejects', async () => {
+    // f = (x = p) => x; q = f: the alias branch scanned the UDF body but
+    // skipped param defaults (QA4 P1 #3) — an omitted arg evaluates the
+    // default against the caller scope.
+    const e0 = __mtfStats.evals, f0 = __mtfStats.gateFail;
+    const fDecl = {
+      type: 'func', name: 'f',
+      params: [{ name: 'x', default: ident('p') }],
+      body: ident('x'),
+    } as Node;
+    const body = [
+      fDecl,
+      assign('q', ident('f')),
+      assign('x', security(str(''), str('60'), call(ident('q')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 },
+      scope => scope.define('p', mkVal(7)));
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+    expect(__mtfStats.evals - e0).toBeGreaterThanOrEqual(12);
+  });
+
+  it('q() + q() shared producer passes — DAG dedup, no false cycle', async () => {
+    // The same producer node is reached twice (QA4 P3): path-independent
+    // producer walks must reuse the memoized verdict — only a node on the
+    // recursion stack is a genuine cycle.
+    const e0 = __mtfStats.evals, a0 = __mtfStats.agHits, f0 = __mtfStats.gateFail;
+    const arrow: Node = { type: 'arrow', params: [], body: ident('close') };
+    const body = [
+      assign('q', arrow),
+      assign('x', security(str(''), str('60'),
+        binary('+', call(ident('q')), call(ident('q'))))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.agHits - a0).toBeGreaterThanOrEqual(6);
+    expect(__mtfStats.evals - e0).toBeLessThanOrEqual(6);
+  });
+
+  it('array-returning agnostic expr still caches via the per-caller path', async () => {
+    // Mutable-kind results skip only the SHARED agnostic write (QA6 P3):
+    // the per-caller (node, caller, j) entry must still be written and
+    // read, or the expr recomputes on every chart bar that maps to the
+    // same tf bar. (arraylit wouldn't work — its elements split into
+    // per-element exprs; array.new_float returns a real array value.)
+    const e0 = __mtfStats.evals, a0 = __mtfStats.agHits;
+    const body = [assign('x', security(str(''), str('60'),
+      call(member(ident('array'), 'new_float'), num(0), ident('close'))))];
+    // Stable caller scope → per-caller entries hit across chart bars.
+    await runSecurity(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.agHits - a0).toBe(0);
+    // Without the per-caller fallthrough this is ~10 evals (one per chart
+    // bar mapped to a completed tf bar); cached it stays ≤ 4.
+    expect(__mtfStats.evals - e0).toBeLessThanOrEqual(4);
+  });
+
   it('dynamic tf switch drops agnostic values — recomputed on the new tf', async () => {
     const tf15 = mkBars(12, M15, 0, i => i * 10);
     const aCall = security(str(''), ident('tf'), ident('close'));

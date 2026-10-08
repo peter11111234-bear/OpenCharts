@@ -157,14 +157,16 @@ describe('MTF caller-agnostic cache (Task 2)', () => {
     expect(d.evals).toBeGreaterThan(5000);
   }, 120_000);
 
-  it('array-valued expr is never written to the agnostic cache', async () => {
+  it('array-valued expr skips the agnostic cache but still caches per-caller', async () => {
     const { res, d } = await runSrc(ARR_SRC);
     expect(res.warnings).toEqual([]);
     expect(d.gatePass).toBeGreaterThanOrEqual(1); // gate accepts mk() — the
-    // mutable-kind guard (not the gate) is what skips the cache write, so the
-    // expr recomputes on every chart bar instead of hitting at most tfBars.
-    expect(d.evals).toBeGreaterThan(4000);
+    // mutable-kind guard (not the gate) is what skips the SHARED write.
+    // The per-caller (node, caller, j) entry is still written/read, so the
+    // expr computes ~once per tf bar instead of once per chart bar.
     expect(d.agHits).toBe(0);
+    expect(d.hits).toBeGreaterThan(4000);  // per-caller hits across chart bars
+    expect(d.evals).toBeLessThanOrEqual(1500); // ~tfBars, not ~chartBars
   }, 120_000);
 
   it('dynamic tf switch clears agnosticCache → values recomputed', async () => {

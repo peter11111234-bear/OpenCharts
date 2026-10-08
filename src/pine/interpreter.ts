@@ -118,6 +118,15 @@ interface RunState {
    *  decl slots created here are written every bar, so their ensureBar is a
    *  guaranteed no-op and they stay out of ensureList. */
   topLevelBody: boolean;
+  /** Index of the currently-executing top-level stmt (-1 = not in the
+   *  top-level loop). Together with pruneCutoff this decides whether a
+   *  decl slot created here is provably written every bar. */
+  topStmtIdx: number;
+  /** First top-level stmt index that may skip the rest of the bar
+   *  (top-level break/continue/return, bare or inside an if/switch arm or
+   *  loop exit). Decls at or after it aren't provably written every bar,
+   *  so their slots stay registered. Infinity = no early exit in body. */
+  pruneCutoff: number;
   /** `expr[n]` on non-Ident obj → lazily tracked BarSeries. */
   callHist: Map<Node, BarSeries>;
   /** Call node → stable callsite id for plot/alert routing. */
@@ -152,6 +161,8 @@ function runOf(ctx: BuiltinCtx): RunState {
       allSeries: new Set(),
       ensureList: [],
       topLevelBody: false,
+      topStmtIdx: -1,
+      pruneCutoff: Infinity,
       callHist: new Map(),
       callsites: new Map(),
       callsiteSeq: 0,
@@ -318,13 +329,76 @@ function trackSeries(run: RunState, s: BarSeries): void {
   }
 }
 
+/** Child nodes of an AST node (skips scalars like loc/type/name). */
+function astChildren(node: object): Node[] {
+  const out: Node[] = [];
+  for (const v of Object.values(node)) {
+    if (Array.isArray(v)) {
+      for (const it of v) if (it && typeof it === 'object' && 'type' in it) out.push(it as Node);
+    } else if (v && typeof v === 'object' && 'type' in (v as object)) {
+      out.push(v as Node);
+    }
+  }
+  return out;
+}
+
+/**
+ * May evaluating this top-level stmt skip the REST of the body's stmts?
+ * `return` always exits the run; `break`/`continue` exit the top-level
+ * sequence unless a loop or switch on the path absorbs them (`for`/
+ * `while` absorb both in their body, `switch` absorbs `break` in matched
+ * case bodies). Function bodies are opaque — their `return`/`break`/
+ * `continue` can't escape to the top level. Used once per run to pick
+ * `run.pruneCutoff`: decls at or after an early-exit stmt aren't provably
+ * written every bar, so their slots keep registering for ensureBar.
+ */
+function stmtMayExitTop(n: Node, absorbBreak: boolean, absorbCont: boolean): boolean {
+  switch (n.type) {
+    case 'return': return true;
+    case 'break': return !absorbBreak;
+    case 'continue': return !absorbCont;
+    case 'func': case 'method': case 'arrow': return false;
+    case 'for': case 'while': {
+      // Loop bodies absorb break/continue; bound/test exprs can't contain
+      // them, but scan generically with the outer flags anyway.
+      const loop = n as { body?: Node[]; from?: Node; to?: Node; step?: Node; test?: Node };
+      for (const s of loop.body ?? []) if (stmtMayExitTop(s, true, true)) return true;
+      for (const e of [loop.from, loop.to, loop.step, loop.test]) {
+        if (e && stmtMayExitTop(e, absorbBreak, absorbCont)) return true;
+      }
+      return false;
+    }
+    case 'switch': {
+      const sw = n as { subject?: Node; cases?: { test?: Node; body?: Node[] }[] };
+      if (sw.subject && stmtMayExitTop(sw.subject, absorbBreak, absorbCont)) return true;
+      for (const c of sw.cases ?? []) {
+        if (c.test && stmtMayExitTop(c.test, absorbBreak, absorbCont)) return true;
+        // Matched-case bodies run inside a try that absorbs BREAK (the
+        // default arm does not — flagging it anyway is conservative).
+        for (const s of c.body ?? []) if (stmtMayExitTop(s, true, absorbCont)) return true;
+      }
+      return false;
+    }
+    default: {
+      for (const c of astChildren(n)) {
+        if (stmtMayExitTop(c, absorbBreak, absorbCont)) return true;
+      }
+      return false;
+    }
+  }
+}
+
 /**
  * The BarSeries backing a declaration. `persistent` slots (var decls —
  * written once then carried) and slots created outside the top-level body
  * (if/for/while/switch arms, seq, UDF bodies — conditionally executed) must
  * be densified at every bar end, so they join ensureList. Top-level non-var
  * decl slots are setAt every bar, which makes ensureBar a guaranteed no-op;
- * skipping their registration is a pure perf win with identical semantics.
+ * skipping their registration is a pure perf win with identical semantics —
+ * UNLESS the stmt sits at/after a top-level early-exit point: a `break`/
+ * `continue`/`return` (bare or inside an if arm) can skip the rest of the
+ * body on some bar, leaving that decl unwritten and its history misaligned.
+ * `run.pruneCutoff` marks the first such stmt; at-or-after decls register.
  */
 function slotFor(
   run: RunState,
@@ -337,7 +411,9 @@ function slotFor(
   if (!s) {
     s = new BarSeries();
     run.declSlots.set(key, s);
-    if (persistent || !run.topLevelBody) trackSeries(run, s);
+    if (persistent || !run.topLevelBody || run.topStmtIdx >= run.pruneCutoff) {
+      trackSeries(run, s);
+    }
   }
   scope.define(name, s);
   return s;
@@ -1559,17 +1635,30 @@ async function runScriptInner(
   if (opts.shouldAbort?.()) return empty();
 
   // ── bar loop ──
+  // Static early-exit scan: the first top-level stmt that may skip the rest
+  // of the body (bare or if/switch-arm break/continue/return) caps pruning —
+  // decls at or after it aren't provably written every bar, so their slots
+  // must stay in ensureList or `x[1]` misaligns on skipped bars.
+  run.pruneCutoff = body.length;
+  for (let i = 0; i < body.length; i++) {
+    if (stmtMayExitTop(body[i]!, false, false)) { run.pruneCutoff = i; break; }
+  }
   let barErr: PineRuntimeError | null = null;
   let sliceStart = nowMs();
   for (let bar = 0; bar < bars.length; bar++) {
     if (bar > 0) barCtx.seek(bar);
     try {
       // Decl slots created while topLevelBody is set are written every bar —
-      // their ensureBar is a no-op, so slotFor keeps them out of ensureList.
+      // their ensureBar is a no-op, so slotFor keeps them out of ensureList
+      // (topStmtIdx < pruneCutoff only; see the scan above).
       run.topLevelBody = true;
       try {
-        for (const stmt of body) evalExpr(stmt, frame0);
+        for (let i = 0; i < body.length; i++) {
+          run.topStmtIdx = i;
+          evalExpr(body[i]!, frame0);
+        }
       } finally {
+        run.topStmtIdx = -1;
         run.topLevelBody = false;
       }
     } catch (e) {

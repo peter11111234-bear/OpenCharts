@@ -838,6 +838,68 @@ describe('allSeries membership pruning (ensureBar list)', () => {
     expect(nums(firstPlotValues(res))).toEqual(['na', 2, 3, 4]);
   });
 
+  it('decl after a top-level early-exit stmt stays in ensureList', async () => {
+    // `if cond / break` inside the top-level body can skip the remaining
+    // stmts on some bars (BREAK/CONTINUE escape evalBlock and land on the
+    // 'outside loop' warn). A decl AFTER that point isn't provably written
+    // every bar → its slot must keep registering for ensureBar, or history
+    // misaligns on skipped bars. Decls BEFORE the exit still prune.
+    const baseline = await densified([plot(ident('close'), 'c')]);
+
+    const after = await densified([
+      {
+        type: 'if',
+        test: bin('>', ident('close'), num(1000)), // constant-false is fine:
+        then: [{ type: 'break', loc: undefined } as Node], // structural scan
+        elseIfs: [],
+        else: null,
+      } as Node,
+      assign('y', bin('+', ident('close'), num(1))),
+    ]);
+    expect(after.size).toBe(baseline.size + 1); // y's slot registered
+
+    // Same shape but the decl sits BEFORE the early-exit stmt → still pruned.
+    const before = await densified([
+      assign('y', bin('+', ident('close'), num(1))),
+      {
+        type: 'if',
+        test: bin('>', ident('close'), num(1000)),
+        then: [{ type: 'break', loc: undefined } as Node],
+        elseIfs: [],
+        else: null,
+      } as Node,
+    ]);
+    expect(before.size).toBe(baseline.size);
+  });
+
+  it('skipped bars keep history aligned via ensureBar carry-forward', async () => {
+    // break fires on bars 1-2 (close 2,3): z is unwritten there. With z
+    // registered (decl after the early-exit stmt) ensureBar carries bar0's
+    // value forward, so the bar-3 read of z[1] sees the CARRIED bar-2 slot.
+    const res = await runScript(
+      [
+        {
+          type: 'if',
+          test: bin('and',
+            bin('>', ident('close'), num(1)),
+            bin('<', ident('close'), num(4))),
+          then: [{ type: 'break', loc: undefined } as Node],
+          elseIfs: [],
+          else: null,
+        } as Node,
+        assign('z', ident('close')),
+        assign('prev', histref(ident('z'), num(1))),
+        plot(ident('prev'), 'p'),
+      ],
+      mkBars(4),
+    );
+    // z: [1, carried 1, carried 1, 4]; prev=z[1] written only bars 0,3:
+    // [na, carried na, carried na, z@2 = 1] → plot emits on bars 0 and 3
+    // only: [na, 1]. Without registration z's bar-2 slot is unset → the
+    // bar-3 histref read misaligns.
+    expect(nums(firstPlotValues(res))).toEqual(['na', 1]);
+  });
+
   it('top-level decl + conditional := keeps write semantics', async () => {
     const res = await runScript(
       [

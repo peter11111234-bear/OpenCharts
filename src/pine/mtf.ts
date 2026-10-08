@@ -1240,29 +1240,39 @@ function childNodes(node: Node): Node[] {
 
 /**
  * Gate: may this expr's (node, j) result be shared across caller scopes?
- * S0 = SERIES_NAMES ∪ store.globals ∪ store.funcs — names the tf scope shadows,
- * so their bindings are caller-independent. Ident → bound ∪ S0 ∪ known builtin
- * names; a bare call into a file-level UDF (callee ident ∈ store.funcs)
- * recurses into the UDF body with bound = params ∪ body decls (`seen` prevents
- * recursion cycles) — a free ident inside the body still resolves through
- * PivotScope → callerScope. A callee ident ∈ store.globals may hold a
- * FUNCTION VALUE (`q = () => p`) whose body has the same caller-leak, so the
- * producer is walked with an empty bound (a `:=`-rewritten global fails
- * closed). `reassign` to a non-bound name writes caller or
- * tf-visible state (order-dependent) → unsafe. Decl-level constructs inside an
- * expression (typedecl/import/indicator/strategy) are rejected outright.
- * Memoized per node into spec.agnosticSafe — the verdict is AST-level and
- * survives tf rebuilds (S0 is store-level, not frame-level).
+ * Only names the tf scope shadows make a value caller-independent:
+ * SERIES_NAMES, store.globals (resolved through their PRODUCER chain —
+ * a global's value comes from re-evaluating its producer in the tf
+ * context, so `q = () => y; y = p` leaks `p` through the alias unless
+ * the whole chain walks clean), and store.funcs (UDF body walked with
+ * bound = params ∪ body decls; param DEFAULTS walk with the call-site
+ * bound since they evaluate at the caller). Locals of the gated subtree
+ * and — STRICT_NAMESPACES off — known builtin names also pass.
+ *
+ * Producer/UDF walks share `inStack` (nodes on the current recursion
+ * path → genuine cycles reject) while finished producer verdicts memo
+ * into `prodVerdicts` so DAG sharing (`q() + q()`, `outer = inner`)
+ * never false-rejects. `reassign` to a non-bound name writes caller or
+ * tf-visible state (order-dependent) → unsafe. Decl-level constructs
+ * inside an expression (typedecl/import/indicator/strategy) are rejected
+ * outright. Memoized per node into spec.agnosticSafe — the verdict is
+ * AST-level and survives tf rebuilds.
  */
 function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
   const memo = spec.agnosticSafe ??= new Map();
   const hit = memo.get(node);
   if (hit !== undefined) return hit;
   const s0 = new Set<string>(SERIES_NAMES);
-  for (const k of store.globals.keys()) s0.add(k);
-  for (const k of store.funcs.keys()) s0.add(k);
   const known = STRICT_NAMESPACES ? new Set<string>() : builtinNames();
-  const seen = new Set<Node>();
+  // Recursion-stack keys for cycle detection (a second visit via DAG
+  // sharing must NOT reject — only a node still being walked is a cycle).
+  const inStack = new Set<object>();
+  // Producer walks are path-independent (bound = ∅) — memoize the verdict
+  // per producer node so shared decls (`q() + q()`, tuple components on
+  // the same value node) don't re-walk or false-reject.
+  const prodVerdicts = new Map<Node, boolean>();
+  // Producer bodies bind nothing from the gated subtree — one shared set.
+  const NO_BOUND = new Set<string>();
 
   const walkBlock = (stmts: Node[] | Node, bound: Set<string>): boolean => {
     if (!Array.isArray(stmts)) return walk(stmts, bound);
@@ -1272,11 +1282,58 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
     }
     return true;
   };
+  /** Walk a store.funcs UDF: param DEFAULTS evaluate at the call site
+   *  (caller bound set), while the body binds only its own params/decls.
+   *  `inStack` keyed on the decl node cuts `f = () => f()` recursion. */
+  const udfSafe = (decl: Node, bound: Set<string>): boolean => {
+    const d = decl as { params?: Param[]; body?: Node | Node[] };
+    for (const p of d.params ?? []) {
+      if (p.default && !walk(p.default, bound)) return false;
+    }
+    if (!d.body) return true;
+    if (inStack.has(decl)) return false;
+    inStack.add(decl);
+    try {
+      const b2 = new Set<string>();
+      for (const p of d.params ?? []) b2.add(p.name);
+      return walkBlock(d.body, b2);
+    } finally {
+      inStack.delete(decl);
+    }
+  };
+
+  /** Walk a store.globals producer chain, bound = ∅: reading a global
+   *  re-evaluates its producer in the tf context, so every name it can
+   *  reach must resolve the same way (`y = p` leaks the caller binding,
+   *  `outer = inner` follows the alias). A `:=`-rewritten global can't be
+   *  proven stable → false. Verdicts memoize; only on-stack nodes cycle. */
+  const producerSafe = (name: string): boolean => {
+    const def = store.globals.get(name)!;
+    if (def.writes.length > 0 || !def.node) return false;
+    const v = prodVerdicts.get(def.node);
+    if (v !== undefined) return v;
+    if (inStack.has(def.node)) return false;
+    inStack.add(def.node);
+    try {
+      const ok = walk(def.node, NO_BOUND);
+      prodVerdicts.set(def.node, ok);
+      return ok;
+    } finally {
+      inStack.delete(def.node);
+    }
+  };
 
   const walk = (n: Node, bound: Set<string>): boolean => {
     switch (n.type) {
-      case 'ident':
-        return bound.has(n.name) || s0.has(n.name) || known.has(n.name);
+      case 'ident': {
+        if (bound.has(n.name)) return true;
+        // Global name: resolve through its producer — `y = p` and
+        // `outer = inner` chains can't auto-pass on S0 membership alone.
+        if (store.globals.has(n.name)) return producerSafe(n.name);
+        // UDF name (callee or function value): scan defaults + body.
+        if (store.funcs.has(n.name)) return udfSafe(store.funcs.get(n.name)!, bound);
+        return s0.has(n.name) || known.has(n.name);
+      }
       case 'call': {
         // Nested request.* calls evaluate in the caller's chart scope — their
         // specs/caches are caller-keyed, so the result is caller-dependent.
@@ -1288,40 +1345,9 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
         // Calling a method on a bound object reads caller-owned state.
         if (n.callee.type === 'member' && n.callee.obj.type === 'ident'
             && bound.has(n.callee.obj.name)) return false;
-        if (n.callee.type === 'ident' && store.funcs.has(n.callee.name)) {
-          const decl = store.funcs.get(n.callee.name)! as { params?: Param[]; body?: Node | Node[] };
-          for (const p of decl.params ?? []) {
-            if (p.default && !walk(p.default, bound)) return false;
-          }
-          if (decl.body && !seen.has(n.callee)) {
-            seen.add(n.callee);
-            const b2 = new Set(bound);
-            for (const p of decl.params ?? []) b2.add(p.name);
-            if (!walkBlock(decl.body, b2)) return false;
-          }
-        } else if (n.callee.type === 'ident' && store.globals.has(n.callee.name)) {
-          // Callee is a file-level global: `q = () => p` stores a FUNCTION VALUE
-          // whose body was never scanned — free idents inside it resolve through
-          // PivotScope → live callerScope, so the call result is caller-dependent.
-          // Walk the global's producer with an EMPTY bound (locals of the gated
-          // expr aren't in scope where the producer was written); `seen` keyed
-          // on the producer node cuts `g = () => h(); h = () => g()` cycles.
-          // A `:=`-rewritten global can't be proven stable → conservative false.
-          const def = store.globals.get(n.callee.name)!;
-          if (def.writes.length > 0 || !def.node || seen.has(def.node)) return false;
-          seen.add(def.node);
-          // `q = f` aliasing a UDF: scan the UDF body too, exactly as if f
-          // were the callee (params + top-level bound only).
-          if (def.node.type === 'ident' && store.funcs.has(def.node.name)) {
-            const decl = store.funcs.get(def.node.name)! as { params?: Param[]; body?: Node | Node[] };
-            const b2 = new Set<string>();
-            for (const p of decl.params ?? []) b2.add(p.name);
-            if (decl.body && !walkBlock(decl.body, b2)) return false;
-          }
-          if (!walk(def.node, new Set())) return false;
-        } else if (!walk(n.callee, bound)) {
-          return false;
-        }
+        // The callee resolves via the ident case: funcs → UDF walk,
+        // globals → producer-chain walk (aliases never bare-pass).
+        if (!walk(n.callee, bound)) return false;
         for (const a of n.args) if (!walk(a.value, bound)) return false;
         return true;
       }
@@ -1395,29 +1421,38 @@ function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
   // (advanceTo is a no-op there, leaving the ctx pointed at a stale bar).
   if (j < 0) return NA;
   const agnostic = exprSafeForAgnostic(spec, node);
+  const caller = spec.callerScope ?? EMPTY_SCOPE;
+  let v: Value;
   if (agnostic) {
     const m = spec.agnosticCache ??= new Map();
     const hit = m.get(node)?.get(j);
     if (hit !== undefined) { __mtfStats.hits++; __mtfStats.agHits++; return hit; }
-    const v = computeAt(spec, node, j);
+    // Mutable results can't go into the shared cache — check the per-caller
+    // entry first: a prior compute may already be cached under this caller.
+    const pc = spec.nodeCache.get(node)?.get(caller)?.get(j);
+    if (pc !== undefined) { __mtfStats.hits++; return pc; }
+    v = computeAt(spec, node, j);
     if (!(v.kind in MUTABLE_KINDS)) {
       let by = m.get(node);
       if (!by) { by = new Map(); m.set(node, by); }
       by.set(j, v);
+      return v;
     }
-    return v;
+    // Mutable payload: skip only the SHARED agnostic write (sharing one
+    // object across callers would leak mutations) — the per-caller write
+    // below still caches (node, caller, j) as before.
+  } else {
+    const m = spec.nodeCache.get(node);
+    const hit = m?.get(caller)?.get(j);
+    if (hit !== undefined) { __mtfStats.hits++; return hit; }
+    v = computeAt(spec, node, j);
   }
-  const caller = spec.callerScope ?? EMPTY_SCOPE;
-  const m = spec.nodeCache.get(node);
-  const hit = m?.get(caller)?.get(j);
-  if (hit !== undefined) { __mtfStats.hits++; return hit; }
-  const v = computeAt(spec, node, j);
+  let m = spec.nodeCache.get(node);
   let byCaller = m?.get(caller);
   if (!byCaller) {
     byCaller = new Map();
-    let m2 = m;
-    if (!m2) { m2 = new Map(); spec.nodeCache.set(node, m2); }
-    m2.set(caller, byCaller);
+    if (!m) { m = new Map(); spec.nodeCache.set(node, m); }
+    m.set(caller, byCaller);
   }
   byCaller.set(j, v);
   return v;
