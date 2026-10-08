@@ -1238,7 +1238,8 @@ function freshInit(v: Node | undefined, bound: Set<string>): boolean {
  *  that may pass. A non-var decl SHADOWS an outer var binding of the same
  *  name → it leaves varBound (P3); every binding drops stale freshness and
  *  re-earns it from its initializer. */
-function addDeclNames(node: Node, out: Set<string>, varOut?: Set<string>, fresh?: Set<string>): void {
+function addDeclNames(node: Node, out: Set<string>, varOut?: Set<string>, fresh?: Set<string>,
+  rebound?: Set<string>, local?: Set<string>): void {
   const n = node as {
     type: string; name?: string; names?: string[]; var?: boolean; value?: Node;
     multi?: { name: string; value?: Node }[];
@@ -1251,6 +1252,12 @@ function addDeclNames(node: Node, out: Set<string>, varOut?: Set<string>, fresh?
       if (!isVar && freshInit(init, out)) fresh.add(nm);
       else fresh.delete(nm);
     }
+    // `=` re-decl is scope.define — a NEW local slot. A stale rebound mark
+    // (from an earlier `u := …` reaching this slot) no longer applies to the
+    // shadowing binding; `local` records the name so a child-scope copy can
+    // skip it when merging rebound marks upward (QA17).
+    rebound?.delete(nm);
+    local?.add(nm);
   };
   if (n.type === 'func' || n.type === 'method') { if (n.name) bind(n.name, false); return; }
   // Tuple destructure (checked before isDeclType — 'tuple' isn't in that set):
@@ -1322,6 +1329,10 @@ function childNodes(node: Node): Node[] {
  * a provably fresh initializer (`[…]`, `array.new*`, `ns.new`/`T.new`).
  * Bound-but-not-fresh roots (params, `u = a` aliases, for-in vars, var
  * slots) may hold objects shared with the caller → reject (QA15 P2).
+ * `:=`-rebound fresh roots also reject: the write-through puts an unproven
+ * (possibly shared) value in the slot, and the rebind persists after a
+ * child block exits — `rebound` marks merge from arm copies upward unless
+ * the arm re-declared the name (`=` shadows → arm-local slot) (QA17).
  * Decl-level constructs inside an expression (typedecl/import/indicator/
  * strategy) are rejected outright. Memoized per node into
  * spec.agnosticSafe — the verdict is AST-level and survives tf rebuilds.
@@ -1343,33 +1354,57 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
   // Producer bodies bind nothing from the gated subtree — one shared set.
   const NO_BOUND = new Set<string>();
 
-  const walkBlock = (stmts: Node[] | Node, bound: Set<string>, varBound: Set<string>, fresh: Set<string>): boolean => {
-    if (!Array.isArray(stmts)) return walk(stmts, bound, varBound, fresh);
+  const walkBlock = (stmts: Node[] | Node, bound: Set<string>, varBound: Set<string>,
+    fresh: Set<string>, rebound: Set<string>, local?: Set<string>): boolean => {
+    if (!Array.isArray(stmts)) return walk(stmts, bound, varBound, fresh, rebound);
     for (const s of stmts) {
-      if (!walk(s, bound, varBound, fresh)) return false;
-      addDeclNames(s, bound, varBound, fresh); // sequential: earlier decls bind for later stmts
+      if (!walk(s, bound, varBound, fresh, rebound)) return false;
+      addDeclNames(s, bound, varBound, fresh, rebound, local); // sequential: earlier decls bind for later stmts
     }
     return true;
+  };
+  /** Walk a child-block scope (if/switch arm, loop body, seq): the runtime
+   *  scope is a CHILD of the current one, so `:=` on a name bound in the
+   *  parent writes through to the parent's slot — the rebind persists after
+   *  the block. On exit the child's rebound names merge upward, skipping
+   *  names the child re-declared (`=` is scope.define → arm-local slot, the
+   *  rebind died with it). Params/loop vars seed `loc` for the same reason.
+   *  Rebound marks are never dropped from a fresh set: a rebound root can
+   *  only re-earn freshness via a `=` re-decl (QA17). */
+  const walkScoped = (stmts: Node[] | Node, bound: Set<string>, varBound: Set<string>,
+    fresh: Set<string>, rebound: Set<string>, seed?: Iterable<string>): boolean => {
+    const b2 = new Set(bound), v2 = new Set(varBound), f2 = new Set(fresh), r2 = new Set(rebound);
+    const loc = new Set<string>(seed);
+    if (seed) for (const nm of seed) { v2.delete(nm); f2.delete(nm); r2.delete(nm); }
+    const ok = walkBlock(stmts, b2, v2, f2, r2, loc);
+    for (const nm of r2) if (!loc.has(nm)) rebound.add(nm);
+    return ok;
   };
   /** Walk a store.funcs UDF: param DEFAULTS evaluate at the call site
    *  (caller bound set), while the body binds only its own params/decls.
    *  `inStack` keyed on the decl node cuts recursion — pushed BEFORE the
    *  defaults walk so `f = (x = f) => x` and `f ↔ g` default ping-pong
    *  terminate (reject) instead of overflowing the stack. */
-  const udfSafe = (decl: Node, bound: Set<string>, varBound: Set<string>, fresh: Set<string>): boolean => {
+  const udfSafe = (decl: Node, bound: Set<string>, varBound: Set<string>,
+    fresh: Set<string>, rebound: Set<string>): boolean => {
     if (inStack.has(decl)) return false;
     inStack.add(decl);
     try {
       const d = decl as { params?: Param[]; body?: Node | Node[] };
       for (const p of d.params ?? []) {
-        if (p.default && !walk(p.default, bound, varBound, fresh)) return false;
+        if (p.default && !walk(p.default, bound, varBound, fresh, rebound)) return false;
       }
       if (!d.body) return true;
-      const b2 = new Set<string>(), vb2 = new Set<string>(), f2 = new Set<string>();
+      const b2 = new Set<string>(), vb2 = new Set<string>(), f2 = new Set<string>(),
+        r2 = new Set(rebound);
       // Params are bound-but-never-fresh: they alias the caller's argument
-      // object, so `p[i] :=` mutates shared state (QA15 P2).
-      for (const p of d.params ?? []) b2.add(p.name);
-      return walkBlock(d.body, b2, vb2, f2);
+      // object, so `p[i] :=` mutates shared state (QA15 P2). A param shadowing
+      // an outer rebound name clears the mark — the param is per-eval storage
+      // (QA17). UDF bodies bind isolated scopes, so their rebound marks never
+      // merge to the caller.
+      const loc = new Set<string>();
+      for (const p of d.params ?? []) { b2.add(p.name); r2.delete(p.name); loc.add(p.name); }
+      return walkBlock(d.body, b2, vb2, f2, r2, loc);
     } finally {
       inStack.delete(decl);
     }
@@ -1388,7 +1423,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
     if (inStack.has(def.node)) return false;
     inStack.add(def.node);
     try {
-      const ok = walk(def.node, NO_BOUND, NO_BOUND, NO_BOUND);
+      const ok = walk(def.node, NO_BOUND, NO_BOUND, NO_BOUND, NO_BOUND);
       prodVerdicts.set(def.node, ok);
       return ok;
     } finally {
@@ -1396,7 +1431,8 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
     }
   };
 
-  const walk = (n: Node, bound: Set<string>, varBound: Set<string>, fresh: Set<string>): boolean => {
+  const walk = (n: Node, bound: Set<string>, varBound: Set<string>, fresh: Set<string>,
+    rebound: Set<string>): boolean => {
     switch (n.type) {
       case 'ident': {
         if (bound.has(n.name)) return true;
@@ -1404,7 +1440,7 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
         // `outer = inner` chains can't auto-pass on S0 membership alone.
         if (store.globals.has(n.name)) return producerSafe(n.name);
         // UDF name (callee or function value): scan defaults + body.
-        if (store.funcs.has(n.name)) return udfSafe(store.funcs.get(n.name)!, bound, varBound, fresh);
+        if (store.funcs.has(n.name)) return udfSafe(store.funcs.get(n.name)!, bound, varBound, fresh, rebound);
         return s0.has(n.name) || known.has(n.name);
       }
       case 'call': {
@@ -1420,18 +1456,25 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
             && bound.has(n.callee.obj.name)) return false;
         // The callee resolves via the ident case: funcs → UDF walk,
         // globals → producer-chain walk (aliases never bare-pass).
-        if (!walk(n.callee, bound, varBound, fresh)) return false;
-        for (const a of n.args) if (!walk(a.value, bound, varBound, fresh)) return false;
+        if (!walk(n.callee, bound, varBound, fresh, rebound)) return false;
+        for (const a of n.args) if (!walk(a.value, bound, varBound, fresh, rebound)) return false;
         return true;
       }
       case 'func': case 'method': case 'arrow': {
-        const b2 = new Set(bound), vb2 = new Set(varBound), f2 = new Set(fresh);
+        const b2 = new Set(bound), vb2 = new Set(varBound), f2 = new Set(fresh),
+          r2 = new Set(rebound);
         // Params shadow any outer var/fresh binding of the same name (QA15
         // P3): `p :=` inside writes the param slot, and `p[i] :=` mutates
-        // the ARGUMENT object — never provably fresh.
-        for (const p of n.params) { b2.add(p.name); vb2.delete(p.name); f2.delete(p.name); }
-        for (const p of n.params) if (p.default && !walk(p.default, bound, varBound, fresh)) return false;
-        return walkBlock(n.body, b2, vb2, f2);
+        // the ARGUMENT object — never provably fresh. A param shadowing an
+        // outer rebound name clears the mark for the body copy, and `loc`
+        // keeps the name out of any upward merge (QA17).
+        const loc = new Set<string>();
+        for (const p of n.params) {
+          b2.add(p.name); vb2.delete(p.name); f2.delete(p.name); r2.delete(p.name);
+          loc.add(p.name);
+        }
+        for (const p of n.params) if (p.default && !walk(p.default, bound, varBound, fresh, rebound)) return false;
+        return walkBlock(n.body, b2, vb2, f2, r2, loc);
       }
       case 'reassign': {
         // `:=` on a var-bound name mutates a persistent callsite-keyed slot —
@@ -1451,64 +1494,70 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
           // member/index writes through them mutate shared state (QA15 P2).
           let root: Node = n.target;
           while (root.type === 'member' || root.type === 'histref') root = root.obj;
-          if (root.type !== 'ident' || !fresh.has(root.name)) return false;
+          // A fresh root that was `:=`-rebound may now hold a shared object
+          // (QA17) — the write-through put an unproven value in its slot.
+          if (root.type !== 'ident' || !fresh.has(root.name) || rebound.has(root.name)) return false;
+        } else if (n.target.type === 'ident') {
+          // Ident `:=` passed the gate, but the write-through rebinds the
+          // name to an unproven value: mark it rebound so later member/index
+          // targets on this root reject, and arm copies merge the mark upward
+          // (the runtime rebind persists after the block). A `=` re-decl
+          // clears it — scope.define creates a new local slot (QA17).
+          rebound.add(n.target.name);
         }
-        if (n.target.type !== 'ident' && !walk(n.target, bound, varBound, fresh)) return false;
-        return walk(n.value, bound, varBound, fresh);
+        if (n.target.type !== 'ident' && !walk(n.target, bound, varBound, fresh, rebound)) return false;
+        return walk(n.value, bound, varBound, fresh, rebound);
       }
       case 'if': case 'ifexpr': {
-        if (!walk(n.test, bound, varBound, fresh)) return false;
-        if (!walkBlock(n.then, new Set(bound), new Set(varBound), new Set(fresh))) return false;
+        if (!walk(n.test, bound, varBound, fresh, rebound)) return false;
+        if (!walkScoped(n.then, bound, varBound, fresh, rebound)) return false;
         for (const e of n.elseIfs) {
-          if (!walk(e.test, bound, varBound, fresh)) return false;
-          if (!walkBlock(e.body, new Set(bound), new Set(varBound), new Set(fresh))) return false;
+          if (!walk(e.test, bound, varBound, fresh, rebound)) return false;
+          if (!walkScoped(e.body, bound, varBound, fresh, rebound)) return false;
         }
-        if (n.else && !walkBlock(n.else, new Set(bound), new Set(varBound), new Set(fresh))) return false;
+        if (n.else && !walkScoped(n.else, bound, varBound, fresh, rebound)) return false;
         return true;
       }
       case 'for': {
         const from = n.from;
         // `for x in e` parses as from = Ident FOR_IN (a sentinel, not a name).
-        if (!(from.type === 'ident' && from.name === FOR_IN) && !walk(from, bound, varBound, fresh)) return false;
-        if (!walk(n.to, bound, varBound, fresh)) return false;
-        if (n.step && !walk(n.step, bound, varBound, fresh)) return false;
-        const inner = new Set(bound), vInner = new Set(varBound), fInner = new Set(fresh);
+        if (!(from.type === 'ident' && from.name === FOR_IN) && !walk(from, bound, varBound, fresh, rebound)) return false;
+        if (!walk(n.to, bound, varBound, fresh, rebound)) return false;
+        if (n.step && !walk(n.step, bound, varBound, fresh, rebound)) return false;
         // A loop var re-bound as a non-var local shadows an outer `var`
         // name — `c :=` inside the loop writes the loop slot, not the var
         // slot, so it leaves varBound for this body (QA13 P3). It also
         // drops freshness: a `for c in arr` element aliases arr's storage
-        // (QA15 P2).
-        for (const nm of n.varName.split(',')) {
-          if (!nm) continue;
-          inner.add(nm);    // `[a,b]` tuple loops
-          vInner.delete(nm);
-          fInner.delete(nm);
-        }
-        return walkBlock(n.body, inner, vInner, fInner);
+        // (QA15 P2). Loop-var rebound marks stay loop-local: seeding the
+        // names skips them in the upward merge (QA17).
+        const lvars = n.varName.split(',').filter(nm => nm);
+        const inner = new Set(bound);
+        for (const nm of lvars) inner.add(nm);   // `[a,b]` tuple loops
+        return walkScoped(n.body, inner, varBound, fresh, rebound, lvars);
       }
       case 'while':
-        if (!walk(n.test, bound, varBound, fresh)) return false;
-        return walkBlock(n.body, new Set(bound), new Set(varBound), new Set(fresh));
+        if (!walk(n.test, bound, varBound, fresh, rebound)) return false;
+        return walkScoped(n.body, bound, varBound, fresh, rebound);
       case 'switch': {
-        if (n.subject && !walk(n.subject, bound, varBound, fresh)) return false;
+        if (n.subject && !walk(n.subject, bound, varBound, fresh, rebound)) return false;
         for (const c of n.cases) {
-          if (c.test && !walk(c.test, bound, varBound, fresh)) return false;
-          if (!walkBlock(c.body, new Set(bound), new Set(varBound), new Set(fresh))) return false;
+          if (c.test && !walk(c.test, bound, varBound, fresh, rebound)) return false;
+          if (!walkScoped(c.body, bound, varBound, fresh, rebound)) return false;
         }
         return true;
       }
       case 'seq':
-        return walkBlock(n.stmts, new Set(bound), new Set(varBound), new Set(fresh));
+        return walkScoped(n.stmts, bound, varBound, fresh, rebound);
       case 'typedecl': case 'import': case 'indicator': case 'strategy':
         return false;
       default: {
-        for (const c of childNodes(n)) if (!walk(c, bound, varBound, fresh)) return false;
+        for (const c of childNodes(n)) if (!walk(c, bound, varBound, fresh, rebound)) return false;
         return true;
       }
     }
   };
 
-  const safe = walk(node, new Set(), new Set(), new Set());
+  const safe = walk(node, new Set(), new Set(), new Set(), new Set());
   memo.set(node, safe);
   if (safe) __mtfStats.gatePass++; else __mtfStats.gateFail++;
   return safe;

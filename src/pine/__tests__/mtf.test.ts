@@ -879,6 +879,136 @@ describe('caller-agnostic eval cache', () => {
     expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
   });
 
+  it('index := on a for-in element rejects — element aliases the iterated array', async () => {
+    // `for c in a → c[0] := …` — a for-in var aliases an element of the
+    // caller-visible array `a`, so it is bound-but-not-fresh → reject
+    // (QA15 P2 for-in alias class).
+    const f0 = __mtfStats.gateFail;
+    const f = {
+      type: 'func', name: 'forinw', params: [],
+      body: [
+        {
+          type: 'for', varName: 'c',
+          from: { type: 'ident', name: '<for-in>' } as Node,
+          to: ident('a'),
+          body: [
+            { type: 'reassign', target: histref(ident('c'), num(0)),
+              value: num(0) } as Node,
+          ],
+        } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      { type: 'var', name: 'a', value: arraylit([arraylit([num(0)])]) } as Node,
+      f,
+      assign('x', security(str(''), str('60'), call(ident('forinw')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it(':= rebind of a fresh root to a param rejects — u := p writes through', async () => {
+    // `u = [0]; u := p; u[0] := …` — the ident rebind passed the gate (u is
+    // a bound non-var local), but the write-through makes u's slot alias the
+    // caller-visible param array. u stayed `fresh`, so `u[0] :=` used to
+    // mutate the caller's persistent var array under the agnostic cache
+    // (QA17). The rebind must drop the root's fresh eligibility.
+    const f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'rebindw', params: [{ name: 'p' }],
+      body: [
+        assign('u', arraylit([num(0)])),
+        { type: 'reassign', target: ident('u'), value: ident('p') } as Node,
+        { type: 'reassign', target: histref(ident('u'), num(0)), value: num(99) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      { type: 'var', name: 'a', value: arraylit([num(0)]) } as Node,
+      g,
+      assign('x', security(str(''), str('60'), call(ident('rebindw'), ident('a')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('arm-nested := rebind rejects — the rebind persists after the block', async () => {
+    // `u = [0]; if ok → u := p; u[0] := …` — the arm walks a COPY of the
+    // tracking sets; a naive `fresh.delete` in that copy leaves the parent's
+    // u fresh. Runtime `:=` writes through to the ancestor slot, so the
+    // rebind survives the arm: rebound marks merge upward (QA17).
+    const f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'armw', params: [{ name: 'p' }],
+      body: [
+        assign('u', arraylit([num(0)])),
+        {
+          type: 'if', test: { type: 'bool', v: true } as Node,
+          then: [{ type: 'reassign', target: ident('u'), value: ident('p') } as Node],
+          elseIfs: [], else: null,
+        } as Node,
+        { type: 'reassign', target: histref(ident('u'), num(0)), value: num(99) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      { type: 'var', name: 'a', value: arraylit([num(0)]) } as Node,
+      g,
+      assign('x', security(str(''), str('60'), call(ident('armw'), ident('a')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('= re-decl inside an arm shadows — outer fresh root stays eligible', async () => {
+    // `u = [0]; if c → u = [9]` — `=` is scope.define: the arm's u is a NEW
+    // arm-local slot, not a rebind of the outer u. After the arm, `u[0] :=`
+    // still writes the outer fresh array → agnostic-safe (QA17 shadow rule).
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'shadw', params: [],
+      body: [
+        assign('u', arraylit([num(0)])),
+        {
+          type: 'if', test: { type: 'bool', v: true } as Node,
+          then: [assign('u', arraylit([num(9)]))],
+          elseIfs: [], else: null,
+        } as Node,
+        { type: 'reassign', target: histref(ident('u'), num(0)), value: num(1) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      g,
+      assign('x', security(str(''), str('60'), call(ident('shadw')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('index := on an un-rebound fresh root still passes — regression', async () => {
+    // `u = [0]; u[0] := 1` — plain member/index write on a fresh root with
+    // no intervening rebind stays agnostic-safe (QA17 must not regress it).
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'plainw', params: [],
+      body: [
+        assign('u', arraylit([num(0)])),
+        { type: 'reassign', target: histref(ident('u'), num(0)), value: num(1) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      g,
+      assign('x', security(str(''), str('60'), call(ident('plainw')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+  });
+
  });
 
 describe('request.security regression fixes', () => {
