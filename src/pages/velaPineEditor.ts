@@ -29,7 +29,7 @@ import { svg16 } from "@luxalgo/vela/ui";
 import {
   pineLibCreate, pineLibGet, pineLibList, pineLibSave, pineLibRename,
   pineLibDuplicate, pineLibRecent, pineLibRecentPush,
-  pineLibMigrateLegacyHist,
+  pineLibMigrateLegacyHist, pineLibSubscribe,
 } from "../pine/lib/pineLib.ts";
 import { openScriptsDialog } from "./velaPineScriptsDialog.ts";
 
@@ -353,6 +353,14 @@ let open = false;
 // indicator handle we're updating in place.
 type EditorState = { currentId: string | null; dirty: boolean; handleId?: string };
 let editorState: EditorState = { currentId: null, dirty: false };
+
+// Keep currentId consistent with the library: deleting the open script must
+// not leave a dead id that makes Save throw 'script not found' (F8).
+pineLibSubscribe(() => {
+  if (editorState.currentId && !pineLibGet(editorState.currentId)) {
+    editorState = { ...editorState, currentId: null };
+  }
+});
 
 // Run the pine-hist → pineLib migration once per session, first editor open.
 let migrated = false;
@@ -722,7 +730,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
     area.value = initialSrc;
   } else if (draft?.src && !editorState.currentId) {
     area.value = draft.src;
-    editorState.currentId = draft.id;
+    editorState.currentId = draft.id && pineLibGet(draft.id) ? draft.id : null;
   } else if (editorState.currentId) {
     area.value = pineLibGet(editorState.currentId)?.source ?? initialSrc;
   } else {

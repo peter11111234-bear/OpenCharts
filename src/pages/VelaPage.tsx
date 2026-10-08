@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { VelaWorkspace, type ChartCell } from "@luxalgo/vela/workspace";
+import type { InputValue } from "@luxalgo/vela/plugin";
 import { InterpreterPineEngine } from "./velaPineEditor.ts";
 import { ShioajiVelaProvider } from "../services/shioaji/velaProvider.ts";
 import { TW_INSTRUMENTS } from "../services/shioaji/instruments.ts";
@@ -227,22 +228,40 @@ export function VelaPage() {
       else {
         const raw = localStorage.getItem("vela-workspace-v2");
         if (raw) {
-          interface ExtEntry { script?: unknown }
+          interface ExtEntry { script?: unknown; name?: string; id?: string; hidden?: boolean; inputs?: Record<string, unknown> }
+          interface ParkedEntry { chartIndex: number; entry: ExtEntry }
           const doc = JSON.parse(raw) as {
             charts?: Array<{ ext?: Record<string, unknown> }>;
           };
+          // Heavy scripts are MOVED to a parked list, not deleted — a user's
+          // MTF indicator must never silently vanish. Parked entries restore
+          // on idle below (deferred, off the boot path).
+          const parked: ParkedEntry[] = (() => {
+            try {
+              const p = JSON.parse(localStorage.getItem("vela-workspace-v2.parked-pine") || "[]") as ParkedEntry[];
+              return Array.isArray(p) ? p : [];
+            } catch { return []; }
+          })();
           let stripped = false;
-          for (const c of doc.charts ?? []) {
+          (doc.charts ?? []).forEach((c, chartIndex) => {
             const entries = c.ext?.["opencharts.pine-scripts"];
-            if (!Array.isArray(entries)) continue;
+            if (!Array.isArray(entries)) return;
             const kept = (entries as ExtEntry[]).filter(
               (e) => typeof e.script !== "string" || !e.script.includes("request.security"),
             );
+            for (const e of entries as ExtEntry[]) {
+              if (typeof e.script === "string" && e.script.includes("request.security")) {
+                parked.push({ chartIndex, entry: e });
+              }
+            }
             if (kept.length !== entries.length) {
               if (kept.length) c.ext!["opencharts.pine-scripts"] = kept;
               else delete c.ext!["opencharts.pine-scripts"];
               stripped = true;
             }
+          });
+          if (parked.length) {
+            try { localStorage.setItem("vela-workspace-v2.parked-pine", JSON.stringify(parked)); } catch { /* quota */ }
           }
           if (stripped) localStorage.setItem("vela-workspace-v2", JSON.stringify(doc));
         }
@@ -276,6 +295,33 @@ export function VelaPage() {
 
     // Debug handle for scripts/tests (chart.runIndicator, ws.state()).
     (window as unknown as Record<string, unknown>).__vela = ws;
+
+    // Deferred restore of parked heavy scripts — they were moved off the
+    // workspace doc above (not deleted), now re-run on idle so boot stays
+    // free of synchronous runScript calls (the original TRIS-class hang).
+    // runIndicator never rejects; failed entries stay parked for next load.
+    const restoreParked = async () => {
+      let parked: { chartIndex: number; entry: { script?: unknown; name?: string; id?: string; hidden?: boolean; inputs?: Record<string, InputValue> } }[] = [];
+      try {
+        const p = JSON.parse(localStorage.getItem("vela-workspace-v2.parked-pine") || "[]") as typeof parked;
+        if (Array.isArray(p)) parked = p;
+      } catch { /* corrupt */ }
+      if (!parked.length || !ws) return;
+      const cells = ws.cells();
+      const remaining = (await Promise.all(parked.map(async ({ chartIndex, entry }) => {
+        const cell = cells[chartIndex] ?? cells[0];
+        if (!cell || typeof entry.script !== "string") return { chartIndex, entry };
+        const r = await cell.chart.runIndicator(entry.script, {
+          id: entry.id, language: "pine", title: entry.name, inputs: entry.inputs,
+        });
+        if (!r.ok) return { chartIndex, entry };
+        if (entry.hidden) r.handle?.setVisible(false);
+        return null;
+      }))).filter((e): e is NonNullable<typeof e> => e !== null);
+      try { localStorage.setItem("vela-workspace-v2.parked-pine", JSON.stringify(remaining)); } catch { /* quota */ }
+    };
+    if ("requestIdleCallback" in window) requestIdleCallback(() => void restoreParked(), { timeout: 5000 });
+    else setTimeout(() => void restoreParked(), 3000);
 
     // Pine seeding disabled — the auto-run loop was a freeze suspect. Pine scripts
     // now load manually via the topbar Pine button.
