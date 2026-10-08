@@ -1009,6 +1009,74 @@ describe('caller-agnostic eval cache', () => {
     expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
   });
 
+  it('nested index := on a fresh container rejects — element may alias shared state', async () => {
+    // `u = [p]; u[0][0] := 42` — u is a fresh container but its ELEMENT
+    // aliases the caller's var-held array p; the depth-2 target writes
+    // through u[0] into shared state. The gate counts chain depth rather
+    // than tracking element freshness, so this rejects (H2).
+    const f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'nestw', params: [{ name: 'p' }],
+      body: [
+        assign('u', arraylit([ident('p')])),
+        { type: 'reassign', target: histref(histref(ident('u'), num(0)), num(0)),
+          value: num(42) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      { type: 'var', name: 'a', value: arraylit([num(7)]) } as Node,
+      g,
+      assign('x', security(str(''), str('60'), call(ident('nestw'), ident('a')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('nested index := rejects even with a literal element — conservative depth rule', async () => {
+    // `u = [0]; u[0][0] := 1` — the element is a plain int here (the write
+    // would throw at runtime → warns + na), but the gate counts depth, not
+    // element freshness, so depth ≥ 2 still rejects (H2).
+    const f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'nestlit', params: [],
+      body: [
+        assign('u', arraylit([num(0)])),
+        { type: 'reassign', target: histref(histref(ident('u'), num(0)), num(0)),
+          value: num(1) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      g,
+      assign('x', security(str(''), str('60'), call(ident('nestlit')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBeGreaterThanOrEqual(1);
+  });
+
+  it('member := on a fresh root is single-level — gate still passes', async () => {
+    // `u = [0]; u.f := 1` — a single member step on a fresh root writes the
+    // container's own slot; the depth limit only cuts depth ≥ 2 (H2). The
+    // verdict is structural — field validity at runtime is irrelevant here.
+    const p0 = __mtfStats.gatePass, f0 = __mtfStats.gateFail;
+    const g = {
+      type: 'func', name: 'memw', params: [],
+      body: [
+        assign('u', arraylit([num(0)])),
+        { type: 'reassign', target: member(ident('u'), 'f'), value: num(1) } as Node,
+        num(0),
+      ],
+    } as Node;
+    const body = [
+      g,
+      assign('x', security(str(''), str('60'), call(ident('memw')))),
+    ];
+    await runTransient(body, chart, '15', { '|60': tf60 });
+    expect(__mtfStats.gateFail - f0).toBe(0);
+    expect(__mtfStats.gatePass - p0).toBeGreaterThanOrEqual(1);
+  });
+
  });
 
 describe('request.security regression fixes', () => {

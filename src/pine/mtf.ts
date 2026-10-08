@@ -1326,9 +1326,13 @@ function childNodes(node: Node): Node[] {
  * Member/index targets (`t.f := v`, `a[i] := v`) judge by their ROOT
  * ident — they mutate the object held by that binding, not the name:
  * pass only when the root ∈ `fresh`, i.e. bound in the same subtree by
- * a provably fresh initializer (`[…]`, `array.new*`, `ns.new`/`T.new`).
- * Bound-but-not-fresh roots (params, `u = a` aliases, for-in vars, var
- * slots) may hold objects shared with the caller → reject (QA15 P2).
+ * a provably fresh initializer (`[…]`, `array.new*`, `ns.new`/`T.new`),
+ * AND the target chain is single-level. Bound-but-not-fresh roots
+ * (params, `u = a` aliases, for-in vars, var slots) may hold objects
+ * shared with the caller → reject (QA15 P2). Deeper chains
+ * (`u[0][0] :=`, `a.b.c :=`) also reject: a fresh container's ELEMENTS
+ * may alias shared state (`u = [p]`), so depth ≥ 2 can reach shared
+ * interior objects (H2).
  * `:=`-rebound fresh roots also reject: the write-through puts an unproven
  * (possibly shared) value in the slot, and the rebind persists after a
  * child block exits — `rebound` marks merge from arm copies upward unless
@@ -1485,18 +1489,26 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
             && (varBound.has(n.target.name) || !bound.has(n.target.name))) return false;
         if (n.target.type === 'member' || n.target.type === 'histref') {
           // `t.f := v` / `a[i] := v` mutate the OBJECT held by the root
-          // binding, so the root — not the target chain — decides the
-          // verdict. Pass ONLY when the root is fresh: bound in this same
-          // subtree by a provably fresh initializer (`[…]`, `array.new*`,
+          // binding, so the root ident and the chain depth — not the
+          // target node itself — decide the verdict. Pass ONLY when the
+          // root is fresh: bound in this same subtree by a provably fresh
+          // initializer (`[…]`, `array.new*`,
           // `T.new`). Every other binding may hold an object shared with
           // the caller — a param is its argument, `u = a` aliases whatever
           // `a` held, a `for c in arr` var is an element of arr — so
           // member/index writes through them mutate shared state (QA15 P2).
-          let root: Node = n.target;
-          while (root.type === 'member' || root.type === 'histref') root = root.obj;
+          let root: Node = n.target, depth = 0;
+          while (root.type === 'member' || root.type === 'histref') { root = root.obj; depth++; }
           // A fresh root that was `:=`-rebound may now hold a shared object
           // (QA17) — the write-through put an unproven value in its slot.
-          if (root.type !== 'ident' || !fresh.has(root.name) || rebound.has(root.name)) return false;
+          // DEPTH LIMIT: only single-level targets (`u[i] :=`, `u.f :=`)
+          // pass. A fresh container's ELEMENTS may alias shared state
+          // (`u = [p]` — u fresh, element p caller-owned), so a single-level
+          // write mutates only the container's own slot while any deeper
+          // chain (`u[0][0] :=`, `a.b.c :=`) can reach shared interior
+          // objects — reject until element-freshness tracking exists.
+          if (root.type !== 'ident' || depth > 1
+              || !fresh.has(root.name) || rebound.has(root.name)) return false;
         } else if (n.target.type === 'ident') {
           // Ident `:=` passed the gate, but the write-through rebinds the
           // name to an unproven value: mark it rebound so later member/index
