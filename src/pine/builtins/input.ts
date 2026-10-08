@@ -70,17 +70,53 @@ function rawDefval(v: Value): unknown {
   }
 }
 
-/** Record schema (dedup by id) and look up a user override. */
+// Per-callsite memo of {id,title,schema,resolver}. schema.push is one-shot per
+// run (ctx.inputSchemas is []-reset at run start). `resolver` is the function
+// that derives the coerced return value from (defval, override) — bound once
+// per callsite, called per bar with the fresh override.
+//
+// Cache lifetime: WeakMap<RtCtx> so each run's memo is dropped with the ctx.
+// Cache key: ctx.callsite — already stable `#N` per Call node, and already
+// composes with siteStack inside UDFs.
+interface InputMemo {
+  id: string;
+  title: string;
+  schemaPushed: boolean;
+  // rawDefval-captured value — constant per run (input-qualified).
+  resolved: Value;
+}
+let __inputSchemaBuilds = 0;
+export { __inputSchemaBuilds }; // test instrumentation only
+
+const INPUT_MEMO = new WeakMap<RtCtx, Map<string, InputMemo>>();
+const inputMemoOf = (ctx: RtCtx): Map<string, InputMemo> => {
+  let m = INPUT_MEMO.get(ctx);
+  if (!m) { m = new Map(); INPUT_MEMO.set(ctx, m); }
+  return m;
+};
+
 function recordAndOverride(
   ctx: RtCtx,
   bound: Map<string, Value>,
   type: string,
   defval: unknown,
-): { id: string; title: string; override: unknown } {
+  coerce: (defval: unknown, override: unknown) => Value,
+): { id: string; title: string; value: Value } {
+  const site = ctx.callsite ?? `g${ctx.miscSeq ?? 0}`;
+  const memo = inputMemoOf(ctx).get(site);
+  if (memo !== undefined) {
+    // Re-read the override per bar — one dict lookup, correct if ctx.inputs
+    // is ever injected mid-run. Fresh {...} wrapper — callers may mutate the
+    // returned Value, so the memoized object must never escape.
+    const override = ctx.inputs?.[memo.title] ?? ctx.inputs?.[memo.id];
+    const v = override !== undefined ? coerce(memo.resolved, override) : memo.resolved;
+    return { id: memo.id, title: memo.title, value: { ...v } };
+  }
+  __inputSchemaBuilds++;
   const title = strArg(bound, 'title', 'input');
   // Fallback id must be stable per call site: CJK titles slug to '' and a
   // per-call counter would mint a fresh id every bar, defeating the schema dedup.
-  const id = slugify(title, `input_${ctx.callsite ?? ctx.miscSeq ?? 0}`);
+  const id = slugify(title, `input_${site}`);
 
   const schema: InputSchemaLite = { id, name: title, type, defval };
   const minval = bound.get('minval');
@@ -101,8 +137,11 @@ function recordAndOverride(
   ctx.inputSchemas ??= [];
   if (!ctx.inputSchemas.some(s => s.id === schema.id)) ctx.inputSchemas.push(schema);
 
-  const override = ctx.inputs?.[title] ?? ctx.inputs?.[id];
-  return { id, title, override };
+  const resolved = coerce(defval, ctx.inputs?.[title] ?? ctx.inputs?.[id]);
+  const entry: InputMemo = { id, title, schemaPushed: true, resolved };
+  inputMemoOf(ctx).set(site, entry);
+  // Fresh wrapper here too — memo.resolved must stay untouched by callers.
+  return { id, title, value: { ...resolved } };
 }
 
 function scalarInput(
@@ -113,15 +152,18 @@ function scalarInput(
   return (ctx, args, named) => {
     const bound = bindArgs(args, named, INPUT_ORDER);
     const raw = rawDefval(unwrapped(bound.get('defval') ?? dflt));
-    const { override } = recordAndOverride(ctx, bound, schemaType, raw);
-    // Vela's input panel sends '' for untouched color/string inputs — treat
-    // an empty string as "no override" so the script's defval survives.
-    if (override !== undefined && !(kind === 'color' && override === '')
-        && !(kind === 'string' && override === '')) {
-      return coerceOverride(override, kind);
-    }
-    // Normalize defval to the declared kind (input.int(10.5) → 10).
-    return coerceOverride(raw, kind);
+    const { value } = recordAndOverride(ctx, bound, schemaType, raw, (dv, ov) => {
+      const o = ov;
+      // Vela's input panel sends '' for untouched color/string inputs — treat
+      // an empty string as "no override" so the script's defval survives.
+      if (o !== undefined && !(kind === 'color' && o === '')
+          && !(kind === 'string' && o === '')) {
+        return coerceOverride(o, kind);
+      }
+      // Normalize defval to the declared kind (input.int(10.5) → 10).
+      return coerceOverride(dv, kind);
+    });
+    return value;
   };
 }
 
@@ -140,9 +182,11 @@ registerBuiltin('input', 'price', scalarInput('float', 'price', { kind: 'float',
 registerBuiltin('input', 'time', (ctx, args, named) => {
   const bound = bindArgs(args, named, INPUT_ORDER);
   const defval = unwrapped(bound.get('defval') ?? { kind: 'int', v: 0 } as Value);
-  const { override } = recordAndOverride(ctx as RtCtx, bound, 'time', rawDefval(defval));
-  if (override !== undefined) return { kind: 'int', v: Math.trunc(Number(override)) };
-  return { kind: 'int', v: Math.trunc(asNum(defval)) };
+  const { value } = recordAndOverride(ctx as RtCtx, bound, 'time', rawDefval(defval),
+    (_dv, ov) => ov !== undefined
+      ? { kind: 'int', v: Math.trunc(Number(ov)) }
+      : { kind: 'int', v: Math.trunc(asNum(defval)) });
+  return value;
 });
 
 // input.source(defval, title, ...) → Series Value
@@ -154,20 +198,20 @@ registerBuiltin('input', 'source', (c, args, named) => {
   const defName = defval.kind === 'series'
     ? sourceNameOf(ctx, defval.v)
     : defval.kind === 'string' ? defval.v : 'close';
-  const { override } = recordAndOverride(ctx, bound, 'source', defName);
-
   // Override: a series name ('close') or a live Series Value.
-  if (override !== undefined) {
-    if (override !== null && typeof override === 'object' && 'kind' in (override as Value)) {
-      return override as Value;
+  const { value } = recordAndOverride(ctx, bound, 'source', defName, (_dv, ov) => {
+    if (ov !== undefined) {
+      if (ov !== null && typeof ov === 'object' && 'kind' in (ov as Value)) {
+        return ov as Value;
+      }
+      const s = seriesNamed(ctx, String(ov));
+      return s ? { kind: 'series', v: s } : { kind: 'series', v: ctx.close };
     }
-    const s = seriesNamed(ctx, String(override));
+    if (defval.kind === 'series') return defval;
+    const s = seriesNamed(ctx, asStr(defval));
     return s ? { kind: 'series', v: s } : { kind: 'series', v: ctx.close };
-  }
-
-  if (defval.kind === 'series') return defval;
-  const s = seriesNamed(ctx, asStr(defval));
-  return s ? { kind: 'series', v: s } : { kind: 'series', v: ctx.close };
+  });
+  return value;
 });
 
 // Generic `input(defval, title, ...)` — infers type from defval kind.
@@ -178,12 +222,15 @@ registerBuiltin('', 'input', (c, args, named) => {
   // A builtin price series (input(close)) stays a source; any other series-wrapped
   // arg is a scalar defval and must be unwrapped before type inference.
   if (raw0.kind === 'series' && SOURCES.some(n => seriesNamed(ctx, n) === raw0.v)) {
-    const { override } = recordAndOverride(ctx, bound, 'source', sourceNameOf(ctx, raw0.v));
-    if (override !== undefined) {
-      const s = seriesNamed(ctx, String(override));
-      return s ? { kind: 'series', v: s } : raw0;
-    }
-    return raw0;
+    const { value } = recordAndOverride(ctx, bound, 'source', sourceNameOf(ctx, raw0.v),
+      (_dv, ov) => {
+        if (ov !== undefined) {
+          const s = seriesNamed(ctx, String(ov));
+          return s ? { kind: 'series', v: s } : raw0;
+        }
+        return raw0;
+      });
+    return value;
   }
   const defval = unwrapped(raw0);
   const kind: 'int' | 'float' | 'bool' | 'string' | 'color' =
@@ -193,7 +240,7 @@ registerBuiltin('', 'input', (c, args, named) => {
     : defval.kind === 'color' ? 'color'
     : 'string';
   const raw = rawDefval(defval);
-  const { override } = recordAndOverride(ctx, bound, kind, raw);
-  if (override !== undefined) return coerceOverride(override, kind);
-  return coerceOverride(raw, kind);
+  const { value } = recordAndOverride(ctx, bound, kind, raw,
+    (dv, ov) => ov !== undefined ? coerceOverride(ov, kind) : coerceOverride(dv, kind));
+  return value;
 });
