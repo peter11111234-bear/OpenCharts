@@ -1259,6 +1259,17 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
     return evalExpr(fn.body, callFr);
   } catch (e) {
     if (e instanceof ReturnSignal) return e.value;
+    if (e === BREAK || e === CONTINUE) {
+      // Loop-internal breaks are absorbed by evalFor/evalWhile/evalSwitch
+      // before they reach here — a signal escaping the whole body is invalid
+      // Pine (TV rejects at compile time). Erroring beats the bar loop's
+      // warn-and-skip, which would prune later decls and silently misalign
+      // ta.* ordinal reads (stmtMayExitTop can't see inside callee closures).
+      throw pineErr(
+        callNode,
+        `'${e === BREAK ? 'break' : 'continue'}' outside loop in function '${fn.name}'`,
+      );
+    }
     throw e;
   } finally {
     run.topLevelBody = wasTop;

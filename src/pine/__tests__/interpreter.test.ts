@@ -445,6 +445,84 @@ describe('UDFs', () => {
   });
 });
 
+describe('UDF break/continue escape', () => {
+  it('break escaping a UDF body aborts the run, not a silent bar-skip', async () => {
+    // QA10/QA11: BREAK used to bubble to the bar loop's warn-and-skip, so
+    // the rest of the bar was dropped while stmtMayExitTop still pruned
+    // later decls → ta.* ordinal reads silently misaligned. Now a hard error.
+    const body: Node[] = [
+      funcDecl('f', [], [{ type: 'break' } as Node, num(0)]),
+      assign('y', call(ident('f'), [])),
+      plot(ident('y'), 'y'),
+    ];
+    await expect(runScript(body, mkBars(3))).rejects.toThrow(
+      /'break' outside loop in function 'f'/,
+    );
+  });
+
+  it('continue escaping a UDF body aborts the run too', async () => {
+    const body: Node[] = [
+      funcDecl('g', [], [{ type: 'continue' } as Node, num(0)]),
+      assign('y', call(ident('g'), [])),
+      plot(ident('y'), 'y'),
+    ];
+    await expect(runScript(body, mkBars(3))).rejects.toThrow(
+      /'continue' outside loop in function 'g'/,
+    );
+  });
+
+  it('loop-internal break inside a UDF still works', async () => {
+    // evalFor absorbs the BREAK inside the UDF's own body — it must not
+    // reach callUdfValue's new catch.
+    const body: Node[] = [
+      funcDecl('f', [], [
+        {
+          type: 'for',
+          varName: 'i',
+          from: num(0),
+          to: num(10),
+          body: [
+            {
+              type: 'if',
+              test: bin('>', ident('i'), num(2)),
+              then: [{ type: 'break' } as Node],
+              elseIfs: [],
+              else: null,
+            } as Node,
+            ident('i'),
+          ],
+        } as Node,
+      ]),
+      assign('y', call(ident('f'), [])),
+      plot(ident('y'), 'y'),
+    ];
+    const res = await runScript(body, mkBars(3));
+    // i: 0,1,2 evaluated; break at 3 → last value is 2.
+    expect(nums(firstPlotValues(res))).toEqual([2, 2, 2]);
+  });
+
+  it('the QA10 divergence: break inside UDF called under `if` now errors', async () => {
+    // Original bug: f()'s escaping BREAK skipped the rest of the bar, but
+    // the `if` stmt was treated as opaque by stmtMayExitTop → y's slot was
+    // pruned → ta.sma read misaligned history. Assert the new error, not
+    // the old wrong value.
+    const body: Node[] = [
+      funcDecl('f', [], [{ type: 'break' } as Node, num(0)]),
+      {
+        type: 'if',
+        test: bool(true),
+        then: [call(ident('f'), [])],
+        elseIfs: [],
+        else: null,
+      } as Node,
+      assign('y', ident('bar_index')),
+      assign('m', nsCall('ta', 'sma', [{ value: ident('y') }, { value: num(2) }])),
+      plot(ident('m'), 'm'),
+    ];
+    await expect(runScript(body, mkBars(3))).rejects.toThrow(/'break' outside loop/);
+  });
+});
+
 describe('na / operator semantics', () => {
   it('na propagates through arithmetic', async () => {
     const body: Node[] = [
