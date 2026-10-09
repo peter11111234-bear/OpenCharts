@@ -99,6 +99,25 @@ Pinned-not-fixed (`it.fails` in `strategy.test.ts`, needs leg-level entry ids �
 
 Documented, no code: `strategy.risk.*` + ~37 v5 members missing; `calc_on_*`/`slippage`/`margin_*`/`use_bar_magnifier` parsed-not-honored (by design); dup-id reversed-direction modify semantics unverified (F7).
 
+### Task 4 — B3 PineTS shim spike (executed 2026-10-09)
+
+Step 0 collision check: `ta.tr`/`rsi`/`supertrend` all already exist in `ta.ts`; `registerBuiltin` is a plain `Map.set` — silent overwrite. Decision: register pilots under the SAME names (parity-first per plan NOTE), warn once per overwrite, test captures + restores originals (`pinetsShim.test.ts` `beforeAll`/`afterAll`). Production path untouched — `builtins/index.ts` does not import the shim.
+
+Delivered: `src/pine/pinetsShim.ts` — `PtSeries` (upstream `Series.ts` semantics over our `contracts.Series`: `get(i)` = i bars ago, na → NaN, fractional lookback truncates), `PineTsCtx` facade (`idx`, `precision()` method — upstream signature `(value, decimals=10)`, `taState` in `ctx.state['pt|taState']` (per-RUN shared bag like upstream Context), `get()` verbatim-adapted, `data.{open,high,low,close,volume,openTime}`, `pine.{ta,syminfo}`, `ta` alias, `params`), verbatim-adapted ports of `tr` (:6-33), `rsi` (:5-117), `supertrend` (:28-187) with Source comments, `wrapPorted` (bindArgs → raw args → `_callId` = `rt.callsite`), `registerPortedTa()`.
+
+Parity results (pinetsShim.test.ts, 5 tests green):
+- `ta.tr`: ported == existing on bars ≥1 exactly (≤8dp); **bar-0 divergence** — pinets returns `high−low` for `handle_na=true` on a na `close[1]`, ours returns `na` (upstream comment inverts the v5 doc wording; our impl is the conservative read). Flagged: verify against live TV before any cutover.
+- `ta.rsi`: ported == existing bar-for-bar (≤8dp), including the shared seed-bar convention (first value at bar `length`); `it.fails`-level divergence only on all-flat windows (pinets → 100, ours → na).
+- `ta.supertrend`: tuple `[st, dir]` correct, dir flips on crafted reversal; ATR seeds at bar `atrPeriod-1` (counts tr from bar 0) vs ours `atrPeriod` — one-bar-earlier first value, documented.
+
+Facade coverage over `ta/methods` (68 files, grep `context.<field>`):
+- Covered: `taState` (58 files), `idx` (45), `precision` (33+), `data` (25), `get` (21), `pine` (4: hma/macd/mom via `pine.ta.*` — need sibling ports; vwap via `pine.syminfo.timezone` — covered), `ta` alias (hma), `params` (param.ts — field added).
+- Uncovered: none on fields. `pine.ta.X` cross-calls create an ordering dependency tier: hma→wma, macd→ema, mom→change must be ported together or `pine.ta` must bridge to existing builtins.
+- **~97% of methods need only the delivered facade**; remaining blockers are per-method semantics, not plumbing.
+
+GO for full B3 — the port loop is mechanical (verbatim body + `Source:` comment + order tuple + a parity test). Recommended order: stateless (sma/stdev/variance/cog/correlation/median/mode…) → stateful rma-chain (ema/rma/atr) → composite (macd/hma/vwap needing `pine.ta`) → param.ts last.
+
+
 ---
 
 ## Task 1: "將此指標增加到整個版面" real implementation
