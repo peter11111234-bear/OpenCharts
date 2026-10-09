@@ -174,13 +174,13 @@ registerStatePersistence({
 });
 
 /**
- * In-process interpreter engine (from-scratch `src/pine/`, `PineInterpreterEngine`).
- * Replaces the PineTS transpiler path (scope/named-arg bugs) — source passes
- * through unchanged; the interpreter handles named args natively. BOM strip
- * lives in the base `prepare`; this alias exists so VelaPage can register it
- * without importing `src/pine/engine.ts` directly.
+ * Pine engine registration — worker-backed (`PineWorkerEngine`, src/pine/):
+ * runScript executes in a dedicated module Worker so heavy scripts don't
+ * block the UI; falls back to in-process `PineInterpreterEngine` semantics
+ * when Worker is unavailable. BOM strip lives in the base `prepare`; this
+ * alias exists so VelaPage can register it without importing src/pine directly.
  */
-export { PineInterpreterEngine as InterpreterPineEngine } from '../pine/engine.ts';
+export { PineWorkerEngine as InterpreterPineEngine } from '../pine/pineWorkerEngine.ts';
 
 
 // 「Edit」legend action — 把指標的 source 拉回 Pine editor（openEditor 吃

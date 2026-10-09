@@ -17,7 +17,7 @@ import type {
 } from '@luxalgo/vela';
 import type { BarData, DrawObj, PlotOpts, RunResult, Value } from './contracts';
 import { parse } from './parser';
-import { collectInputs, runScript } from './interpreter';
+import { collectInputs, runScript, type RunOptions } from './interpreter';
 import { tfFloor, tfNext } from './mtf';
 import './builtins/index';
 import './mtf';
@@ -256,6 +256,10 @@ export class PineInterpreterEngine implements ScriptingEngine {
     // Bundled engines defer their first run until the 'complete' notification
     // when the bars snapshot is a partial history (backfill in progress).
     let deferred = req.historyState === 'backfill';
+    // Per-session run context: the worker engine binds a dedicated
+    // PineRunClient/worker to THIS session — a chart can host several pine
+    // indicators, so several execute() sessions share one engine instance.
+    const sessionCtx = this.sessionRunner();
 
     // Single-flight + coalescing: at most one run in flight per session; if a
     // re-run is requested while one is executing, only the LATEST request is
@@ -286,7 +290,10 @@ export class PineInterpreterEngine implements ScriptingEngine {
             // stale emit advertise input values the curves weren't computed with.
             const runInputs = { ...inputs };
             const __t0 = performance.now();
-            const result: RunResult = await runScript(parse(token.source), barData, {
+            // runProgram is the worker seam: PineWorkerEngine overrides it to
+            // ship the run off-thread; shouldAbort stays meaningful only on the
+            // in-process path (worker abort rides the client protocol).
+            const result: RunResult = await this.runProgram(token.source, barData, {
               symbol: req.market.symbol,
               timeframe: req.market.timeframe,
               fetchSeries: toFetch(req.fetchSeries, bars),
@@ -297,6 +304,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
               // right after it carries the latest bars+inputs, so the stale
               // emit is one frame of lag, not a wrong final state.
               shouldAbort: () => stopped,
+              sessionCtx,
             });
             // Dev-only run timing: window.__pineRunLog collects {bars, ms} per
             // run so browser QA can split prefetch vs eval cost without a
@@ -333,7 +341,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
     if (!deferred) request(getBars());
 
     return {
-      stop: () => { stopped = true; runId++; pending = null; },
+      stop: () => { stopped = true; runId++; pending = null; this.abortRun(sessionCtx); },
       update: (next: Record<string, InputValue>) => {
         inputs = { ...inputs, ...next };
         if (!deferred) request(getBars());
@@ -346,6 +354,19 @@ export class PineInterpreterEngine implements ScriptingEngine {
       },
     };
   }
+
+
+  /** Per-execute-session runner context; the worker engine returns a
+   *  PineRunClient so each session owns its worker. */
+  protected sessionRunner(): unknown { return undefined; }
+
+  /** Parse + run in-process. PineWorkerEngine overrides to run off-thread. */
+  protected runProgram(source: string, barData: BarData[], opts: RunOptions & { sessionCtx?: unknown }): Promise<RunResult> {
+    return runScript(parse(source), barData, opts);
+  }
+
+  /** Called by session stop() — worker engine disposes that session's client. */
+  protected abortRun(_sessionCtx: unknown): void { /* in-process needs nothing: shouldAbort polls `stopped` */ }
 }
 
 const syminfoOf = (info: NonNullable<ExecutionRequest['market']['symbolInfo']>): Record<string, Value> => {
