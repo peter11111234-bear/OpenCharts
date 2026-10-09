@@ -106,9 +106,9 @@ Step 0 collision check: `ta.tr`/`rsi`/`supertrend` all already exist in `ta.ts`;
 Delivered: `src/pine/pinetsShim.ts` — `PtSeries` (upstream `Series.ts` semantics over our `contracts.Series`: `get(i)` = i bars ago, na → NaN, fractional lookback truncates), `PineTsCtx` facade (`idx`, `precision()` method — upstream signature `(value, decimals=10)`, `taState` in `ctx.state['pt|taState']` (per-RUN shared bag like upstream Context), `get()` verbatim-adapted, `data.{open,high,low,close,volume,openTime}`, `pine.{ta,syminfo}`, `ta` alias, `params`), verbatim-adapted ports of `tr` (:6-33), `rsi` (:5-117), `supertrend` (:28-187) with Source comments, `wrapPorted` (bindArgs → raw args → `_callId` = `rt.callsite`), `registerPortedTa()`.
 
 Parity results (pinetsShim.test.ts, 5 tests green):
-- `ta.tr`: ported == existing on bars ≥1 exactly (≤8dp); **bar-0 divergence** — pinets returns `high−low` for `handle_na=true` on a na `close[1]`, ours returns `na` (upstream comment inverts the v5 doc wording; our impl is the conservative read). Flagged: verify against live TV before any cutover.
+- `ta.tr`: ported == existing on bars ≥1 exactly (≤8dp); ~~**bar-0 divergence**~~ **RESOLVED (QA round-1):** pinets returns `high−low` for `handle_na=true` on a na `close[1]`, our builtin originally returned `na` (upstream comment had inverted the v5 doc wording) — fixed, both now agree on every bar.
 - `ta.rsi`: ported == existing bar-for-bar (≤8dp), including the shared seed-bar convention (first value at bar `length`); `it.fails`-level divergence only on all-flat windows (pinets → 100, ours → na).
-- `ta.supertrend`: tuple `[st, dir]` correct, dir flips on crafted reversal; ATR seeds at bar `atrPeriod-1` (counts tr from bar 0) vs ours `atrPeriod` — one-bar-earlier first value, documented.
+- `ta.supertrend`: tuple `[st, dir]` correct, dir flips on crafted reversal; ~~ATR seeds at bar `atrPeriod-1` (pinets) vs `atrPeriod` (ours)~~ — after the QA round-1 trVs fix, ours also seeds at `atrPeriod-1`: identical warmup.
 
 Facade coverage over `ta/methods` (68 files, grep `context.<field>`):
 - Covered: `taState` (58 files), `idx` (45), `precision` (33+), `data` (25), `get` (21), `pine` (4: hma/macd/mom via `pine.ta.*` — need sibling ports; vwap via `pine.syminfo.timezone` — covered), `ta` alias (hma), `params` (param.ts — field added).
@@ -116,6 +116,20 @@ Facade coverage over `ta/methods` (68 files, grep `context.<field>`):
 - **~97% of methods need only the delivered facade**; remaining blockers are per-method semantics, not plumbing.
 
 GO for full B3 — the port loop is mechanical (verbatim body + `Source:` comment + order tuple + a parity test). Recommended order: stateless (sma/stdev/variance/cog/correlation/median/mode…) → stateful rma-chain (ema/rma/atr) → composite (macd/hma/vwap needing `pine.ta`) → param.ts last.
+
+### QA Round-1 fix loop (2026-10-09)
+
+Fixed:
+- `ta.tr` handle_na inversion — both the `ta.tr` builtin and internal `trVs` (atr/supertrend/dmi/kc) now follow TV: `handle_na=true` (default) → `high−low` when `close[1]` is na; `handle_na=false` → na. atr seeds at bar `len−1` (was `len`). The bar-0 divergence flagged above under Task 4 is resolved — builtin now matches pinets/TV on every bar.
+- `增加到整個版面` menu item: `cell.chart.indicators()` moved inside try (disposed cell no longer throws outside the guard); module-level `addingToLayout` flag returns early with '處理中' toast on re-entry.
+
+Documented, no code (deferred findings):
+- `strategy.netprofit` vs equity timing divergence on partial exits — netprofit updates on leg consumption, equity marks position open until fully closed; cosmetic under partial exits, revisit if PnL probes ever mix the two mid-trade.
+- Reversal fills book 100% commission to the closing legs (opening legs of the reversed position pay nothing on that fill); per-leg commission split unverified against TV.
+- `oca_type='reduce'` qty semantics ignored — OCA group cancels siblings on fill but never reduces their qty.
+- `增加到整個版面` dedup skips cells already hosting the same `source` with different inputs — correct-ish for idempotent adds, but can't add a second instance of the same script.
+- `RESOLVED_BUILTIN` memoization means pinetsShim must register at import time (before first eval) if ever flipped on by default — mid-session `registerPortedTa()` would be invisible to already-resolved callsites.
+- `handle.title` serializes as `'Indicator'` in some paths — cosmetic staleness only.
 
 
 ---
