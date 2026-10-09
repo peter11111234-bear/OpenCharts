@@ -104,6 +104,10 @@ export function registerMtf(h: MtfHooks): void {
 interface RunState {
   /** Declaring node → the variable's BarSeries (stable across bars/scopes). */
   declSlots: Map<object, BarSeries>;
+  /** Declaring node → live CowSeries for `var` alias decls (carries the
+   *  materialized `:=` copy across bars; rebind() re-points the inner each
+   *  bar so reads still see the caller's current history until a write). */
+  declCows: Map<object, CowSeries>;
   /** Slots registered for bar-end densification — dedup for ensureList
    *  (post-pruning this holds ONLY slots that still need ensureBar). */
   trackedSlots: Set<BarSeries>;
@@ -154,6 +158,7 @@ function runOf(ctx: BuiltinCtx): RunState {
   if (!r) {
     r = {
       declSlots: new Map(),
+      declCows: new Map(),
       trackedSlots: new Set(),
       ensureList: [],
       topLevelBody: false,
@@ -462,8 +467,22 @@ function bindDeclared(
     // Aliased decl (x = y): registration stays unconditional — the alias
     // target's own write cadence is unknown, and add is deduped anyway.
     trackSeries(run, v.v);
-    scope.define(name, v.v);
+    // `x := …` must not write through into a shared caller slot (ctx.close,
+    // SecSeries). The name binds a CowSeries: reads delegate to v.v, the
+    // first `:=` materializes a private copy. declSlots keeps the RAW slot:
+    // var-rebind needs it, and a same-site mixed-kind decl's slotFor().setAt
+    // lands on the raw slot (SecSeries.setAt warn+no-ops) instead of
+    // materializing a stale-history cow. `var` reuses its cow across bars so
+    // `:=` history survives; plain decls re-bind fresh each execution.
     run.declSlots.set(key, v.v);
+    let cow = persistent ? run.declCows.get(key) : undefined;
+    if (!cow) {
+      cow = new CowSeries(v.v);
+      if (persistent) run.declCows.set(key, cow);
+    } else {
+      cow.rebind(v.v);
+    }
+    scope.define(name, cow);
     return v.v;
   }
   const s = slotFor(run, key, scope, name, persistent);
@@ -603,7 +622,7 @@ function evalNode(node: Node, frame: Frame): Value {
           bindDeclared(run, dk, scope, it.name, v, bar, /*persistent*/ true);
           last = v.kind === 'series' ? v.v.cur() : v;
         } else {
-          const s = run.declSlots.get(dk)!;
+          const s = run.declCows.get(dk) ?? run.declSlots.get(dk)!;
           scope.define(it.name, s);
           last = valueAt(s, bar);
         }
@@ -1759,7 +1778,7 @@ function compileStmt(stmt: Node): CompiledStmt {
           return v.kind === 'series' ? v.v.cur() : v;
         });
         const later: Compiled = wrapCompiled(stmt, (frame, run) => {
-          const s = run.declSlots.get(siteKey(run, it))!;
+          const s = run.declCows.get(siteKey(run, it)) ?? run.declSlots.get(siteKey(run, it))!;
           frame.scope.define(name, s);
           return valueAt(s, frame.ctx.barIndex);
         });
@@ -1781,7 +1800,7 @@ function compileStmt(stmt: Node): CompiledStmt {
             bindDeclared(run, dk, scope, it.name, v, bar, /*persistent*/ true);
             last = v.kind === 'series' ? v.v.cur() : v;
           } else {
-            const s = run.declSlots.get(dk)!;
+            const s = run.declCows.get(dk) ?? run.declSlots.get(dk)!;
             scope.define(it.name, s);
             last = valueAt(s, bar);
           }

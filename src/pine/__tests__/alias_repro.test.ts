@@ -18,7 +18,7 @@ const num = (v: unknown): unknown =>
   v && typeof v === 'object' && 'v' in v ? v.v : v;
 
 describe('bindDeclared alias write-through (pre-existing bug)', () => {
-  it.fails('x = input.source(close); x := 999 — must not corrupt ctx.close', async () => {
+  it('x = input.source(close); x := 999 — must not corrupt ctx.close', async () => {
     const src = `//@version=6
 indicator("t")
 x = input.source(close)
