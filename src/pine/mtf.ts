@@ -173,6 +173,11 @@ interface SecuritySpec {
   /** First-hit warm-up done: tf bars 0..last j evaluated so strict-window
    *  expressions see full history when the call is chart-gated. */
   warmed?: boolean;
+  /** security_lower_tf: highest tf bar index evaluated so far. Bars inside a
+   *  chart GAP (before the current window) must still be evaluated once so
+   *  stateful exprs (`var acc`) see every tf bar — like TV, which runs the
+   *  expression on the whole requested series. -1 = none yet. */
+  ltfEvaledThrough: number;
   /** Chart-domain emit history per expr node — `security(...)[n]` on the chart
    *  reads the previous CHART bar's mapped value, not the previous tf bar. */
   chartHist?: Map<Node, Map<object, BarSeries>>;
@@ -466,6 +471,7 @@ export function prepareSecurity(body: Node[], _frame0?: unknown): void {
       agnosticCache: null, agnosticSafe: null, prodVerdicts: null,
       warned: new Set(),
       varScope: null, varProg: [], varUpto: -1, varInited: new Set(),
+      ltfEvaledThrough: -1,
     });
   });
 }
@@ -976,6 +982,7 @@ function resetTfFrame(spec: SecuritySpec): void {
   spec.varUpto = -1;
   spec.varInited.clear();
   spec.warmed = false;
+  spec.ltfEvaledThrough = -1;
   spec.chartHist = undefined;    // chart-domain history is tf-frame-scoped
   spec.lastChartBar = undefined;
 }
@@ -1780,13 +1787,17 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     let bi = lt >= 0 && bars[lt]!.openTime === t0 ? lt : lt + 1;
     // Last bar this window can reference: openTime < end.
     const lastIn = tfBarAtOrBefore(bars, end - 1);
-    // Warm-up: a gated first call creates the frame mid-series — replay tf
-    // bars 0..lastIn once so strict-window exprs (ta.sma needs L bars of real
-    // history) see the same history an ungated run produced. nodeCache makes
-    // each eval a one-shot; cost is the work an ungated run does anyway.
-    if (!spec.warmed) {
-      for (let w = 0; w <= lastIn; w++) for (const e of spec.exprs) evalAt(spec, e, w);
-      spec.warmed = true;
+    // Evaluate every tf bar up to the window's end exactly once, in tf order —
+    // including bars inside a chart GAP (no chart bar's window covers them).
+    // evalAt is memoized (one-shot per node×caller×bar), so gap bars eval
+    // before this window's bars and the emit loop below re-reads cache hits;
+    // chronological order is preserved. On the first call this is the old
+    // warm-up (tf bars 0..lastIn), extended to cover gaps on later calls so
+    // stateful exprs (`var acc`) count tf bars, not emitted elements.
+    if (lastIn > spec.ltfEvaledThrough) {
+      for (let w = spec.ltfEvaledThrough + 1; w <= lastIn; w++)
+        for (const e of spec.exprs) evalAt(spec, e, w);
+      spec.ltfEvaledThrough = lastIn;
     }
     // evalAt wraps series results in SecSeries for chart-anchored [n] access;
     // inside the array payload consumers read raw values, so unwrap to the

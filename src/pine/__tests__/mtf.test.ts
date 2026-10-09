@@ -1609,6 +1609,33 @@ describe('request.security regression fixes', () => {
     expect(cell(1)).toEqual([53, 54, 55]);
   });
 
+  it('security_lower_tf evaluates ltf bars inside chart gaps — stateful exprs stay contiguous', async () => {
+    // QA round-2 probe 2b (P1): a stateful UDF expr must advance once per ltf
+    // bar. Chart bars at 0/30/45 skip the [15,30) window entirely; ltf bars
+    // 15/20/25 fall in the gap but still evaluate on TV (the expression runs
+    // on the whole requested series). Pre-fix the ltf path only evaluated
+    // bars inside emitted windows (+first-call warm-up) → emitted values were
+    // eval-order ordinals [1,2,3]/[4,5,6]/[7,8], under-counting by 3.
+    const M5 = 300_000;
+    const body = parse([
+      'counter() =>',
+      '    var acc = 0',
+      '    acc := acc + 1',
+      'x = request.security_lower_tf("", "5", counter())',
+    ].join('\n')).body;
+    // ltf bars at 0,5,…,50m (11 bars); chart bars at 0/30/45 — gap over 15/20/25.
+    const ltf5 = mkBars(11, M5, 0, () => 10);
+    const chartBars = [0, 30, 45].map(t => ({
+      openTime: t * 60000, open: 10, high: 11, low: 9, close: 10, volume: 100,
+    }));
+    const { values } = await runSecurity(body, chartBars, '15', { '|5': ltf5 });
+    const cell = (i: number): (number | 'na')[] =>
+      values[i]!.kind === 'array' ? values[i]!.v.map(valOf) : [];
+    expect(cell(0)).toEqual([1, 2, 3]);        // ltf bars 0/5/10
+    expect(cell(1)).toEqual([7, 8, 9]);        // gap bars 15/20/25 evaluated → +3
+    expect(cell(2)).toEqual([10, 11]);         // ltf bars 35/40 (45..50 outside window)
+  });
+
 });
 
 // ── end-to-end through parse + runScript ────────────────────────────────────
