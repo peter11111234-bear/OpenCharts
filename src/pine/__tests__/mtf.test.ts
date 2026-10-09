@@ -1636,6 +1636,52 @@ describe('request.security regression fixes', () => {
     expect(cell(2)).toEqual([10, 11]);         // ltf bars 35/40 (45..50 outside window)
   });
 
+  it('security_lower_tf with an empty ltf feed returns an empty array, not na', async () => {
+    // QA round-2 probe 1c (P2): the shared `!bars → NA` early-out treated ltf
+    // like plain security(); array.size(x) on na errors instead of reporting 0.
+    // TV: [] under ignore_invalid_symbol, runtime error otherwise — never na.
+    const chartBars = mkBars(2, M15, 0);
+    const body = [assign('x', call(member(ident('request'), 'security_lower_tf'),
+      str(''), str('5'), ident('close')))];
+    const { values } = await runSecurity(body, chartBars, '15', { '|5': [] });
+    for (const v of values) {
+      expect(v.kind).toBe('array');
+      if (v.kind === 'array') expect(v.v).toEqual([]);
+    }
+  });
+
+  it('security_lower_tf warns once when ltf is not lower than the chart tf', async () => {
+    // QA round-2 probe 1a (P2): ltf==chart silently emitted 1 elem/bar; TV
+    // rejects the call with a runtime error. We keep emitting (leniency) but
+    // must surface a warning — once per spec, not per bar.
+    const chartBars = mkBars(3, M15, 0);
+    const tf15 = mkBars(3, M15, 0, i => 100 + i);
+    const body = [assign('x', call(member(ident('request'), 'security_lower_tf'),
+      str(''), str('15'), ident('close')))];
+    const { values, warnings } = await runSecurity(body, chartBars, '15', { '|15': tf15 });
+    // Emission unchanged: one element per chart bar when opens align.
+    expect(values.map(v => v.kind === 'array' ? v.v.map(valOf) : []))
+      .toEqual([[100], [101], [102]]);
+    const hits = warnings.filter(w => w.includes('not lower than the chart'));
+    expect(hits.length).toBe(1);
+    // ltf strictly higher than chart warns too.
+    const chart2 = mkBars(2, M15, 0);
+    const tf60b = mkBars(1, H1, 0);
+    const body60 = [assign('x', call(member(ident('request'), 'security_lower_tf'),
+      str(''), str('60'), ident('close')))];
+    const r2 = await runSecurity(body60, chart2, '15', { '|60': tf60b });
+    expect(r2.warnings.filter(w => w.includes('not lower than the chart')).length).toBe(1);
+  });
+
+  it('security_lower_tf stays silent for a genuinely lower tf', async () => {
+    const chartBars = mkBars(2, M15, 0);
+    const tf5 = mkBars(6, 300_000, 0, i => 50 + i);
+    const body = [assign('x', call(member(ident('request'), 'security_lower_tf'),
+      str(''), str('5'), ident('close')))];
+    const { warnings } = await runSecurity(body, chartBars, '15', { '|5': tf5 });
+    expect(warnings.filter(w => w.includes('not lower than the chart'))).toEqual([]);
+  });
+
 });
 
 // ── end-to-end through parse + runScript ────────────────────────────────────

@@ -1730,7 +1730,12 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   }
 
   const bars = spec.bars;
-  if (!bars || bars.length === 0) return NA;
+  if (!bars || bars.length === 0)
+    // security_lower_tf's contract is "array of per-lower-bar values" — an
+    // empty/missing feed yields an empty array (TV: [] under
+    // ignore_invalid_symbol, runtime error otherwise), never na. Plain
+    // security() still degrades to na on an empty feed.
+    return spec.isLtf ? { kind: 'array', v: [] } : NA;
   // Rebind the tf scope's caller pivot to THIS invocation's frame — the same
   // call node may be evaluated inside different UDF call scopes, and the
   // expression must resolve params/locals against the live caller.
@@ -1787,6 +1792,17 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     let bi = lt >= 0 && bars[lt]!.openTime === t0 ? lt : lt + 1;
     // Last bar this window can reference: openTime < end.
     const lastIn = tfBarAtOrBefore(bars, end - 1);
+    // TV rejects security_lower_tf unless the requested tf is strictly lower
+    // than the chart's ("timeframe must be lower than the chart's"). We keep
+    // accepting the call but surface it once: same-or-higher tf means each
+    // window catches ≤1 bar — almost never the intent.
+    const ltfMs = tfParts(tf).unit === 'D' || tfParts(tf).unit === 'W' || tfParts(tf).unit === 'M'
+      ? tfNext(tfFloor(t0, tf), tf) - tfFloor(t0, tf)   // calendar duration
+      : tfToMs(tf) ?? Infinity;
+    if (ltfMs >= chartDur) {
+      warnOnce(spec, ctx,
+        `request.security_lower_tf: timeframe "${tf}" is not lower than the chart's "${chartPeriod}" — TradingView rejects this call`);
+    }
     // Evaluate every tf bar up to the window's end exactly once, in tf order —
     // including bars inside a chart GAP (no chart bar's window covers them).
     // evalAt is memoized (one-shot per node×caller×bar), so gap bars eval
