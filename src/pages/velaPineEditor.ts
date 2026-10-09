@@ -218,6 +218,7 @@ registerLegendAction({
 // `run` receives no DOM node and activeElement isn't reliable for these.
 let lastPointer = { x: 0, y: 0 };
 let openMoreMenuEl: HTMLElement | null = null;
+let addingToLayout = false; // in-flight '增加到整個版面' run → ignore double-clicks
 document.addEventListener('pointerdown', (e) => { lastPointer = { x: e.clientX, y: e.clientY }; }, true);
 
 function closeMoreMenu(): void {
@@ -235,6 +236,8 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     { label: `為 ${ind.title} 新增快訊…`, disabled: true },
     { label: `在 ${ind.title} 上增加指標/策略…`, disabled: true },
     { label: '將此指標增加到整個版面', run: () => {
+        if (addingToLayout) { try { ctx.toast?.('處理中', 'info'); } catch { /* no toast */ } return; }
+        addingToLayout = true;
         void (async () => {
           const h = ctx.chart.indicators().find(x => x.id === ind.id);
           if (!h?.source) return;
@@ -245,9 +248,8 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
           let added = 0;
           for (const cell of cells) {
             if (cell.chart === ctx.chart) continue;
-            const live = cell.chart.indicators();
-            if (live.some(x => x.source === h.source)) continue;
             try {
+              if (cell.chart.indicators().some(x => x.source === h.source)) continue; // disposed cell → throws inside try
               const r = await cell.chart.runIndicator(h.source!, {
                 language: 'pine', title: h.title, inputs,
               });
@@ -255,7 +257,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
             } catch { /* one bad cell must not block the rest */ }
           }
           try { ctx.toast?.(added > 0 ? `已加入 ${added} 個圖表` : '其他圖表已有此指標或無可用圖表', 'info'); } catch { /* no toast */ }
-        })();
+        })().finally(() => { addingToLayout = false; });
       } },
     { label: favsRead().includes(ind.id) ? '★ 從收藏夾移除' : '☆ 將此指標新增至收藏夾', run: () => toggleIndicatorFav(ind.id) },
     { label: '', sep: true },
