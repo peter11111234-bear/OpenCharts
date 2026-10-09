@@ -1766,25 +1766,28 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     : tfToMs(chartPeriod) ?? DAY;
 
   if (spec.isLtf) {
-    // security_lower_tf: one value per tf bar whose openTime lies inside the
-    // current chart bar [t0, t0+chartDur). Returned oldest-first (Pine order:
-    // array index 0 = earliest lower bar).
-    // First tf bar whose openTime lies INSIDE [t0, t0+chartDur) — lo0 must
-    // skip bars starting before t0 (a sparse-gap bar already emitted under
-    // the previous chart bar must not be repeated).
+    // security_lower_tf: one array element per NOMINAL tf slot inside the
+    // current chart bar [t0, t0+chartDur), oldest-first (Pine order: index 0 =
+    // earliest lower bar). A slot with no tf bar emits na — the array length
+    // is chartDur/ltfDur slots, not the count of bars that happen to exist.
+    // Slots align to the tf's own grid (tfFloor), so a chart bar opening
+    // mid-slot still produces that slot's cell.
+    const end = t0 + chartDur;
     const lt = tfBarAtOrBefore(bars, t0);
-    const lo0 = lt >= 0 && bars[lt]!.openTime === t0 ? lt : lt + 1;
-    const lo1 = tfBarAtOrBefore(bars, t0 + chartDur - 1);
-    if (lo0 >= bars.length || lo1 < lo0) return { kind: 'array', v: [] };
+    // First bar whose openTime lies inside the window — bars starting before
+    // t0 (a sparse bar straddling the chart open) already emitted under the
+    // previous chart bar and must not be repeated.
+    let bi = lt >= 0 && bars[lt]!.openTime === t0 ? lt : lt + 1;
+    // Last bar this window can reference: openTime < end.
+    const lastIn = tfBarAtOrBefore(bars, end - 1);
     // Warm-up: a gated first call creates the frame mid-series — replay tf
-    // bars 0..lo1 once so strict-window exprs (ta.sma needs L bars of real
+    // bars 0..lastIn once so strict-window exprs (ta.sma needs L bars of real
     // history) see the same history an ungated run produced. nodeCache makes
     // each eval a one-shot; cost is the work an ungated run does anyway.
     if (!spec.warmed) {
-      for (let w = 0; w <= lo1; w++) for (const e of spec.exprs) evalAt(spec, e, w);
+      for (let w = 0; w <= lastIn; w++) for (const e of spec.exprs) evalAt(spec, e, w);
       spec.warmed = true;
     }
-    const out: Value[] = [];
     // evalAt wraps series results in SecSeries for chart-anchored [n] access;
     // inside the array payload consumers read raw values, so unwrap to the
     // tf-bar-j2 scalar.
@@ -1792,12 +1795,23 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
       const v = evalAt(spec, e, j2);
       return v.kind === 'series' ? v.v.cur() : v;
     };
-    for (let j2 = lo0; j2 <= lo1; j2++) {
-      out.push(
-        spec.exprs.length === 1
-          ? scalarAt(spec.exprs[0]!, j2)
-          : { kind: 'array', v: spec.exprs.map(e => scalarAt(e, j2)) },
-      );
+    const out: Value[] = [];
+    // bi advances monotonically while slots step forward → O(slots + bars).
+    for (let slot = tfFloor(t0, tf); slot < end;) {
+      const slotEnd = tfNext(slot, tf);
+      if (slotEnd <= slot) break;            // unparseable tf — no progress
+      if (slotEnd > t0) {                    // slots fully before t0 belong to the prior bar
+        let j2 = -1;                         // last tf bar opening inside this slot
+        const lim = Math.min(slotEnd, end);
+        while (bi < bars.length && bars[bi]!.openTime < lim) j2 = bi++;
+        out.push(
+          j2 < 0 ? NA :
+          spec.exprs.length === 1
+            ? scalarAt(spec.exprs[0]!, j2)
+            : { kind: 'array', v: spec.exprs.map(e => scalarAt(e, j2)) },
+        );
+      }
+      slot = slotEnd;
     }
     return { kind: 'array', v: out };
   }
