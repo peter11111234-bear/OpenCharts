@@ -167,28 +167,30 @@ describe('wilder family', () => {
     expect(numv(res[3]!)).toBeCloseTo((103 + 2 * rma2) / 3, 9);
   });
 
-  it('tr: bar0 na (handle_na default), else max(h-l,|h-c1|,|l-c1|)', () => {
+  it('tr: bar0 h−l (handle_na default true), else max(h-l,|h-c1|,|l-c1|)', () => {
     const bars = mkBars(3, (i) => [
       { open: 10, high: 12, low: 8, close: 10 },
       { open: 10, high: 15, low: 9, close: 14 },
       { open: 14, high: 16, low: 13, close: 15 },
     ][i]!);
     const res = runBars(bars, (c) => call('tr', c, []));
-    expect(res[0]!.kind).toBe('na');
+    expect(numv(res[0]!)).toBeCloseTo(4, 9); // TV: handle_na=true → h−l when close[1] na
     expect(numv(res[1]!)).toBeCloseTo(Math.max(6, 5, 1), 9);
     expect(numv(res[2]!)).toBeCloseTo(Math.max(3, 2, 1), 9);
   });
 
-  it('tr(handle_na=false) gives h-l on bar 0', () => {
+  it('tr(handle_na=false) gives na on bar 0', () => {
     const res = runBars(mkBars(2), (c) => call('tr', c, [], { handle_na: { kind: 'bool', v: false } }));
-    expect(numv(res[0]!)).toBeCloseTo(3, 9);
+    expect(res[0]!.kind).toBe('na');
   });
 
   it('atr non-negative after warmup', () => {
     const res = runBars(mkBars(30), (c) => call('atr', c, [iv(10)]));
-    expect(res[9]!.kind).toBe('na'); // tr bar0 = na → rma seeds at bar 10
-    for (let i = 10; i < 30; i++) expect(numv(res[i]!)).toBeGreaterThanOrEqual(0);
+    expect(res[8]!.kind).toBe('na');
+    // tr is real from bar 0 → rma seeds at bar len−1 = 9 (10 real tr values)
+    for (let i = 9; i < 30; i++) expect(numv(res[i]!)).toBeGreaterThanOrEqual(0);
   });
+
 
   it('rsi in 0..100, =100 on monotonic rise', () => {
     const res = runBars(mkBars(40), (c) => call('rsi', c, [ser(c.close), iv(14)]));

@@ -89,8 +89,7 @@ afterAll(() => {
 describe('pinetsShim pilots', () => {
   it('ta.tr ported: hand-computed TR over 8 bars', () => {
     // pinets tr(handle_na=true default) returns high−low on bar 0 where
-    // close[1] is na. NOTE: our builtin returns na there — the upstream port
-    // and our impl disagree on exactly one bar; documented in the ledger.
+    // close[1] is na; our builtin now matches TV/pinets on every bar.
     const bars: BarData[] = [
       { openTime: 0, open: 10, high: 12, low: 8, close: 10, volume: 1 },
       { openTime: 1, open: 10, high: 15, low: 9, close: 14, volume: 1 },
@@ -105,12 +104,11 @@ describe('pinetsShim pilots', () => {
     expect(res2[0]!.kind).toBe('na');
   });
 
-  it('ta.tr ported == existing builtin on bars ≥1 (parity)', () => {
+  it('ta.tr ported == existing builtin bar-for-bar (parity)', () => {
     const origTr = orig.get('tr')!;
     const a = runBars(WAVY, (c) => origTr(c, [], {}));
     const b = runBars(WAVY, (c) => BUILTINS.get('ta.tr')!(c, [], {}));
-    // Bar 0 diverges by design (pinets h−l vs ours na) — compare from bar 1.
-    for (let i = 1; i < WAVY.length; i++) {
+    for (let i = 0; i < WAVY.length; i++) {
       expect(numv(b[i]!)).toBeCloseTo(numv(a[i]!), 8);
     }
   });

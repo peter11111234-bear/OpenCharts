@@ -474,7 +474,7 @@ function trVs(ctx: BuiltinCtx): VS {
     const l = num(ctx.low.get(ctx.barIndex - b));
     if (h === undefined || l === undefined) return undefined;
     const pc = b > 0 ? num(ctx.close.get(ctx.barIndex - b + 1)) : undefined;
-    if (pc === undefined) return undefined; // handle_na=true semantics
+    if (pc === undefined) return h - l; // TV handle_na=true default: na prev close → high−low
     return Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
   });
 }
@@ -629,7 +629,7 @@ reg('tr', (ctx, args, named) => {
   const h = num(ctx.high.get(0)), l = num(ctx.low.get(0));
   if (h === undefined || l === undefined) return NA;
   const pc = bar > 0 ? num(ctx.close.get(1)) : undefined;
-  if (pc === undefined) return handleNa ? NA : fl(h - l);
+  if (pc === undefined) return handleNa ? fl(h - l) : NA;
   return fl(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
 });
 

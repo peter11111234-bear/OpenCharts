@@ -5254,10 +5254,10 @@
         "text": "落底K",
         "textalign": "text.align_left",
         "textcolor": "#FFFFFF",
-        "tooltip": "TP: 93.3",
-        "x": 14,
+        "tooltip": "TP: 92.4",
+        "x": 13,
         "xloc": "xloc.bar_index",
-        "y": 84.504438,
+        "y": 83.390005,
         "yloc": "yloc.price"
       }
     },
@@ -5271,7 +5271,7 @@
         "text": "見高K",
         "textalign": "text.align_left",
         "textcolor": "#FFFFFF",
-        "tooltip": "TP: 4.3",
+        "tooltip": "TP: 1.9",
         "x": 68,
         "xloc": "xloc.bar_index",
         "y": 167.11244,
@@ -5288,10 +5288,10 @@
         "text": "正N",
         "textalign": "text.align_left",
         "textcolor": "#FFFFFF",
-        "tooltip": "正N 目標\nE: 249.7\nN: 245.2\nV: 171.7",
+        "tooltip": "正N 目標\nE: 250.8\nN: 246.3\nV: 171.7",
         "x": 71,
         "xloc": "xloc.bar_index",
-        "y": 171.025387,
+        "y": 171.024932,
         "yloc": "yloc.price"
       }
     },
@@ -5325,7 +5325,7 @@
         "tooltip": "倒N 目標\nN: 162.1\nV: 158.4\nE: 158.0",
         "x": 73,
         "xloc": "xloc.bar_index",
-        "y": 157.268246,
+        "y": 157.268638,
         "yloc": "yloc.price"
       }
     },
@@ -5406,7 +5406,7 @@
         "tooltip": "倒N 目標\nV: 157.1\nE: 156.8\nE: 153.7",
         "x": 78,
         "xloc": "xloc.bar_index",
-        "y": 153.310711,
+        "y": 153.310981,
         "yloc": "yloc.price"
       }
     },
@@ -5487,7 +5487,7 @@
         "tooltip": "倒N 目標\nV: 81.7\nE: 10.1\nE: 6.7",
         "x": 126,
         "xloc": "xloc.bar_index",
-        "y": 78.21243,
+        "y": 78.212437,
         "yloc": "yloc.price"
       }
     },
@@ -5551,7 +5551,7 @@
         "tooltip": "倒N 目標\nN: 80.6\nV: 78.3\nE: 76.5",
         "x": 131,
         "xloc": "xloc.bar_index",
-        "y": 76.819488,
+        "y": 76.819494,
         "yloc": "yloc.price"
       }
     },
@@ -5600,7 +5600,7 @@
         "tooltip": null,
         "x": 70,
         "xloc": "xloc.bar_index",
-        "y": 161.007363,
+        "y": 161.007365,
         "yloc": "yloc.price"
       }
     },
@@ -5616,7 +5616,7 @@
         "x2": 70,
         "xloc": "xloc.bar_index",
         "y1": 81.938287,
-        "y2": 161.007363
+        "y2": 161.007365
       }
     },
     {
@@ -5677,7 +5677,7 @@
         "tooltip": "正N 目標\nE: 90.9\nV: 90.2\nN: 86.9",
         "x": 137,
         "xloc": "xloc.bar_index",
-        "y": 90.46404,
+        "y": 90.464036,
         "yloc": "yloc.price"
       }
     },
