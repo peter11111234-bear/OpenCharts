@@ -1111,3 +1111,13 @@ CAUTION — behavioral check before committing: the two collectors differ on `lo
 git add src/pine/mtf.ts src/pine/interpreter.ts
 git commit -m "refactor: gate uses shared astChildren collector (F11)"
 ```
+
+## Changelog (post-implementation notes)
+
+- **2026-10-09 — F1 semantics decision:** `x := v` where `x` was declared from a
+  security()/series expression now writes to a per-decl CowSeries copy
+  **silently** — no warning. TradingView Pine allows `:=` on any declared
+  series variable; the only hard error remains `close := …` / other builtin
+  ctx-series idents (identity check in evalReassign). The warn→silent
+  downgrade is intentional, not a missing check. See
+  `docs/superpowers/plans/2026-10-09-alias-write-through-round2.md`.
