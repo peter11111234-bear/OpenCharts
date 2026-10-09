@@ -787,4 +787,24 @@ describe('fix regressions', () => {
     expect(numv(r[3]!)).toBe(105); // highest(high, 2) at bar 3
     expect(numv(r[4]!)).toBe(106);
   });
+
+  it('ta.tr mid-series NaN close honors handle_na (probe 5d)', () => {
+    // num() surfaces {kind:'float',v:NaN} as a number → pc!==undefined skipped
+    // the handle_na branch and Math.max propagated NaN → na. Non-finite pc now
+    // counts as na prev close, so handle_na governs like the ported impl.
+    const bars: BarData[] = [
+      { openTime: 0, open: 9.5, high: 11, low: 9, close: 10, volume: 100 },
+      { openTime: 60000, open: -0.5, high: 1, low: -1, close: NaN, volume: 100 },
+      { openTime: 120000, open: 11.5, high: 13, low: 11, close: 12, volume: 100 },
+    ];
+    const on = runBars(bars, (c) => call('tr', c, [], { handle_na: { kind: 'bool', v: true } }));
+    expect(numv(on[0]!)).toBe(2);   // bar0: no prev close → h−l
+    expect(numv(on[1]!)).toBe(11);  // bar1: prev close 10 finite → real tr
+    expect(numv(on[2]!)).toBe(2);   // bar2: prev close NaN + handle_na → h−l
+    const off = runBars(bars, (c) => call('tr', c, [], { handle_na: { kind: 'bool', v: false } }));
+    expect(off[2]!.kind).toBe('na'); // same NaN close, handle_na=false → na
+    // trVs consumers (atr) share the guard: atr(1) = tr → same 2 at bar 2.
+    const atr = runBars(bars, (c) => call('atr', c, [iv(1)]));
+    expect(numv(atr[2]!)).toBe(2);
+  });
 });

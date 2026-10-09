@@ -474,7 +474,9 @@ function trVs(ctx: BuiltinCtx): VS {
     const l = num(ctx.low.get(ctx.barIndex - b));
     if (h === undefined || l === undefined) return undefined;
     const pc = b > 0 ? num(ctx.close.get(ctx.barIndex - b + 1)) : undefined;
-    if (pc === undefined) return h - l; // TV handle_na=true default: na prev close → high−low
+    // num() surfaces a NaN close as a number — treat non-finite like absent:
+    // TV handle_na=true default → na prev close yields high−low.
+    if (pc === undefined || !Number.isFinite(pc)) return h - l;
     return Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
   });
 }
@@ -629,7 +631,9 @@ reg('tr', (ctx, args, named) => {
   const h = num(ctx.high.get(0)), l = num(ctx.low.get(0));
   if (h === undefined || l === undefined) return NA;
   const pc = bar > 0 ? num(ctx.close.get(1)) : undefined;
-  if (pc === undefined) return handleNa ? fl(h - l) : NA;
+  // num() surfaces a NaN close as a number — count it as na so handle_na
+  // actually governs (else Math.max propagates NaN → na even under true).
+  if (pc === undefined || !Number.isFinite(pc)) return handleNa ? fl(h - l) : NA;
   return fl(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
 });
 
