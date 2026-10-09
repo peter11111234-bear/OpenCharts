@@ -587,6 +587,18 @@ function qtyOf(bound: Map<string, Value>, name: string): number {
   return n !== undefined && Number.isFinite(n) ? n : 0;
 }
 
+/** qty + qty_percent value/flag bundle — spread into a StratOrder literal.
+ *  A present-but-≤0 arg means zero contracts, so presence must travel with
+ *  the value (qtySet/eqPctSet). Used by all four order builtins. */
+function qtyFields(bound: Map<string, Value>): Pick<StratOrder, 'qty' | 'qtySet' | 'eqPct' | 'eqPctSet'> {
+  return {
+    qty: qtyOf(bound, 'qty'),
+    qtySet: bound.has('qty'),
+    eqPct: qtyOf(bound, 'qty_percent'),
+    eqPctSet: bound.has('qty_percent'),
+  };
+}
+
 function optNum(bound: Map<string, Value>, name: string): number | undefined {
   const n = curNum(bound.get(name) ?? NA);
   return n !== undefined && Number.isFinite(n) ? n : undefined;
@@ -624,10 +636,7 @@ registerBuiltin('strategy', 'entry', (c, args, named) => {
     id: strOf(bound.get('id'), 'entry'),
     fromEntry: '',
     dir,
-    qty: qtyOf(bound, 'qty'),
-    qtySet: bound.has('qty'),
-    eqPct: qtyOf(bound, 'qty_percent'),
-    eqPctSet: bound.has('qty_percent'),
+    ...qtyFields(bound),
     limit: optNum(bound, 'limit'),
     stop: optNum(bound, 'stop'),
     ocaName: strOf(bound.get('oca_name')) || undefined,
@@ -647,10 +656,7 @@ registerBuiltin('strategy', 'exit', (c, args, named) => {
     id: strOf(bound.get('id'), 'exit'),
     fromEntry: strOf(bound.get('from_entry')),
     dir: 0,
-    qty: qtyOf(bound, 'qty'),
-    qtySet: bound.has('qty'),
-    eqPct: qtyOf(bound, 'qty_percent'),
-    eqPctSet: bound.has('qty_percent'),
+    ...qtyFields(bound),
     limit: optNum(bound, 'limit'),
     stop: optNum(bound, 'stop'),
     profitTicks: optNum(bound, 'profit'),
@@ -676,10 +682,7 @@ registerBuiltin('strategy', 'close', (c, args, named) => {
     id: strOf(bound.get('id')),
     fromEntry: '',
     dir: 0,
-    qty: qtyOf(bound, 'qty'),
-    qtySet: bound.has('qty'),
-    eqPct: qtyOf(bound, 'qty_percent'),
-    eqPctSet: bound.has('qty_percent'),
+    ...qtyFields(bound),
     limit: undefined,
     stop: undefined,
     // evalArg wraps bool args in a BarSeries — read through the wrapper.
@@ -714,10 +717,7 @@ registerBuiltin('strategy', 'order', (c, args, named) => {
     id: strOf(bound.get('id'), 'order'),
     fromEntry: '',
     dir,
-    qty: qtyOf(bound, 'qty'),
-    qtySet: bound.has('qty'),
-    eqPct: qtyOf(bound, 'qty_percent'),
-    eqPctSet: bound.has('qty_percent'),
+    ...qtyFields(bound),
     limit: optNum(bound, 'limit'),
     stop: optNum(bound, 'stop'),
     ocaName: strOf(bound.get('oca_name')) || undefined,

@@ -221,6 +221,18 @@ let openMoreMenuEl: HTMLElement | null = null;
 let addingToLayout = false; // in-flight '增加到整個版面' run → ignore double-clicks
 document.addEventListener('pointerdown', (e) => { lastPointer = { x: e.clientX, y: e.clientY }; }, true);
 
+/** Toast that tolerates a missing/failing toast impl — ctx.toast is optional
+ *  and a handful of call sites all need the same swallow-on-throw behavior. */
+function toast(ctx: WidgetContext, msg: string, kind?: 'info' | 'success' | 'error'): void {
+  try { ctx.toast?.(msg, kind); } catch { /* no toast */ }
+}
+
+/** Workspace cells when ctx is the WorkspaceWidgetContext (legend actions get
+ *  it at runtime); [] on a plain chart context — callers no-op benignly. */
+function workspaceCells(ctx: WidgetContext): WorkspaceWidgetContext['cells'] {
+  return (ctx as unknown as WorkspaceWidgetContext).cells ?? [];
+}
+
 function closeMoreMenu(): void {
   openMoreMenuEl?.remove();
   openMoreMenuEl = null;
@@ -241,7 +253,7 @@ function closeMoreMenu(): void {
  * runs may have no pointer at all).
  */
 function chartForIndicator(ctx: WidgetContext, ind: { id: string }, point: { x: number; y: number }): WidgetContext['chart'] {
-  const cells = (ctx as unknown as WorkspaceWidgetContext).cells ?? [];
+  const cells = workspaceCells(ctx);
   // indicators() throws on a disposed cell — exclude it, don't blow up the menu.
   const owners = cells.filter(c => {
     try { return c.chart.indicators().some(h => h.id === ind.id); }
@@ -273,7 +285,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     { label: `為 ${ind.title} 新增快訊…`, disabled: true },
     { label: `在 ${ind.title} 上增加指標/策略…`, disabled: true },
     { label: '將此指標增加到整個版面', run: () => {
-        if (addingToLayout) { try { ctx.toast?.('處理中', 'info'); } catch { /* no toast */ } return; }
+        if (addingToLayout) { toast(ctx, '處理中'); return; }
         addingToLayout = true;
         void (async () => {
           const srcChart = chartForIndicator(ctx, ind, openPoint);
@@ -281,8 +293,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
           if (!h?.source) return;
           let inputs: Record<string, InputValue> | undefined;
           try { inputs = h.inputValues(); } catch { /* unreadable → declaration defaults */ }
-          const wctx = ctx as unknown as WorkspaceWidgetContext;
-          const cells = wctx.cells ?? [];
+          const cells = workspaceCells(ctx);
           let added = 0;
           let timedOut = 0;
           for (const cell of cells) {
@@ -301,12 +312,10 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
               else if (r.ok) added++;
             } catch { /* one bad cell must not block the rest */ }
           }
-          try {
             const msg = timedOut > 0
               ? (added > 0 ? `已加入 ${added} 個圖表，${timedOut} 個逾時` : `${timedOut} 個圖表加入逾時，可能仍在加入中`)
               : (added > 0 ? `已加入 ${added} 個圖表` : '其他圖表已有此指標或無可用圖表');
-            ctx.toast?.(msg, 'info');
-          } catch { /* no toast */ }
+            toast(ctx, msg);
         })().finally(() => { addingToLayout = false; });
       } },
     { label: favsRead().includes(ind.id) ? '★ 從收藏夾移除' : '☆ 將此指標新增至收藏夾', run: () => toggleIndicatorFav(ind.id) },
@@ -327,7 +336,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     isPine
       ? { label: '複製', run: () => {
             const p = navigator.clipboard?.writeText(ind.source ?? '');
-            if (p) void p.then(() => { try { ctx.toast?.('已複製', 'success'); } catch {} }, () => { try { ctx.toast?.('複製失敗', 'error'); } catch {} });
+            if (p) void p.then(() => toast(ctx, '已複製', 'success'), () => toast(ctx, '複製失敗', 'error'));
           } }
       : { label: '複製（內建指標無來源）', disabled: true },
     { label: '隱藏', run: () => { chartForIndicator(ctx, ind, openPoint).indicators().find(x => x.id === ind.id)?.setVisible(false); } },
@@ -338,7 +347,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     { label: '設定…', run: () => {
         const renderer = chartForIndicator(ctx, ind, openPoint).renderer;
         if (renderer.supportsIndicatorSettings) renderer.openIndicatorSettings(ind.id);
-        else { try { ctx.toast?.('設定功能尚未支援', 'info'); } catch { /* no toast */ } }
+        else toast(ctx, '設定功能尚未支援');
       } },
   ];
 

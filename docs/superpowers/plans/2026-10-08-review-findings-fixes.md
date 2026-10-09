@@ -1121,3 +1121,21 @@ git commit -m "refactor: gate uses shared astChildren collector (F11)"
   ctx-series idents (identity check in evalReassign). The warn→silent
   downgrade is intentional, not a missing check. See
   `docs/superpowers/plans/2026-10-09-alias-write-through-round2.md`.
+
+- **2026-10-09 — BREAKING semantic changes (phase-2, see `2026-10-09-backlog-phase2.md`):**
+  - `strategy.entry/exit/order` positional args now follow Pine v5 signature:
+    `when` moved from position 5 to LAST (deprecated non-positional in v5).
+    Old scripts passing `entry("id", long, qty, limit, stop, cond)` now bind
+    `cond` to `oca_name` — migrate call sites to named args or drop the arg.
+  - `strategy.closedtrades.*(i)` indexing flipped to TV order: `0` = FIRST
+    closed trade (was: last). Existing scripts reading closedtrades by index
+    must be reviewed.
+  - `ta.tr(handle_na)` semantics corrected: default `true` now returns
+    `high−low` when `close[1]` is na (was inverted: returned `na`). Cascades
+    to `ta.atr`/`ta.supertrend`/`ta.dmi`/`ta.kc` — rma seeds one bar earlier.
+    Golden baselines re-generated (TRIS390, 見高K4.55 — atr-derived fields only).
+  - `request.security_lower_tf` emits only EXISTING lower bars (no na padding);
+    array length varies with the feed. `array.size()`/`array.get(i)` callers
+    relying on fixed slot counts must migrate.
+  - `strategy.entry`/`close`/`exit`/`order`: explicit `qty<=0` or
+    `qty_percent<=0` now means zero contracts (was: silently defaulted).

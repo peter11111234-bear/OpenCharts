@@ -1798,7 +1798,8 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     // than the chart's ("timeframe must be lower than the chart's"). We keep
     // accepting the call but surface it once: same-or-higher tf means each
     // window catches ≤1 bar — almost never the intent.
-    const ltfMs = tfParts(tf).unit === 'D' || tfParts(tf).unit === 'W' || tfParts(tf).unit === 'M'
+    const ltfUnit = tfParts(tf).unit;
+    const ltfMs = ltfUnit === 'D' || ltfUnit === 'W' || ltfUnit === 'M'
       ? tfNext(tfFloor(t0, tf), tf) - tfFloor(t0, tf)   // calendar duration
       : tfToMs(tf) ?? Infinity;
     if (ltfMs >= chartDur) {

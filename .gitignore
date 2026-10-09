@@ -18,6 +18,11 @@ scripts/golden/*.actual.json
 
 # runtime artifacts
 logs/
+
+# throwaway agent reports / QA artifacts (probe .mjs stay tracked)
+scratch/report-*.md
+scratch/qa-round*-*.md
+scratch/_findings.json
 .bench/
 vite-restart.log
 scripts/watchdog.log
