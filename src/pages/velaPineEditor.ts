@@ -233,15 +233,19 @@ function closeMoreMenu(): void {
  * and indicator ids are shared across cells (restored/parked scripts reuse
  * `entry.id`), so `ctx.chart.indicators().find(h => h.id === ind.id)` can hit the
  * wrong chart. ChartCell's DOM host isn't on the typed `ctx.cells` entries, so
- * the clicked cell is recovered by hit-testing `lastPointer` against
+ * the opener cell is recovered by hit-testing a pointer snapshot against
  * `.vela-cell[data-cell-id]` elements (the only per-cell DOM marker vela emits).
+ * `point` is the pointer position captured when the ⋯ menu OPENED — not the
+ * later menu-item click (the menu is body-mounted and may overlap another
+ * cell, so live `lastPointer` resolves the wrong owner; keyboard-triggered
+ * runs may have no pointer at all).
  */
-function chartForIndicator(ctx: WidgetContext, ind: { id: string }): WidgetContext['chart'] {
+function chartForIndicator(ctx: WidgetContext, ind: { id: string }, point: { x: number; y: number }): WidgetContext['chart'] {
   const cells = (ctx as unknown as WorkspaceWidgetContext).cells ?? [];
   const owners = cells.filter(c => c.chart.indicators().some(h => h.id === ind.id));
   if (owners.length === 1) return owners[0]!.chart;
-  if (owners.length > 1 && (lastPointer.x > 0 || lastPointer.y > 0)) {
-    const el = ctx.host.ownerDocument.elementFromPoint(lastPointer.x, lastPointer.y);
+  if (owners.length > 1 && (point.x > 0 || point.y > 0)) {
+    const el = ctx.host.ownerDocument.elementFromPoint(point.x, point.y);
     const cellId = el?.closest<HTMLElement>('.vela-cell')?.dataset.cellId;
     const hit = cellId ? owners.find(c => c.id === cellId) : undefined;
     if (hit) return hit.chart;
@@ -251,6 +255,12 @@ function chartForIndicator(ctx: WidgetContext, ind: { id: string }): WidgetConte
 
 function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; source?: string }): void {
   if (openMoreMenuEl) { closeMoreMenu(); return; }
+  // Snapshot the pointer NOW, at menu-open time — by the time a menu item is
+  // clicked, lastPointer holds the item's coords (menu is body-mounted and
+  // may overlap another cell). Real-mouse flow already works because the ⋯
+  // click activates the row's cell first; this covers stale-active /
+  // keyboard / synthetic-click paths.
+  const openPoint = { x: lastPointer.x, y: lastPointer.y };
   const doc = ctx.host.ownerDocument;
 
   type Item = { label: string; disabled?: boolean; primary?: boolean; sep?: boolean; run?: () => void };
@@ -262,7 +272,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
         if (addingToLayout) { try { ctx.toast?.('處理中', 'info'); } catch { /* no toast */ } return; }
         addingToLayout = true;
         void (async () => {
-          const srcChart = chartForIndicator(ctx, ind);
+          const srcChart = chartForIndicator(ctx, ind, openPoint);
           const h = srcChart.indicators().find(x => x.id === ind.id);
           if (!h?.source) return;
           let inputs: Record<string, InputValue> | undefined;
@@ -270,20 +280,30 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
           const wctx = ctx as unknown as WorkspaceWidgetContext;
           const cells = wctx.cells ?? [];
           let added = 0;
+          let timedOut = 0;
           for (const cell of cells) {
             if (cell.chart === srcChart) continue;
             try {
               if (cell.chart.indicators().some(x => x.source === h.source)) continue; // disposed cell → throws inside try
               // A dead feed can leave runIndicator unsettled — cap the wait so
               // one wedged cell can't stall the loop (and pin addingToLayout).
+              const p = cell.chart.runIndicator(h.source!, { language: 'pine', title: h.title, inputs });
+              void p.catch(() => {}); // swallow late rejection — race below owns the verdict
               const r = await Promise.race([
-                cell.chart.runIndicator(h.source!, { language: 'pine', title: h.title, inputs }),
+                p,
                 new Promise<null>(resolve => setTimeout(() => resolve(null), 15000)),
               ]);
-              if (r?.ok) added++;
+              if (r === null) timedOut++;
+              else if (r.ok) added++;
             } catch { /* one bad cell must not block the rest */ }
           }
-          try { ctx.toast?.(added > 0 ? `已加入 ${added} 個圖表` : '其他圖表已有此指標或無可用圖表', 'info'); } catch { /* no toast */ }
+          try {
+            ctx.toast?.(
+              added > 0 ? `已加入 ${added} 個圖表`
+                : timedOut > 0 ? '等待逾時——指標可能仍在加入中'
+                : '其他圖表已有此指標或無可用圖表',
+              'info');
+          } catch { /* no toast */ }
         })().finally(() => { addingToLayout = false; });
       } },
     { label: favsRead().includes(ind.id) ? '★ 從收藏夾移除' : '☆ 將此指標新增至收藏夾', run: () => toggleIndicatorFav(ind.id) },
@@ -307,13 +327,13 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
             if (p) void p.then(() => { try { ctx.toast?.('已複製', 'success'); } catch {} }, () => { try { ctx.toast?.('複製失敗', 'error'); } catch {} });
           } }
       : { label: '複製（內建指標無來源）', disabled: true },
-    { label: '隱藏', run: () => { chartForIndicator(ctx, ind).indicators().find(x => x.id === ind.id)?.setVisible(false); } },
-    { label: '移除', run: () => { chartForIndicator(ctx, ind).indicators().find(x => x.id === ind.id)?.remove(); } },
+    { label: '隱藏', run: () => { chartForIndicator(ctx, ind, openPoint).indicators().find(x => x.id === ind.id)?.setVisible(false); } },
+    { label: '移除', run: () => { chartForIndicator(ctx, ind, openPoint).indicators().find(x => x.id === ind.id)?.remove(); } },
     { label: '', sep: true },
     { label: '物件樹', disabled: true },
     { label: '', sep: true },
     { label: '設定…', run: () => {
-        const renderer = chartForIndicator(ctx, ind).renderer;
+        const renderer = chartForIndicator(ctx, ind, openPoint).renderer;
         if (renderer.supportsIndicatorSettings) renderer.openIndicatorSettings(ind.id);
         else { try { ctx.toast?.('設定功能尚未支援', 'info'); } catch { /* no toast */ } }
       } },

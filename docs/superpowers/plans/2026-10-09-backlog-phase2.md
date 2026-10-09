@@ -153,6 +153,15 @@ Documented, no code (deferred findings):
 - (d) `設定…` vendor seam effectively dead (see A3 above): `openIndicatorSettings` no-ops for script indicator rows — needs a host-side inputs dialog.
 - Bare `ta.tr` lazy constant (ta.ts registerLazyConstant) keeps the same `pc === undefined` gap the builtin had — asymmetric NaN handling remains on that path; not exercised by the probe, deferred.
 
+### Fix-loop round 3 — residuals (executed 2026-10-09)
+
+Fixed:
+- **F1 (MEDIUM)** `chartForIndicator` hit-tested live `lastPointer` — by the time a menu item is clicked it holds the body-mounted menu item's coords (may overlap another cell), and keyboard runs have no pointer. `toggleMoreMenu` now snapshots `openPoint` at menu-open and threads it to `chartForIndicator(ctx, ind, openPoint)` (all 4 call sites). Real-mouse flow was already safe (the ⋯ click activates its cell first); this covers stale-active / keyboard / synthetic-click paths.
+- **F2 (LOW)** the raced `runIndicator` promise could reject late as an unhandled rejection; stored as `p` and given a no-op `.catch` — the race still owns the verdict.
+- **F3 (LOW)** timeout toast honesty: added>0 → '已加入 N 個圖表'; added===0 && timedOut>0 → '等待逾時——指標可能仍在加入中'; else → existing-indicators msg.
+- **F4 (LOW, pine)** the dynamic-unprefetched `!bars → NA` early-out ran before the isLtf `[]` carve-out — unfetched ltf specs now return `{kind:'array',v:[]}` (warning kept). Regression pin in mtf.test.ts; suite 662/1skip.
+
+Remaining ultra-edge (documented, not fixed): `qty>0` combined with `qty_percent=0` — flag precedence between the two qty channels is unverified against TV (entry sizes which source wins, close legs which dominates).
 
 ---
 

@@ -1718,7 +1718,9 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     if (!bars) {
       warnOnce(spec, ctx,
         `request.security: dynamic (symbol="${sym}", timeframe="${tf}") was not prefetched — returning na`);
-      return NA;
+      // isLtf contract: an array of per-lower-bar values — an unfetched feed
+      // yields [] (same as the empty-feed carve-out below), never na.
+      return spec.isLtf ? { kind: 'array', v: [] } : NA;
     }
     if (spec.bars !== bars || spec.tfResolved !== tf) {
       // Dynamic tf/sym switched to a different series → drop the tf frame;

@@ -1649,6 +1649,20 @@ describe('request.security regression fixes', () => {
       if (v.kind === 'array') expect(v.v).toEqual([]);
     }
   });
+  it('security_lower_tf with an UNFETCHED dynamic ltf returns [] + warns, not na', async () => {
+    // Round-3 residual (F4): the dynamic-unprefetched early-out returned NA
+    // before the isLtf [] carve-out — array.size(x) errored on na.
+    const chartBars = mkBars(2, M15, 0);
+    const body = [assign('x', call(member(ident('request'), 'security_lower_tf'),
+      str(''), ident('dyn_tf'), ident('close')))];
+    const { values, warnings } = await runSecurity(body, chartBars, '15', {},
+      scope => scope.define('dyn_tf', { kind: 'string', v: '5' }));
+    for (const v of values) {
+      expect(v.kind).toBe('array');
+      if (v.kind === 'array') expect(v.v).toEqual([]);
+    }
+    expect(warnings.filter(w => w.includes('not prefetched'))).toHaveLength(1);
+  });
 
   it('security_lower_tf warns once when ltf is not lower than the chart tf', async () => {
     // QA round-2 probe 1a (P2): ltf==chart silently emitted 1 elem/bar; TV
