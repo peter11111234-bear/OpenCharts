@@ -609,6 +609,42 @@ describe('strategy QA 2026-10-09', () => {
     expect(numV(getConstant('strategy.position_size', ctx))).toBe(1);
   });
 
+  it('entry qty=0 / qty<0 fills zero contracts — never the default qty', async () => {
+    // QA round-2 3a/3b (P2): qtyOf stored explicit ≤0 as qty=0, which
+    // resolveQty couldn't tell from "absent" → fell back to default_qty_value
+    // and filled 1 contract. qtySet now distinguishes present from absent.
+    for (const q of [0, -2]) {
+      const r = await runScript(parse(
+        `strategy("s")\nif bar_index == 0\n  strategy.entry("L", strategy.long, qty=${q})\nplot(strategy.position_size)`),
+        mkBars(6, 10), { symbol: 'TEST', timeframe: 'D' });
+      const pos = [...r.plots.values()][0]!.values.map(numV);
+      expect(pos, `qty=${q}`).toEqual([0, 0, 0, 0, 0, 0]);
+    }
+  });
+
+  it('close qty=0 closes nothing — an explicit zero is not a flatten', async () => {
+    // QA round-2 3c (P2): qty=0 failed qty>0 and eqPct>0, then fell through
+    // to `return pos` — a full-position close.
+    const r = await runScript(parse(
+      `strategy("s")\nif bar_index == 0\n  strategy.entry("L", strategy.long, qty=2)\nif bar_index == 3\n  strategy.close("L", qty=0)\nplot(strategy.position_size)`),
+      mkBars(6, 10), { symbol: 'TEST', timeframe: 'D' });
+    const pos = [...r.plots.values()][0]!.values.map(numV);
+    expect(pos).toEqual([0, 2, 2, 2, 2, 2]);
+  });
+
+  it('close qty_percent=0 closes nothing; absent qty_percent still flattens', async () => {
+    // Same family: explicit 0 ≠ absent. qty_percent=0 → 0 contracts;
+    // plain close("L") → full position (default qty_percent=100).
+    const r0 = await runScript(parse(
+      `strategy("s")\nif bar_index == 0\n  strategy.entry("L", strategy.long, qty=2)\nif bar_index == 3\n  strategy.close("L", qty_percent=0)\nplot(strategy.position_size)`),
+      mkBars(6, 10), { symbol: 'TEST', timeframe: 'D' });
+    expect([...r0.plots.values()][0]!.values.map(numV)).toEqual([0, 2, 2, 2, 2, 2]);
+    const rAll = await runScript(parse(
+      `strategy("s")\nif bar_index == 0\n  strategy.entry("L", strategy.long, qty=2)\nif bar_index == 3\n  strategy.close("L")\nplot(strategy.position_size)`),
+      mkBars(6, 10), { symbol: 'TEST', timeframe: 'D' });
+    expect([...rAll.plots.values()][0]!.values.map(numV)).toEqual([0, 2, 2, 2, 0, 0]);
+  });
+
   it('positional close_all(comment) labels the exit execution', async () => {
     // v5 close_all() order: (comment, alert_message, immediately) — pre-fix it
     // shared close()'s order, binding positional arg0 to a dead `id` slot.

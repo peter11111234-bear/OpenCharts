@@ -48,8 +48,13 @@ export interface StratOrder {
   dir: number;
   /** Absolute qty (>0 = explicit), else 0 → config/qty_percent. */
   qty: number;
+  /** `qty` was passed explicitly — a present ≤0 is zero contracts, NOT the
+   *  default-qty fallback. */
+  qtySet?: boolean;
   /** Percent of equity (entries) / of position (exits); 0 = unused. */
   eqPct: number;
+  /** `qty_percent` was passed explicitly — same ≤0 = zero contracts rule. */
+  eqPctSet?: boolean;
   limit?: number;
   stop?: number;
   /** strategy.close(immediately=true) → fill at close(bar). */
@@ -77,7 +82,7 @@ export interface StratOrder {
   /** Order comment (TV paints it next to the trade marker). */
   comment?: string;
   /** Duplicate-id / OCA-reduce modifications applied during replay. */
-  mod?: { qty: number; eqPct: number; limit?: number; stop?: number };
+  mod?: { qty: number; qtySet?: boolean; eqPct: number; eqPctSet?: boolean; limit?: number; stop?: number };
 }
 
 /** One order fill — a StrategyTrade anchor for the IndicatorModel. */
@@ -353,7 +358,7 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     // Duplicate pending entry id → modify in place (Pine semantics).
     if (o.kind === 'entry' || o.kind === 'order') {
       const dupe = pending.find(p => (p.kind === 'entry' || p.kind === 'order') && p.id === o.id && p.dir === o.dir);
-      if (dupe) { dupe.mod = { qty: o.qty, eqPct: o.eqPct, limit: o.limit, stop: o.stop }; o.seen = o.bar; continue; }
+      if (dupe) { dupe.mod = { qty: o.qty, qtySet: o.qtySet, eqPct: o.eqPct, eqPctSet: o.eqPctSet, limit: o.limit, stop: o.stop }; o.seen = o.bar; continue; }
       // Same-direction entry while positioned → ignored unless pyramiding.
       if (sim.qty !== 0 && Math.sign(sim.qty) === o.dir && sim.openTrades >= cfg.pyramiding + 1) { o.seen = o.bar; continue; }
     }
@@ -391,6 +396,12 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     if (o.kind === 'entry' || o.kind === 'order') {
       const eqPct = o.mod?.eqPct ?? o.eqPct;
       const qty = o.mod?.qty ?? o.qty;
+      const qtySet = o.mod?.qtySet ?? o.qtySet ?? false;
+      const eqPctSet = o.mod?.eqPctSet ?? o.eqPctSet ?? false;
+      // Explicit non-positive qty/qty_percent = zero contracts, NOT a
+      // default-qty substitution — qty=0 must never fill 1 contract.
+      if (qtySet && !(qty > 0)) return 0;
+      if (eqPctSet && !(eqPct > 0)) return 0;
       if (eqPct > 0) return equityNow(atBar) * eqPct / (100 * price);
       if (qty > 0) return qty;
       switch (cfg.default_qty_type) {
@@ -410,6 +421,9 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     if (pos === 0) return 0;
     if (o.qty > 0) return Math.min(o.qty, pos);
     if (o.eqPct > 0) return pos * Math.min(1, o.eqPct / 100);
+    // Explicit qty=0 (or qty_percent=0) closes NOTHING — an absent arg
+    // falls through to the full-position default, a present zero does not.
+    if (o.qtySet === true || o.eqPctSet === true) return 0;
     return pos;
   }
 
@@ -611,7 +625,9 @@ registerBuiltin('strategy', 'entry', (c, args, named) => {
     fromEntry: '',
     dir,
     qty: qtyOf(bound, 'qty'),
+    qtySet: bound.has('qty'),
     eqPct: qtyOf(bound, 'qty_percent'),
+    eqPctSet: bound.has('qty_percent'),
     limit: optNum(bound, 'limit'),
     stop: optNum(bound, 'stop'),
     ocaName: strOf(bound.get('oca_name')) || undefined,
@@ -632,7 +648,9 @@ registerBuiltin('strategy', 'exit', (c, args, named) => {
     fromEntry: strOf(bound.get('from_entry')),
     dir: 0,
     qty: qtyOf(bound, 'qty'),
+    qtySet: bound.has('qty'),
     eqPct: qtyOf(bound, 'qty_percent'),
+    eqPctSet: bound.has('qty_percent'),
     limit: optNum(bound, 'limit'),
     stop: optNum(bound, 'stop'),
     profitTicks: optNum(bound, 'profit'),
@@ -659,7 +677,9 @@ registerBuiltin('strategy', 'close', (c, args, named) => {
     fromEntry: '',
     dir: 0,
     qty: qtyOf(bound, 'qty'),
+    qtySet: bound.has('qty'),
     eqPct: qtyOf(bound, 'qty_percent'),
+    eqPctSet: bound.has('qty_percent'),
     limit: undefined,
     stop: undefined,
     // evalArg wraps bool args in a BarSeries — read through the wrapper.
@@ -695,7 +715,9 @@ registerBuiltin('strategy', 'order', (c, args, named) => {
     fromEntry: '',
     dir,
     qty: qtyOf(bound, 'qty'),
+    qtySet: bound.has('qty'),
     eqPct: qtyOf(bound, 'qty_percent'),
+    eqPctSet: bound.has('qty_percent'),
     limit: optNum(bound, 'limit'),
     stop: optNum(bound, 'stop'),
     ocaName: strOf(bound.get('oca_name')) || undefined,
