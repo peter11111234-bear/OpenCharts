@@ -1588,10 +1588,11 @@ describe('request.security regression fixes', () => {
     expect(arr.kind).toBe('array');
     if (arr.kind !== 'array') return;
     expect(arr.v.length).toBe(2);                  // two existing bars, not three slots
-    const cellOf = (e: Value | undefined): (number | 'na')[] =>
-      e !== undefined && e.kind === 'array' ? e.v.map(valOf) : [];
-    expect(cellOf(arr.v[0])).toEqual([100, 10]);
-    expect(cellOf(arr.v[1])).toEqual([102, 30]);
+    const [e0, e1] = arr.v;
+    const e0v = e0 !== undefined && e0.kind === 'array' ? e0.v.map(valOf) : [];
+    const e1v = e1 !== undefined && e1.kind === 'array' ? e1.v.map(valOf) : [];
+    expect(e0v).toEqual([100, 10]);
+    expect(e1v).toEqual([102, 30]);
   });
 
 

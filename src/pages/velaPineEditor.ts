@@ -242,7 +242,11 @@ function closeMoreMenu(): void {
  */
 function chartForIndicator(ctx: WidgetContext, ind: { id: string }, point: { x: number; y: number }): WidgetContext['chart'] {
   const cells = (ctx as unknown as WorkspaceWidgetContext).cells ?? [];
-  const owners = cells.filter(c => c.chart.indicators().some(h => h.id === ind.id));
+  // indicators() throws on a disposed cell — exclude it, don't blow up the menu.
+  const owners = cells.filter(c => {
+    try { return c.chart.indicators().some(h => h.id === ind.id); }
+    catch { return false; }
+  });
   if (owners.length === 1) return owners[0]!.chart;
   if (owners.length > 1 && (point.x > 0 || point.y > 0)) {
     const el = ctx.host.ownerDocument.elementFromPoint(point.x, point.y);
@@ -298,11 +302,10 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
             } catch { /* one bad cell must not block the rest */ }
           }
           try {
-            ctx.toast?.(
-              added > 0 ? `已加入 ${added} 個圖表`
-                : timedOut > 0 ? '等待逾時——指標可能仍在加入中'
-                : '其他圖表已有此指標或無可用圖表',
-              'info');
+            const msg = timedOut > 0
+              ? (added > 0 ? `已加入 ${added} 個圖表，${timedOut} 個逾時` : `${timedOut} 個圖表加入逾時，可能仍在加入中`)
+              : (added > 0 ? `已加入 ${added} 個圖表` : '其他圖表已有此指標或無可用圖表');
+            ctx.toast?.(msg, 'info');
           } catch { /* no toast */ }
         })().finally(() => { addingToLayout = false; });
       } },
