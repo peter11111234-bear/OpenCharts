@@ -289,16 +289,20 @@ describe('strategy.equity', () => {
     expect(numV(getConstant('strategy.closedtrades', ctx))).toBe(1);
   });
 });
+/** evalArg wraps series args in a one-slot Series — mirrors the runtime shape. */
+const wrap = (v: Value): Value => {
+  const s = new Series();
+  s.set(v);
+  return { kind: 'series', v: s };
+};
+
+const callTrades = (name: string, ctx: BuiltinCtx, i: number): Value =>
+  callStrategy(name, [{ kind: 'int', v: i }], {}, ctx);
+
 
 // ── order gating / fill-model regressions ──────────────────────────────────
 
 describe('strategy order gating', () => {
-  const wrap = (v: Value): Value => {
-    const s = new Series();
-    s.set(v);
-    return { kind: 'series', v: s };
-  };
-
   it('when=false records no order on any strategy call', () => {
     const { ctx } = mkRtCtx(mkBars(5, 10));
     const whenFalse = { when: wrap({ kind: 'bool', v: false }) };
@@ -484,26 +488,24 @@ describe('strategy.closedtrades/opentrades accessors', () => {
     return { ctx, barCtx };
   };
 
-  const callTrades = (name: string, ctx: BuiltinCtx, i: number): Value =>
-    callStrategy(name, [{ kind: 'int', v: i }], {}, ctx);
-
-  it('closedtrades.* expose per-trade fields, index 0 = most recent', () => {
+  it('closedtrades.* expose per-trade fields, index 0 = FIRST closed trade', () => {
     const { ctx } = twoTrades();
     expect(numV(getConstant('strategy.closedtrades', ctx))).toBe(2);
-    // Most recent = the short trade (entry 15 → exit 17, loss).
-    expect(numV(callTrades('closedtrades.entry_bar_index', ctx, 0))).toBe(5);
-    expect(numV(callTrades('closedtrades.entry_price', ctx, 0))).toBe(15);
-    expect(numV(callTrades('closedtrades.entry_time', ctx, 0))).toBe(5 * 60000);
-    expect(numV(callTrades('closedtrades.exit_bar_index', ctx, 0))).toBe(7);
-    expect(numV(callTrades('closedtrades.exit_price', ctx, 0))).toBe(17);
-    expect(numV(callTrades('closedtrades.exit_time', ctx, 0))).toBe(7 * 60000);
-    expect(numV(callTrades('closedtrades.profit', ctx, 0))).toBeCloseTo(-2);
-    expect(numV(callTrades('closedtrades.size', ctx, 0))).toBe(-1);
+    // TV: trade_num is the chronological index — 0 = first closed trade
+    // (the long: entry 11 → exit 13, win), last = strategy.closedtrades - 1.
+    expect(numV(callTrades('closedtrades.entry_bar_index', ctx, 0))).toBe(1);
+    expect(numV(callTrades('closedtrades.entry_price', ctx, 0))).toBe(11);
+    expect(numV(callTrades('closedtrades.entry_time', ctx, 0))).toBe(1 * 60000);
+    expect(numV(callTrades('closedtrades.exit_bar_index', ctx, 0))).toBe(3);
+    expect(numV(callTrades('closedtrades.exit_price', ctx, 0))).toBe(13);
+    expect(numV(callTrades('closedtrades.exit_time', ctx, 0))).toBe(3 * 60000);
+    expect(numV(callTrades('closedtrades.profit', ctx, 0))).toBeCloseTo(2);
+    expect(numV(callTrades('closedtrades.size', ctx, 0))).toBe(1);
     expect(numV(callTrades('closedtrades.commission', ctx, 0))).toBe(0);
-    // Older trade = the long (entry 11 → exit 13, win).
-    expect(numV(callTrades('closedtrades.entry_price', ctx, 1))).toBe(11);
-    expect(numV(callTrades('closedtrades.profit', ctx, 1))).toBeCloseTo(2);
-    expect(numV(callTrades('closedtrades.size', ctx, 1))).toBe(1);
+    // Second closed trade = the short (entry 15 → exit 17, loss).
+    expect(numV(callTrades('closedtrades.entry_price', ctx, 1))).toBe(15);
+    expect(numV(callTrades('closedtrades.profit', ctx, 1))).toBeCloseTo(-2);
+    expect(numV(callTrades('closedtrades.size', ctx, 1))).toBe(-1);
     // Out of range → na.
     expect(callTrades('closedtrades.profit', ctx, 2).kind).toBe('na');
     expect(callTrades('closedtrades.profit', ctx, -1).kind).toBe('na');
@@ -552,11 +554,139 @@ plot(strategy.grossprofit, "gp")
 plot(strategy.grossloss, "gl")`;
     const r = await runScript(parse(src), mkBars(8, 10), { symbol: 'TEST', timeframe: 'D' });
     const last = (k: string) => numV(r.plots.get(k)!.values.at(-1));
-    expect(last('p0')).toBeCloseTo(-2);
-    expect(last('p1')).toBeCloseTo(2);
-    expect(last('e0')).toBe(15);
+    // Chronological: trade 0 = long (+2, entry @11), trade 1 = short (-2).
+    expect(last('p0')).toBeCloseTo(2);
+    expect(last('p1')).toBeCloseTo(-2);
+    expect(last('e0')).toBe(11);
     expect(last('np')).toBeCloseTo(0);
     expect(last('gp')).toBeCloseTo(2);
     expect(last('gl')).toBeCloseTo(2);
+  });
+});
+
+// ── 2026-10-09 QA round: TV-parity regression pins ─────────────────────────
+// Probed via scratch/_strategy_qa.mjs; findings in docs/strategy-qa-2026-10-09.md.
+
+describe('strategy QA 2026-10-09', () => {
+  it('strategy.close honors qty — partial close leaves the rest open', () => {
+    // TV: close("L", qty=1) on a 2-contract position leaves +1 open.
+    // Pre-fix: qty/qty_percent were ignored — close always flattened.
+    const bars = mkBars(6, 10);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    callStrategy('entry', [{ kind: 'string', v: 'L' }, { kind: 'string', v: 'strategy.long' }, { kind: 'int', v: 2 }], {}, ctx);
+    barCtx.seek(2);
+    callStrategy('close', [{ kind: 'string', v: 'L' }], { qty: wrap({ kind: 'int', v: 1 }) }, ctx);
+    barCtx.seek(3); // close fills bar3 open (13): 1 of 2 → +1 remains
+    expect(numV(getConstant('strategy.position_size', ctx))).toBe(1);
+    expect(numV(getConstant('strategy.opentrades', ctx))).toBe(1);
+    expect(numV(getConstant('strategy.closedtrades', ctx))).toBe(0); // leg only half-consumed
+  });
+
+  it('strategy.close honors qty_percent', () => {
+    const bars = mkBars(6, 10);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    callStrategy('entry', [{ kind: 'string', v: 'L' }, { kind: 'string', v: 'strategy.long' }, { kind: 'int', v: 2 }], {}, ctx);
+    barCtx.seek(2);
+    callStrategy('close', [{ kind: 'string', v: 'L' }], { qty_percent: wrap({ kind: 'int', v: 50 }) }, ctx);
+    barCtx.seek(3);
+    expect(numV(getConstant('strategy.position_size', ctx))).toBe(1);
+  });
+
+  it('positional args follow the v5 signature — close(id, comment, qty, …)', () => {
+    // v5 close() order: (id, comment, qty, qty_percent, alert_message,
+    // immediately) — `when` is deprecated and NOT positional. Pre-fix order
+    // had `when` 2nd, so ("L","note",1) bound qty→comment and lost qty.
+    const bars = mkBars(6, 10);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    callStrategy('entry', [{ kind: 'string', v: 'L' }, { kind: 'string', v: 'strategy.long' }, { kind: 'int', v: 2 }], {}, ctx);
+    barCtx.seek(2);
+    callStrategy('close', [
+      { kind: 'string', v: 'L' },
+      { kind: 'string', v: 'half' },
+      { kind: 'int', v: 1 },
+    ], {}, ctx);
+    barCtx.seek(3);
+    expect(numV(getConstant('strategy.position_size', ctx))).toBe(1);
+  });
+
+  it('positional close_all(comment) labels the exit execution', async () => {
+    // v5 close_all() order: (comment, alert_message, immediately) — pre-fix it
+    // shared close()'s order, binding positional arg0 to a dead `id` slot.
+    const src = `strategy("s")
+if bar_index == 0
+  strategy.entry("L", strategy.long)
+if bar_index == 2
+  strategy.close_all("done-all")
+plot(strategy.position_size)`;
+    const r = await runScript(parse(src), mkBars(5, 10), { symbol: 'TEST', timeframe: 'D' });
+    const exit = r.execs!.find(e => e.kind === 'exit');
+    expect(exit).toBeDefined();
+    expect(exit!.label).toBe('done-all');
+  });
+
+  it('position_avg_price re-derives from remaining legs after a partial exit', () => {
+    // TV: position_avg_price = average entry of the trades still open. Two
+    // legs @11 and @12 (avg 11.5); FIFO exit of the first 2 contracts retires
+    // the @11 leg → remaining position is the @12 leg → avg 12.
+    const bars = mkBars(8, 10);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    strategyDecl(ctx, { type: 'strategy', args: [{ name: 'pyramiding', value: numN(2) }] });
+    callStrategy('entry', [{ kind: 'string', v: 'A' }, { kind: 'string', v: 'strategy.long' }, { kind: 'int', v: 2 }], {}, ctx);
+    barCtx.seek(1); // A fills bar1 open 11 (2x)
+    callStrategy('entry', [{ kind: 'string', v: 'B' }, { kind: 'string', v: 'strategy.long' }, { kind: 'int', v: 2 }], {}, ctx);
+    barCtx.seek(2); // B fills bar2 open 12 (2x) → avg (22+24)/4 = 11.5
+    expect(numV(getConstant('strategy.position_avg_price', ctx))).toBeCloseTo(11.5);
+    barCtx.seek(3);
+    callStrategy('exit', [{ kind: 'string', v: 'X' }, { kind: 'string', v: 'A' }, { kind: 'int', v: 2 }], {}, ctx);
+    barCtx.seek(4); // exit fills bar4 open 14 → leg A consumed FIFO
+    expect(numV(getConstant('strategy.position_size', ctx))).toBe(2);
+    expect(numV(getConstant('strategy.opentrades', ctx))).toBe(1);
+    expect(numV(getConstant('strategy.position_avg_price', ctx))).toBe(12);
+  });
+
+  it('equity is continuous across a partial exit (leg-price PnL booking)', () => {
+    // PnL must book at the closed leg's entry price, not the blended average.
+    // Legs @11 (2x) and @12 (2x), avg 11.5. Exit 2 at bar4 open 14: leg-exact
+    // realized = 2×(14−11)=6; remaining @12, close 14 → openprofit +4.
+    // equity = 100000 + 6 + 4 = 100010. Pre-fix booked 2×(14−11.5)=5 realized
+    // but kept stale avg 11.5 → openprofit +5: equity equal by accident, both
+    // halves wrong (openprofit 5 vs TV's 4; closedtrades.profit 6 vs realized 5).
+    const bars = mkBars(8, 10);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    strategyDecl(ctx, { type: 'strategy', args: [{ name: 'pyramiding', value: numN(2) }] });
+    callStrategy('entry', [{ kind: 'string', v: 'A' }, { kind: 'string', v: 'strategy.long' }, { kind: 'int', v: 2 }], {}, ctx);
+    barCtx.seek(1);
+    callStrategy('entry', [{ kind: 'string', v: 'B' }, { kind: 'string', v: 'strategy.long' }, { kind: 'int', v: 2 }], {}, ctx);
+    barCtx.seek(3);
+    callStrategy('exit', [{ kind: 'string', v: 'X' }, { kind: 'string', v: 'A' }, { kind: 'int', v: 2 }], {}, ctx);
+    barCtx.seek(4);
+    expect(numV(getConstant('strategy.equity', ctx))).toBeCloseTo(100010);
+    expect(numV(getConstant('strategy.openprofit', ctx))).toBeCloseTo(4);
+    // The retired leg reports leg-exact profit: 2×(14−11) = 6.
+    expect(numV(callTrades('closedtrades.profit', ctx, 0))).toBeCloseTo(6);
+    expect(numV(getConstant('strategy.netprofit', ctx))).toBeCloseTo(6);
+  });
+
+  // TV-parity pins for bugs whose fix needs per-leg entry-id tracking in the
+  // replay ledger — outside the ≤20-line QA-fix scope (see findings doc).
+  it.fails('strategy.close(id) only closes the named entry — unmatched id is a no-op', () => {
+    const bars = mkBars(6, 10);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    callStrategy('entry', [{ kind: 'string', v: 'L' }, { kind: 'string', v: 'strategy.long' }], {}, ctx);
+    barCtx.seek(2);
+    callStrategy('close', [{ kind: 'string', v: 'NOPE' }], {}, ctx);
+    barCtx.seek(3);
+    expect(numV(getConstant('strategy.position_size', ctx))).toBe(1);
+  });
+
+  it.fails('strategy.exit(from_entry) does not fill when no open entry has that id', () => {
+    const bars = mkBars(6, 10);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    callStrategy('entry', [{ kind: 'string', v: 'L' }, { kind: 'string', v: 'strategy.long' }], {}, ctx);
+    barCtx.seek(2);
+    callStrategy('exit', [{ kind: 'string', v: 'X' }, { kind: 'string', v: 'NOPE' }], {}, ctx);
+    barCtx.seek(3);
+    expect(numV(getConstant('strategy.position_size', ctx))).toBe(1);
+    expect(numV(getConstant('strategy.opentrades', ctx))).toBe(1);
   });
 });

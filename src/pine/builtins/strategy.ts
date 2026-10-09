@@ -404,10 +404,10 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
           return cfg.default_qty_value;
       }
     }
-    // exit / close — contracts to close.
+    // exit / close — contracts to close. Both honor qty/qty_percent
+    // (TV: close has qty + qty_percent params, default qty_percent=100).
     const pos = Math.abs(sim.qty);
     if (pos === 0) return 0;
-    if (o.kind === 'close') return pos;
     if (o.qty > 0) return Math.min(o.qty, pos);
     if (o.eqPct > 0) return pos * Math.min(1, o.eqPct / 100);
     return pos;
@@ -434,30 +434,28 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     const comm = commission(match, price);
     sim.realizedPnl -= comm;
     const closeLeg = (c: number): void => {
+      // Position bookkeeping only — realized PnL books per consumed leg in
+      // the FIFO loop below (leg-exact prices, matching closedtrades.profit).
       const q = Math.min(Math.abs(c), Math.abs(sim.qty));
-      sim.realizedPnl += q * (price - sim.avgEntry) * Math.sign(sim.qty);
       sim.qty -= Math.sign(sim.qty) * q;
-      // TV: a trade is closed only when the position goes fully flat — partial
-      // exits do not count. openTrades ≈ legs feeding the position, so a full
-      // close adds every leg (pyramiding-safe approximation).
-      if (sim.qty === 0) {
-        sim.closedTrades += Math.max(1, sim.openTrades);
-        sim.avgEntry = 0;
-        sim.openTrades = 0;
-      }
+      if (sim.qty === 0) sim.avgEntry = 0;
     };
     // Trade ledger: open legs are strategy.opentrades rows; exit fills consume
     // them FIFO — a fully-consumed leg becomes a strategy.closedtrades row.
     // The fill's commission lands on the closing side's legs when the fill
     // reduces a position, otherwise on the leg it opens.
-    const closing = Math.min(Math.abs(match), Math.abs(sim.qty));
+    // Only fills trading AGAINST the open position consume legs — a
+    // same-direction entry adds a leg, it never closes one.
+    const closing = Math.sign(match) === Math.sign(sim.qty) ? 0 : Math.min(Math.abs(match), Math.abs(sim.qty));
     const opening = Math.abs(match) - closing;
     if (closing > 0) {
       let left = closing;
       while (left > 1e-12 && sim.openLegs.length > 0) {
         const leg = sim.openLegs[0]!;
         const q = Math.min(left, leg.qty);
-        leg.pnl += q * (price - leg.price) * leg.dir;
+        const pnl = q * (price - leg.price) * leg.dir;
+        leg.pnl += pnl;
+        sim.realizedPnl += pnl; // leg-exact: TV books trade profit at its own entry price
         leg.exitQty += q;
         leg.exitNotional += q * price;
         leg.exitBar = bar;
@@ -475,6 +473,7 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
             profit: leg.pnl - leg.entryComm - leg.exitComm,
             commission: leg.entryComm + leg.exitComm,
           });
+          sim.closedTrades++; // a fully-consumed leg is one closed trade
         }
       }
     }
@@ -488,14 +487,9 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     }
     if (sim.qty === 0) {
       sim.qty = match;
-      sim.avgEntry = price;
-      sim.openTrades += 1;
     } else if (Math.sign(sim.qty) === Math.sign(match)) {
-      const w = Math.abs(match);
       if (o.kind === 'entry' || o.kind === 'order') {
-        sim.avgEntry = (sim.avgEntry * Math.abs(sim.qty) + price * w) / (Math.abs(sim.qty) + w);
         sim.qty += match;
-        sim.openTrades += 1;
       } else {
         closeLeg(match); // shouldn't happen (exit dir opposes position)
       }
@@ -504,12 +498,15 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
       const before = Math.abs(sim.qty);
       closeLeg(match);
       const rem = Math.abs(match) - before;
-      if (rem > 0) {
-        sim.qty = Math.sign(match) * rem;
-        sim.avgEntry = price;
-        sim.openTrades += 1;
-      }
+      if (rem > 0) sim.qty = Math.sign(match) * rem;
     }
+    // Live-leaf derivation: opentrades = open legs; avg price = weighted mean
+    // of the legs still open (TV: position_avg_price covers remaining trades,
+    // so a partial exit against the cheapest leg moves the average).
+    sim.openTrades = sim.openLegs.length;
+    let legQty = 0, legNotional = 0;
+    for (const l of sim.openLegs) { legQty += l.qty; legNotional += l.qty * l.price; }
+    sim.avgEntry = legQty > 1e-12 ? legNotional / legQty : 0;
     // OCA: a fill in an oca group retires (cancel) or shrinks (reduce) its
     // pending siblings. cancelledAt = bar-1 forbids same-bar sibling fills —
     // the group is one-cancels-others, not first-touched-wins-later.
@@ -593,10 +590,14 @@ function pushOrder(ctx: BuiltinCtx, o: Omit<StratOrder, 'bar' | 'seq' | 'seen'>)
 
 // ── builtins ────────────────────────────────────────────────────────────────
 
-const ENTRY_ORDER = ['id', 'direction', 'qty', 'limit', 'stop', 'when', 'comment', 'comment_disabled', 'alert_message', 'oca_name', 'oca_type', 'disable_alert'] as const;
-const EXIT_ORDER = ['id', 'from_entry', 'qty', 'qty_percent', 'profit', 'limit', 'loss', 'stop', 'trail_price', 'trail_points', 'trail_offset', 'when', 'comment', 'comment_disabled', 'comment_profit', 'comment_loss', 'comment_trailing', 'alert_message', 'alert_profit', 'alert_loss', 'alert_trailing', 'disable_alert'] as const;
-const ORDER_ORDER = ['id', 'direction', 'qty', 'limit', 'stop', 'when', 'comment', 'alert_message', 'oca_name', 'oca_type', 'disable_alert'] as const;
-const CLOSE_ORDER = ['id', 'when', 'immediately', 'comment', 'qty', 'qty_percent', 'alert_message', 'disable_alert'] as const;
+// Pine v5 signature orders. `when` was deprecated in v5 — it binds only as a
+// named arg (bindArgs accepts any named key) and never occupies a positional
+// slot; a positional arg after `when`'s old slot belongs to the next v5 param.
+const ENTRY_ORDER = ['id', 'direction', 'qty', 'limit', 'stop', 'oca_name', 'oca_type', 'comment', 'comment_disabled', 'alert_message', 'disable_alert', 'when'] as const;
+const EXIT_ORDER = ['id', 'from_entry', 'qty', 'qty_percent', 'profit', 'limit', 'loss', 'stop', 'trail_price', 'trail_points', 'trail_offset', 'oca_name', 'oca_type', 'comment', 'comment_disabled', 'comment_profit', 'comment_loss', 'comment_trailing', 'alert_message', 'alert_profit', 'alert_loss', 'alert_trailing', 'disable_alert', 'when'] as const;
+const ORDER_ORDER = ['id', 'direction', 'qty', 'limit', 'stop', 'oca_name', 'oca_type', 'comment', 'alert_message', 'disable_alert', 'when'] as const;
+const CLOSE_ORDER = ['id', 'comment', 'qty', 'qty_percent', 'alert_message', 'immediately', 'disable_alert', 'when'] as const;
+const CLOSE_ALL_ORDER = ['comment', 'alert_message', 'immediately', 'disable_alert', 'when'] as const;
 
 registerBuiltin('strategy', 'entry', (c, args, named) => {
   const bound = bindArgs(args, named, ENTRY_ORDER);
@@ -639,6 +640,8 @@ registerBuiltin('strategy', 'exit', (c, args, named) => {
     trailPrice: optNum(bound, 'trail_price'),
     trailPoints: optNum(bound, 'trail_points'),
     trailOffset: optNum(bound, 'trail_offset'),
+    ocaName: strOf(bound.get('oca_name')) || undefined,
+    ocaType: strOf(bound.get('oca_type')) || undefined,
     immediate: false,
     comment: strOf(bound.get('comment')) || undefined,
   });
@@ -667,7 +670,7 @@ registerBuiltin('strategy', 'close', (c, args, named) => {
 });
 
 registerBuiltin('strategy', 'close_all', (c, args, named) => {
-  const bound = bindArgs(args, named, CLOSE_ORDER);
+  const bound = bindArgs(args, named, CLOSE_ALL_ORDER);
   const when = bound.get('when');
   if (when !== undefined && !truthy(when)) return { kind: 'void' };
   const imm = bound.get('immediately');
@@ -778,16 +781,16 @@ registerLazyConstant('strategy', 'opentrades', (c) => {
 });
 
 // ── per-trade function accessors + P&L rollups ─────────────────────────────
-// strategy.closedtrades.* / strategy.opentrades.* take trade_num: closed rows
-// are most-recent-first (0 = last closed), open rows oldest-first. Out of
-// range → na. Fields missing on a row kind → na.
+// strategy.closedtrades.* / strategy.opentrades.* take trade_num: TV numbers
+// trades chronologically — 0 = FIRST trade, last = count-1. Out of range →
+// na. Fields missing on a row kind → na.
 
 function regClosed(name: string, pick: (t: ClosedTrade) => number): void {
   registerBuiltin('strategy.closedtrades', name, (c, args) => {
     if (!c) return NA;
     const rows = simAt(c, c.barIndex).closed;
     const i = curNum(args[0] ?? NA);
-    const t = i !== undefined && i >= 0 && i < rows.length ? rows[rows.length - 1 - Math.trunc(i)]! : undefined;
+    const t = i !== undefined && i >= 0 && i < rows.length ? rows[Math.trunc(i)]! : undefined;
     if (t === undefined) return NA;
     const v = pick(t);
     return Number.isFinite(v) ? numVal(v) : NA;
