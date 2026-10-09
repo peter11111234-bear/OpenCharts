@@ -216,13 +216,20 @@ function lenOf(bound: Map<string, Value>, name = 'length'): number | undefined {
 
 // ── window helpers (strict unless noted) ─────────────────────────────────────
 // windows are bar-range [b-L+1, b]; a bar out of src history reads undefined.
+//
+// Two layers:
+//  * *Scan — direct O(L) recompute. Used as the backward-query fallback inside
+//    winAgg (a bar below the first-ever query can't be reached by sliding).
+//  * winAgg — callsite-keyed incremental VS (stateFor, so it shares the ctx-
+//    scoped/per-spec keying of every other builtin): maintains a sliding
+//    aggregate and a per-bar memo; forward steps are O(1) amortized.
 
 function winOk(vs: VS, b: number, L: number): boolean {
   for (let i = 0; i < L; i++) if (vs.get(b - i) === undefined) return false;
   return true;
 }
 
-function meanWin(vs: VS, b: number, L: number): number | undefined {
+function meanScan(vs: VS, b: number, L: number): number | undefined {
   let s = 0;
   for (let i = 0; i < L; i++) {
     const v = vs.get(b - i);
@@ -233,13 +240,13 @@ function meanWin(vs: VS, b: number, L: number): number | undefined {
 }
 
 /** Sum ignoring na/out-of-window values (ta.sum semantics). */
-function sumLoose(vs: VS, b: number, L: number): number {
+function sumScan(vs: VS, b: number, L: number): number {
   let s = 0;
   for (let i = 0; i < L; i++) s += vs.get(b - i) ?? 0;
   return s;
 }
 
-function wmaWin(vs: VS, b: number, L: number): number | undefined {
+function wmaScan(vs: VS, b: number, L: number): number | undefined {
   let num_ = 0, den = 0;
   for (let i = 0; i < L; i++) {
     const v = vs.get(b - i);
@@ -251,7 +258,7 @@ function wmaWin(vs: VS, b: number, L: number): number | undefined {
   return num_ / den;
 }
 
-function highestWin(vs: VS, b: number, L: number): number | undefined {
+function highestScan(vs: VS, b: number, L: number): number | undefined {
   let m: number | undefined;
   for (let i = 0; i < L; i++) {
     const v = vs.get(b - i);
@@ -261,7 +268,7 @@ function highestWin(vs: VS, b: number, L: number): number | undefined {
   return m;
 }
 
-function lowestWin(vs: VS, b: number, L: number): number | undefined {
+function lowestScan(vs: VS, b: number, L: number): number | undefined {
   let m: number | undefined;
   for (let i = 0; i < L; i++) {
     const v = vs.get(b - i);
@@ -271,8 +278,8 @@ function lowestWin(vs: VS, b: number, L: number): number | undefined {
   return m;
 }
 
-function stdevWin(vs: VS, b: number, L: number, biased: boolean): number | undefined {
-  const m = meanWin(vs, b, L);
+function stdevScan(vs: VS, b: number, L: number, biased: boolean): number | undefined {
+  const m = meanScan(vs, b, L);
   if (m === undefined) return undefined;
   let s = 0;
   for (let i = 0; i < L; i++) {
@@ -281,6 +288,137 @@ function stdevWin(vs: VS, b: number, L: number, biased: boolean): number | undef
   }
   return Math.sqrt(s / (biased ? L : L - 1));
 }
+
+type WinKind = 'mean' | 'sum' | 'wma' | 'max' | 'min' | 'sd_b' | 'sd_u';
+
+// Identity for VS objects — the window aggregate is keyed by the source VS
+// (which already embeds callsite+series for vsOf / a unique key for derived
+// VS), not by callsite itself: two call sites over the same VS legitimately
+// share one sliding state.
+const VS_IDS = new WeakMap<VS, number>();
+let nextVsId = 1;
+const vsId = (v: VS): number => {
+  let id = VS_IDS.get(v);
+  if (id === undefined) { id = nextVsId++; VS_IDS.set(v, id); }
+  return id;
+};
+
+/** Incremental window aggregate. Forward bars slide the [b-L+1, b] window in
+ *  O(1) amortized; na/out-of-history bars tracked by a bad counter (enter++ /
+ *  exit--, matching the strict-window semantics of the scans). Bars before
+ *  the first query or non-monotonic lookups fall back to the O(L) scan — the
+ *  incremental bookkeeping can't walk backward. */
+function winAgg(ctx: BuiltinCtx, kind: WinKind, vs: VS, L: number): VS {
+  return stateFor<VS>(ctx, ['wvs', kind, vsId(vs), L], () => {
+    const memo = new Map<number, number | undefined>();
+    const useDq = kind === 'max' || kind === 'min';
+    // dq: index-stamped monotonic deque (parallel arrays + head index, so the
+    // per-step exit pop is O(1) — Array.shift would reintroduce O(L)).
+    const dqJ: number[] = [], dqV: number[] = [];
+    let qh = 0;
+    let bad = 0, wnum = 0;
+    const acc = { x: 0, c: 0 }, accSq = { x: 0, c: 0 };
+    const accAdd = (a: { x: number; c: number }, v: number): void => {
+      const t = a.x + v;
+      a.c += Math.abs(a.x) >= Math.abs(v) ? a.x - t + v : v - t + a.x;
+      a.x = t;
+    };
+    const add = (j: number, v: number | undefined, w = 0): void => {
+      if (v === undefined) { bad++; return; }
+      if (useDq) {
+        while (dqJ.length > qh &&
+               (kind === 'max' ? dqV[dqJ.length - 1]! <= v : dqV[dqJ.length - 1]! >= v)) {
+          dqJ.pop(); dqV.pop();
+        }
+        dqJ.push(j); dqV.push(v);
+      } else {
+        accAdd(acc, v);
+        if (kind === 'sd_b' || kind === 'sd_u') accAdd(accSq, v * v);
+        else if (kind === 'wma') wnum += w * v;
+      }
+    };
+    const del = (j: number, v: number | undefined): void => {
+      if (v === undefined) { bad--; return; }
+      if (useDq) { if (dqJ[qh] === j) qh++; }
+      else {
+        accAdd(acc, -v);
+        if (kind === 'sd_b' || kind === 'sd_u') accAdd(accSq, -v * v);
+      }
+    };
+    const sum = () => acc.x + acc.c;
+    const sumSq = () => accSq.x + accSq.c;
+    const result = (): number | undefined => {
+      switch (kind) {
+        case 'sum': return sum();
+        case 'max': case 'min':
+          return bad > 0 ? undefined : dqV[qh];
+        case 'wma': return bad > 0 ? undefined : wnum / (L * (L + 1) / 2);
+        case 'mean': return bad > 0 ? undefined : sum() / L;
+        default: { // sd_b / sd_u
+          if (bad > 0) return undefined;
+          const s = sum();
+          const vv = sumSq() - (s * s) / L;
+          return Math.sqrt(Math.max(0, vv) / (kind === 'sd_b' ? L : L - 1));
+        }
+      }
+    };
+    const direct = (b: number): number | undefined => {
+      switch (kind) {
+        case 'mean': return meanScan(vs, b, L);
+        case 'sum': return sumScan(vs, b, L);
+        case 'wma': return wmaScan(vs, b, L);
+        case 'max': return highestScan(vs, b, L);
+        case 'min': return lowestScan(vs, b, L);
+        case 'sd_b': return stdevScan(vs, b, L, true);
+        default: return stdevScan(vs, b, L, false);
+      }
+    };
+    const self: VS = {
+      last: -1,
+      get(b: number): number | undefined {
+        if (b <= self.last) {
+          if (memo.has(b)) return memo.get(b);
+          const v = direct(b); // window predates the sliding watermark
+          memo.set(b, v);
+          return v;
+        }
+        if (self.last === -1) {
+          const lo = b - L + 1;
+          for (let j = lo; j <= b; j++) add(j, vs.get(j), j - lo + 1);
+        } else {
+          for (let i = self.last + 1; i <= b; i++) {
+            const vIn = vs.get(i), vOut = vs.get(i - L);
+            del(i - L, vOut);
+            add(i, vIn);
+            if (kind === 'wma')
+              // N(i) = Σ_{j=i-L+1..i} (j-i+L)·v_j slides via
+              // N(i) = N(i-1) + (L+1)·v_i − v_{i-L} − ΣW(i)   (na → 0)
+              wnum += (L + 1) * (vIn ?? 0) - (vOut ?? 0) - sum();
+            memo.set(i, result());
+          }
+        }
+        self.last = b;
+        const v = result();
+        memo.set(b, v);
+        return v;
+      },
+    };
+    return self;
+  });
+}
+
+const meanWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number | undefined =>
+  winAgg(ctx, 'mean', vs, L).get(b);
+const sumLoose = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number =>
+  winAgg(ctx, 'sum', vs, L).get(b) ?? 0;
+const wmaWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number | undefined =>
+  winAgg(ctx, 'wma', vs, L).get(b);
+const highestWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number | undefined =>
+  winAgg(ctx, 'max', vs, L).get(b);
+const lowestWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number | undefined =>
+  winAgg(ctx, 'min', vs, L).get(b);
+const stdevWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number, biased: boolean): number | undefined =>
+  winAgg(ctx, biased ? 'sd_b' : 'sd_u', vs, L).get(b);
 
 // ── ta.* building blocks shared by several builtins ──────────────────────────
 
@@ -320,9 +458,9 @@ function rmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: Key): VS {
     const x = src.get(b);
     if (x === undefined) return undefined;
     if (b < len - 1) return undefined;
-    if (b === len - 1) return meanWin(src, b, len);
+    if (b === len - 1) return meanWin(ctx, src, b, len);
     const p = rmaVsGet(ctx, src, len, tag, b - 1);
-    if (p === undefined) return meanWin(src, b, len); // defensive reseed
+    if (p === undefined) return meanWin(ctx, src, b, len); // defensive reseed
     return a * x + (1 - a) * p;
   });
 }
@@ -345,12 +483,12 @@ function hmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: Key): VS {
   const half = Math.max(1, Math.floor(len / 2));
   const root = Math.max(1, Math.round(Math.sqrt(len)));
   const inner = vseries(ctx, ['hma-in', ...kparts(tag), len], (b) => {
-    const f = wmaWin(src, b, half);
-    const s = wmaWin(src, b, len);
+    const f = wmaWin(ctx, src, b, half);
+    const s = wmaWin(ctx, src, b, len);
     if (f === undefined || s === undefined) return undefined;
     return 2 * f - s;
   });
-  return vseries(ctx, ['hma', ...kparts(tag), len], (b) => wmaWin(inner, b, root));
+  return vseries(ctx, ['hma', ...kparts(tag), len], (b) => wmaWin(ctx, inner, b, root));
 }
 
 // ── arg plumbing ─────────────────────────────────────────────────────────────
@@ -389,7 +527,7 @@ reg('sma', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length']);
   const src = srcOf(ctx, b); const L = lenOf(b);
   if (!src || L === undefined) return NA;
-  return fl(meanWin(src, ctx.barIndex, L));
+  return fl(meanWin(ctx, src, ctx.barIndex, L));
 });
 
 reg('ema', (ctx, args, named) => {
@@ -417,7 +555,7 @@ reg('wma', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length']);
   const src = srcOf(ctx, b); const L = lenOf(b);
   if (!src || L === undefined) return NA;
-  return fl(wmaWin(src, ctx.barIndex, L));
+  return fl(wmaWin(ctx, src, ctx.barIndex, L));
 });
 
 reg('hma', (ctx, args, named) => {
@@ -509,7 +647,7 @@ reg('stdev', (ctx, args, named) => {
   const biased = boolArg(b, 'biased', true);
   // biased=false needs ≥2 samples (÷L-1); biased=true & L==1 → 0 (fl covers it).
   if (L < 2 && !biased) return NA;
-  return fl(stdevWin(src, ctx.barIndex, L, biased));
+  return fl(stdevWin(ctx, src, ctx.barIndex, L, biased));
 });
 
 reg('variance', (ctx, args, named) => {
@@ -518,7 +656,7 @@ reg('variance', (ctx, args, named) => {
   if (!src || L === undefined) return NA;
   const biased = boolArg(b, 'biased', true);
   if (L < 2 && !biased) return NA;
-  const m = meanWin(src, ctx.barIndex, L);
+  const m = meanWin(ctx, src, ctx.barIndex, L);
   if (m === undefined) return NA;
   let s = 0;
   for (let i = 0; i < L; i++) {
@@ -533,8 +671,8 @@ reg('bb', (ctx, args, named) => {
   const src = srcOf(ctx, b); const L = lenOf(b);
   const m = numArg(b, 'mult', 2);
   if (!src || L === undefined || !Number.isFinite(m)) return arr(NA, NA, NA);
-  const basis = meanWin(src, ctx.barIndex, L);
-  const sd = stdevWin(src, ctx.barIndex, L, true);
+  const basis = meanWin(ctx, src, ctx.barIndex, L);
+  const sd = stdevWin(ctx, src, ctx.barIndex, L, true);
   if (basis === undefined || sd === undefined) return arr(NA, NA, NA);
   return arr(fl(basis), fl(basis + m * sd), fl(basis - m * sd));
 });
@@ -544,8 +682,8 @@ reg('bbw', (ctx, args, named) => {
   const src = srcOf(ctx, b); const L = lenOf(b);
   const m = numArg(b, 'mult', 2);
   if (!src || L === undefined || !Number.isFinite(m)) return NA;
-  const basis = meanWin(src, ctx.barIndex, L);
-  const sd = stdevWin(src, ctx.barIndex, L, true);
+  const basis = meanWin(ctx, src, ctx.barIndex, L);
+  const sd = stdevWin(ctx, src, ctx.barIndex, L, true);
   if (basis === undefined || sd === undefined || basis === 0) return NA;
   return fl(((basis + m * sd) - (basis - m * sd)) / basis);
 });
@@ -555,21 +693,21 @@ reg('highest', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length']);
   const { src, len } = srcLen(ctx, b, ctx.high, 'high');
   if (len === undefined) return NA;
-  return fl(highestWin(src, ctx.barIndex, len));
+  return fl(highestWin(ctx, src, ctx.barIndex, len));
 });
 
 reg('lowest', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length']);
   const { src, len } = srcLen(ctx, b, ctx.low, 'low');
   if (len === undefined) return NA;
-  return fl(lowestWin(src, ctx.barIndex, len));
+  return fl(lowestWin(ctx, src, ctx.barIndex, len));
 });
 
 reg('highestbars', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length']);
   const { src, len } = srcLen(ctx, b, ctx.high, 'high');
   if (len === undefined) return NA;
-  const m = highestWin(src, ctx.barIndex, len);
+  const m = highestWin(ctx, src, ctx.barIndex, len);
   if (m === undefined) return NA;
   for (let i = 0; i < len; i++) if (src.get(ctx.barIndex - i) === m) return { kind: 'int', v: i === 0 ? 0 : -i };
   return NA;
@@ -579,7 +717,7 @@ reg('lowestbars', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length']);
   const { src, len } = srcLen(ctx, b, ctx.low, 'low');
   if (len === undefined) return NA;
-  const m = lowestWin(src, ctx.barIndex, len);
+  const m = lowestWin(ctx, src, ctx.barIndex, len);
   if (m === undefined) return NA;
   for (let i = 0; i < len; i++) if (src.get(ctx.barIndex - i) === m) return { kind: 'int', v: i === 0 ? 0 : -i };
   return NA;
@@ -652,7 +790,7 @@ reg('sum', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length']);
   const src = srcOf(ctx, b); const L = lenOf(b);
   if (!src || L === undefined) return NA;
-  return fl(sumLoose(src, ctx.barIndex, L));
+  return fl(sumLoose(ctx, src, ctx.barIndex, L));
 });
 
 function corImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>): Value {
@@ -662,7 +800,7 @@ function corImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>): 
   if (!sa || !sb || L === undefined || L < 2) return NA;
   const bar = ctx.barIndex;
   if (!winOk(sa, bar, L) || !winOk(sb, bar, L)) return NA;
-  const ma = meanWin(sa, bar, L)!, mb = meanWin(sb, bar, L)!;
+  const ma = meanWin(ctx, sa, bar, L)!, mb = meanWin(ctx, sb, bar, L)!;
   let sxy = 0, sxx = 0, syy = 0;
   for (let i = 0; i < L; i++) {
     const da = sa.get(bar - i)! - ma, db = sb.get(bar - i)! - mb;
@@ -679,7 +817,7 @@ reg('dev', (ctx, args, named) => {
   const src = srcOf(ctx, b); const L = lenOf(b);
   if (!src || L === undefined) return NA;
   const bar = ctx.barIndex;
-  const m = meanWin(src, bar, L);
+  const m = meanWin(ctx, src, bar, L);
   if (m === undefined) return NA;
   let s = 0;
   for (let i = 0; i < L; i++) s += Math.abs(src.get(bar - i)! - m);
@@ -959,7 +1097,7 @@ reg('cci', (ctx, args, named) => {
   const src = srcOf(ctx, b); const L = lenOf(b);
   if (!src || L === undefined) return NA;
   const bar = ctx.barIndex;
-  const m = meanWin(src, bar, L);
+  const m = meanWin(ctx, src, bar, L);
   if (m === undefined) return NA;
   let dev = 0;
   for (let i = 0; i < L; i++) dev += Math.abs(src.get(bar - i)! - m);
@@ -1022,8 +1160,8 @@ reg('wpr', (ctx, args, named) => {
   const L = lenOf(b);
   if (L === undefined) return NA;
   const bar = ctx.barIndex;
-  const hh = highestWin(vsOf(ctx, { kind: 'series', v: ctx.high }, 'high'), bar, L);
-  const ll = lowestWin(vsOf(ctx, { kind: 'series', v: ctx.low }, 'low'), bar, L);
+  const hh = highestWin(ctx, vsOf(ctx, { kind: 'series', v: ctx.high }, 'high'), bar, L);
+  const ll = lowestWin(ctx, vsOf(ctx, { kind: 'series', v: ctx.low }, 'low'), bar, L);
   const c = num(ctx.close.get(0));
   if (hh === undefined || ll === undefined || c === undefined) return NA;
   const den = hh - ll;
@@ -1114,10 +1252,10 @@ function kcImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>, us
         return h === undefined || l === undefined ? undefined : h - l;
       });
   const basis = useWma
-    ? vseries(ctx, ['kc-b', ...tag], (bb) => wmaWin(src, bb, L))
+    ? vseries(ctx, ['kc-b', ...tag], (bb) => wmaWin(ctx, src, bb, L))
     : emaVs(ctx, src, L, ['kc-b', ...tag]);
   const rng = useWma
-    ? vseries(ctx, ['kc-r', ...tag], (bb) => wmaWin(rngSrc, bb, L))
+    ? vseries(ctx, ['kc-r', ...tag], (bb) => wmaWin(ctx, rngSrc, bb, L))
     : emaVs(ctx, rngSrc, L, ['kc-r', ...tag]);
   const bar = ctx.barIndex;
   const base = basis.get(bar), r = rng.get(bar);
@@ -1151,7 +1289,7 @@ reg('fisher', (ctx, args, named) => {
   let out: [number, number] | undefined;
   for (let bb = lastBar.n + 1; bb <= bar; bb++) {
     const price = src.get(bb);
-    const hi = highestWin(src, bb, L), lo = lowestWin(src, bb, L);
+    const hi = highestWin(ctx, src, bb, L), lo = lowestWin(ctx, src, bb, L);
     if (price === undefined || hi === undefined || lo === undefined) { memo.set(bb, undefined); out = undefined; continue; }
     const range = hi - lo;
     let v = range === 0 ? 0 : 0.66 * ((price - lo) / range - 0.5) + 0.67 * (st.v ?? 0);
