@@ -226,6 +226,29 @@ function closeMoreMenu(): void {
   openMoreMenuEl = null;
 }
 
+
+/**
+ * Resolve the chart that actually owns a clicked legend row. `ctx.chart` is the
+ * ambient ACTIVE cell's chart, but the row lives on whichever cell rendered it —
+ * and indicator ids are shared across cells (restored/parked scripts reuse
+ * `entry.id`), so `ctx.chart.indicators().find(h => h.id === ind.id)` can hit the
+ * wrong chart. ChartCell's DOM host isn't on the typed `ctx.cells` entries, so
+ * the clicked cell is recovered by hit-testing `lastPointer` against
+ * `.vela-cell[data-cell-id]` elements (the only per-cell DOM marker vela emits).
+ */
+function chartForIndicator(ctx: WidgetContext, ind: { id: string }): WidgetContext['chart'] {
+  const cells = (ctx as unknown as WorkspaceWidgetContext).cells ?? [];
+  const owners = cells.filter(c => c.chart.indicators().some(h => h.id === ind.id));
+  if (owners.length === 1) return owners[0]!.chart;
+  if (owners.length > 1 && (lastPointer.x > 0 || lastPointer.y > 0)) {
+    const el = ctx.host.ownerDocument.elementFromPoint(lastPointer.x, lastPointer.y);
+    const cellId = el?.closest<HTMLElement>('.vela-cell')?.dataset.cellId;
+    const hit = cellId ? owners.find(c => c.id === cellId) : undefined;
+    if (hit) return hit.chart;
+  }
+  return ctx.chart;
+}
+
 function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; source?: string }): void {
   if (openMoreMenuEl) { closeMoreMenu(); return; }
   const doc = ctx.host.ownerDocument;
@@ -239,7 +262,8 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
         if (addingToLayout) { try { ctx.toast?.('處理中', 'info'); } catch { /* no toast */ } return; }
         addingToLayout = true;
         void (async () => {
-          const h = ctx.chart.indicators().find(x => x.id === ind.id);
+          const srcChart = chartForIndicator(ctx, ind);
+          const h = srcChart.indicators().find(x => x.id === ind.id);
           if (!h?.source) return;
           let inputs: Record<string, InputValue> | undefined;
           try { inputs = h.inputValues(); } catch { /* unreadable → declaration defaults */ }
@@ -247,13 +271,16 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
           const cells = wctx.cells ?? [];
           let added = 0;
           for (const cell of cells) {
-            if (cell.chart === ctx.chart) continue;
+            if (cell.chart === srcChart) continue;
             try {
               if (cell.chart.indicators().some(x => x.source === h.source)) continue; // disposed cell → throws inside try
-              const r = await cell.chart.runIndicator(h.source!, {
-                language: 'pine', title: h.title, inputs,
-              });
-              if (r.ok) added++;
+              // A dead feed can leave runIndicator unsettled — cap the wait so
+              // one wedged cell can't stall the loop (and pin addingToLayout).
+              const r = await Promise.race([
+                cell.chart.runIndicator(h.source!, { language: 'pine', title: h.title, inputs }),
+                new Promise<null>(resolve => setTimeout(() => resolve(null), 15000)),
+              ]);
+              if (r?.ok) added++;
             } catch { /* one bad cell must not block the rest */ }
           }
           try { ctx.toast?.(added > 0 ? `已加入 ${added} 個圖表` : '其他圖表已有此指標或無可用圖表', 'info'); } catch { /* no toast */ }
@@ -280,14 +307,15 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
             if (p) void p.then(() => { try { ctx.toast?.('已複製', 'success'); } catch {} }, () => { try { ctx.toast?.('複製失敗', 'error'); } catch {} });
           } }
       : { label: '複製（內建指標無來源）', disabled: true },
-    { label: '隱藏', run: () => { ctx.chart.indicators().find(x => x.id === ind.id)?.setVisible(false); } },
-    { label: '移除', run: () => { ctx.chart.indicators().find(x => x.id === ind.id)?.remove(); } },
+    { label: '隱藏', run: () => { chartForIndicator(ctx, ind).indicators().find(x => x.id === ind.id)?.setVisible(false); } },
+    { label: '移除', run: () => { chartForIndicator(ctx, ind).indicators().find(x => x.id === ind.id)?.remove(); } },
     { label: '', sep: true },
     { label: '物件樹', disabled: true },
     { label: '', sep: true },
     { label: '設定…', run: () => {
-        const renderer = ctx.chart.renderer;
+        const renderer = chartForIndicator(ctx, ind).renderer;
         if (renderer.supportsIndicatorSettings) renderer.openIndicatorSettings(ind.id);
+        else { try { ctx.toast?.('設定功能尚未支援', 'info'); } catch { /* no toast */ } }
       } },
   ];
 
