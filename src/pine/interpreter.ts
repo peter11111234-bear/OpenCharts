@@ -108,6 +108,11 @@ interface RunState {
    *  materialized `:=` copy across bars; rebind() re-points the inner each
    *  bar so reads still see the caller's current history until a write). */
   declCows: Map<object, CowSeries>;
+  /** declSlots key whose entry is FOREIGN-OWNED (ctx.close / a UDF/call /
+   *  security / tf-domain series the decl merely aliases). A later
+   *  mixed-kind scalar decl on the same key must NOT setAt through it —
+   *  slotFor() swaps in an owned BarSeries and clears the tag. */
+  declAliased: Set<object>;
   /** Slots registered for bar-end densification — dedup for ensureList
    *  (post-pruning this holds ONLY slots that still need ensureBar). */
   trackedSlots: Set<BarSeries>;
@@ -159,6 +164,7 @@ function runOf(ctx: BuiltinCtx): RunState {
     r = {
       declSlots: new Map(),
       declCows: new Map(),
+      declAliased: new Set(),
       trackedSlots: new Set(),
       ensureList: [],
       topLevelBody: false,
@@ -227,22 +233,34 @@ class CowSeries extends ForwardingSeries {
     return this.cow ?? this.inner;
   }
 
-  /** Re-point at the caller's (possibly new) slot at the next bar —
-   *  keeps the materialized local copy (post-`:=` history) intact. */
-  rebind(inner: Series): void { this.inner = inner; }
+  /** Rebind returns a NEW CowSeries sharing this one's materialized copy:
+   * the `:=` history must survive the name's re-declaration, but an array
+   * slot that captured THIS wrapper (evalExpr returns {kind:'series'} = the
+   * wrapper object) must keep reading the old inner — mutating this.inner
+   * in place would retro-mutate every stored reference. */
+  rebind(inner: Series): CowSeries {
+    const n = new CowSeries(inner);
+    n.cow = this.cow; // shared materialized copy
+    return n;
+  }
 
-  /** Re-seed the current bar's slot with the arg value — Pine re-binds params
-   *  every invocation, so a carried-forward `:=` value must not leak into the
-   *  next bar's reads. No-op until a write materialized the local copy. */
-  seed(v: Value, bar: number): void {
-    if (this.cow) this.cow.setAt(bar, v);
+  /** Re-seed the current bar's slot — Pine re-binds names every
+   *  invocation/bar, so a carried-forward `:=` value must not leak into the
+   *  next bar's reads. No-op until a write materialized the local copy.
+   *  `v` is a THUNK: the arg's current value is only sampled when a copy
+   *  exists — an eager read on a non-materialized cow would needlessly poke
+   *  emit-history producers (SecSeries atOffset mutates their emit cache).
+   *  Guard retro-writes: out-of-order evalAt can seed a bar the copy already
+   *  advanced past — a clamped setAt would corrupt history. Drop it. */
+  seed(v: () => Value, bar: number): void {
+    if (this.cow && bar >= this.cow.currentBar) this.cow.setAt(bar, v());
   }
 
   /** Materialize the private copy, mapping `inner`'s history onto bar indexes. */
   private writable(bar: number): BarSeries {
     if (this.cow) return this.cow;
     const src = this.inner;
-    const base = src instanceof BarSeries ? src.currentBar : Math.max(bar, 0);
+    const base = Math.max(bar, src instanceof BarSeries ? src.currentBar : 0);
     const copy = new BarSeries();
     for (let b = 0; b <= base; b++) copy.setAt(b, histGetAt(src, base - b, base));
     this.cow = copy;
@@ -442,9 +460,12 @@ function slotFor(
   persistent = false,
 ): BarSeries {
   let s = run.declSlots.get(key);
-  if (!s) {
+  if (!s || run.declAliased.has(key)) {
+    // Missing slot — or a foreign alias target a mixed-kind flip must not
+    // write through: swap in an owned BarSeries and clear the tag.
     s = new BarSeries();
     run.declSlots.set(key, s);
+    run.declAliased.delete(key);
     if (persistent || !run.topLevelBody || run.topStmtIdx >= run.pruneCutoff) {
       trackSeries(run, s);
     }
@@ -464,26 +485,62 @@ function bindDeclared(
   persistent = false,
 ): BarSeries {
   if (v.kind === 'series' && v.v instanceof BarSeries) {
-    // Aliased decl (x = y): registration stays unconditional — the alias
-    // target's own write cadence is unknown, and add is deduped anyway.
+    // Aliased decl (x = series expr): registration stays unconditional —
+    // the alias target's own write cadence is unknown, and add is deduped
+    // anyway. declSlots keeps the RAW slot but tags it foreign-owned:
+    // `x := …` on the name must not write through into ctx.close or a
+    // SecSeries, and a later mixed-kind scalar decl on the same key must
+    // swap in an owned slot (slotFor). The name binds a CowSeries: reads
+    // delegate to v.v; the first `:=` materializes a private copy.
+    // EVERY series decl gets a tracked cow in declCows (`var` included):
+    // rebind() returns a FRESH wrapper sharing the materialized copy (old
+    // wrappers captured into arrays must keep their inner), and
+    // non-persistent decls re-seed the shared copy with the current value —
+    // `x = e` re-inits every bar, so a carried `:=` value must not survive.
     trackSeries(run, v.v);
-    // `x := …` must not write through into a shared caller slot (ctx.close,
-    // SecSeries). The name binds a CowSeries: reads delegate to v.v, the
-    // first `:=` materializes a private copy. declSlots keeps the RAW slot:
-    // var-rebind needs it, and a same-site mixed-kind decl's slotFor().setAt
-    // lands on the raw slot (SecSeries.setAt warn+no-ops) instead of
-    // materializing a stale-history cow. `var` reuses its cow across bars so
-    // `:=` history survives; plain decls re-bind fresh each execution.
     run.declSlots.set(key, v.v);
-    let cow = persistent ? run.declCows.get(key) : undefined;
+    run.declAliased.add(key);
+    let cow = run.declCows.get(key);
+    if (cow && v.v === cow) {
+      // Self-alias: the decl's RHS resolved to this decl's own cow (e.g.
+      // `x = cond ? x : other` re-entered where x was previously bound to
+      // this cow). Rebinding inner to itself would make readTarget()
+      // infinitely recurse. The name stays bound to the cow; declSlots and
+      // declAliased already carry the alias target's record — nothing to
+      // re-point.
+      scope.define(name, cow);
+      return v.v;
+    }
     if (!cow) {
       cow = new CowSeries(v.v);
-      if (persistent) run.declCows.set(key, cow);
     } else {
-      cow.rebind(v.v);
+      // Fresh wrapper each bind: the previous wrapper object may live inside
+      // array slots (vals[i] = tmpV) and must keep reading its old inner.
+      // The materialized `:=` copy is adopted so write history survives.
+      cow = cow.rebind(v.v);
     }
+    if (!persistent) cow.seed(() => valueAt(v.v, bar), bar);
+    run.declCows.set(key, cow);
+    // Non-persistent decls re-init every bar: seed the materialized copy with
+    // this bar's RHS value so a carried `:=` doesn't leak past a re-decl.
+
+
     scope.define(name, cow);
     return v.v;
+  }
+  // A `na` scalar on a decl whose raw slot is a SecSeries is the gaps_on
+  // "no emission this chart bar" transport artifact, not a value to store —
+  // keep the name on the existing cow (unmaterialized → forwards to the
+  // SecSeries, whose cur() forward-fills the last emitted tf value). A
+  // ternary like `x = cond ? high : na` produces a REAL na the user means:
+  // it must land in an owned slot, not hide behind a stale ctx alias.
+  if (v.kind === 'na' && run.declAliased.has(key)
+      && run.declSlots.get(key)?.constructor.name === 'SecSeries') {
+    const cow = run.declCows.get(key);
+    if (cow) {
+      scope.define(name, cow);
+      return cow;
+    }
   }
   const s = slotFor(run, key, scope, name, persistent);
   s.setAt(bar, v);
@@ -668,7 +725,12 @@ function evalNode(node: Node, frame: Frame): Value {
           k = {};
           keys!.set(name, k);
         }
-        slotFor(run, k, scope, name, /*persistent*/ !!node.var).setAt(bar, items[i] ?? NA);
+        slotFor(run, k, scope, name, /*persistent*/ !!node.var).setAt(
+          bar,
+          items[i] === undefined ? NA
+            : items[i]!.kind === 'series' ? valueAt(items[i]!.v, bar)
+            : items[i]!,
+        );
       });
       return v;
     }
@@ -1308,12 +1370,13 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
         let byParam = run.paramCows.get(cowKey);
         if (!byParam) { byParam = new Map(); run.paramCows.set(cowKey, byParam); }
         let cow = byParam.get(p.name) as CowSeries | undefined;
-        if (!cow) { cow = new CowSeries(a.v); byParam.set(p.name, cow); }
-        else cow.rebind(a.v);
+        if (!cow) { cow = new CowSeries(a.v); }
+        else { cow = cow.rebind(a.v); }
+        byParam.set(p.name, cow);
         // Pine re-binds params each invocation: seed this bar's slot with the
         // arg's current value so a previous bar's `:=` doesn't carry forward
         // into this bar's reads (history stays bumped).
-        cow.seed(a.v.cur(), bar);
+        cow.seed(() => a.v.cur(), bar);
         callScope.define(p.name, cow);
       } else {
         // No callNode (method dispatch via ctx.callUdf): seed a
@@ -1388,8 +1451,6 @@ function evalReassign(node: Reassign, frame: Frame): Value {
     const v = unseries(raw);
     if (slot instanceof BarSeries) {
       slot.setAt(bar, v);
-    } else if (slot instanceof Series) {
-      slot.set(v);
     } else {
       throw pineErr(node, `'${t.name}' is not a mutable variable`);
     }
@@ -1728,7 +1789,12 @@ function compileStmt(stmt: Node): CompiledStmt {
         names.forEach((name, i) => {
           let k = keys!.get(name);
           if (!k) { k = {}; keys!.set(name, k); }
-          slotFor(run, k, scope, name, /*persistent*/ isVar).setAt(bar, items[i] ?? NA);
+          slotFor(run, k, scope, name, /*persistent*/ isVar).setAt(
+            bar,
+            items[i] === undefined ? NA
+              : items[i]!.kind === 'series' ? valueAt(items[i]!.v, bar)
+              : items[i]!,
+          );
         });
         return v;
       }) };

@@ -1104,7 +1104,7 @@ class CowSeries extends ForwardingSeries {
   private writable(bar: number): BarSeries {
     if (this.cow) return this.cow;
     const src = this.inner;
-    const base = src instanceof BarSeries ? src.currentBar : Math.max(bar, 0);
+    const base = Math.max(bar, src instanceof BarSeries ? src.currentBar : 0);
     const copy = new BarSeries();
     for (let b = 0; b <= base; b++) copy.setAt(b, histGetAt(src, base - b, base));
     this.cow = copy;
