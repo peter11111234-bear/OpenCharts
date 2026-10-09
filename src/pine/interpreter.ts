@@ -1375,6 +1375,15 @@ function evalReassign(node: Reassign, frame: Frame): Value {
     if (slot === undefined) {
       throw pineErr(node, `cannot reassign undeclared variable '${t.name}'`);
     }
+    // Built-in bar series are read-only — `close := x` must not write into
+    // ctx.close (identity check also catches tf-frame ctx shadows, and UDF
+    // param bindings pass because their slot is a different object).
+    if (slot === ctx.open || slot === ctx.high || slot === ctx.low ||
+        slot === ctx.close || slot === ctx.volume || slot === ctx.time ||
+        slot === ctx.hl2 || slot === ctx.hlc3 || slot === ctx.ohlc4 ||
+        slot === ctx.hlcc4) {
+      throw pineErr(node, `cannot reassign built-in variable '${t.name}'`);
+    }
     const raw = evalExpr(node.value, frame);
     const v = unseries(raw);
     if (slot instanceof BarSeries) {

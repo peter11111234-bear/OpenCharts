@@ -120,6 +120,40 @@ describe('var / assign / reassign', () => {
     );
   });
 
+  it(':= on a built-in series (close) throws — cannot corrupt ctx.close', async () => {
+    // `close := 999` used to write straight into ctx.close, silently
+    // corrupting every later read. Built-ins are read-only.
+    await expect(runScript([reassign('close', num(999))], mkBars(2))).rejects.toThrow(
+      /built-in variable 'close'/,
+    );
+  });
+
+  it(':= on a built-in inside a UDF body still throws (identity survives scope)', async () => {
+    const body: Node[] = [
+      funcDecl('f', [], [reassign('close', num(999)), num(1)]),
+      call(ident('f'), []),
+    ];
+    await expect(runScript(body, mkBars(2))).rejects.toThrow(/built-in variable 'close'/);
+  });
+
+  it(':= on a UDF param bound to close stays mutable (CowSeries, not ctx.close)', async () => {
+    // f(close): the param binds a CowSeries around ctx.close — `src := …`
+    // must write the private copy, not error and not corrupt ctx.close.
+    const body: Node[] = [
+      funcDecl('f', ['src'], [
+        reassign('src', num(999)),
+        ident('src'),
+      ]),
+      assign('r', call(ident('f'), [{ value: ident('close') }])),
+      plot(ident('r'), 'r'),
+      plot(ident('close'), 'c'),
+    ];
+    const res = await runScript(body, mkBars(3));
+    const plots = [...res.plots.values()];
+    expect(nums(plots[0]!.values)).toEqual([999, 999, 999]);
+    expect(nums(plots[1]!.values)).toEqual([1, 2, 3]);
+  });
+
   it(':= self-reference on undeclared name errors (x := x[1]+1)', async () => {
     await expect(
       runScript([reassign('x', bin('+', histref(ident('x'), num(1)), num(1)))], mkBars(3)),
