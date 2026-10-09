@@ -21,11 +21,13 @@ import {
   registerLegendAction,
   registerIcon,
   type CellStateContext,
+  type InputValue,
   type WidgetContext,
 } from "@luxalgo/vela/plugin";
 // `svg16` is a pure helper (builds markup), but it lives only in /ui — the
 // registry itself is chunk-BZQM2XO7.js, shared via plugin's re-export.
 import { svg16 } from "@luxalgo/vela/ui";
+import type { WorkspaceWidgetContext } from "@luxalgo/vela/workspace";
 import {
   pineLibCreate, pineLibGet, pineLibList, pineLibSave, pineLibRename,
   pineLibDuplicate, pineLibRecent, pineLibRecentPush,
@@ -233,9 +235,27 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     { label: `為 ${ind.title} 新增快訊…`, disabled: true },
     { label: `在 ${ind.title} 上增加指標/策略…`, disabled: true },
     { label: '將此指標增加到整個版面', run: () => {
-        const h = ctx.chart.indicators().find(x => x.id === ind.id);
-        if (!h?.source) return;
-        try { ctx.toast?.(`已複製「${h.title}」到版面指標`, 'info'); } catch { /* no toast */ }
+        void (async () => {
+          const h = ctx.chart.indicators().find(x => x.id === ind.id);
+          if (!h?.source) return;
+          let inputs: Record<string, InputValue> | undefined;
+          try { inputs = h.inputValues(); } catch { /* unreadable → declaration defaults */ }
+          const wctx = ctx as unknown as WorkspaceWidgetContext;
+          const cells = wctx.cells ?? [];
+          let added = 0;
+          for (const cell of cells) {
+            if (cell.chart === ctx.chart) continue;
+            const live = cell.chart.indicators();
+            if (live.some(x => x.source === h.source)) continue;
+            try {
+              const r = await cell.chart.runIndicator(h.source!, {
+                language: 'pine', title: h.title, inputs,
+              });
+              if (r.ok) added++;
+            } catch { /* one bad cell must not block the rest */ }
+          }
+          try { ctx.toast?.(added > 0 ? `已加入 ${added} 個圖表` : '其他圖表已有此指標或無可用圖表', 'info'); } catch { /* no toast */ }
+        })();
       } },
     { label: favsRead().includes(ind.id) ? '★ 從收藏夾移除' : '☆ 將此指標新增至收藏夾', run: () => toggleIndicatorFav(ind.id) },
     { label: '', sep: true },
