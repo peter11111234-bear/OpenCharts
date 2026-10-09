@@ -1,8 +1,8 @@
 // Slice-D parity harness: run every corpus script twice — once with the
-// compiled-dispatch bar loop forced on (`__pineCompiled`, until Task 6 makes
-// it the default) and once forced off (`__pineInterp`) — and snapshot()-
+// compiled-dispatch bar loop (default) and once forced off (`__pineInterp`) —
+// and snapshot()-
 // compare both RunResults bit-for-bit.
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { parse } from '../parser';
 import { runScript, __compileCalls, __compiledKinds, PineRuntimeError } from '../interpreter';
 import '../builtins';
@@ -171,14 +171,11 @@ async function runBoth(src: string): Promise<{ interp: RunResult; comp: RunResul
   g.__pineInterp = true;
   const interp = await runScript(parse(src), bars, OPTS());
   delete g.__pineInterp;
-  g.__pineCompiled = true;
   const comp = await runScript(parse(src), bars, OPTS());
-  delete g.__pineCompiled;
   return { interp, comp };
 }
 
 describe('compiled vs interpreted parity', () => {
-  beforeEach(() => { delete g.__pineInterp; delete g.__pineCompiled; });
   for (const c of CORPUS) {
     it(c.name, async () => {
       const { interp, comp } = await runBoth(c.src);
@@ -225,9 +222,7 @@ plot(x)`;
     g.__pineInterp = true;
     const interp = await runOne();
     delete g.__pineInterp;
-    g.__pineCompiled = true;
     const comp = await runOne();
-    delete g.__pineCompiled;
     expect(comp).toEqual(interp);
     expect(comp.msg).toContain('undeclared');
   });
@@ -243,17 +238,13 @@ plot(x)`;
   it('flag on → compile() called once per top-level stmt', async () => {
     const src = 'indicator("t")\na = close\nplot(a)';
     const before = __compileCalls;
-    g.__pineCompiled = true;
     await runScript(parse(src), mkBars(5), OPTS());
-    delete g.__pineCompiled;
     // 2 top-level stmts (assign + call; indicator() lives in decl) + children.
     expect(__compileCalls - before).toBeGreaterThanOrEqual(2);
   });
 
   it('call stmts compile to direct closures', async () => {
-    g.__pineCompiled = true;
     await runScript(parse('indicator("t")\nplot(close * 2 + open / 3)'), mkBars(5), OPTS());
-    delete g.__pineCompiled;
     expect(__compiledKinds.get('call')).toBe('direct');
   });
 
@@ -274,9 +265,7 @@ plot(x)`;
       for: 'fallback', while: 'fallback', switch: 'fallback',
       indicator: 'fallback', strategy: 'fallback',
     };
-    g.__pineCompiled = true;
     for (const c of CORPUS) await runScript(parse(c.src), mkBars(10), OPTS());
-    delete g.__pineCompiled;
     for (const [type, kind] of __compiledKinds) {
       expect(EXPECTED[type], `unexpected compiled kind for '${type}'`).toBe(kind);
     }
