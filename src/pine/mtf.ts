@@ -1766,12 +1766,12 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     : tfToMs(chartPeriod) ?? DAY;
 
   if (spec.isLtf) {
-    // security_lower_tf: one array element per NOMINAL tf slot inside the
+    // security_lower_tf: one array element per EXISTING lower bar inside the
     // current chart bar [t0, t0+chartDur), oldest-first (Pine order: index 0 =
-    // earliest lower bar). A slot with no tf bar emits na — the array length
-    // is chartDur/ltfDur slots, not the count of bars that happen to exist.
-    // Slots align to the tf's own grid (tfFloor), so a chart bar opening
-    // mid-slot still produces that slot's cell.
+    // earliest lower bar). Missing bars are SKIPPED — the array length varies
+    // with the feed (TV semantics; PineTS reference:
+    // request/methods/security_lower_tf.ts pushes only bars whose open lies in
+    // [t0, end); no na padding).
     const end = t0 + chartDur;
     const lt = tfBarAtOrBefore(bars, t0);
     // First bar whose openTime lies inside the window — bars starting before
@@ -1796,22 +1796,14 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
       return v.kind === 'series' ? v.v.cur() : v;
     };
     const out: Value[] = [];
-    // bi advances monotonically while slots step forward → O(slots + bars).
-    for (let slot = tfFloor(t0, tf); slot < end;) {
-      const slotEnd = tfNext(slot, tf);
-      if (slotEnd <= slot) break;            // unparseable tf — no progress
-      if (slotEnd > t0) {                    // slots fully before t0 belong to the prior bar
-        let j2 = -1;                         // last tf bar opening inside this slot
-        const lim = Math.min(slotEnd, end);
-        while (bi < bars.length && bars[bi]!.openTime < lim) j2 = bi++;
-        out.push(
-          j2 < 0 ? NA :
-          spec.exprs.length === 1
-            ? scalarAt(spec.exprs[0]!, j2)
-            : { kind: 'array', v: spec.exprs.map(e => scalarAt(e, j2)) },
-        );
-      }
-      slot = slotEnd;
+    // bi advances monotonically over existing bars → O(bars).
+    while (bi < bars.length && bars[bi]!.openTime < end) {
+      const j2 = bi++;
+      out.push(
+        spec.exprs.length === 1
+          ? scalarAt(spec.exprs[0]!, j2)
+          : { kind: 'array', v: spec.exprs.map(e => scalarAt(e, j2)) },
+      );
     }
     return { kind: 'array', v: out };
   }

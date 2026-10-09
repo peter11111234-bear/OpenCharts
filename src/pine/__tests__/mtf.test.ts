@@ -1549,33 +1549,32 @@ describe('request.security regression fixes', () => {
     expect(cell(0)).toEqual(['na', 2, 2]);  // tr@0 na; tr@k = max(2, 2, 0) = 2
     expect(cell(1)).toEqual([2, 2, 2]);
   });
-  it('security_lower_tf pads missing lower bars with na (nominal slot count)', async () => {
-    // Chart 15m, lower tf 5m → 3 nominal slots per chart bar. Chart bar0's
-    // window has only slots 0 and 2 populated; slot 1 must emit na instead of
-    // shrinking the array.
+  it('security_lower_tf emits only existing lower bars — no na padding', async () => {
+    // Chart 15m, lower tf 5m → up to 3 slots, but TV emits only bars that
+    // exist. bar0 window has bars at 0m and 10m only → [100, 102] (len 2).
     const m5 = 300_000;
     const chartBars = mkBars(3, M15, 0);
     const tf5: BarData[] = [
-      // bar0 window [0, 15m): slots at 0,5,10 — bar at 5m missing
+      // bar0 window [0, 15m): bars at 0m and 10m — 5m bar missing
       { openTime: 0, open: 0, high: 1, low: -1, close: 100, volume: 1 },
       { openTime: 2 * m5, open: 0, high: 1, low: -1, close: 102, volume: 1 },
-      // bar1 window [15m, 30m): all three slots present
+      // bar1 window [15m, 30m): all three bars present
       { openTime: 3 * m5, open: 0, high: 1, low: -1, close: 103, volume: 1 },
       { openTime: 4 * m5, open: 0, high: 1, low: -1, close: 104, volume: 1 },
       { openTime: 5 * m5, open: 0, high: 1, low: -1, close: 105, volume: 1 },
-      // bar2 window [30m, 45m): no bars at all → all na
+      // bar2 window [30m, 45m): no bars at all → []
     ];
     const body = [assign('x', call(member(ident('request'), 'security_lower_tf'),
       str(''), str('5'), ident('close')))];
     const { values } = await runSecurity(body, chartBars, '15', { '|5': tf5 });
     const cell = (i: number): (number | 'na')[] =>
       values[i]!.kind === 'array' ? values[i]!.v.map(valOf) : [];
-    expect(cell(0)).toEqual([100, 'na', 102]);
+    expect(cell(0)).toEqual([100, 102]);           // missing 5m bar skipped
     expect(cell(1)).toEqual([103, 104, 105]);
-    expect(cell(2)).toEqual(['na', 'na', 'na']);   // empty window still emits 3 slots
+    expect(cell(2)).toEqual([]);                   // empty window → empty array
   });
 
-  it('security_lower_tf tuple expr pads na per slot', async () => {
+  it('security_lower_tf tuple expr emits one inner array per existing bar', async () => {
     const m5 = 300_000;
     const chartBars = mkBars(1, M15, 0);
     const tf5: BarData[] = [
@@ -1588,12 +1587,13 @@ describe('request.security regression fixes', () => {
     const arr = values[0]!;
     expect(arr.kind).toBe('array');
     if (arr.kind !== 'array') return;
-    expect(arr.v.length).toBe(3);
-    const [e0, e1, e2] = arr.v;
-    expect(e0!.kind === 'array' ? (e0 as { kind: 'array' }).v.map(valOf) : []).toEqual([100, 10]);
-    expect(e1!.kind).toBe('na');                   // missing slot → na, not an inner array
-    expect(e2!.kind === 'array' ? (e2 as { kind: 'array' }).v.map(valOf) : []).toEqual([102, 30]);
+    expect(arr.v.length).toBe(2);                  // two existing bars, not three slots
+    const cellOf = (e: Value | undefined): (number | 'na')[] =>
+      e !== undefined && e.kind === 'array' ? e.v.map(valOf) : [];
+    expect(cellOf(arr.v[0])).toEqual([100, 10]);
+    expect(cellOf(arr.v[1])).toEqual([102, 30]);
   });
+
 
   it('security_lower_tf shares the fetchSeries pipeline — one fetch for the ltf key', async () => {
     const m5 = 300_000;
