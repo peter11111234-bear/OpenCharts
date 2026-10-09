@@ -138,6 +138,21 @@ Documented, no code (deferred findings):
 - **A3 (MEDIUM) vendor seam**: `renderer.supportsIndicatorSettings` is `typeof renderer.openIndicatorSettings === 'function'` — the native renderer always defines it, so it's TRUE even when the call silently no-ops (`openSettingsFor` → `if (this.rows.has(id))` — script-indicator legend rows don't live in `inputsUI.rows`, so script indicators always no-op; native rows only open if mounted there). Our `設定…` now toasts '設定功能尚未支援' only when the flag is false — effectively dead code on the native renderer. To make 設定… actually work we would need our own inputs dialog (host side, D-scope) — deferred, not a bug in our glue.
 - Live-verified (headless chromium @ :5173): 2-cell `2h` layout, shared `ind-1` (EMA 20) on both cells, ⋯→隱藏 on c2's row hid c2's `ind-1` (`visible=false`) while c1's stayed `true`. Note: `pointerdown` on a cell activates it (`active` switched c1→c2), so QA's stale-active repro needs a path where activation didn't fire — the resolver covers it regardless via owner-unique + hit-test.
 
+### Fix-loop round 2 — pine engine boundary bugs (executed 2026-10-09; commits 8939f25, f89f0e8, 0086753, b6d7cd2)
+
+Fixed (`scratch/qa-round2-boundary.md` findings; regression pins in mtf.test.ts / strategy.test.ts / ta.test.ts — each verified red on pre-fix code):
+- **B1/2b (P1)** `security_lower_tf` skipped ltf bars inside chart gaps → stateful UDFs under-counted. Per-spec `ltfEvaledThrough` high-water mark now evaluates every tf bar up to the window's end exactly once (supersedes the one-shot warmup); emitted arrays carry true ltf-bar ordinals.
+- **B3/1a+1c (P2)** ltf ≥ chart tf silently accepted → `warnOnce` per spec ("timeframe is not lower than the chart's"); empty/missing ltf feed returns `{kind:'array',v:[]}` carved out of the shared `!bars → NA` early-out (ltf contract is array-or-error, never na).
+- **B2/3a-3c (P2)** `qty<=0` / `qty_percent<=0` silently substituted (entry → default 1-lot, close → full flatten). `qtySet`/`eqPctSet` flags on `StratOrder`+`mod` distinguish absent from present-≤0: explicit ≤0 → 0 contracts; absent → existing defaults.
+- **B4/5d (P3)** `ta.tr`/`trVs` `pc === undefined` check let a mid-series NaN close slip through `num()` → `Math.max` → na even under `handle_na=true`; non-finite `pc` now counts as na prev close (parity with the ported impl).
+
+Documented, no code (deferred findings):
+- (a) Same-bar ordering: a pending limit entry fills BEFORE a same-bar market exit in the replay loop (FIFO event order); TV likely nets the market exit first — intra-bar ordering [INFERENCE — needs live TV check].
+- (b) `strategy.close(id)` / `strategy.exit(from_entry)` id-matching family — unmatched ids still close positions (FIFO); pinned `it.fails` (P2/P3/P5/P7/P11/P12 in strategy.test.ts), needs per-leg entry-id tracking in the replay ledger.
+- (c) Disabled-label menu strings interpolate `ind.title` (script's declared title, e.g. "Indicator"), not the legend row text — cosmetic.
+- (d) `設定…` vendor seam effectively dead (see A3 above): `openIndicatorSettings` no-ops for script indicator rows — needs a host-side inputs dialog.
+- Bare `ta.tr` lazy constant (ta.ts registerLazyConstant) keeps the same `pc === undefined` gap the builtin had — asymmetric NaN handling remains on that path; not exercised by the probe, deferred.
+
 
 ---
 
