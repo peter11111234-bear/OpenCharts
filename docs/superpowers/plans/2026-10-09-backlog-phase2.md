@@ -131,6 +131,13 @@ Documented, no code (deferred findings):
 - `RESOLVED_BUILTIN` memoization means pinetsShim must register at import time (before first eval) if ever flipped on by default — mid-session `registerPortedTa()` would be invisible to already-resolved callsites.
 - `handle.title` serializes as `'Indicator'` in some paths — cosmetic staleness only.
 
+### Fix-loop round 2 — ⋯ menu wrong-cell + add-to-layout wedge (executed 2026-10-09, commit b28d629)
+
+- **A1 (HIGH) fixed**: `ctx.chart` is the ambient ACTIVE cell's chart, but a legend ⋯ row belongs to its own cell and restored/parked scripts share indicator ids across cells → `ctx.chart.indicators().find(h => h.id === ind.id)` could silently hit the wrong chart. Added `chartForIndicator(ctx, ind)` in `src/pages/velaPineEditor.ts`: filter `wctx.cells` to owners of `ind.id`; exactly one owner → its chart; several → hit-test `lastPointer` via `elementFromPoint` against `.vela-cell[data-cell-id]` (the only per-cell DOM marker vela emits — `cell.host` is not on the typed `ctx.cells` entries); else `ctx.chart`. Wired into 隱藏 / 移除 / 設定… / the 增加到整個版面 source-handle lookup.
+- **A2 (MEDIUM) fixed**: `cell.chart.runIndicator` awaited unbounded — a dead feed (no ready/error) pinned `addingToLayout` forever. Now `Promise.race` with a 15 s settle timeout per cell; timeout counts as failed, loop continues, outer `.finally` still releases the flag.
+- **A3 (MEDIUM) vendor seam**: `renderer.supportsIndicatorSettings` is `typeof renderer.openIndicatorSettings === 'function'` — the native renderer always defines it, so it's TRUE even when the call silently no-ops (`openSettingsFor` → `if (this.rows.has(id))` — script-indicator legend rows don't live in `inputsUI.rows`, so script indicators always no-op; native rows only open if mounted there). Our `設定…` now toasts '設定功能尚未支援' only when the flag is false — effectively dead code on the native renderer. To make 設定… actually work we would need our own inputs dialog (host side, D-scope) — deferred, not a bug in our glue.
+- Live-verified (headless chromium @ :5173): 2-cell `2h` layout, shared `ind-1` (EMA 20) on both cells, ⋯→隱藏 on c2's row hid c2's `ind-1` (`visible=false`) while c1's stayed `true`. Note: `pointerdown` on a cell activates it (`active` switched c1→c2), so QA's stale-active repro needs a path where activation didn't fire — the resolver covers it regardless via owner-unique + hit-test.
+
 
 ---
 
