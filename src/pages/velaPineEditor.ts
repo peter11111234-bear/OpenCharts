@@ -17,33 +17,40 @@
 // the workspace reads the plugin instance → callouts/actions never render.
 import {
   registerWidgetAction,
+  registerWidgetAttachment,
+  registerSidePanel,
   registerStatePersistence,
   registerLegendAction,
   registerIcon,
   type CellStateContext,
   type InputValue,
+  type SidePanelHeader,
   type WidgetContext,
 } from "@luxalgo/vela/plugin";
 // `svg16` is a pure helper (builds markup), but it lives only in /ui — the
 // registry itself is chunk-BZQM2XO7.js, shared via plugin's re-export.
+// IndicatorHandle only re-exports from the root barrel; a type-only import is
+// erased at compile time, so this cannot duplicate the contribution registry.
+import type { IndicatorHandle } from "@luxalgo/vela";
 import { svg16 } from "@luxalgo/vela/ui";
 import type { WorkspaceWidgetContext } from "@luxalgo/vela/workspace";
 import {
   pineLibCreate, pineLibGet, pineLibList, pineLibSave, pineLibRename,
-  pineLibDuplicate, pineLibRecent, pineLibRecentPush,
+  pineLibDuplicate, pineLibRecent, pineLibRecentPush, pineLibOnWriteError,
+  pineLibWriteFailed,
   pineLibMigrateLegacyHist, pineLibSubscribe,
 } from "../pine/lib/pineLib.ts";
 import { openScriptsDialog } from "./velaPineScriptsDialog.ts";
 import { combinedManifestEntries } from "../pineScripts.ts";
+import type { PineEditorHandle, PineLintError } from "../pine/pineMonaco.ts";
 
-// ── Modal styles ── the vela-pine-* classes are ours; nothing ships them.
-// Without these the overlay renders as a static <div> under #root and pushes
-// the h-screen workspace out of view (chart "disappears" when opening Pine).
+// ── Panel styles ── the vela-pine-* classes are ours; nothing ships them.
+// The editor lives in a shell side PANEL (TV parity: right-dock, not a modal) —
+// the shell owns the chrome (header row, close button, dock exclusivity,
+// persisted width). `.vela-pine-dialog` is just our body container now.
 const PINE_CSS = `
-.vela-pine-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55)}
-.vela-pine-dialog{display:flex;flex-direction:column;width:min(900px,92vw);max-height:88vh;background:#1e222d;border:1px solid #363c4e;border-radius:8px;color:#d5d8e0;font:13px/1.4 sans-serif;box-shadow:0 12px 40px rgba(0,0,0,.6);overflow:hidden}
-.vela-pine-headbar{display:flex;align-items:center;gap:4px;padding:6px 10px;border-bottom:1px solid #2a2e39}
-.vela-pine-apptitle{color:#d5d8e0;font-weight:600;font-size:13px;padding:0 8px;white-space:nowrap}
+.vela-pine-dialog{display:flex;flex-direction:column;height:100%;background:var(--vela-bg,#1e222d);color:var(--vela-fg,#d1d4dc);font:13px/1.4 sans-serif;overflow:hidden}
+.vela-pine-headbar{display:flex;align-items:center;gap:4px;padding:2px 4px;overflow-x:auto;white-space:nowrap}
 .vela-pine-namebtn{display:flex;align-items:center;gap:6px;background:none;border:0;color:#ddd;padding:4px 8px;font-size:13px;cursor:pointer;border-radius:4px;max-width:260px}
 .vela-pine-namebtn:hover{background:#2a2e39}
 .vela-pine-namelabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -55,7 +62,8 @@ const PINE_CSS = `
 .vela-pine-hbtn.primary:hover{color:#4a80ff;background:#2a2e39}
 .vela-pine-hbtn:disabled{color:#4a4e5c;cursor:default;background:none}
 .vela-pine-spacer{flex:1}
-.vela-pine-area{width:100%;flex:1;min-height:320px;max-height:60vh;overflow:auto;resize:none;background:#161a24;color:#d5d8e0;border:0;padding:10px 14px;font:13px/1.55 ui-monospace,Consolas,monospace;white-space:pre;outline:none}
+.vela-pine-edhost{flex:1;min-height:0;background:#161a24;overflow:hidden}
+.vela-pine-edhost .vela-pine-area{width:100%;height:100%;overflow:auto;resize:none;background:#161a24;color:#d5d8e0;border:0;padding:10px 14px;font:13px/1.55 ui-monospace,Consolas,monospace;white-space:pre;outline:none}
 .vela-pine-statusbar{display:flex;align-items:center;gap:14px;padding:5px 12px;border-top:1px solid #2a2e39;color:#787b86;font-size:11px}
 .vela-pine-statusbar a{color:#2962ff;text-decoration:none}
 .vela-pine-statusbar a:hover{text-decoration:underline}
@@ -105,20 +113,51 @@ const PINE_CSS = `
  * indicators by name — `ctx.addIndicator` adds are flagged `external` and dropped
  * from the saved document ("their plugin's job"). This handler serializes each
  * cell's script indicators into `charts[i].ext` and re-adds them on restore.
+ *
+ * pendingAdds: entries an in-flight restore asked for that aren't in
+ * indicators() yet. serializeCellScripts merges them so a persist landing
+ * mid-restore (state:changed fires per addIndicator) doesn't overwrite ext with
+ * a truncated list — the real "indicators vanished" path. Entries expire so a
+ * failed/removed add can't resurrect.
  */
 type SavedScript = { name: string; script: string; id?: string; hidden?: boolean; inputs?: Record<string, string | number | boolean> };
 
+const PENDING_MS = 30_000;
+const pendingAdds = new Map<string, { at: number; entry: SavedScript }[]>();
+
+// Workspace handle for serialize/restore — CellStateContext can't take args
+// and exposes no cell accessor, so VelaPage binds the ws it built. window.__vela
+// stays a debug handle only. Rebind (StrictMode remount, new ws instance)
+// clears pendingAdds: entries keyed by cellId would otherwise bleed up to
+// PENDING_MS of stale adds into a different workspace's first serialize.
+let workspaceRef: { cell(id: string): { instances?: { id?: string; external?: boolean; handle?: { id: string } | null }[] } | undefined } | null = null;
+export function bindVelaWorkspace(ws: NonNullable<typeof workspaceRef>): void {
+  workspaceRef = ws;
+  pendingAdds.clear();
+}
+export function unbindVelaWorkspace(ws: unknown): void {
+  if (workspaceRef === ws) {
+    workspaceRef = null;
+    pendingAdds.clear();
+  }
+}
+
 function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined {
   const out: SavedScript[] = [];
-  // Manifest indicators (picker adds, incl. "My scripts" library entries) are
-  // persisted by vela's own ledger by NAME — serializing them here re-adds a
-  // second copy on every restore (the compounding EMA20×N bug). Match on the
-  // exact script text; a user-edited copy keeps its own identity and still
-  // round-trips through this ext bag.
-  const manifestScripts = new Set(combinedManifestEntries().map((e) => e.script));
+  // Only EXTERNAL indicators belong in ext — vela's own ledger persists manifest
+  // (picker-added) indicators by name, so serializing them here re-adds a second
+  // copy every restore (the compounding EMA20×N bug). CellStateContext exposes
+  // no cell, so we look up the workspace ref VelaPage bound at boot. Handles
+  // without an instance row (chart.runIndicator bypasses the cell ledger) are
+  // external by construction.
+  const cell = workspaceRef?.cell(ctx.cellId);
+  const isExternal = (handleId: string): boolean => {
+    const inst = cell?.instances?.find((i) => (i.handle?.id ?? i.id) === handleId);
+    return !inst || inst.external === true;
+  };
   for (const handle of ctx.chart.indicators()) {
     if (!handle.source) continue; // native (core) indicator — not ours
-    if (manifestScripts.has(handle.source)) continue; // ledger-owned — see above
+    if (!isExternal(handle.id)) continue; // ledger-owned — vela persists it by name
     const values = handle.inputValues();
     const defaults: Record<string, string | number | boolean> = {};
     for (const s of handle.inputs) defaults[s.key] = s.defval;
@@ -133,24 +172,113 @@ function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined 
       inputs: Object.keys(overrides).length > 0 ? overrides : undefined,
     });
   }
+  // Sweep dead cellIds: an entry can't outlive PENDING_MS even if its cell
+  // died before ever serializing again (persistence has no destroy hook —
+  // dehydrate IS the last call, so this is the only prune path left).
+  const nowSweep = Date.now();
+  for (const [cid, arr] of pendingAdds) {
+    const kept = arr.filter((p) => nowSweep - p.at < PENDING_MS);
+    if (kept.length) pendingAdds.set(cid, kept); else pendingAdds.delete(cid);
+  }
+  // Merge entries a restore asked for that haven't become live yet — without
+  // this a mid-restore persist would persist a PARTIAL list and the missing
+  // entries would be lost if the tab closes before the next write.
+  const pend = pendingAdds.get(ctx.cellId);
+  if (pend?.length) {
+    const now = Date.now();
+    // Drop an entry the FIRST time it's live-covered (the live loop above
+    // already wrote it) or once it expires (add failed / user removed it
+    // before it landed) — a removed indicator can't resurrect, and id-less
+    // entries can't double-merge while their row is live.
+    // A pending entry is covered ONLY by an EXTERNAL live handle — a
+    // ledger-seeded row with matching source must NOT claim it (the ledger
+    // owns that row; our pending external is a separate user add), and one
+    // live handle can only cover ONE pending copy: consume matches per
+    // handle so N pending identical entries need N live externals, else a
+    // persist after the first lands would drop the rest (data loss).
+    const live = ctx.chart.indicators().filter((h) => isExternal(h.id));
+    const consumed = new Set<string>();
+    const still = pend.filter((p) => {
+      const covered = live.some((h) => {
+        if (consumed.has(h.id)) return false;
+        const match =
+          (p.entry.id && h.id === p.entry.id) ||
+          (normScript(h.source) === normScript(p.entry.script) && inputsMatch(h, p.entry.inputs));
+        if (match) consumed.add(h.id);
+        return match;
+      });
+      return !covered && now - p.at < PENDING_MS;
+    });
+    for (const p of still) out.push(p.entry);
+    if (still.length) pendingAdds.set(ctx.cellId, still);
+    else pendingAdds.delete(ctx.cellId);
+  }
   return out.length ? out : undefined;
+}
+
+/** Script-text compare needs BOM + EOL normalization: engine.prepare strips
+ *  BOM but keeps line endings, while manifest entries carry the verbatim file
+ *  bytes — a BOM'd/CRLF script on one side and LF-only on the other would
+ *  silently miss the ledger dedup and re-add a ledger-owned row as external. */
+function normScript(s: string | undefined): string {
+  return (s ?? "").replace(/^﻿/, "").replace(/\r\n/g, "\n");
+}
+
+/** Overrides stored against an entry equal the live handle's? An entry with no
+ *  inputs (all defaults) matches a handle whose current values are all defval —
+ *  the same comparison serialize ran. */
+function inputsMatch(handle: IndicatorHandle, inputs: Record<string, string | number | boolean> | undefined): boolean {
+  const cur = handle.inputValues();
+  const defaults: Record<string, string | number | boolean> = {};
+  for (const s of handle.inputs) defaults[s.key] = s.defval;
+  const overrides = inputs ?? {};
+  for (const [k, v] of Object.entries(overrides)) if (cur[k] !== v) return false;
+  // A stored entry must ALSO not claim a handle carrying overrides the entry
+  // lacks — e.g. ledger-restored EMA20(length=50) is not "the same indicator"
+  // as ext EMA20(defaults).
+  for (const k of Object.keys(cur)) {
+    if (!(k in overrides) && cur[k] !== defaults[k]) return false;
+  }
+  return true;
 }
 
 function restoreCellScripts(payload: unknown, ctx: CellStateContext): void {
   if (!Array.isArray(payload)) return;
-  // Legacy blobs may still carry manifest-owned entries (the dup bug wrote
-  // them in). Skipping them here is the one-shot migration: vela's ledger
-  // already re-adds those by name, so nothing user-visible is lost.
-  const manifestScripts = new Set(combinedManifestEntries().map((e) => e.script));
+  // Claimable pool = handles live BEFORE this restore ran. Snapshot once:
+  // indicators THIS restore adds must not satisfy later entries — otherwise
+  // two deliberately-identical externals collapse (the second claims the
+  // first's just-added row). Ledger-owned indicators are never serialized into
+  // ext anymore (serialize checks instance.external), so identical-source
+  // matches here are genuine duplicates the user added by hand.
+  const preexisting = ctx.chart.indicators().filter((h) => h.source);
+  const claimed = new Set<string>();
+  // Legacy pollution: blobs written before instance.external was serialized
+  // carried ledger-owned (manifest-seeded) indicators inside ext. Restoring
+  // them via addIndicator flags a parallel copy that self-perpetuates — the
+  // ledger re-adds its own seeded instance too (one duplicate per boot,
+  // compounding). Two dedup paths share the work: the ledger may already be
+  // converged at restore (docs say it runs after) → live-handle `hit` claims
+  // matching rows; instances can also still be pending (manifest unresolved)
+  // → script-text match against the manifest catches what the live list
+  // can't see yet. Both sides normalize EOL/BOM (normScript) because engine
+  // storage strips BOM but manifest entries carry verbatim file bytes.
+  const ledgerScripts = new Set(
+    combinedManifestEntries()
+      .map((e) => normScript(e.script))
+      .filter((s): s is string => typeof s === "string"),
+  );
   for (const entry of payload) {
     if (typeof entry !== "object" || entry === null) continue;
     const e = entry as Partial<SavedScript>;
     if (typeof e.name !== "string" || typeof e.script !== "string") continue;
-    if (manifestScripts.has(e.script)) continue;
-    // Idempotence guard: a restore can fire twice (StrictMode remount, boot +
-    // applyState). An id already live on the chart means this entry is already
-    // running — re-adding would mint a duplicate row.
+    // Idempotence: a restore firing twice (StrictMode remount) finds the entry's
+    // own id already live → that one is ours, skip without consuming a claim.
     if (e.id && ctx.chart.indicators().some((h) => h.id === e.id)) continue;
+    // A live handle with identical source AND inputs claims this entry —
+    // covers duplicate ext entries and ledger-vs-ext overlap in old blobs.
+    const hit = preexisting.find((h) => normScript(h.source) === normScript(e.script) && !claimed.has(h.id) && inputsMatch(h, e.inputs));
+    if (hit) { claimed.add(hit.id); continue; }
+    if (ledgerScripts.has(normScript(e.script))) continue;
     try {
       ctx.addIndicator({
         name: e.name,
@@ -160,6 +288,11 @@ function restoreCellScripts(payload: unknown, ctx: CellStateContext): void {
         hidden: e.hidden,
         inputs: e.inputs,
       });
+      // Track until the handle is live+serialized once — a persist between now
+      // and then would otherwise drop this entry from ext.
+      const list = pendingAdds.get(ctx.cellId) ?? [];
+      list.push({ at: Date.now(), entry: { name: e.name, script: e.script, id: e.id, hidden: e.hidden, inputs: e.inputs } });
+      pendingAdds.set(ctx.cellId, list);
     } catch {
       // engine not ready or duplicate id — skip silently
     }
@@ -445,7 +578,6 @@ function scriptTitle(src: string, fallback = "pine"): string {
 
 
 const EDITOR_ID = "pine-editor";
-let open = false;
 
 // Editor session state — which library script is loaded, whether the buffer
 // has unsaved edits, and (if launched from the legend ⋯) which on-chart
@@ -471,37 +603,136 @@ const TEMPLATES = {
   builtin: `//@version=6\n// Copied from a built-in — replace the body.\nindicator("Built-in copy", overlay=true)\nplot(ta.sma(close, 20))\n`,
 };
 
-function closeModal(overlay: HTMLElement, menus?: HTMLElement[]): void {
-  for (const m of menus ?? []) m.remove();
-  overlay.remove();
-  open = false;
+let writeErrorUnsub: (() => void) | null = null;
+// Popup menus append to doc.body — outside the panel body — so the shell's
+// panel close can't reach them. Track and clean on detach/destroy or they'd
+// survive as ghost UI.
+const openMenus: HTMLElement[] = [];
+
+// ── Docked side panel (TV parity) ── the shell owns the header row, close
+// button, dock exclusivity and persisted width; we mount our surface into the
+// body it hands us. `panelCtx` doubles as the "mounted" latch; `pendingOpen`
+// carries content for a not-yet-mounted panel.
+const PANEL_ID = "opencharts.pine";
+let panelCtx: WidgetContext | null = null;
+let panelBody: HTMLElement | null = null;
+let panelRoot: HTMLElement | null = null;      // our .vela-pine-dialog node
+let undockStrip: (() => void) | null = null;   // bottom-strip undo while docked there
+let bottomDocked = false;
+let pendingOpen: { src: string; editingId?: string; scriptId?: string } | null = null;
+let edHandle: PineEditorHandle | null = null;  // module scope for teardown/reopen
+let refreshPanel: (() => void) | null = null;  // rebuildOnChart, set by mountEditor
+// Buffer text staged for the editor — written by applyOpenArgs before mount,
+// flushed into monaco/textarea once the surface exists.
+let pendingValue = "";
+
+/** Open the docked panel and aim the editor at `initialSrc`. If the shell
+ *  hasn't mounted the panel yet, stash the args for mount to consume. */
+function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scriptId?: string): void {
+  if (!migrated) { migrated = true; try { pineLibMigrateLegacyHist(); } catch { /* first run */ } }
+  const want = { src: initialSrc, editingId, scriptId };
+  if (panelCtx && panelRoot) {
+    // Panel already mounted (visible or hidden): apply now — if hidden the
+    // shell's onOpen fires on toggle and only consumes pendingOpen, so we
+    // push the buffer directly instead of stashing.
+    applyOpenArgs(want);
+    if (want.src && edHandle) edHandle.setValue(want.src);
+    ctx.togglePanel?.(PANEL_ID, true);
+    refreshPanel?.();
+  } else {
+    pendingOpen = want;
+    ctx.togglePanel?.(PANEL_ID, true);
+  }
 }
 
-function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scriptId?: string): void {
-  if (open) return;
-  open = true;
+function applyOpenArgs(want: { src: string; editingId?: string; scriptId?: string }): void {
+  // scriptId is authoritative (caller resolved "this buffer IS that script").
+  // Without it, a non-empty src means editing an indicator — reset currentId
+  // so Save can't overwrite an unrelated script.
+  editorState = {
+    currentId: want.scriptId ?? (want.src ? null : editorState.currentId),
+    dirty: false,
+    handleId: want.editingId,
+  };
+  if (want.src) pendingValue = want.src;
+}
+
+function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHeader): void {
   if (!migrated) { migrated = true; try { pineLibMigrateLegacyHist(); } catch { /* first run */ } }
+  panelCtx = ctx;
+  panelBody = body;
   const doc = ctx.host.ownerDocument;
 
-  const overlay = doc.createElement("div");
-  overlay.className = "vela-pine-overlay";
-  const dialog = doc.createElement("div");
-  dialog.className = "vela-pine-dialog";
+  const root = doc.createElement("div");
+  root.className = "vela-pine-dialog";
+  panelRoot = root;
+  if (pendingOpen) { const w = pendingOpen; pendingOpen = null; applyOpenArgs(w); }
 
-  // scriptId is authoritative (caller resolved "this buffer IS that script").
-  // Without it, a non-empty initialSrc means editing an indicator — reset
-  // currentId so Save can't overwrite an unrelated script.
-  editorState = {
-    currentId: scriptId ?? (initialSrc ? null : editorState.currentId),
-    dirty: false,
-    handleId: editingId,
+  // ── Editor surface ── Monaco when it mounts; textarea fallback for
+  // environments where monaco can't run (jsdom, worker-less CSP). `area` keeps
+  // the textarea-shaped API the rest of this function already uses — writes
+  // before mount land in pendingValue and flush into the editor on create.
+  const edHost = doc.createElement("div");
+  edHost.className = "vela-pine-edhost";
+  let ed: PineEditorHandle | null = null;
+  let ta: HTMLTextAreaElement | null = null;
+  // Bound lazily by mountMonaco — lintOnChange/markRunError no-op until then.
+  let lintPineSrc: ((src: string) => PineLintError | null) | null = null;
+  let parseErrLoc: ((err: string) => PineLintError | null) | null = null;
+  const lintTimers: number[] = [];
+  function lintOnChange(): void {
+    if (!lintPineSrc || !ed) return;
+    for (const t of lintTimers) doc.defaultView?.clearTimeout?.(t);
+    lintTimers.length = 0;
+    lintTimers.push(doc.defaultView?.setTimeout?.(() => {
+      if (lintPineSrc && ed) ed.markError(lintPineSrc(ed.getValue()));
+    }, 400) ?? 0);
+  }
+  /** Surface a run/compile error in the editor + statusbar. */
+  function markRunError(err: string): void {
+    setStatus(`Error: ${err}`, "err");
+    const loc = parseErrLoc?.(err) ?? null;
+    if (loc && ed) {
+      ed.markError(loc);
+      ed.setPosition(loc.line, loc.col);
+      ed.focus();
+    }
+  }
+  function mountFallback(): void {
+    if (ta) return;
+    const el = doc.createElement("textarea");
+    el.className = "vela-pine-area";
+    el.spellcheck = false;
+    el.value = pendingValue;
+    el.addEventListener("input", onContentChanged);
+    el.addEventListener("keyup", () => updateCursorFromFallback());
+    el.addEventListener("click", () => updateCursorFromFallback());
+    edHost.appendChild(el);
+    ta = el;
+  }
+  /** Fold any existing textarea buffer back into pendingValue + remove the
+   *  fallback — called inside async closures where `ta` narrows to `never`. */
+  function adoptFallbackToPending(): void {
+    if (!ta) return;
+    pendingValue = ta.value;
+    ta.remove();
+    ta = null;
+  }
+  const area = {
+    get value(): string { return ed ? ed.getValue() : ta ? ta.value : pendingValue; },
+    set value(v: string) {
+      pendingValue = v;
+      if (ed) ed.setValue(v);
+      if (ta) ta.value = v;
+    },
+    focus(): void { ed ? ed.focus() : ta?.focus(); },
   };
-  // Popup menus append to doc.body (outside overlay) — track so closeModal
-  // can clean them; otherwise they survive as ghost UI.
-  const openMenus: HTMLElement[] = [];
-  const area = doc.createElement("textarea");
-  area.className = "vela-pine-area";
-  area.spellcheck = false;
+  function updateCursorFromFallback(): void {
+    if (!ta) return;
+    const pos = ta.selectionStart;
+    const before = ta.value.slice(0, pos);
+    cursorPos.textContent = `Line ${before.split("\n").length}, Col ${pos - before.lastIndexOf("\n")}`;
+  }
 
   const statusMsg = doc.createElement("span");
   statusMsg.className = "vela-pine-msg";
@@ -510,12 +741,10 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
     statusMsg.dataset.kind = kind;
   };
 
-  // ── Header ── TV: [Pine Editor] [name ▾] ... [Add to chart] [Save] [⋯] [—] [✕]
+  // ── Header ── the shell owns the panel's row, title and ✕; our controls go
+  // into header.slot. TV order: [name ▾] [↻] [Add to chart] [Save] [Publish] [⋯]
   const headbar = doc.createElement("div");
   headbar.className = "vela-pine-headbar";
-  const appTitle = doc.createElement("div");
-  appTitle.className = "vela-pine-apptitle";
-  appTitle.textContent = "Pine Editor";
 
   const nameBtn = doc.createElement("button");
   nameBtn.type = "button";
@@ -543,10 +772,12 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
         const name = doc.defaultView?.prompt?.("Script name", def) ?? "";
         if (!name.trim()) return;
         const s = pineLibCreate(name.trim(), src);
+        if (pineLibWriteFailed()) return; // status already shown via onWriteError
         editorState.currentId = s.id;
         setStatus(`Saved "${s.name}"`, "ok");
       } else {
         pineLibSave(editorState.currentId, src);
+        if (pineLibWriteFailed()) return;
         setStatus("Saved", "ok");
       }
       editorState.dirty = false;
@@ -555,11 +786,21 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
       setStatus(`Save failed: ${e instanceof Error ? e.message : String(e)}`, "err");
     }
   };
+  // Quota/denied writes inside pineLib would otherwise report "Saved" while
+  // nothing hit storage — surface them in the statusline while THIS editor is
+  // open, and always via ctx.toast (a write can fail while no editor is open,
+  // or a second editor would steal a single-slot handler).
+  writeErrorUnsub = pineLibOnWriteError((msg) => {
+    if (statusMsg.isConnected) setStatus(msg, "err");
+    ctx.toast(msg, "error");
+  });
 
   const makeCopy = () => {
     if (!editorState.currentId) { setStatus("Save the script first", "err"); return; }
     pineLibSave(editorState.currentId, area.value); // capture current buffer
+    if (pineLibWriteFailed()) return;
     const c = pineLibDuplicate(editorState.currentId);
+    if (pineLibWriteFailed()) return;
     editorState.currentId = c.id;
     area.value = c.source;
     editorState.dirty = false;
@@ -681,7 +922,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
       item("Make a copy…", null, makeCopy),
       item("Rename…", null, renameScript),
       item("Version history…", null, openVersionHistory),
-      item("Move script to bottom", null, () => { setStatus("Bottom dock: not in this phase"); }, true),
+      item(bottomDocked ? "Move script back to side panel" : "Move script to bottom", null, () => { dockToBottom(); }),
       sep(),
       item("Create new ▸", null, openCreateNew),
       sep(),
@@ -753,7 +994,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
           } else {
             const r = await ctx.chart.runIndicator(src);
             if (r && typeof r === 'object' && 'ok' in r && r.ok === false) {
-              setStatus(`Run failed: ${'error' in r ? String(r.error) : 'unknown'}`, "err");
+              markRunError('error' in r ? String(r.error) : 'unknown');
               return;
             }
             setStatus("Original gone — added new", "ok");
@@ -764,14 +1005,14 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
         } else {
           const r = await ctx.chart.runIndicator(src);
           if (r && typeof r === 'object' && 'ok' in r && r.ok === false) {
-            setStatus(`Run failed: ${'error' in r ? String(r.error) : 'unknown'}`, "err");
+            markRunError('error' in r ? String(r.error) : 'unknown');
             return;
           }
           setStatus("Added", "ok");
         }
         rebuildOnChart();
       } catch (e) {
-        setStatus(`Error: ${e instanceof Error ? e.message : String(e)}`, "err");
+        markRunError(e instanceof Error ? e.message : String(e));
       }
     })();
   });
@@ -782,15 +1023,30 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
   saveBtn.textContent = "Save";
   saveBtn.addEventListener("click", saveScript);
 
-  // TV header order: [Publish script] [⋯] [—] [✕]. Publish is a community
-  // feature we don't have — keep it disabled for pixel-parity.
+  // TV header order: [Publish script] [⋯] [—] [✕]. No community backend exists
+  // locally, so Publish maps to the local-equivalent share: copy the source to
+  // the clipboard AND drop a .pine download — the script leaves the app either
+  // way (TV's publish sends it to a shared library; here the clipboard/file is
+  // the handoff seam).
   const publishBtn = doc.createElement("button");
   publishBtn.type = "button";
   publishBtn.className = "vela-pine-hbtn";
   publishBtn.textContent = "Publish script";
-  publishBtn.disabled = true;
-  publishBtn.title = "Publish: not available locally";
-
+  publishBtn.title = "Copy source + download .pine";
+  publishBtn.addEventListener("click", () => {
+    const src = area.value;
+    const name = scriptTitle(src, editorState.currentId ? pineLibGet(editorState.currentId)?.name ?? "script" : "script");
+    // Clipboard first — headless/denied contexts still get the file.
+    void doc.defaultView?.navigator?.clipboard?.writeText?.(src).catch(() => {});
+    const blob = new Blob([src], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = doc.createElement("a");
+    a.href = url;
+    a.download = `${name.replace(/[^\w\-. \u4e00-\u9fff]/g, "_")}.pine`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setStatus(`Shared "${name}" — copied + downloaded`, "ok");
+  });
   const moreBtn = doc.createElement("button");
   moreBtn.type = "button";
   moreBtn.className = "vela-pine-hbtn";
@@ -798,50 +1054,50 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
   moreBtn.title = "More";
   moreBtn.disabled = true;   // phase 3: Editor settings / Command palette / Pine logs
 
-  const collapseBtn = doc.createElement("button");
-  collapseBtn.type = "button";
-  collapseBtn.className = "vela-pine-hbtn";
-  collapseBtn.textContent = "—";
-  collapseBtn.title = "Collapse";
-  collapseBtn.addEventListener("click", () => {
+  // Dock-to-bottom: `dockStrip` parks the WHOLE root between the chart area and
+  // the bottom bar (TV's "Move script to bottom"). Calling again while docked
+  // moves it back into the panel body.
+  const dockToBottom = () => {
+    if (!panelRoot || !panelCtx) return;
+    if (bottomDocked) {
+      undockStrip?.(); undockStrip = null; bottomDocked = false;
+      panelBody?.appendChild(panelRoot);
+      panelCtx.togglePanel?.(PANEL_ID, true);
+      setStatus("Docked at side", "ok");
+      return;
+    }
     try { sessionStorage.setItem("opencharts.pine.draft", JSON.stringify({ id: editorState.currentId, src: area.value })); } catch { /* quota */ }
-    closeModal(overlay, openMenus);
-  });
+    panelCtx.togglePanel?.(PANEL_ID, false);
+    undockStrip = panelCtx.dockStrip?.(panelRoot) ?? null;
+    bottomDocked = !!undockStrip;
+    setStatus(bottomDocked ? "Docked at bottom" : "Bottom dock unavailable", bottomDocked ? "ok" : "err");
+  };
 
-  const closeBtn = doc.createElement("button");
-  closeBtn.type = "button";
-  closeBtn.className = "vela-pine-hbtn";
-  closeBtn.textContent = "✕";
-  closeBtn.title = "Close";
-  closeBtn.addEventListener("click", () => {
-    if (editorState.dirty && !doc.defaultView?.confirm?.("Unsaved changes will be lost. Close anyway?")) return;
-    closeModal(overlay, openMenus);
-  });
+  headbar.append(nameBtn, reloadBtn, addToChartBtn, saveBtn, publishBtn, moreBtn);
 
-  const spacer = doc.createElement("div");
-  spacer.className = "vela-pine-spacer";
-
-  headbar.append(appTitle, nameBtn, reloadBtn, spacer, addToChartBtn, saveBtn, publishBtn, moreBtn, collapseBtn, closeBtn);
-
-  // ── Buffer init: legend-edit src > collapsed draft > library entry > template ──
+  // ── Buffer init: pendingOpen src (staged by applyOpenArgs) > collapsed
+  // draft > current library entry > template ──
   const draft = (() => { try { return JSON.parse(sessionStorage.getItem("opencharts.pine.draft") || "null") as { id: string | null; src: string } | null; } catch { return null; } })();
-  if (initialSrc) {
-    area.value = initialSrc;
+  if (pendingValue) {
+    area.value = pendingValue;
   } else if (draft?.src && !editorState.currentId) {
     area.value = draft.src;
     editorState.currentId = draft.id && pineLibGet(draft.id) ? draft.id : null;
   } else if (editorState.currentId) {
-    area.value = pineLibGet(editorState.currentId)?.source ?? initialSrc;
+    area.value = pineLibGet(editorState.currentId)?.source ?? "";
   } else {
     area.value = TEMPLATES.indicator;
   }
   try { sessionStorage.removeItem("opencharts.pine.draft"); } catch { /* noop */ }
   refreshName();
 
-  area.addEventListener("input", () => {
+  /** Single change hook for both monaco (`ed.onChange`) and fallback
+   *  (`input` listener) — dirty tracking + debounced live lint. */
+  function onContentChanged(): void {
     editorState.dirty = true;
     refreshName();
-  });
+    lintOnChange();
+  }
 
   // ── On-chart indicators: what this cell is currently running ──
   const onChart = doc.createElement("div");
@@ -849,7 +1105,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
   const onChartLabel = doc.createElement("div");
   onChartLabel.className = "vela-pine-onchart-label";
   const rebuildOnChart = () => {
-    const handles = ctx.chart.indicators().filter(h => typeof h.source === 'string' && h.source.length > 0);
+    const handles = (panelCtx ?? ctx).chart.indicators().filter(h => typeof h.source === 'string' && h.source.length > 0);
     onChartLabel.textContent = handles.length === 0 ? "On-chart indicators (none)" : `On-chart indicators (${handles.length}) — click to load`;
     [...onChart.querySelectorAll('.vela-pine-onchart-item, .vela-pine-onchart-empty')].forEach(e => e.remove());
     if (handles.length === 0) {
@@ -891,6 +1147,7 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
       onChart.appendChild(row);
     }
   };
+  refreshPanel = rebuildOnChart; // panel handle's onChart/onOpen reach it
   rebuildOnChart();
 
   // ── Statusbar ──
@@ -900,17 +1157,12 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
   cursorPos.type = "button";
   cursorPos.className = "vela-pine-hbtn";
   cursorPos.title = "Go to line";
-  const updateCursor = () => {
-    const pos = area.selectionStart;
-    const before = area.value.slice(0, pos);
-    const line = before.split("\n").length;
-    const col = pos - before.lastIndexOf("\n");
+  // Monaco reports cursor moves via onCursor; the textarea fallback drives the
+  // same label through updateCursorFromFallback (hooked on keyup/click there).
+  const setCursorLabel = (line: number, col: number) => {
     cursorPos.textContent = `Line ${line}, Col ${col}`;
   };
-  updateCursor();
-  area.addEventListener("keyup", updateCursor);
-  area.addEventListener("click", updateCursor);
-  area.addEventListener("input", updateCursor);
+  setCursorLabel(1, 1);
   cursorPos.addEventListener("click", () => {
     const input = doc.defaultView?.prompt?.("Go to line:column", "1:1");
     if (!input) return;
@@ -918,13 +1170,20 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
     if (!m) { setStatus("Use line:col", "err"); return; }
     const line = Math.max(1, parseInt(m[1]!, 10));
     const col = Math.max(1, parseInt(m[2] ?? "1", 10));
-    const lines = area.value.split("\n");
+    if (ed) {
+      ed.focus();
+      ed.setPosition(line, col);
+      setCursorLabel(line, col);
+      return;
+    }
+    if (!ta) return;
+    const lines = ta.value.split("\n");
     let pos = 0;
     for (let i = 0; i < Math.min(line - 1, lines.length); i++) pos += lines[i]!.length + 1;
     pos += Math.min(col - 1, lines[Math.min(line - 1, lines.length - 1)]!.length);
-    area.focus();
-    area.setSelectionRange(pos, pos);
-    updateCursor();
+    ta.focus();
+    ta.setSelectionRange(pos, pos);
+    updateCursorFromFallback();
   });
 
   const verLabel = doc.createElement("a");
@@ -935,34 +1194,60 @@ function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scr
 
   statusbar.append(cursorPos, statusMsg, verLabel);
 
-  // ── Assemble ──
-  dialog.append(headbar, area, onChartLabel, onChart, statusbar);
-  overlay.appendChild(dialog);
+  // ── Assemble ── the shell owns the panel's header row and close button;
+  // our controls live in `header.slot` (between title and ✕), the body gets
+  // the editor host + on-chart list + statusbar.
+  header.slot.appendChild(headbar);
+  root.append(edHost, onChartLabel, onChart, statusbar);
+  body.appendChild(root);
 
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) {
-      if (editorState.dirty && !doc.defaultView?.confirm?.("Unsaved changes will be lost. Close anyway?")) return;
-      closeModal(overlay, openMenus);
-    }
-  });
-  overlay.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      if (editorState.dirty && !doc.defaultView?.confirm?.("Unsaved changes will be lost. Close anyway?")) return;
-      closeModal(overlay, openMenus);
-    }
+  root.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); saveScript(); }
     if ((e.ctrlKey || e.metaKey) && e.key === "o") { e.preventDefault(); openScriptsDialogAction(); }
   });
 
-  // Append to document.body — ctx.host is a cell host that dies on
-  // cell:destroyed (undo, layout change, state restore), taking the modal with it.
-  // MutationObserver catches external .remove() (HMR, devtools, other teardown)
-  // so `open` doesn't latch permanently.
+  // The shell removes the panel body from the DOM on close (no onClose hook) —
+  // watch root connectivity to drop floating menus that would survive as
+  // ghosts, and mirror the textarea's visible state. The monaco instance is
+  // kept: detaching doesn't lose buffer/undo history.
   const mo = new MutationObserver(() => {
-    if (!overlay.isConnected) { open = false; mo.disconnect(); }
+    if (!root.isConnected) { for (const m of openMenus) m.remove(); openMenus.length = 0; }
   });
-  doc.body.appendChild(overlay);
   mo.observe(doc.documentElement, { childList: true, subtree: true });
+
+  // ── Monaco mount (lazy chunk). The textarea fallback mounts FIRST so the
+  // buffer is editable immediately; mountPineEditor swaps it out when the
+  // monaco chunk resolves, folding any early edits into pendingValue.
+  mountFallback();
+  void (async () => {
+    try {
+      const mod = await import("../pine/pineMonaco.ts");
+      if (panelRoot !== root || !root.isConnected && !body.isConnected) return; // torn down or superseded
+      lintPineSrc = mod.lintPineSource;
+      parseErrLoc = mod.parseErrorLocation;
+      // `ta` narrows to `never` inside this async closure — adoptFallbackToPending
+      // lives outside it so the real type is preserved.
+      adoptFallbackToPending();
+      const handle = await mod.mountPineEditor(edHost, { initialValue: pendingValue });
+      if (panelRoot !== root) { handle.dispose(); return; }
+      ed = handle;
+      edHandle = handle; // module handle: destroy() must reach the live editor
+      ed.onChange(onContentChanged);
+      ed.onCursor((line, col) => setCursorLabel(line, col));
+      const km = ed.monaco.KeyMod;
+      const kc = ed.monaco.KeyCode;
+      ed.addKeybinding(km.CtrlCmd | kc.KeyS, saveScript);
+      ed.addKeybinding(km.CtrlCmd | kc.KeyO, () => { openScriptsDialogAction(); });
+      ed.addKeybinding(km.CtrlCmd | kc.Enter, () => { addToChartBtn.click(); });
+      lintOnChange();
+      ed.focus();
+    } catch (e) {
+      // Monaco can't run here (jsdom, worker-less CSP) — the textarea keeps
+      // editing usable and surfaces the failure instead of dying silently.
+      mountFallback();
+      setStatus(`Monaco unavailable (${e instanceof Error ? e.message : String(e)}) — textarea mode`, "err");
+    }
+  })();
   area.focus();
 }
 
@@ -982,4 +1267,89 @@ registerWidgetAction({
   label: "Pine",
   order: 0,
   run: (ctx) => openEditor(ctx),
+});
+
+// ── Right rail (TV parity) ── TV puts Pine Editor in the right-hand vertical
+// toolbar; the topbar button alone isn't the same affordance. A widget
+// attachment appends a slim icon column at the end of the .vela-ws-main flex
+// row — after the panel dock, so it stays the outermost right column.
+const RAIL_CSS = `
+.vela-pine-rail{display:flex;flex-direction:column;gap:2px;padding:6px 2px;
+  width:34px;flex:none;align-items:center;
+  border-left:1px solid var(--vela-border,#2a2e39);
+  background:var(--vela-bg,#1e222d)}
+.vela-pine-rail button{width:28px;height:28px;display:flex;align-items:center;
+  justify-content:center;border:0;border-radius:4px;background:none;
+  color:var(--vela-fg-muted,#868993);cursor:pointer}
+.vela-pine-rail button:hover{background:rgba(255,255,255,.08);color:var(--vela-fg,#d1d4dc)}
+.vela-pine-rail svg{width:16px;height:16px}
+`;
+// The editor is a contributed SIDE PANEL — a docked column beside the chart
+// (TV parity: right dock with collapse/close in the shell chrome). Registered
+// at import time; the shell hands mount() the body + a header slot.
+registerSidePanel({
+  id: PANEL_ID,
+  title: "Pine Editor",
+  icon: "edit",
+  width: 520,
+  resizable: true,
+  minWidth: 320,
+  mount(ctx, body, header) {
+    mountEditor(ctx, body, header);
+    return {
+      // Re-bind to the cell's chart whenever the active cell changes — the
+      // panel's ctx is the mount-time cell; rebuild re-reads through it.
+      onChart() { refreshPanel?.(); },
+      onOpen() {
+        // Consume args stashed while the panel was closed (rail/legend open)
+        // and push the stashed source into the LIVE editor, not just state.
+        if (pendingOpen && panelRoot) {
+          const w = pendingOpen; pendingOpen = null;
+          applyOpenArgs(w);
+          refreshPanel?.();
+          if (edHandle) edHandle.setValue(pendingValue);
+        }
+      },
+      destroy() {
+        writeErrorUnsub?.(); writeErrorUnsub = null;
+        for (const m of openMenus) m.remove(); openMenus.length = 0;
+        undockStrip?.(); undockStrip = null; bottomDocked = false;
+        edHandle?.dispose(); edHandle = null;
+        panelCtx = null; panelBody = null; panelRoot = null; refreshPanel = null;
+      },
+    };
+  },
+});
+registerWidgetAttachment({
+  id: "opencharts.pine-rail",
+  mount(ctx) {
+    const doc = ctx.host.ownerDocument;
+    const main = ctx.host.querySelector?.(".vela-ws-main") as HTMLElement | null;
+    if (!main) return () => {}; // layout variant without the row → skip rail
+    if (!doc.querySelector("style[data-vela-pine-rail]")) {
+      const s = doc.createElement("style");
+      s.dataset.velaPineRail = "";
+      s.textContent = RAIL_CSS;
+      doc.head.appendChild(s);
+    }
+    const rail = doc.createElement("div");
+    rail.className = "vela-pine-rail";
+    const mkBtn = (title: string, svg: string, onClick: () => void): HTMLButtonElement => {
+      const b = doc.createElement("button");
+      b.type = "button";
+      b.title = title;
+      b.setAttribute("aria-label", title);
+      b.innerHTML = svg;
+      b.addEventListener("click", onClick);
+      return b;
+    };
+    const PEN = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M11.5 3.5 12.7 4.7a1 1 0 0 1 0 1.4l-8.2 8.2-2.8.7.7-2.8 8.2-8.2a1 1 0 0 1 1.4 0Z"/></svg>';
+    const FOLDER = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 2h5A1.5 1.5 0 0 1 14.5 6.5v5A1.5 1.5 0 0 1 13 13H3.5A1.5 1.5 0 0 1 2 11.5Z"/></svg>';
+    rail.append(
+      mkBtn("Pine Editor", PEN, () => openEditor(ctx)),
+      mkBtn("My scripts", FOLDER, () => openScriptsDialog(ctx, (id) => openPineEditorWithScript(ctx, id))),
+    );
+    main.appendChild(rail);
+    return () => rail.remove();
+  },
 });

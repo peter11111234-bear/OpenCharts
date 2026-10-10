@@ -6,6 +6,8 @@ import { ShioajiVelaProvider } from "../services/shioaji/velaProvider.ts";
 import { TW_INSTRUMENTS } from "../services/shioaji/instruments.ts";
 import { combinedManifestEntries } from "../pineScripts.ts";
 import "./velaPineEditor.ts"; // 註冊頂列 "Pine" 按鈕（side effect）
+import { bindVelaWorkspace, unbindVelaWorkspace } from "./velaPineEditor.ts";
+import { initVelaLayouts } from "./velaLayouts.ts";
 
 
 /**
@@ -295,6 +297,11 @@ export function VelaPage() {
 
     // Debug handle for scripts/tests (chart.runIndicator, ws.state()).
     (window as unknown as Record<string, unknown>).__vela = ws;
+    initVelaLayouts(ws);
+    bindVelaWorkspace(ws);
+    // Pre-warm pine workers while provider history fetches — restore storms
+    // hit hot workers instead of paying N×spawn.
+    void import("../pine/pineWorkerClient.ts").then((m) => m.prewarmPineWorkers(2)).catch(() => { /* workerless env */ });
 
     // Deferred restore of parked heavy scripts — they were moved off the
     // workspace doc above (not deleted), now re-run on idle so boot stays
@@ -331,7 +338,14 @@ export function VelaPage() {
         const r = await cell.chart.runIndicator(entry.script, {
           id: entry.id, language: "pine", title: entry.name, inputs: entry.inputs,
         });
-        if (!r.ok) return { chartIndex, entry };
+        if (!r.ok) {
+          // Was silently re-parked forever — the user just saw their indicator
+          // "not come back". Toast once per failed entry per boot so it's
+          // diagnosable without spamming (each boot retries once).
+          const msg = 'error' in r ? String(r.error) : 'run failed';
+          ws.toast(`Could not restore "${entry.name ?? "script"}": ${msg.slice(0, 120)}`, "error", 8000);
+          return { chartIndex, entry };
+        }
         if (entry.hidden) r.handle?.setVisible(false);
         return null;
       }))).filter((e): e is NonNullable<typeof e> => e !== null);
@@ -354,6 +368,7 @@ export function VelaPage() {
 
     return () => {
       offCreated();
+      unbindVelaWorkspace(ws);
       delete (window as unknown as Record<string, unknown>).__vela;
       ws.destroy();
     };
