@@ -36,6 +36,22 @@ export function pineLibSubscribe(fn: () => void): () => void {
   return () => { subs.delete(fn); };
 }
 
+// Quota/denied writes used to be swallowed silently — a save LOOKED done but
+// nothing persisted (the "my scripts vanished" class of bug). The library is
+// UI-free, so failures surface through registered handlers (the Pine editor
+// routes to ctx.toast AND its statusline; a Set so one open editor can't steal
+// the slot from another, and closed editors just no-op). Unsubscribe via the
+// returned disposer.
+const errorSubs = new Set<(msg: string) => void>();
+export function pineLibOnWriteError(fn: (msg: string) => void): () => void {
+  errorSubs.add(fn);
+  return () => { errorSubs.delete(fn); };
+}
+function reportWriteError(e: unknown): void {
+  const msg = `Script library save failed: ${e instanceof Error ? e.message : String(e)}`;
+  for (const f of errorSubs) f(msg);
+}
+
 function readDoc(): Doc {
   try {
     const raw = localStorage.getItem(LIB_KEY);
@@ -47,11 +63,20 @@ function readDoc(): Doc {
     return { version: 1, scripts: [] };
   }
 }
+let lastWriteFailed = false;
+/** True when the most recent writeDoc hit a quota/denied error — lets callers
+ *  (the editor's save path) report failure instead of "Saved". */
+export function pineLibWriteFailed(): boolean { return lastWriteFailed; }
+
 function writeDoc(d: Doc): void {
+  lastWriteFailed = false;
   try {
     localStorage.setItem(LIB_KEY, JSON.stringify(d));
-  } catch {
-    // quota — fail silently; caller still sees the in-memory shape on next read
+  } catch (e) {
+    // quota/denied — the caller's entry is still live in memory for this session
+    // but won't survive a reload; say so instead of faking success.
+    lastWriteFailed = true;
+    reportWriteError(e);
   }
   emit();
 }
@@ -86,7 +111,7 @@ export function pineLibSave(id: string, source: string): PineScriptEntry {
   const d = readDoc();
   const e = d.scripts.find(s => s.id === id);
   if (!e) throw new Error(`pineLib: script not found: ${id}`);
-  if (e.source === source) return e;           // no-op save
+  if (e.source === source) { lastWriteFailed = false; return e; } // no-op save — clear stale flag
   e.source = source;
   e.updatedAt = Date.now();
   e.versions.push({ t: e.updatedAt, src: source });
