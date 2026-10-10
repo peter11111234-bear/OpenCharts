@@ -24,6 +24,7 @@ scratch/report-*.md
 scratch/qa-round*-*.md
 scratch/_findings.json
 .bench/
+.scratch/
 vite-restart.log
 scripts/watchdog.log
 scripts/scratch/

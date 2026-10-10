@@ -120,41 +120,69 @@ const PINE_CSS = `
  * a truncated list — the real "indicators vanished" path. Entries expire so a
  * failed/removed add can't resurrect.
  */
-type SavedScript = { name: string; script: string; id?: string; hidden?: boolean; inputs?: Record<string, string | number | boolean> };
+type SavedScript = { name: string; script: string; id?: string; hidden?: boolean; inputs?: Record<string, string | number | boolean>;
+  // 'external' = the user added this script to the chart directly (chart.runIndicator /
+  // addIndicator), NOT seeded from the manifest ledger. Old blobs have no origin and
+  // fall through to the legacy manifest-text dedup; entries stamped 'external' bypass it,
+  // so a user-pasted copy of a manifest script round-trips instead of silently dropping.
+  origin?: 'external' };
 
 const PENDING_MS = 30_000;
+// pendingAdds stamps use a MONOTONIC clock (performance.now, not Date.now): a wall-clock
+// NTP step mid-restore could prune live entries or resurrect expired ones — the 30s TTL
+// must measure elapsed time, not wall time.
 const pendingAdds = new Map<string, { at: number; entry: SavedScript }[]>();
-
-// Workspace handle for serialize/restore — CellStateContext can't take args
+// inFlightAdds: claim key cellId+'|'+normScript(script)+'|'+id+'|'+inputsSig — a
+// second restore firing before the first's addIndicator lands has no handle to
+// claim (preexisting snapshot is stale, e.id live-check misses). id+inputs in the
+// key keep N deliberately-identical-script copies distinct; within ONE restore,
+// per-call localClaims does the same dedup instead. Released when the pending
+// entry leaves pendingAdds (covered, expired, or swept) — never on a twin whose
+// entry is still pending. Cleared on bind/unbind (new ws = fresh claims).
+const inFlightAdds = new Set<string>();
+function inputsSig(inputs: Record<string, string | number | boolean> | undefined): string {
+  return inputs ? Object.keys(inputs).sort().map((k) => k + '=' + String(inputs[k])).join(';') : '';
+}
+function inFlightKey(cellId: string, e: { script?: string; id?: string; inputs?: Record<string, string | number | boolean> }): string {
+  return cellId + '|' + normScript(e.script) + '|' + (e.id ?? '') + '|' + inputsSig(e.inputs);
+}
+// Drops the claim only when no still-pending entry shares the key — twin entries
+// (identical script+id+inputs in the same restore) share one claim.
+function releaseClaim(cellId: string, e: { script?: string; id?: string; inputs?: Record<string, string | number | boolean> }, remaining: { entry: SavedScript }[]): void {
+  const key = inFlightKey(cellId, e);
+  if (!remaining.some((p) => inFlightKey(cellId, p.entry) === key)) inFlightAdds.delete(key);
+}
 // and exposes no cell accessor, so VelaPage binds the ws it built. window.__vela
 // stays a debug handle only. Rebind (StrictMode remount, new ws instance)
-// clears pendingAdds: entries keyed by cellId would otherwise bleed up to
-// PENDING_MS of stale adds into a different workspace's first serialize.
+// clears pendingAdds AND inFlightAdds: pending entries gate serialize merge,
+// claims gate restore dedup — both would bleed stale state into a different
+// workspace otherwise.
 let workspaceRef: { cell(id: string): { instances?: { id?: string; external?: boolean; handle?: { id: string } | null }[] } | undefined } | null = null;
+// Handles without an instance row (chart.runIndicator bypasses the cell ledger)
+// are external by construction — shared by serialize filter and restore dedup.
+function isExternalHandle(cellId: string, handleId: string): boolean {
+  const inst = workspaceRef?.cell(cellId)?.instances?.find((i) => (i.handle?.id ?? i.id) === handleId);
+  return !inst || inst.external === true;
+}
 export function bindVelaWorkspace(ws: NonNullable<typeof workspaceRef>): void {
   workspaceRef = ws;
   pendingAdds.clear();
+  inFlightAdds.clear();
 }
 export function unbindVelaWorkspace(ws: unknown): void {
   if (workspaceRef === ws) {
     workspaceRef = null;
     pendingAdds.clear();
+    inFlightAdds.clear();
   }
 }
 
-function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined {
+export function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined {
   const out: SavedScript[] = [];
   // Only EXTERNAL indicators belong in ext — vela's own ledger persists manifest
   // (picker-added) indicators by name, so serializing them here re-adds a second
-  // copy every restore (the compounding EMA20×N bug). CellStateContext exposes
-  // no cell, so we look up the workspace ref VelaPage bound at boot. Handles
-  // without an instance row (chart.runIndicator bypasses the cell ledger) are
-  // external by construction.
-  const cell = workspaceRef?.cell(ctx.cellId);
-  const isExternal = (handleId: string): boolean => {
-    const inst = cell?.instances?.find((i) => (i.handle?.id ?? i.id) === handleId);
-    return !inst || inst.external === true;
-  };
+  // copy every restore (the compounding EMA20×N bug).
+  const isExternal = (handleId: string): boolean => isExternalHandle(ctx.cellId, handleId);
   for (const handle of ctx.chart.indicators()) {
     if (!handle.source) continue; // native (core) indicator — not ours
     if (!isExternal(handle.id)) continue; // ledger-owned — vela persists it by name
@@ -170,14 +198,18 @@ function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined 
       id: handle.id,
       hidden: !handle.visible,
       inputs: Object.keys(overrides).length > 0 ? overrides : undefined,
+      origin: 'external',
     });
   }
   // Sweep dead cellIds: an entry can't outlive PENDING_MS even if its cell
   // died before ever serializing again (persistence has no destroy hook —
   // dehydrate IS the last call, so this is the only prune path left).
-  const nowSweep = Date.now();
+  const nowSweep = performance.now();
   for (const [cid, arr] of pendingAdds) {
     const kept = arr.filter((p) => nowSweep - p.at < PENDING_MS);
+    // Expired entries release their claim too — a dropped pending entry whose
+    // claim outlived it would permanently skip re-restore of the same script.
+    for (const p of arr) if (!kept.includes(p)) releaseClaim(cid, p.entry, kept);
     if (kept.length) pendingAdds.set(cid, kept); else pendingAdds.delete(cid);
   }
   // Merge entries a restore asked for that haven't become live yet — without
@@ -185,7 +217,7 @@ function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined 
   // entries would be lost if the tab closes before the next write.
   const pend = pendingAdds.get(ctx.cellId);
   if (pend?.length) {
-    const now = Date.now();
+    const now = performance.now();
     // Drop an entry the FIRST time it's live-covered (the live loop above
     // already wrote it) or once it expires (add failed / user removed it
     // before it landed) — a removed indicator can't resurrect, and id-less
@@ -209,6 +241,7 @@ function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined 
       });
       return !covered && now - p.at < PENDING_MS;
     });
+    for (const p of pend) if (!still.includes(p)) releaseClaim(ctx.cellId, p.entry, still);
     for (const p of still) out.push(p.entry);
     if (still.length) pendingAdds.set(ctx.cellId, still);
     else pendingAdds.delete(ctx.cellId);
@@ -242,7 +275,7 @@ function inputsMatch(handle: IndicatorHandle, inputs: Record<string, string | nu
   return true;
 }
 
-function restoreCellScripts(payload: unknown, ctx: CellStateContext): void {
+export function restoreCellScripts(payload: unknown, ctx: CellStateContext): void {
   if (!Array.isArray(payload)) return;
   // Claimable pool = handles live BEFORE this restore ran. Snapshot once:
   // indicators THIS restore adds must not satisfy later entries — otherwise
@@ -267,18 +300,34 @@ function restoreCellScripts(payload: unknown, ctx: CellStateContext): void {
       .map((e) => normScript(e.script))
       .filter((s): s is string => typeof s === "string"),
   );
+  // Per-call staging — claims land in inFlightAdds only AFTER the loop, so N
+  // deliberately-identical entries in ONE payload all get added (each claims
+  // its own live row later); a SECOND restore call still finds them claimed.
+  const newClaims = new Set<string>();
+  // origin:'external' entries may only be claimed by EXTERNAL live handles —
+  // a ledger-owned row with matching source+inputs owns itself (the ledger
+  // re-adds it); letting it claim our entry silently drops the user's add.
+  const externalOnly = preexisting.filter((h) => isExternalHandle(ctx.cellId, h.id));
   for (const entry of payload) {
     if (typeof entry !== "object" || entry === null) continue;
     const e = entry as Partial<SavedScript>;
     if (typeof e.name !== "string" || typeof e.script !== "string") continue;
+    const flightKey = inFlightKey(ctx.cellId, e);
+    // Double-restore (handles still in-flight): a second restore before the first's
+    // addIndicator lands has no handle to claim — inFlightAdds is the only dedup.
+    if (inFlightAdds.has(flightKey)) continue;
     // Idempotence: a restore firing twice (StrictMode remount) finds the entry's
     // own id already live → that one is ours, skip without consuming a claim.
     if (e.id && ctx.chart.indicators().some((h) => h.id === e.id)) continue;
     // A live handle with identical source AND inputs claims this entry —
     // covers duplicate ext entries and ledger-vs-ext overlap in old blobs.
-    const hit = preexisting.find((h) => normScript(h.source) === normScript(e.script) && !claimed.has(h.id) && inputsMatch(h, e.inputs));
+    const pool = e.origin === 'external' ? externalOnly : preexisting;
+    const hit = pool.find((h) => normScript(h.source) === normScript(e.script) && !claimed.has(h.id) && inputsMatch(h, e.inputs));
     if (hit) { claimed.add(hit.id); continue; }
-    if (ledgerScripts.has(normScript(e.script))) continue;
+    // Legacy blobs (no origin) keep the manifest-text skip. origin:'external' was
+    // stamped only for user-added scripts (never ledger-seeded), so it safely
+    // bypasses — a hand-pasted copy of a manifest script stays external.
+    if (e.origin !== 'external' && ledgerScripts.has(normScript(e.script))) continue;
     try {
       ctx.addIndicator({
         name: e.name,
@@ -288,15 +337,18 @@ function restoreCellScripts(payload: unknown, ctx: CellStateContext): void {
         hidden: e.hidden,
         inputs: e.inputs,
       });
+      newClaims.add(flightKey);
       // Track until the handle is live+serialized once — a persist between now
-      // and then would otherwise drop this entry from ext.
+      // and then would otherwise drop this entry from ext. origin passes through
+      // (legacy entries keep no-origin until they serialize live and get stamped).
       const list = pendingAdds.get(ctx.cellId) ?? [];
-      list.push({ at: Date.now(), entry: { name: e.name, script: e.script, id: e.id, hidden: e.hidden, inputs: e.inputs } });
+      list.push({ at: performance.now(), entry: { name: e.name, script: e.script, id: e.id, hidden: e.hidden, inputs: e.inputs, origin: e.origin } });
       pendingAdds.set(ctx.cellId, list);
     } catch {
       // engine not ready or duplicate id — skip silently
     }
   }
+  for (const k of newClaims) inFlightAdds.add(k);
 }
 
 registerStatePersistence({
