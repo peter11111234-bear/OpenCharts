@@ -193,4 +193,72 @@ describe('PineRunClient', () => {
     w.gate.resolve();
     await expect(first).resolves.toBeDefined();
   });
+
+  it('ignores a done whose id does not match the live run', async () => {
+    // A stray/out-of-order result must not settle the current pending run —
+    // only a reply carrying the live id may resolve it.
+    class StubWorker implements WorkerLike {
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onerror: ((e: unknown) => void) | null = null;
+      postMessage(m: unknown): void {
+        const msg = m as ToWorker;
+        if (msg.t !== 'run') return;
+        // Stray done with a wrong id arrives first, the real reply second.
+        this.onmessage?.({ data: { t: 'done', id: 999, result: {} } });
+        this.onmessage?.({
+          data: { t: 'done', id: msg.id, result: {
+            plots: new Map(), drawings: [], fills: [], bgcolors: new Map(),
+            barcolors: new Map(), alerts: [], alertconditions: [], warnings: [],
+            inputs: [], props: [], title: 'real', overlay: false,
+          } } satisfies FromWorker,
+        });
+      }
+      terminate(): void { /* noop */ }
+    }
+    const client = new PineRunClient({ factory: () => new StubWorker() });
+    const r = await client.run({ source: '', bars: [] });
+    expect(r.title).toBe('real');
+  });
+
+  it('drops malformed payloads without wedging the pending run', async () => {
+    // nullish/primitive messages must not throw inside onmessage — an uncaught
+    // throw there would strand the run promise forever.
+    class StubWorker implements WorkerLike {
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onerror: ((e: unknown) => void) | null = null;
+      postMessage(m: unknown): void {
+        const msg = m as ToWorker;
+        if (msg.t !== 'run') return;
+        this.onmessage?.({ data: null });
+        this.onmessage?.({ data: 42 });
+        this.onmessage?.({ data: { t: 'fail', id: msg.id, error: { name: 'Error', message: 'boom' } } });
+      }
+      terminate(): void { /* noop */ }
+    }
+    const client = new PineRunClient({ factory: () => new StubWorker() });
+    await expect(client.run({ source: '', bars: [] })).rejects.toThrow('boom');
+  });
+
+  it('answers a malformed fetchReq with ok:false instead of dropping it', async () => {
+    // A fetchReq missing sym/tf must get a reply — silently dropping it leaks
+    // the worker-side pending Map entry until the run settles.
+    class StubWorker implements WorkerLike {
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onerror: ((e: unknown) => void) | null = null;
+      readonly replies: ToWorker[] = [];
+      postMessage(m: unknown): void {
+        const msg = m as ToWorker;
+        if (msg.t === 'fetchRes') { this.replies.push(msg); return; }
+        if (msg.t !== 'run') return;
+        this.onmessage?.({ data: { t: 'fetchReq', fid: 7, sym: 'ES' } }); // tf missing
+        this.onmessage?.({ data: { t: 'fail', id: msg.id, error: { name: 'Error', message: 'x' } } });
+      }
+      terminate(): void { /* noop */ }
+    }
+    const w = new StubWorker();
+    const client = new PineRunClient({ factory: () => w });
+    await expect(client.run({ source: '', bars: [], opts: { fetchSeries: async () => [] } }))
+      .rejects.toThrow('x');
+    expect(w.replies).toEqual([{ t: 'fetchRes', fid: 7, ok: false, error: 'malformed or unpending fetchReq' }]);
+  });
 });

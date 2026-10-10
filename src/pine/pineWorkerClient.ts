@@ -21,10 +21,13 @@ export interface ClientRunOpts extends Omit<RunOptions, 'fetchSeries' | 'shouldA
 }
 
 interface PendingRun {
+  id: number;
   resolve: (r: RunResult) => void;
   reject: (e: Error) => void;
   fetchSeries?: FetchSeriesFn;
 }
+
+const isObj = (x: unknown): x is Record<string, unknown> => x !== null && typeof x === 'object';
 
 function reviveError(e: FailError): Error {
   if (e.name === 'PineRuntimeError') {
@@ -77,31 +80,46 @@ export class PineRunClient {
   }
 
   private onMsg(m: unknown): void {
-    // Worker postMessage payload — boundary cast to our protocol type.
-    const msg = m as FromWorker;
-    if (msg.t === 'done' || msg.t === 'fail') {
-      const p = this.pending;
-      this.pending = null;
-      if (!p) return;
-      if (msg.t === 'done') p.resolve(msg.result);
-      else p.reject(reviveError(msg.error));
-      return;
-    }
-    if (msg.t === 'fetchReq') {
-      const fid = msg.fid;
-      // Capture the worker that issued the request — a fetch resolving
-      // after dispose/respawn must not post into a NEW worker, where a
-      // colliding fid would silently feed it stale bars.
-      const w = this.worker;
-      const fetch = this.pending?.fetchSeries;
-      if (!fetch || !w) {
-        w?.postMessage({ t: 'fetchRes', fid, ok: false, error: 'no pending run' } satisfies ToWorker);
+    // Boundary validation, not a blind cast: nullish/primitive or wrongly
+    // shaped payloads would throw inside onmessage — a worker-side throw is
+    // uncaught and leaves `pending` hanging forever (session wedge).
+    if (!isObj(m)) return;
+    const msg = m as unknown as FromWorker;
+    try {
+      if (msg.t === 'done' || msg.t === 'fail') {
+        const p = this.pending;
+        if (!p || p.id !== msg.id) return; // stale/stray result must not settle the live run
+        this.pending = null;
+        if (msg.t === 'done') p.resolve(msg.result);
+        else p.reject(reviveError(msg.error));
         return;
       }
-      fetch(msg.sym, msg.tf).then(
-        (bars) => w.postMessage({ t: 'fetchRes', fid, ok: true, bars } satisfies ToWorker),
-        (e) => w.postMessage({ t: 'fetchRes', fid, ok: false, error: e instanceof Error ? e.message : String(e) } satisfies ToWorker),
-      );
+      if (msg.t === 'fetchReq') {
+        const fid = msg.fid;
+        // Capture the worker that issued the request — a fetch resolving
+        // after dispose/respawn must not post into a NEW worker, where a
+        // colliding fid would silently feed it stale bars.
+        const w = this.worker;
+        const fetch = this.pending?.fetchSeries;
+        // Malformed payloads answer ok:false (when a fid exists) instead of
+        // being dropped — a dropped reply leaves the worker's pending Map
+        // entry leaked until the run settles.
+        if (!fetch || !w || typeof fid !== 'number' || typeof msg.sym !== 'string' || typeof msg.tf !== 'string') {
+          if (w && typeof fid === 'number') w.postMessage({ t: 'fetchRes', fid, ok: false, error: 'malformed or unpending fetchReq' } satisfies ToWorker);
+          return;
+        }
+        fetch(msg.sym, msg.tf).then(
+          (bars) => w.postMessage({ t: 'fetchRes', fid, ok: true, bars } satisfies ToWorker),
+          (e) => w.postMessage({ t: 'fetchRes', fid, ok: false, error: e instanceof Error ? e.message : String(e) } satisfies ToWorker),
+        );
+      }
+    } catch (e) {
+      // Defensive settle: a post-snapshot throw would otherwise strand the
+      // run promise forever (an exception inside worker.onmessage is
+      // uncaught — it does NOT surface as worker.onerror).
+      const p = this.pending;
+      this.pending = null;
+      p?.reject(e instanceof Error ? e : new Error(String(e)));
     }
   }
 
@@ -118,7 +136,7 @@ export class PineRunClient {
     const id = this.nextId++;
     const { fetchSeries, ...opts } = input.opts ?? {};
     return new Promise<RunResult>((resolve, reject) => {
-      this.pending = { resolve, reject, fetchSeries };
+      this.pending = { id, resolve, reject, fetchSeries };
       try {
         w.postMessage({
           t: 'run', id,

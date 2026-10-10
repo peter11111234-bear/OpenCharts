@@ -36,6 +36,10 @@ export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWo
   };
 
   return (msg) => {
+    // Shape guard: a nullish/primitive payload must not throw out of the
+    // handler — a sync throw here reaches worker.onerror, the client then
+    // marks the transport dead and RE-RUNS the script in-process.
+    if (msg === null || typeof msg !== 'object') return;
     if (msg.t === 'fetchRes') {
       const p = pending.get(msg.fid);
       // No pending entry = the run that issued it already settled.
