@@ -41,6 +41,52 @@ function reviveError(e: FailError): Error {
   return err;
 }
 
+/**
+ * Idle worker pool — a session's worker survives run end for the NEXT session to
+ * reuse. Without this every indicator add/restore pays the full module-Worker
+ * spawn (300–900ms in dev, still real in prod); a page with N pine indicators
+ * multiplied that by N on every reload. Workers are stateless between runs (the
+ * handler clears its pending map on settle), so reuse is safe. Factory-supplied
+ * workers (tests) bypass the pool — the client owns their lifecycle contract.
+ */
+const POOL_CAP = 4;
+const workerPool: WorkerLike[] = [];
+
+/** Pre-warm the pool so a restore storm hits hot workers. Spawning overlaps
+ *  provider history fetch — the first real run finds an idle worker. Call once
+ *  after the workspace exists (VelaPage does). */
+export function prewarmPineWorkers(n = 2): void {
+  if (typeof Worker === 'undefined') return;
+  for (let i = workerPool.length; i < Math.min(n, POOL_CAP); i++) {
+    try {
+      releaseWorker(new Worker(new URL('./pineWorker.ts', import.meta.url), { type: 'module' }) as WorkerLike);
+    } catch { break; } // no worker support → engine falls back in-process anyway
+  }
+}
+
+// A pooled worker that dies idle (module-eval failure, CSP kill) must not be
+// handed out again — takeWorker would postMessage into a corpse and the run
+// would hang forever with no fallback. Mark it dead on error and cull on take.
+const deadWorkers = new Set<WorkerLike>();
+function takeWorker(factory?: () => WorkerLike): WorkerLike {
+  if (factory) return factory();
+  while (workerPool.length) {
+    const w = workerPool.pop()!;
+    if (deadWorkers.delete(w)) { w.terminate(); continue; }
+    w.onerror = null;
+    return w;
+  }
+  return new Worker(new URL('./pineWorker.ts', import.meta.url), { type: 'module' }) as WorkerLike;
+}
+function releaseWorker(w: WorkerLike): void {
+  if (workerPool.length >= POOL_CAP || deadWorkers.has(w)) { w.terminate(); return; }
+  w.onmessage = null;
+  // Keep an error watcher while idle: a dead pooled worker is a hang, not a fallback.
+  w.onerror = () => { deadWorkers.add(w); };
+  if (w.onmessageerror !== undefined) w.onmessageerror = () => { deadWorkers.add(w); };
+  workerPool.push(w);
+}
+
 export class PineRunClient {
   private worker: WorkerLike | null = null;
   private pending: PendingRun | null = null;
@@ -58,10 +104,7 @@ export class PineRunClient {
 
   private ensureWorker(): WorkerLike {
     if (this.worker) return this.worker;
-    // Real Worker satisfies WorkerLike structurally; DOM's MessageEvent-typed
-    // onmessage signature blocks direct assignment, so cast once here.
-    const mk = this.factory ?? ((): WorkerLike => new Worker(new URL('./pineWorker.ts', import.meta.url), { type: 'module' }) as WorkerLike);
-    const w = mk();
+    const w = takeWorker(this.factory);
     w.onmessage = (e: { data: unknown }) => this.onMsg(e.data);
     w.onerror = (e: unknown) => this.onTransportError(e);
     w.onmessageerror = (e: unknown) => this.onTransportError(e);
@@ -90,6 +133,15 @@ export class PineRunClient {
         const p = this.pending;
         if (!p || p.id !== msg.id) return; // stale/stray result must not settle the live run
         this.pending = null;
+        // Settled cleanly → the worker is idle and stateless. Real workers go
+        // to the pool so the next session skips spawn cost; factory-supplied
+        // workers stay attached (their lifecycle is the caller's contract —
+        // tests observe terminate() only on dispose/stop).
+        if (!this.factory) {
+          const w = this.worker;
+          this.worker = null;
+          if (w) releaseWorker(w);
+        }
         if (msg.t === 'done') p.resolve(msg.result);
         else p.reject(reviveError(msg.error));
         return;

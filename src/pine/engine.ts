@@ -338,7 +338,11 @@ export class PineInterpreterEngine implements ScriptingEngine {
     };
 
     const getBars = () => req.getBars?.() ?? req.bars;
-    if (!deferred) request(getBars());
+    // Skip the zero-bar first run: a boot/restore addIndicator executes before
+    // the provider's history lands, producing a wasted spawn + an empty emit
+    // (restore storms paid ~10s each for bars:0 runs). 'complete'/tick arrives
+    // via notifyBars and starts the real run then.
+    if (!deferred && getBars().length > 0) request(getBars());
 
     return {
       stop: () => { stopped = true; runId++; pending = null; this.abortRun(sessionCtx); },
