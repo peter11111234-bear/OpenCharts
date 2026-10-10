@@ -220,7 +220,7 @@ function serializeCellScripts(ctx: CellStateContext): SavedScript[] | undefined 
  *  BOM but keeps line endings, while manifest entries carry the verbatim file
  *  bytes — a BOM'd/CRLF script on one side and LF-only on the other would
  *  silently miss the ledger dedup and re-add a ledger-owned row as external. */
-function normScript(s: string | undefined): string {
+export function normScript(s: string | undefined): string {
   return (s ?? "").replace(/^﻿/, "").replace(/\r\n/g, "\n");
 }
 
@@ -432,7 +432,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
           for (const cell of cells) {
             if (cell.chart === srcChart) continue;
             try {
-              if (cell.chart.indicators().some(x => x.source === h.source)) continue; // disposed cell → throws inside try
+              if (cell.chart.indicators().some(x => normScript(x.source) === normScript(h.source))) continue; // disposed cell → throws inside try
               // A dead feed can leave runIndicator unsettled — cap the wait so
               // one wedged cell can't stall the loop (and pin addingToLayout).
               const p = cell.chart.runIndicator(h.source!, { language: 'pine', title: h.title, inputs });

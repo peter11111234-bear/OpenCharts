@@ -6,7 +6,7 @@ import { ShioajiVelaProvider } from "../services/shioaji/velaProvider.ts";
 import { TW_INSTRUMENTS } from "../services/shioaji/instruments.ts";
 import { combinedManifestEntries } from "../pineScripts.ts";
 import "./velaPineEditor.ts"; // 註冊頂列 "Pine" 按鈕（side effect）
-import { bindVelaWorkspace, unbindVelaWorkspace } from "./velaPineEditor.ts";
+import { bindVelaWorkspace, unbindVelaWorkspace, normScript } from "./velaPineEditor.ts";
 import { initVelaLayouts } from "./velaLayouts.ts";
 
 
@@ -334,7 +334,7 @@ export function VelaPage() {
         // pass) already owns this script; re-running mints a duplicate row.
         const live = cell.chart.indicators();
         if ((entry.id && live.some((h) => h.id === entry.id)) ||
-            live.some((h) => h.source === entry.script)) return null;
+            live.some((h) => normScript(h.source) === normScript(typeof entry.script === "string" ? entry.script : undefined))) return null;
         const r = await cell.chart.runIndicator(entry.script, {
           id: entry.id, language: "pine", title: entry.name, inputs: entry.inputs,
         });
