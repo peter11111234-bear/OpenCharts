@@ -14,11 +14,11 @@ import type { PineScriptEntry } from "../pine/lib/pineLib.ts";
 // Modal + rail styles — inject-once. velaPineEditor's PINE_CSS redefined
 // `.vela-pine-dialog` as the PANEL body (height:100%, no width bound) and
 // dropped the overlay/apptitle rules the modal still mounts, so this file
-// now owns its whole chrome: scoped selectors can't collide with the panel
-// body class.
+// re-declares them scoped under .vela-pine-overlay. height:auto overrides the
+// panel body's height:100% so small libraries don't pin at the 88vh cap.
 const CATRAIL_CSS = `
 .vela-pine-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55)}
-.vela-pine-overlay .vela-pine-dialog{display:flex;flex-direction:column;width:min(900px,92vw);max-height:88vh;background:#1e222d;border:1px solid #363c4e;border-radius:8px;color:#d5d8e0;font:13px/1.4 sans-serif;box-shadow:0 12px 40px rgba(0,0,0,.6);overflow:hidden}
+.vela-pine-overlay .vela-pine-dialog{display:flex;flex-direction:column;width:min(900px,92vw);height:auto;max-height:88vh;background:#1e222d;border:1px solid #363c4e;border-radius:8px;color:#d5d8e0;font:13px/1.4 sans-serif;box-shadow:0 12px 40px rgba(0,0,0,.6);overflow:hidden}
 .vela-pine-overlay .vela-pine-apptitle{color:#d5d8e0;font-weight:600;font-size:13px;padding:0 8px;white-space:nowrap}
 .vela-pine-overlay .vela-pine-scriptlist{flex:1;overflow:auto;padding:4px 0;min-height:0}
 .vela-pine-catrow{display:flex;flex:1;min-height:0}

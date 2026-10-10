@@ -368,9 +368,12 @@ export function VelaPage() {
 
     return () => {
       offCreated();
-      unbindVelaWorkspace(ws);
       delete (window as unknown as Record<string, unknown>).__vela;
+      // destroy() flushes a pending debounced state write SYNCHRONOUSLY — do
+      // it while workspaceRef is still bound, or the flush's serialize sees
+      // isExternal=true for every handle and writes ledger rows into ext.
       ws.destroy();
+      unbindVelaWorkspace(ws);
     };
   }, []);
 
