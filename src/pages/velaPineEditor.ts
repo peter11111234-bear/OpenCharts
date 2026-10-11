@@ -31,7 +31,7 @@ import {
 // registry itself is chunk-BZQM2XO7.js, shared via plugin's re-export.
 // IndicatorHandle only re-exports from the root barrel; a type-only import is
 // erased at compile time, so this cannot duplicate the contribution registry.
-import type { IndicatorHandle } from "@luxalgo/vela";
+import type { IndicatorHandle, SerializedDrawing } from "@luxalgo/vela";
 import { svg16 } from "@luxalgo/vela/ui";
 import type { WorkspaceWidgetContext } from "@luxalgo/vela/workspace";
 import {
@@ -100,6 +100,16 @@ const PINE_CSS = `
 .vela-pine-scriptmore{background:none;border:0;color:#8b8f9c;font-size:14px;cursor:pointer;padding:0 6px}
 .vela-pine-scriptmore:hover{color:#fff}
 .vela-pine-onchart-del:hover{color:#ef5350}
+.vela-objtree{display:flex;flex-direction:column;height:100%;overflow:auto;background:var(--vela-bg,#1e222d);color:var(--vela-fg,#d1d4dc);font:12px/1.5 sans-serif;padding:4px 0}
+.vela-objtree-group{color:#787b86;font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:8px 12px 3px}
+.vela-objtree-row{display:flex;align-items:center;gap:6px;padding:4px 8px;margin:0 4px;border-radius:4px;cursor:pointer}
+.vela-objtree-row:hover{background:#2a2e39}
+.vela-objtree-row.off .vela-objtree-name{color:#5d606b}
+.vela-objtree-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vela-objtree-id{color:#565a68;font-size:10px}
+.vela-objtree-btn{display:flex;align-items:center;background:none;border:0;color:#8b8f9c;cursor:pointer;padding:2px 3px;border-radius:3px;line-height:1}
+.vela-objtree-btn:hover{color:#fff;background:#363c4e}
+.vela-objtree-empty{color:#565a68;padding:4px 12px;font-size:11px}
 `;
 {
   const style = document.createElement("style");
@@ -386,6 +396,7 @@ registerLegendAction({
 // vertical (⋮); TV uses horizontal "..." so register our own.
 registerIcon("more-h", svg16('<circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/>', 'fill="currentColor" stroke="none"'));
 registerIcon("edit", svg16('<path d="M11.5 3.5 12.7 4.7a1 1 0 0 1 0 1.4l-8.2 8.2-2.8.7.7-2.8 8.2-8.2a1 1 0 0 1 1.4 0Z"/>'));
+registerIcon("objtree", svg16('<path d="M2.5 3.5h4M4 3.5v7a2 2 0 0 0 2 2h5"/><circle cx="9" cy="3.5" r="1.5"/><circle cx="13.5" cy="12.5" r="1.5"/>'));
 // Legend ⋯ (more) — a legend-row action at the END of the hover controls
 // (eye / move / edit / ⋯ / ✕). The callout API renders an always-visible
 // bubble instead, which floats OVER the controls — wrong slot. So this is a
@@ -464,7 +475,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
   const openPoint = { x: lastPointer.x, y: lastPointer.y };
   const doc = ctx.host.ownerDocument;
 
-  type Item = { label: string; disabled?: boolean; primary?: boolean; sep?: boolean; run?: () => void };
+  type Item = { label: string; disabled?: boolean; primary?: boolean; sep?: boolean; sub?: (anchorBtn: HTMLElement) => void; run?: () => void };
   const isPine = typeof ind.source === 'string' && ind.source.length > 0;
   const items: Item[] = [
     { label: `為 ${ind.title} 新增快訊…`, disabled: true },
@@ -507,7 +518,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     { label: '', sep: true },
     { label: '視覺順序', disabled: true },
     { label: '時間週期的可見性', disabled: true },
-    { label: '移動到', disabled: true },
+    { label: '移動到 ▸', sub: (btn) => openMoveSubMenu(btn) },
     { label: '固定至刻度', disabled: true },
     { label: '', sep: true },
     isPine
@@ -527,7 +538,12 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     { label: '隱藏', run: () => { chartForIndicator(ctx, ind, openPoint).indicators().find(x => x.id === ind.id)?.setVisible(false); } },
     { label: '移除', run: () => { chartForIndicator(ctx, ind, openPoint).indicators().find(x => x.id === ind.id)?.remove(); } },
     { label: '', sep: true },
-    { label: '物件樹', disabled: true },
+    { label: '物件樹', run: () => {
+        // Stash the row's owning chart — the panel's mount ctx is the ACTIVE
+        // cell, but the ⋯ row can live on another cell's legend.
+        objTreeChart = chartForIndicator(ctx, ind, openPoint);
+        ctx.togglePanel?.(OBJTREE_PANEL_ID, true);
+      } },
     { label: '', sep: true },
     { label: '設定…', run: () => {
         const renderer = chartForIndicator(ctx, ind, openPoint).renderer;
@@ -542,6 +558,66 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     'border:1px solid #363c4e;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.5);' +
     'font:12px/1.5 -apple-system,"Segoe UI",sans-serif;color:#d5d8e0;user-select:none;';
 
+  // ── '移動到 ▸' second-level menu ── appended INSIDE `menu` so the same
+  // dismiss machinery covers it: menu.contains() sees submenu clicks, and
+  // closeMoreMenu() removes the whole subtree. Anchors to the right of the
+  // parent item's rect; flips left when it would clip the viewport edge.
+  let subMenuEl: HTMLElement | null = null;
+  const closeSubMenu = () => { subMenuEl?.remove(); subMenuEl = null; };
+
+  function openMoveSubMenu(anchorBtn: HTMLElement): void {
+    closeSubMenu();
+    const chart = chartForIndicator(ctx, ind, openPoint);
+    const handle = chart.indicators().find(x => x.id === ind.id);
+    if (!handle?.moveTo) return;
+    const h = handle;
+    // PaneInfo carries no title — Pane.id is an engine id, not display text.
+    // Label a study pane by its first indicator's title, else its order.
+    // (PaneInfo isn't re-exported by the package — declare the consumed shape.)
+    type PaneRow = { id: string; kind: 'price' | 'study'; order: number; indicators: readonly { id: string; title: string }[] };
+    let panes: PaneRow[] = [];
+    try { panes = chart.panes.list(); } catch { /* renderer without pane mgmt */ }
+    const cur = panes.find(p => p.indicators.some(x => x.id === ind.id));
+    type Entry = { label: string; current?: boolean; run?: () => void };
+    const entries: Entry[] = [
+      { label: '價格窗格', current: cur?.kind === 'price', run: () => h.moveTo('price') },
+      { label: '新窗格', run: () => h.moveTo({ newPane: true }) },
+      ...panes.filter(p => p.kind !== 'price').map(p => ({
+        label: p.indicators[0]?.title ?? `窗格 ${p.order}`,
+        current: cur?.id === p.id,
+        run: () => h.moveTo({ pane: p.id }),
+      })),
+    ];
+    const sub = doc.createElement('div');
+    sub.style.cssText =
+      'position:fixed;z-index:10002;min-width:160px;padding:4px;background:#1e222d;' +
+      'border:1px solid #363c4e;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.5);' +
+      'font:12px/1.5 -apple-system,"Segoe UI",sans-serif;color:#d5d8e0;user-select:none;';
+    for (const e of entries) {
+      const b = doc.createElement('button');
+      b.textContent = (e.current ? '✓ ' : '') + e.label;
+      b.style.cssText =
+        'display:block;width:100%;text-align:left;padding:5px 12px;border:0;border-radius:4px;' +
+        'background:transparent;color:' + (e.current ? '#5d606b' : '#d5d8e0') + ';' +
+        'font:inherit;cursor:' + (e.current ? 'default' : 'pointer');
+      if (!e.current) {
+        b.addEventListener('mouseenter', () => { b.style.background = '#2a2e39'; });
+        b.addEventListener('mouseleave', () => { b.style.background = 'transparent'; });
+        b.addEventListener('click', () => { closeMoreMenu(); e.run?.(); });
+      }
+      sub.appendChild(b);
+    }
+    menu.appendChild(sub); // inside the parent: dismissal + teardown ride along
+    const pr = anchorBtn.getBoundingClientRect();
+    const vw = doc.defaultView?.innerWidth ?? 1280;
+    const vh = doc.defaultView?.innerHeight ?? 720;
+    const sw = sub.offsetWidth, sh = sub.offsetHeight;
+    const left = pr.right + 2 + sw > vw ? Math.max(8, pr.left - 2 - sw) : pr.right + 2;
+    sub.style.left = left + 'px';
+    sub.style.top = Math.max(8, Math.min(pr.top, vh - sh - 8)) + 'px';
+    subMenuEl = sub;
+  }
+
   for (const it of items) {
     if (it.sep) {
       const hr = doc.createElement('div');
@@ -555,10 +631,15 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
       'display:block;width:100%;text-align:left;padding:5px 12px;border:0;border-radius:4px;' +
       'background:transparent;color:' + (it.disabled ? '#5d606b' : it.primary ? '#2962ff' : '#d5d8e0') + ';' +
       'font:inherit;cursor:' + (it.disabled ? 'default' : 'pointer');
+    b.addEventListener('mouseenter', () => {
+      if (it.sub) { b.style.background = '#2a2e39'; it.sub(b); }
+      else { closeSubMenu(); if (!it.disabled) b.style.background = '#2a2e39'; }
+    });
     if (!it.disabled) {
-      b.addEventListener('mouseenter', () => { b.style.background = '#2a2e39'; });
       b.addEventListener('mouseleave', () => { b.style.background = 'transparent'; });
-      b.addEventListener('click', () => { closeMoreMenu(); it.run?.(); });
+      // A submenu parent keeps the menu open (hover reveals the flyout;
+      // click re-arms it). Every other item closes the whole menu on click.
+      b.addEventListener('click', () => { if (it.sub) it.sub(b); else { closeMoreMenu(); it.run?.(); } });
     }
     menu.appendChild(b);
   }
@@ -1371,6 +1452,157 @@ registerSidePanel({
       },
     };
   },
+});
+
+// ── Object tree panel (legend ⋯ → 物件樹; TV parity: "Object tree") ──
+// A contributed side panel listing the owning chart's indicators and user
+// drawings — flat grouped list (TV nests drawings under panes; keep it simple).
+// `objTreeChart` carries a one-shot override from the legend opener: without
+// it mount would bind the ACTIVE cell, but a ⋯ menu can belong to another
+// cell. Mount consumes the override, then onChart re-follows the active cell.
+const OBJTREE_PANEL_ID = "opencharts.objtree";
+let objTreeChart: WidgetContext['chart'] | null = null;
+const OT_EYE = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2"/></svg>';
+const OT_EYE_OFF = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3 3l10 10M6.8 4.2A7 7 0 0 1 8 4c4.1 0 6.5 4 6.5 4a15 15 0 0 1-2.3 2.7M9.6 11.7A7 7 0 0 1 8 12c-4.1 0-6.5-4-6.5-4a15 15 0 0 1 2-2.4"/></svg>';
+const OT_GEAR = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4"/></svg>';
+const OT_TRASH = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2.5 4.5h11M6.5 4.5v-1a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1M4.5 4.5l.7 8a1 1 0 0 0 1 .9h3.6a1 1 0 0 0 1-.9l.7-8"/></svg>';
+
+function mountObjectTree(ctx: WidgetContext, body: HTMLElement): { onChart(c: WidgetContext['chart']): void; destroy(): void } {
+  const doc = ctx.host.ownerDocument;
+  let chart = ctx.chart;
+  let unsubs: (() => void)[] = [];
+
+  const root = doc.createElement("div");
+  root.className = "vela-objtree";
+  body.appendChild(root);
+
+  const mkBtn = (title: string, svg: string, onClick: () => void): HTMLButtonElement => {
+    const b = doc.createElement("button");
+    b.type = "button";
+    b.className = "vela-objtree-btn";
+    b.title = title;
+    b.setAttribute("aria-label", title);
+    b.innerHTML = svg;
+    b.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
+    return b;
+  };
+
+  const refresh = () => { if (root.isConnected) rebuild(); };
+
+  function bind(c: WidgetContext['chart']): void {
+    chart = c;
+    for (const u of unsubs) u();
+    unsubs = [];
+    // Rebuild on every object-tree-relevant mutation so external edits (in-chart
+    // deletes, legend eye toggles, pane merges) stay reflected without polling.
+    for (const ev of [
+      "indicator:added", "indicator:removed", "indicator:moved", "indicator:visibility",
+      "pane:changed", "pane:moved",
+      "drawing:created", "drawing:removed", "drawing:edited",
+    ] as const) {
+      unsubs.push(chart.on(ev, refresh));
+    }
+    rebuild();
+  }
+
+  function rebuild(): void {
+    root.textContent = "";
+    const group = (label: string): void => {
+      const g = doc.createElement("div");
+      g.className = "vela-objtree-group";
+      g.textContent = label;
+      root.appendChild(g);
+    };
+    const empty = (label: string): void => {
+      const d = doc.createElement("div");
+      d.className = "vela-objtree-empty";
+      d.textContent = label;
+      root.appendChild(d);
+    };
+    const row = (name: string, meta: string | null): HTMLElement => {
+      const r = doc.createElement("div");
+      r.className = "vela-objtree-row";
+      const n = doc.createElement("span");
+      n.className = "vela-objtree-name";
+      n.textContent = name;
+      r.appendChild(n);
+      if (meta) {
+        const m = doc.createElement("span");
+        m.className = "vela-objtree-id";
+        m.textContent = meta;
+        r.appendChild(m);
+      }
+      return r;
+    };
+
+    // ── 指標 ── eye → setVisible, gear → renderer settings dialog, ✕ → remove
+    group("指標");
+    let handles: IndicatorHandle[] = [];
+    try { handles = chart.indicators(); } catch { /* disposed cell */ }
+    if (!handles.length) empty("無指標");
+    for (const h of handles) {
+      const r = row(h.title, null);
+      if (!h.visible) r.classList.add("off");
+      r.title = h.id;
+      r.addEventListener("click", () => {
+        if (chart.renderer.supportsIndicatorSettings) chart.renderer.openIndicatorSettings(h.id);
+      });
+      r.appendChild(mkBtn(h.visible ? "隱藏" : "顯示", h.visible ? OT_EYE : OT_EYE_OFF, () => {
+        try { h.setVisible(!h.visible); } catch { /* gone */ }
+        rebuild();
+      }));
+      r.appendChild(mkBtn("設定…", OT_GEAR, () => {
+        if (chart.renderer.supportsIndicatorSettings) chart.renderer.openIndicatorSettings(h.id);
+      }));
+      r.appendChild(mkBtn("移除", OT_TRASH, () => {
+        try { h.remove(); } catch { /* gone */ }
+        rebuild();
+      }));
+      root.appendChild(r);
+    }
+
+    // ── 繪圖 ── row click selects + opens settings; eye → show, ✕ → remove
+    group("繪圖");
+    let drawings: SerializedDrawing[] = [];
+    try { drawings = chart.drawings.all(); } catch { /* disposed cell */ }
+    if (!drawings.length) empty("無繪圖");
+    for (const d of drawings) {
+      const r = row(d.type, `…${d.id.slice(-4)}`);
+      if (!d.visible) r.classList.add("off");
+      r.title = d.id;
+      r.addEventListener("click", () => {
+        try { chart.drawings.select([d.id]); chart.drawings.openSettings(d.id); }
+        catch { /* gone */ }
+      });
+      r.appendChild(mkBtn(d.visible ? "隱藏" : "顯示", d.visible ? OT_EYE : OT_EYE_OFF, () => {
+        try { chart.drawings.show(d.id, !d.visible); } catch { /* gone */ }
+        rebuild();
+      }));
+      r.appendChild(mkBtn("移除", OT_TRASH, () => {
+        try { chart.drawings.remove(d.id); } catch { /* gone */ }
+        rebuild();
+      }));
+      root.appendChild(r);
+    }
+  }
+
+  bind(objTreeChart ?? chart); // consume the legend-opener override if set
+  objTreeChart = null;
+  return {
+    // Rebind to the cell's chart whenever the active cell changes.
+    onChart(c) { bind(c); },
+    destroy() { for (const u of unsubs) u(); unsubs = []; },
+  };
+}
+
+registerSidePanel({
+  id: OBJTREE_PANEL_ID,
+  title: "物件樹",
+  icon: "objtree",
+  width: 280,
+  resizable: true,
+  minWidth: 220,
+  mount(ctx, body) { return mountObjectTree(ctx, body); },
 });
 registerWidgetAttachment({
   id: "opencharts.pine-rail",
