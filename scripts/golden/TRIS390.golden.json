@@ -17704,7 +17704,6 @@
         "text": "4H\nO:110.12\nH:111.82\nL:84.31\nC:86.49",
         "textalign": "text.align_left",
         "textcolor": "#FFFFFF",
-        "tooltip": null,
         "x": 1816200000,
         "xloc": "xloc.bar_time",
         "y": 111.820713,

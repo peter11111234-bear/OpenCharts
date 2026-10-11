@@ -205,12 +205,17 @@ const PROP_TABLES: Record<string, Record<string, PropType>> = {
     frame_color: 'str', frame_width: 'num',
   },
 };
+// NOTE: 'xloc' setters generated here for line/label/box are OVERWRITTEN later
+// by hand-rolled set_xloc (TV multi-arg signature writes coords too). The
+// override depends on registration order — keep table entries as-is.
 
 for (const [kind, table] of Object.entries(PROP_TABLES)) {
   for (const [prop, t] of Object.entries(table)) {
     registerBuiltin(kind, `set_${prop}`, (c, args, named) => {
       const bound = bindArgs(args, named, [kind, prop] as const);
-      const obj = asObj(bound.get(kind));
+      // TV names the object arg `id` (line/label/box) or `table_id` — accept
+      // all spellings so named calls don't silently no-op.
+      const obj = asObj(bound.get(kind) ?? bound.get('id') ?? bound.get(`${kind}_id`));
       if (obj) {
         const p = { [prop]: coerceIn(bound.get(prop), t) };
         drawSink(c as RtCtx).update(obj, p);
@@ -313,7 +318,8 @@ registerBuiltin('label', 'new', (c, args, named) => {
   const bound = bindArgs(args, named, [
     'x', 'y', 'text', 'xloc', 'yloc', 'color', 'style',
     'textcolor', 'size', 'textalign', 'tooltip',
-    'text_font_family', 'text_formatting', 'force_overlay',
+    // Upstream order: text_font_family, force_overlay, text_formatting.
+    'text_font_family', 'force_overlay', 'text_formatting',
   ] as const);
   const props: Record<string, unknown> = {
     x: numArg(bound, 'x', 0), y: numArg(bound, 'y', 0),
@@ -325,10 +331,10 @@ registerBuiltin('label', 'new', (c, args, named) => {
     textcolor: colorArg(bound, 'textcolor'),
     size: strArg(bound, 'size', 'size.normal'),
     textalign: strArg(bound, 'textalign', 'text.align_left'),
-    tooltip: bound.has('tooltip') ? strArg(bound, 'tooltip', '') : undefined,
   };
   // Stored-only fields (no downstream reader yet) and constructor-only
   // force_overlay — omit keys when unset; `undefined` diffs against goldens.
+  if (bound.has('tooltip')) props.tooltip = strArg(bound, 'tooltip', '');
   if (bound.has('text_font_family')) props.text_font_family = strArg(bound, 'text_font_family', 'font.family_default');
   if (bound.has('text_formatting')) props.text_formatting = strArg(bound, 'text_formatting', 'format.none');
   if (bound.has('force_overlay')) props.force_overlay = boolArg(bound, 'force_overlay', false);
@@ -376,7 +382,9 @@ registerBuiltin('box', 'new', (c, args, named) => {
     'left', 'top', 'right', 'bottom', 'xloc', 'extend', 'border_color',
     'border_width', 'border_style', 'bgcolor', 'text', 'text_size',
     'text_color', 'text_halign', 'text_valign', 'text_wrap',
-    'text_font_family', 'text_formatting', 'force_overlay',
+    // Upstream ends: text_font_family, force_overlay — box.new has NO
+    // text_formatting ctor param (set_text_formatting accessor only).
+    'text_font_family', 'force_overlay',
   ] as const);
   const props: Record<string, unknown> = {
     left: numArg(bound, 'left', 0), top: numArg(bound, 'top', 0),
@@ -395,7 +403,6 @@ registerBuiltin('box', 'new', (c, args, named) => {
     text_wrap: strArg(bound, 'text_wrap', 'text.wrap_none'),
   };
   if (bound.has('text_font_family')) props.text_font_family = strArg(bound, 'text_font_family', 'font.family_default');
-  if (bound.has('text_formatting')) props.text_formatting = strArg(bound, 'text_formatting', 'format.none');
   if (bound.has('force_overlay')) props.force_overlay = boolArg(bound, 'force_overlay', false);
   const obj = created(ctx, 'box', props);
   return { kind: 'box', v: obj };
@@ -467,8 +474,9 @@ registerBuiltin('table', 'new', (c, args, named) => {
   ] as const);
   const props: Record<string, unknown> = {
     position: strArg(bound, 'position', 'position.top_center'),
-    columns: numArg(bound, 'columns', 1),
-    rows: numArg(bound, 'rows', 1),
+    // Clamp grid size — engine allocates columns×rows eagerly.
+    columns: Math.max(0, Math.min(100, Math.trunc(numArg(bound, 'columns', 1)))),
+    rows: Math.max(0, Math.min(100, Math.trunc(numArg(bound, 'rows', 1)))),
     bgcolor: colorArg(bound, 'bgcolor'),
     frame_color: colorArg(bound, 'frame_color'),
     frame_width: numArg(bound, 'frame_width', 0),
@@ -488,8 +496,9 @@ registerBuiltin('table', 'cell', (c, args, named) => {
   ] as const);
   const obj = asObj(bound.get('table_id') ?? bound.get('table'));
   if (!obj) return { kind: 'void' };
-  const col = numArg(bound, 'column', 0);
-  const row = numArg(bound, 'row', 0);
+  const col = Math.trunc(numArg(bound, 'column', 0));
+  const row = Math.trunc(numArg(bound, 'row', 0));
+  if (col < 0 || row < 0) return { kind: 'void' }; // no negative-cell dead entries
   const cell: CellProps = { text: strArg(bound, 'text', '') };
   const textColor = colorArg(bound, 'text_color');
   if (textColor !== undefined) cell.text_color = textColor;
@@ -551,9 +560,10 @@ const cellSetter = (key: string, coerce: (v: Value) => unknown) =>
     const bound = bindArgs(args, named, ['table_id', 'column', 'row', key] as const);
     const obj = asObj(bound.get('table_id') ?? bound.get('table'));
     if (!obj) return { kind: 'void' };
-    const col = numArg(bound, 'column', 0), row = numArg(bound, 'row', 0);
+    const col = Math.trunc(numArg(bound, 'column', 0)), row = Math.trunc(numArg(bound, 'row', 0));
+    if (col < 0 || row < 0) return { kind: 'void' }; // out-of-grid write: no dead cell
     const cell = cellsOf(obj).get(`${col},${row}`) ?? { text: '' };
-    (cell as Record<string, unknown>)[key] = coerce(bound.get(key)!);
+    (cell as Record<string, unknown>)[key] = coerce(bound.get(key) ?? NA);
     cellsOf(obj).set(`${col},${row}`, cell);
     drawSink(c as RtCtx).update(obj, {});
     return { kind: 'void' };
@@ -615,13 +625,16 @@ registerBuiltin('chart.point', 'now', (c, args, named) => {
 });
 registerBuiltin('chart.point', 'copy', (_c, args) => {
   const p = unwrapped(args[0]);
-  if (p?.kind !== 'udt') return NA;
+  // Reject non-chart.point udt — copying Foo{time,index,price} must not
+  // launder a foreign type into a genuine chart.point.
+  if (p?.kind !== 'udt' || p.v.typeName !== 'chart.point') return NA;
   return chartPoint(p.v.fields.get('time'), p.v.fields.get('index'), p.v.fields.get('price'));
 });
 
-/** chart.point udt → {x,y} pair honoring the polyline's xloc. */
+/** chart.point udt → {x,y} pair honoring the drawing's xloc. Rejects other
+ *  UDTs — a Foo{index,price} is not a chart.point (review: typeName check). */
 const pointXY = (p: Value | undefined, xloc: string): { x: number; y: number } | undefined => {
-  if (p?.kind !== 'udt') return undefined;
+  if (p?.kind !== 'udt' || p.v.typeName !== 'chart.point') return undefined;
   const num = (k: string): number | undefined => {
     const v = p.v.fields.get(k);
     return v !== undefined && (v.kind === 'int' || v.kind === 'float') ? v.v : undefined;

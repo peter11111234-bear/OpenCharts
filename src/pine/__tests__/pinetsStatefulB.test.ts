@@ -317,6 +317,22 @@ describe('pivot_point_levels', () => {
     expect(numv(at39.v[0]!)).toBeCloseTo(p, 6);
   });
 
+  it('Woodie: levels use the NEW period open at anchor (upstream line 98)', () => {
+    const res = runPivots('Woodie', 20);
+    // At bar 20 (anchor): period from bars 0..19 ends; Woodie pivot
+    // wp = (h + l + 2*open_new)/4 where open_new = WAVY[20].open.
+    const at20 = res[20]!;
+    if (at20.kind !== 'array') throw new Error('not array');
+    const win = WAVY.slice(0, 20);
+    const hh = Math.max(...win.map(b => b.high));
+    const ll = Math.min(...win.map(b => b.low));
+    const wp = (hh + ll + 2 * WAVY[20]!.open) / 4;
+    expect(numv(at20.v[0]!)).toBeCloseTo(wp, 6);
+    // Guard against regression to period.open (WAVY[0].open=100):
+    const wpWrong = (hh + ll + 2 * WAVY[0]!.open) / 4;
+    expect(Math.abs(numv(at20.v[0]!) - wpWrong)).toBeGreaterThan(1e-9);
+  });
+
   it('developing=true: levels update bar-by-bar inside the period', () => {
     const res = runPivots('Traditional', 20, true);
     // bar 0: period = bar 0 alone → P = (h+l+c)/3 of bar 0

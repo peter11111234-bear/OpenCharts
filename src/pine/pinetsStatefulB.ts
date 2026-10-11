@@ -1,6 +1,6 @@
 // ── PineTS ported ta methods — STATEFUL B tier ───────────────────────────────
-// 21 methods: max, mfi, min, nvi, obv, pvi, pvt, range, rci, rising, rma, roc,
-// sar, stoch, swma, tsi, valuewhen, vwap, wad, wma, wpr.
+// 22 methods: max, mfi, min, nvi, obv, pivot_point_levels, pvi, pvt, range,
+// rci, rising, rma, roc, sar, stoch, swma, tsi, valuewhen, vwap, wad, wma, wpr.
 // Bodies are verbatim-adapted from pinets-src (AGPL-3.0-only); `Source:` comments
 // carry the upstream path. Series = PtSeries; state via context.taState with the
 // committed/tentative + lastIdx pattern.
@@ -1665,6 +1665,8 @@ function ptWpr(context: PineTsCtx) {
 type PtPivotPeriod = { open: number; high: number; low: number; close: number };
 
 const PIVOT_TYPES = ['Traditional', 'Fibonacci', 'Woodie', 'Classic', 'DM', 'Camarilla'];
+// Array order matches upstream's declaration; the error message's enumeration
+// order (sorted) is upstream-canonical too — kept verbatim on purpose.
 
 function pivotLevelsOf(type: string, { high: h, low: l, close: c }: PtPivotPeriod, open: number): number[] {
     const range = h - l;
@@ -1744,10 +1746,11 @@ function ptPivotPointLevels(context: PineTsCtx) {
         let period: PtPivotPeriod | null = state.prev.period;
         let levels: number[] | null = state.prev.levels;
         if (anchor || !period) {
+            // The period that just ended fixes the levels shown in the new one.
+            // Woodie takes the open of the NEW period (bar.open) — upstream
+            // line 98, verbatim (review fix: was !developing-gated + old open).
+            if (anchor && period) levels = pivotLevelsOf(type, period, type === 'Woodie' ? bar.open : period.open);
             period = { ...bar };
-            if (!developing && anchor && state.prev.period) {
-                levels = pivotLevelsOf(type, state.prev.period, state.prev.period.open);
-            }
         } else {
             period = { open: period.open, high: Math.max(period.high, bar.high), low: Math.min(period.low, bar.low), close: bar.close };
         }

@@ -1279,7 +1279,7 @@ reg('kcw', (ctx, a, n) => {
   const bar = ctx.barIndex;
   const base = basis.get(bar), r = rng.get(bar);
   if (base === undefined || r === undefined) return NA;
-  return fl(base === 0 ? NaN : (2 * r * mult) / base);
+  return fl(base === 0 ? 0 : (2 * r * mult) / base); // upstream returns precision(0) on zero basis
 });
 
 // ── fisher transform ─────────────────────────────────────────────────────────
