@@ -1,6 +1,9 @@
 // ── pinetsStatefulB (B3) tests ──────────────────────────────────────────────
 // Tier: max, mfi, min, nvi, obv, pvi, pvt, range, rci, rising, rma, roc, sar,
 // stoch, swma, tsi, valuewhen, vwap, wad, wma, wpr (21 methods).
+//   pivot_point_levels — ported here (22nd); no builtin counterpart. PineArrayObject
+//   return becomes a plain number[] → Pine array Value (facade `toValue` handles it);
+//   that WAS the "facade lacks array type" blocker — plain JS arrays round-trip.
 //
 // registerPortedTa() OVERWRITES the 16 colliding production builtins for this
 // file (registerBuiltin is a Map.set) — originals captured first, restored
@@ -266,5 +269,80 @@ describe('pinetsStatefulB new methods (no builtin — smoke)', () => {
         WAVY[i - 2]!.close > WAVY[i - 3]!.close;
       expect(numv(vals[i]!)).toBe(expectUp ? 1 : 0);
     }
+  });
+});
+
+describe('pivot_point_levels', () => {
+  /** anchor=true only on bar `start`: period accumulates until next anchor;
+   *  levels freeze from the PREVIOUS completed period (developing=false). */
+  function runPivots(type: string, anchorEvery: number, developing = false): Value[] {
+    const ctx = newCtx(WAVY);
+    const anchorSeries = new Series();
+    const out: Value[] = [];
+    for (let i = 0; i < WAVY.length; i++) {
+      pushBar(ctx, WAVY[i]!, i);
+      anchorSeries.set({ kind: 'bool', v: i > 0 && i % anchorEvery === 0 });
+      out.push(BUILTINS.get('ta.pivot_point_levels')!(ctx, [
+        { kind: 'string', v: type }, { kind: 'series', v: anchorSeries },
+        { kind: 'bool', v: developing },
+      ], {}));
+    }
+    return out;
+  }
+
+  it('Traditional: na before first anchor completes, 11 levels after', () => {
+    const res = runPivots('Traditional', 20);
+    // anchor at bar 20 → levels from bars 0–19 land on bar 20 itself
+    for (let i = 0; i < 20; i++) {
+      const a = res[i]!;
+      if (a.kind !== 'array') throw new Error(`bar ${i} not array`);
+      for (const e of a.v) expect(e!.kind).toBe('na');
+    }
+    const at20 = res[20]!;
+    if (at20.kind !== 'array') throw new Error('not array');
+    expect(at20.v).toHaveLength(11);
+    const nums = at20.v.map(numv);
+    // P = (h+l+c)/3 over bars 0..19; h=high of that window etc.
+    const win = WAVY.slice(0, 20);
+    const hh = Math.max(...win.map(b => b.high));
+    const ll = Math.min(...win.map(b => b.low));
+    const cc = WAVY[19]!.close;
+    const p = (hh + ll + cc) / 3;
+    expect(nums[0]).toBeCloseTo(p, 6);
+    expect(nums[1]).toBeCloseTo(p * 2 - ll, 6);  // R1 = 2P - L
+    expect(nums[2]).toBeCloseTo(p * 2 - hh, 6);  // S1 = 2P - H
+    // levels freeze until next anchor (bar 40)
+    const at39 = res[39]!;
+    if (at39.kind !== 'array') throw new Error('not array');
+    expect(numv(at39.v[0]!)).toBeCloseTo(p, 6);
+  });
+
+  it('developing=true: levels update bar-by-bar inside the period', () => {
+    const res = runPivots('Traditional', 20, true);
+    // bar 0: period = bar 0 alone → P = (h+l+c)/3 of bar 0
+    const b0 = res[0]!;
+    if (b0.kind !== 'array') throw new Error('not array');
+    const p0 = (WAVY[0]!.high + WAVY[0]!.low + WAVY[0]!.close) / 3;
+    expect(numv(b0.v[0]!)).toBeCloseTo(p0, 6);
+    // bar 19: period = bars 0..19 accumulated
+    const b19 = res[19]!;
+    if (b19.kind !== 'array') throw new Error('not array');
+    const win = WAVY.slice(0, 20);
+    const hh = Math.max(...win.map(b => b.high));
+    const ll = Math.min(...win.map(b => b.low));
+    const p = (hh + ll + WAVY[19]!.close) / 3;
+    expect(numv(b19.v[0]!)).toBeCloseTo(p, 6);
+  });
+
+  it('invalid type + Woodie developing throw PineRuntimeError', () => {
+    const ctx = newCtx(WAVY);
+    pushBar(ctx, WAVY[0]!, 0);
+    const boolV = (x: boolean): Value => ({ kind: 'bool', v: x });
+    expect(() => BUILTINS.get('ta.pivot_point_levels')!(ctx, [
+      { kind: 'string', v: 'Bogus' }, boolV(true), boolV(false),
+    ], {})).toThrow(/Invalid argument/);
+    expect(() => BUILTINS.get('ta.pivot_point_levels')!(ctx, [
+      { kind: 'string', v: 'Woodie' }, boolV(true), boolV(true),
+    ], {})).toThrow(/Woodie/);
   });
 });

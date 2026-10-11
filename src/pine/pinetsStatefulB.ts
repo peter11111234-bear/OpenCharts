@@ -20,6 +20,7 @@ import {
   type PtFactory,
   type PtSlice,
 } from './pinetsShim';
+import { PineRuntimeError } from './errors';
 
 // Source: pinets-src/src/namespaces/ta/utils/nonNaWindow.ts:3
 const isNa = (v: unknown): boolean => v === null || v === undefined || (typeof v === 'number' && Number.isNaN(v));
@@ -1657,11 +1658,114 @@ function ptWpr(context: PineTsCtx) {
     return context.precision(wpr);
   };
 }
+// Source: pinets-src/src/namespaces/ta/methods/pivot_point_levels.ts:1-112
+// (verbatim body; PineArrayObject return becomes a plain number[] — toValue
+// wraps it into a Pine {kind:'array'} Value; upstream PineRuntimeError ctor
+// takes (msg, fnName) — ours takes (msg), so fn name is inlined into msg).
+type PtPivotPeriod = { open: number; high: number; low: number; close: number };
+
+const PIVOT_TYPES = ['Traditional', 'Fibonacci', 'Woodie', 'Classic', 'DM', 'Camarilla'];
+
+function pivotLevelsOf(type: string, { high: h, low: l, close: c }: PtPivotPeriod, open: number): number[] {
+    const range = h - l;
+    const p = (h + l + c) / 3;
+    switch (type) {
+        case 'Traditional':
+            return [p, p * 2 - l, p * 2 - h, p + range, p - range, p * 2 + (h - 2 * l), p * 2 - (2 * h - l), p * 3 + (h - 3 * l), p * 3 - (3 * h - l), p * 4 + (h - 4 * l), p * 4 - (4 * h - l)];
+        case 'Fibonacci':
+            return [p, p + 0.382 * range, p - 0.382 * range, p + 0.618 * range, p - 0.618 * range, p + range, p - range, NaN, NaN, NaN, NaN];
+        case 'Woodie': {
+            const wp = (h + l + 2 * open) / 4;
+            const r3 = h + 2 * (wp - l);
+            const s3 = l - 2 * (h - wp);
+            return [wp, 2 * wp - l, 2 * wp - h, wp + range, wp - range, r3, s3, r3 + range, s3 - range, NaN, NaN];
+        }
+        case 'Classic':
+            return [p, 2 * p - l, 2 * p - h, p + range, p - range, p + 2 * range, p - 2 * range, p + 3 * range, p - 3 * range, NaN, NaN];
+        case 'DM': {
+            const x = c < open ? h + 2 * l + c : c > open ? 2 * h + l + c : h + l + 2 * c;
+            return [x / 4, x / 2 - l, x / 2 - h, NaN, NaN, NaN, NaN, NaN, NaN, NaN, NaN];
+        }
+        case 'Camarilla': {
+            const r5 = (h / l) * c;
+            return [p, c + (range * 1.1) / 12, c - (range * 1.1) / 12, c + (range * 1.1) / 6, c - (range * 1.1) / 6, c + (range * 1.1) / 4, c - (range * 1.1) / 4, c + (range * 1.1) / 2, c - (range * 1.1) / 2, r5, c - (r5 - c)];
+        }
+    }
+    return new Array(11).fill(NaN);
+}
+
+function ptPivotPointLevels(context: PineTsCtx) {
+    return (_type: unknown, _anchor: unknown, ...rest: unknown[]) => {
+        // The transpiler appends the call id after the optional `developing` argument.
+        const _callId: string | undefined = typeof rest[rest.length - 1] === 'string' ? rest.pop() as string : undefined;
+        const type = Series.from(_type).get(0) as string;
+        const anchor = Series.from(_anchor).get(0) === true;
+        const developing = rest.length > 0 && Series.from(rest[0]).get(0) === true;
+
+        if (!PIVOT_TYPES.includes(type)) {
+            throw new PineRuntimeError(
+                `ta.pivot_point_levels: Invalid argument '${type}' for 'type'. Possible values: ['Camarilla', 'Traditional', 'DM', 'Classic', 'Fibonacci', 'Woodie']`
+            );
+        }
+        if (developing && type === 'Woodie') {
+            throw new PineRuntimeError('ta.pivot_point_levels: `developing` cannot be `true` when `type` is "Woodie".');
+        }
+
+        if (!context.taState) context.taState = {};
+        const stateKey = _callId || `pivot_point_levels_${type}_${developing}`;
+        if (!context.taState[stateKey]) {
+            context.taState[stateKey] = {
+                lastIdx: -1,
+                // Committed state
+                prev: { period: null, levels: null },
+                // Tentative state
+                current: { period: null, levels: null },
+            };
+        }
+        const state = context.taState[stateKey] as {
+            lastIdx: number;
+            prev: { period: PtPivotPeriod | null; levels: number[] | null };
+            current: { period: PtPivotPeriod | null; levels: number[] | null };
+        };
+
+        // Commit logic
+        if (context.idx > state.lastIdx) {
+            if (state.lastIdx >= 0) state.prev = state.current;
+            state.lastIdx = context.idx;
+        }
+
+        const bar: PtPivotPeriod = {
+            open: Series.from(context.data.open).get(0) as number,
+            high: Series.from(context.data.high).get(0) as number,
+            low: Series.from(context.data.low).get(0) as number,
+            close: Series.from(context.data.close).get(0) as number,
+        };
+
+        let period: PtPivotPeriod | null = state.prev.period;
+        let levels: number[] | null = state.prev.levels;
+        if (anchor || !period) {
+            period = { ...bar };
+            if (!developing && anchor && state.prev.period) {
+                levels = pivotLevelsOf(type, state.prev.period, state.prev.period.open);
+            }
+        } else {
+            period = { open: period.open, high: Math.max(period.high, bar.high), low: Math.min(period.low, bar.low), close: bar.close };
+        }
+        state.current = { period, levels };
+
+        const out = developing ? pivotLevelsOf(type, period, period.open) : (levels ?? new Array(11).fill(NaN));
+        // toValue maps a number[] → Pine array Value; PineArrayObject is only a
+        // marker type upstream — a plain array round-trips identically.
+        return out.map((v) => context.precision(v) as number);
+    };
+}
+
 
 // ── Slice registration ──────────────────────────────────────────────────────
 // order = upstream positional param names (TV names where upstream uses _x).
 
 const SLICE: PtSlice = {
+  pivot_point_levels: { factory: ptPivotPointLevels as unknown as PtFactory, order: ['type', 'anchor', 'developing'] },
   max:       { factory: ptMax as unknown as PtFactory,       order: ['source'] },
   mfi:       { factory: ptMfi as unknown as PtFactory,       order: ['source', 'length'] },
   min:       { factory: ptMin as unknown as PtFactory,       order: ['source'] },
