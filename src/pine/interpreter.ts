@@ -241,6 +241,13 @@ class CowSeries extends ForwardingSeries {
     return this.cow ?? this.inner;
   }
 
+  /** Identity of the forwarded source — lets callers skip a rebind alloc
+   *  when the incoming arg is the same series object. */
+  get source(): Series { return this.inner; }
+
+  /** True once `:=` materialized a private copy (then seed() matters). */
+  get isDirty(): boolean { return this.cow !== null; }
+
   /** Rebind returns a NEW CowSeries sharing this one's materialized copy:
    * the `:=` history must survive the name's re-declaration, but an array
    * slot that captured THIS wrapper (evalExpr returns {kind:'series'} = the
@@ -1352,6 +1359,17 @@ function evalArg(a: Arg, frame: Frame, litFastPath = false): Value {
 /** Bind callsite args (named first, then positional) against a param list. */
 function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame): Value[] {
   const out: Value[] = new Array<Value>(params.length);
+  // Fast path: all-positional calls (the common case) skip the Set +
+  // positionals staging array — eval args straight into param order.
+  if (!callArgs.some(a => a.name !== undefined)) {
+    const n = Math.min(callArgs.length, params.length);
+    for (let i = 0; i < n; i++) out[i] = evalArg(callArgs[i]!, frame);
+    for (let i = n; i < params.length; i++) {
+      const d = params[i]!.default;
+      out[i] = d !== undefined ? evalExpr(d, frame) : NA;
+    }
+    return out;
+  }
   const filled = new Set<number>();
   const positionals: Arg[] = [];
   for (const a of callArgs) {
@@ -1404,13 +1422,16 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
         let byParam = run.paramCows.get(cowKey);
         if (!byParam) { byParam = new Map(); run.paramCows.set(cowKey, byParam); }
         let cow = byParam.get(p.name) as CowSeries | undefined;
-        if (!cow) { cow = new CowSeries(a.v); }
-        else { cow = cow.rebind(a.v); }
+        if (!cow) cow = new CowSeries(a.v);
+        // Skip the rebind alloc when the arg is the same series object —
+        // the stored cow already forwards to it.
+        else if (cow.source !== a.v) cow = cow.rebind(a.v);
         byParam.set(p.name, cow);
         // Pine re-binds params each invocation: seed this bar's slot with the
         // arg's current value so a previous bar's `:=` doesn't carry forward
-        // into this bar's reads (history stays bumped).
-        cow.seed(() => a.v.cur(), bar);
+        // into this bar's reads. Only build the thunk when a materialized
+        // copy exists — seed() is a no-op before the first `:=`.
+        if (cow.isDirty) cow.seed(() => a.v.cur(), bar);
         callScope.define(p.name, cow);
       } else {
         // No callNode (method dispatch via ctx.callUdf): seed a
@@ -2339,6 +2360,16 @@ function jitMatArgExpr(state: JitState, d: JitArg): Value {
 function bindArgsJit(state: JitState, run: RunState, ctx: BuiltinCtx,
                      callArgs: Arg[], ds: JitArg[], params: Param[]): Value[] {
   const out: Value[] = new Array<Value>(params.length);
+  // All-positional fast path: skip Set + positionals staging entirely.
+  if (!callArgs.some(a => a.name !== undefined)) {
+    const n = Math.min(callArgs.length, params.length);
+    for (let i = 0; i < n; i++) out[i] = jitMatArg(state, run, ctx, ds[i]!, false);
+    for (let i = n; i < params.length; i++) {
+      const dfl = params[i]!.default;
+      out[i] = dfl !== undefined ? evalExpr(dfl, state.cur) : NA;
+    }
+    return out;
+  }
   const filled = new Set<number>();
   const positionals: { a: Arg; d: JitArg }[] = [];
   callArgs.forEach((a, i) => {
