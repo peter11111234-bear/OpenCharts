@@ -501,7 +501,10 @@ function bindDeclared(
     // wrappers captured into arrays must keep their inner), and
     // non-persistent decls re-seed the shared copy with the current value —
     // `x = e` re-inits every bar, so a carried `:=` value must not survive.
-    trackSeries(run, v.v);
+    // trackSeries(run, v.v, 'alias'); — REMOVED R12: every alias target is
+    // already tracked by its own binding site or written every bar; tracking
+    // here registered per-bar-fresh LiftedSeries (nz/math.max/…) permanently,
+    // 24k entries → 83% no-op ensureBar calls.
     run.declSlots.set(key, v.v);
     run.declAliased.add(key);
     let cow = run.declCows.get(key);
