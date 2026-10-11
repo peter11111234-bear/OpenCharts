@@ -251,3 +251,8 @@
    elements, nz verbatim passthrough). Everything else reads .cur() at
    call time — callHist invisible to it. evalHistref's own call-site
    tracking covers x[n] on builtin RESULTS, so arg tracking was pure waste.
+ * R14b dead-ends (measured, do not retry): (a) ensureList caller-side
+ `currentBar !== bar` skip — interleaved in-process A/B on K4.55/935:
+ skip 11628 vs noskip 11586 (noise; ~5µs/bar theory vs 12ms base). Virtual-
+ call cost is too small to matter at 1358 calls/bar. (b) trim() inline
+ guard — same class, ~0.3% ceiling. Both reverted.
