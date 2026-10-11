@@ -132,3 +132,13 @@
     - Method 1 (transpile) — planned in a separate session; agnostic cache layer stays useful either way.
     - scratch/ kept tools: gate-rate.mjs (TRIS390 gate tuning), perf-probe.mjs (setAt/ensureBar counters), scratch_probe.test.ts (untracked CPU-profile harness, machine-local).
   * Suite state: 552 pass / 2 fail (the two golden fixture ENOENTs above).
+
+- 2026-10-11 VELA R9 — phase-3 menu + B3 pinets port (commits e004144→14e5691):
+  * Legend ⋯ (data-legend-action="pine-more") now TV-shaped: 移到 ▸ submenu (上移一層/下移一層/合併至 ▸ 列現有 pane via handle.moveTo({pane:id})), 物件樹 via registerSidePanel + objtree icon, 編輯入口保留. 固定至刻度/視覺順序 kept disabled — vela 無 indicator-scale-assign / z-order API (verified vs SDK .d.ts + charting-lib source).
+  * REA CDP: Chrome @9222 remote-debugging 接通, inspect_web_page + capture_browser_scenario 可用; analyze_web_bundle hits MCP 30s timeout on 335-script page — chunk 下載路線取代.
+  * B3 port: 68 ta methods from pinets-src into 4 tier files (stateless 15 / statefulA 24 / statefulB 21 / composite 4 + param), verbatim-adapted (any→unknown, taState typed). pinetsAll.ts aggregator orders slices so composite cross-calls (macd→ema, hma→wma, mom→change) bind REAL ports, not test stand-ins. registerPortedTa() opt-in; NOT default-on (builtins index.ts untouched).
+  * Divergences documented per-tier test headers: pinets SMA-seeds EMA windows (builtin emaVs seeds bar0), bbw ×100 scale, nvi/pvi seed 1.0 vs 1000, tsi [-1,1] vs ×100, sar seed bar1 vs bar0, pivothigh strict vs tie rules, nonNaWindow na-skip vs full-window. kcw name collision: ported = scalar width (pinets semantic), builtin = TV kcW tuple — canonical mapping deferred.
+  * pivot_point_levels BLOCKED: facade lacks Pine array type.
+  * Verify: 830 pass / 1 skip / 47 files; tsc clean on all touched files; live CDP confirm pine-more button renders on TRIS390 chart.
+  * Inventories (scout-produced, .scratch/): pinets-ta-inventory.md (68-method tiering), drawing-accessor-inventory.md (64 have / 10 trivial-add / 16 model-missing set_/get_ accessors — next port target).
+  * 代辦: (a) pinetsAll→builtins 上線切換 decision + kcw canonical naming; (b) drawing accessor 10 trivial-add + 16 model-missing (chart.point setters 優先 — reuse pointXY); (c) array type for facade → unblock pivot_point_levels; (d) REA Ghidra/Hopper env vars 未配 (JS/Web only today).
