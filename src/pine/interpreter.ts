@@ -140,13 +140,13 @@ interface RunState {
   callsiteSeq: number;
   /** Stack of active callsite ids (UDF nesting). Empty = top level. */
   siteStack: string[];
-  nodeIds: Map<object, number>;
-  nodeSeq: number;
-  /** Site-path trie: callsite string → … → nodeId number → stable key object
-   *  for declSlots/callHist/tupleKeys. Replaces join('|') string keys —
-   *  callsite strings ('#N') and nodeId numbers live in separate key spaces,
-   *  so a leaf map can mix both without collision. */
+  /** Site-path trie: callsite string → … → node → stable key object for
+   *  declSlots/callHist/tupleKeys. Root map keyed by callsite string. */
   siteTrie: Map<unknown, unknown>;
+  /** Parallel to siteStack: siteCtx[i] is the trie node reached after
+   *  siteStack[0..i] — maintained on push/pop so siteKey() is one Map.get
+   *  instead of a depth+2 trie walk. */
+  siteCtx: Map<unknown, unknown>[];
   warned: Set<string>;
   /** Top-level frame of the current bar (ctx.callUdf re-enters here). */
   topFrame: Frame | null;
@@ -181,9 +181,8 @@ function runOf(ctx: BuiltinCtx): RunState {
       callsites: new Map(),
       callsiteSeq: 0,
       siteStack: [],
-      nodeIds: new Map(),
-      nodeSeq: 0,
       siteTrie: new Map(),
+      siteCtx: [],
       warned: new Set(),
       topFrame: null,
       misc: new Map(),
@@ -337,22 +336,22 @@ export function pineStr(v: Value): string {
  * same AST node is shared across callsites, so compose with the site path.
  */
 function siteKey(run: RunState, node: object): object {
-  const stack = run.siteStack;
-  if (stack.length === 0) return node;
-  let id = run.nodeIds.get(node);
-  if (id === undefined) { id = run.nodeSeq++; run.nodeIds.set(node, id); }
-  // Walk/create the trie: root → site1 → site2 → … → leaf nodeId → object.
-  // Callsite keys are '#N' strings, nodeIds are numbers — no key-space
-  // collision at the leaf level.
-  let m: Map<unknown, unknown> = run.siteTrie;
-  for (const s of stack) {
-    let next = m.get(s) as Map<unknown, unknown> | undefined;
-    if (next === undefined) { next = new Map(); m.set(s, next); }
-    m = next;
-  }
-  let leaf = m.get(id) as object | undefined;
-  if (leaf === undefined) { leaf = {}; m.set(id, leaf); }
+  // Empty stack → the node itself is the key (top-level decls).
+  if (run.siteCtx.length === 0) return node;
+  // siteCtx mirrors siteStack — leaf map reached via the top entry.
+  const leafMap = run.siteCtx[run.siteCtx.length - 1]!;
+  let leaf = leafMap.get(node) as object | undefined;
+  if (leaf === undefined) { leaf = {}; leafMap.set(node, leaf); }
   return leaf;
+}
+
+/** Push a callsite onto both stacks; siteCtx walks (and grows) the trie. */
+function pushSite(run: RunState, site: string): void {
+  run.siteStack.push(site);
+  const parent = run.siteCtx.length ? run.siteCtx[run.siteCtx.length - 1]! : run.siteTrie;
+  let child = parent.get(site) as Map<unknown, unknown> | undefined;
+  if (child === undefined) { child = new Map(); parent.set(site, child); }
+  run.siteCtx.push(child);
 }
 
 /** Callsite-composed identity for `node` — mtf.ts uses it to key chart-domain
@@ -1095,11 +1094,12 @@ function evalCall(node: Call, frame: Frame): Value {
   const site = callsiteId(run, node);
   const prevSite = rt.callsite;
   rt.callsite = site;
-  run.siteStack.push(site);
+  pushSite(run, site);
   try {
     return evalCallDispatch(node, frame);
   } finally {
     run.siteStack.pop();
+    run.siteCtx.pop();
     rt.callsite = prevSite;
   }
 }
@@ -2116,11 +2116,12 @@ function jitRuntime(state: JitState, run: RunState, ctx: BuiltinCtx) {
       const site = callsiteId(run, node);
       const prevSite = rt.callsite;
       rt.callsite = site;
-      run.siteStack.push(site);
+      pushSite(run, site);
       try {
         return jitCallDispatch(state, run, ctx, node, ds);
       } finally {
         run.siteStack.pop();
+        run.siteCtx.pop();
         rt.callsite = prevSite;
       }
     },
