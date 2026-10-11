@@ -72,6 +72,7 @@ import {
   registerType,
   setField,
 } from './udt';
+import { jitCompile } from './jit';
 
 export type { Frame } from './scope';
 export { PineRuntimeError } from './errors';
@@ -598,10 +599,17 @@ function ctxSeries(ctx: BuiltinCtx, name: string): Series | undefined {
   }
 }
 
+// Perf instrumentation — counts evalNode hits per type for scratch benches.
+// Zero cost in prod (guarded by global flag, lazily attached).
+export const __evalNodeCounts = new Map<string, number>();
+
 function evalNode(node: Node, frame: Frame): Value {
   const { scope, ctx } = frame;
   const run = runOf(ctx);
   const bar = ctx.barIndex;
+  if ((globalThis as Record<string, unknown>).__pineEvalCount) {
+    __evalNodeCounts.set(node.type, (__evalNodeCounts.get(node.type) ?? 0) + 1);
+  }
 
   switch (node.type) {
     case 'num': return numVal(node.v, node.isInt);
@@ -1912,6 +1920,375 @@ function compileStmt(stmt: Node): CompiledStmt {
   }
 }
 
+// ── Slice-E: JIT host ───────────────────────────────────────────────────────
+// jit.ts transpiles the top-level body into one JS source; each bar calls the
+// compiled function with a shim `R` that delegates to the same helpers the
+// evaluator uses — semantics are not re-implemented, only dispatch is skipped.
+
+/** `__pineJit` — opt-IN flag; default OFF. Measured 2026-10-11 on K4.55
+ * (935 bars): jit 2.59ms/bar vs compiled 2.30 vs interp 1.75 — R-call +
+ * arg-descriptor + thunk overhead exceeds the dispatch savings at this
+ * transpile depth (672/798 native). Kept as an opt-in experiment while the
+ * real cost centre (series/UDF machinery, not node dispatch) is un-JITted.
+ * `__pineInterp` still forces the fully-interpreted path. */
+function jitEnabled(): boolean {
+  const g = globalThis as Record<string, unknown>;
+  if (g.__pineJit === true) return true;
+  if (typeof process !== 'undefined' && process.env?.PINE_JIT === '1') return true;
+  return false;
+}
+
+/** Bench instrumentation — per-run native/fallback stmt counts. */
+/** JIT arg descriptor — jit.ts emits these inline at callsites so the callee's
+ * evalArg flavor is chosen after dispatch resolves:
+ * `i` ident (series-or-expr), `l` literal num/bool (LitSeries fast path when
+ * litFastPath), `e` deferred expr thunk, `x` nodeTable idx for callHist keys. */
+type JitArg = { k: 'i' | 'l' | 'e'; x: number; i?: string; n?: string; f?: () => Value };
+
+export const __pineJitStats = { runs: 0, native: 0, fallback: 0, compileMs: 0 };
+
+interface JitState {
+  fn: (R: unknown, run: RunState, nodes: Node[]) => void;
+  nodes: Node[];
+  cur: Frame;                      // mutable — pushScope rewrites .scope
+  scopeStack: Scope[];             // [0] = top-level frame scope
+  save: { topLevelBody: boolean; topStmtIdx: number }[];
+}
+
+function jitRuntime(state: JitState, run: RunState, ctx: BuiltinCtx) {
+  const rt = ctx as RtCtx;
+  const R = {
+    NA, TRUE: VTRUE, FALSE: VFALSE, VOID: { kind: 'void' } as Value,
+    BREAK, CONTINUE,
+    Return: ReturnSignal,
+    num: (v: number, isInt: boolean): Value => numVal(v, isInt),
+    str: (v: string): Value => ({ kind: 'string', v }),
+    color: (v: string): Value => ({ kind: 'color', v }),
+    arr: (items: Value[]): Value => ({ kind: 'array', v: items }),
+    unary: (op: string, a: Value): Value => evalUnary(op, unseries(a)),
+    binary: (op: string, l: Value, r: Value): Value => evalBinary(op, unseries(l), unseries(r), run, ctx),
+    and: (l: () => Value, r: () => Value): Value =>
+      unseriesTruth(l()) && unseriesTruth(r()) ? VTRUE : VFALSE,
+    or: (l: () => Value, r: () => Value): Value =>
+      unseriesTruth(l()) || unseriesTruth(r()) ? VTRUE : VFALSE,
+    truth: (v: Value): boolean => unseriesTruth(v),
+    ident: (name: string): Value => evalIdent(name, state.cur),
+    hist: (name: string, idxV: Value): Value => {
+      // evalHistref's ident arm — scalar idx → BarSeries.get via histGetAt.
+      const u = unseries(idxV);
+      const idx = isNum(u) && Number.isFinite(u.v) ? Math.floor(u.v) : undefined;
+      if (idx === undefined || idx < 0) return NA;
+      const scope = state.cur.scope;
+      const bar = ctx.barIndex;
+      let s = seriesOf(scope, name) ?? ctxSeries(ctx, name);
+      if (!s && name === 'bar_index') s = barIndexSeries(run, ctx);
+      if (!s) {
+        const v = evalIdent(name, state.cur);
+        if (v.kind === 'series') return histGetAt(v.v, idx, bar);
+        return idx === 0 ? v : NA;
+      }
+      return histGetAt(s, idx, bar);
+    },
+    // `ns.prop` where ns may be unbound — evalMember's first branch verbatim.
+    memberIdent: (name: string, prop: string): Value => {
+      const scope = state.cur.scope;
+      if (scope.lookup(name) === undefined) {
+        const key = `${name}.${prop}`;
+        const c = getConstant(key, ctx);
+        if (c !== undefined) return c;
+        const b = BUILTINS.get(key);
+        if (b) return { kind: 'function', v: b };
+        if (name === 'syminfo') {
+          const f = ctx.syminfo[prop];
+          if (f !== undefined) return f;
+        }
+        if (name === 'timeframe') {
+          const f = timeframeFields(ctx).get(prop);
+          if (f !== undefined) return f;
+        }
+        if (name === 'barstate') {
+          const f = barstateUdt(ctx).fields.get(prop);
+          if (f !== undefined) return f;
+        }
+        warn(run, ctx, `unknown constant '${key}'`);
+        return NA;
+      }
+      return R.member(evalIdent(name, state.cur), prop);
+    },
+    member: (objV: Value, prop: string): Value => {
+      const obj = unseries(objV);
+      if (obj.kind === 'udt') {
+        try { return getField(obj, prop); }
+        catch { warn(run, ctx, `type '${obj.v.typeName}' has no field '${prop}'`); return NA; }
+      }
+      if (obj.kind === 'map') return obj.v.get(prop) ?? NA;
+      warn(run, ctx, `cannot access '${prop}' on ${obj.kind}`);
+      return NA;
+    },
+    // ── call dispatch — evalCallDispatch verbatim; args materialize per-target
+    // kind so litFastPath/series semantics match evalArg exactly.
+    // `evalCall` bookkeeping verbatim — rt.callsite/siteStack so plotIndex
+    // resolves a stable sink id under JIT.
+    call: (idx: number, ds: JitArg[]): Value => {
+      const node = state.nodes[idx] as Call;
+      const site = callsiteId(run, node);
+      const prevSite = rt.callsite;
+      rt.callsite = site;
+      run.siteStack.push(site);
+      try {
+        return jitCallDispatch(state, run, ctx, node, ds);
+      } finally {
+        run.siteStack.pop();
+        rt.callsite = prevSite;
+      }
+    },
+    decl: (idx: number, name: string, init: () => Value): void => {
+      const v = init();
+      bindDeclared(run, siteKey(run, state.nodes[idx]!), state.cur.scope, name, v, ctx.barIndex);
+    },
+    declNa: (idx: number, name: string): void => {
+      slotFor(run, siteKey(run, state.nodes[idx]!), state.cur.scope, name).setAt(ctx.barIndex, NA);
+    },
+    // var single-name: same twoPhase logic as compileStmt's var arm.
+    varDecl: (idx: number, name: string, init: () => Value): void => {
+      const node = state.nodes[idx]!;
+      const key = siteKey(run, node);
+      if (!run.declSlots.has(key)) {
+        const v = init();
+        bindDeclared(run, key, state.cur.scope, name, v, ctx.barIndex, /*persistent*/ true);
+      } else {
+        const s = run.declCows.get(key) ?? run.declSlots.get(key)!;
+        state.cur.scope.define(name, s);
+      }
+    },
+    // `:=` on an ident — evalReassign's ident arm verbatim.
+    set: (idx: number, name: string, init: () => Value): void => {
+      const scope = state.cur.scope;
+      const slot = scope.lookup(name);
+      if (slot === undefined) throw pineErr(state.nodes[idx]!, `cannot reassign undeclared variable '${name}'`);
+      if (slot === ctx.open || slot === ctx.high || slot === ctx.low ||
+          slot === ctx.close || slot === ctx.volume || slot === ctx.time ||
+          slot === ctx.hl2 || slot === ctx.hlc3 || slot === ctx.ohlc4 ||
+          slot === ctx.hlcc4) {
+        throw pineErr(state.nodes[idx]!, `cannot reassign built-in variable '${name}'`);
+      }
+      const v = unseries(init());
+      if (slot instanceof BarSeries) slot.setAt(ctx.barIndex, v);
+      else throw pineErr(state.nodes[idx]!, `'${name}' is not a mutable variable`);
+    },
+    pushScope: (): void => {
+      state.save.push({ topLevelBody: run.topLevelBody, topStmtIdx: run.topStmtIdx });
+      run.topLevelBody = false; run.topStmtIdx = -1;
+      rt.scopeDepth = (rt.scopeDepth ?? 0) + 1;
+      state.scopeStack.push(new Scope(state.scopeStack[state.scopeStack.length - 1]!));
+      state.cur = { scope: state.scopeStack[state.scopeStack.length - 1]!, ctx };
+    },
+    popScope: (): void => {
+      rt.scopeDepth!--;
+      const s = state.save.pop()!;
+      run.topLevelBody = s.topLevelBody; run.topStmtIdx = s.topStmtIdx;
+      state.scopeStack.pop();
+      state.cur = { scope: state.scopeStack[state.scopeStack.length - 1]!, ctx };
+    },
+    evalStmt: (idx: number): Value => evalExpr(state.nodes[idx]!, state.cur),
+    // Control-flow signals pass through; everything else becomes a PineRuntimeError
+    // wrapped with the stmt's node — identical to evalExpr's contract.
+    stmtErr: (e: unknown, idx: number): never => {
+      if (e === BREAK || e === CONTINUE || e instanceof ReturnSignal) throw e;
+      throw wrapPineError(e, state.nodes[idx]);
+    },
+  };
+  return R;
+}
+
+/** evalCallDispatch verbatim for the JIT — one dispatch branch per shape
+ * (X.new / ns.fn / obj.method / bare) with jitMatArg picking the arg flavor. */
+function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
+                       node: Call, ds: JitArg[]): Value {
+  const scope = state.cur.scope;
+  const frame = state.cur;
+  if (mtf) {
+    const sec = mtf.tryEvalSecurity(node, frame);
+    if (sec !== null) return sec;
+  }
+  const callee = node.callee;
+  if (callee.type === 'member' && !callee.computed && callee.prop === 'new'
+      && callee.obj.type === 'ident' && isUdtType(callee.obj.name)) {
+    const args: Value[] = [];
+    const named: Record<string, Value> = {};
+    for (const d of ds) {
+      const v = jitMatArgExpr(state, d);
+      if (d.n !== undefined) named[d.n] = v; else args.push(v);
+    }
+    return { kind: 'udt', v: newUdt(callee.obj.name, args, named, d => evalExpr(d, frame)) };
+  }
+  if (callee.type === 'member' && !callee.computed) {
+    let hit = RESOLVED_BUILTIN.get(node);
+    if (hit === undefined) {
+      const parts: string[] = [callee.prop];
+      let head: Node = callee.obj;
+      while (head.type === 'member' && !head.computed) { parts.unshift(head.prop); head = head.obj; }
+      if (head.type === 'ident') {
+        parts.unshift(head.name);
+        hit = { headName: head.name, fn: BUILTINS.get(parts.join('.')) };
+      } else hit = { headName: '', fn: undefined };
+      RESOLVED_BUILTIN.set(node, hit);
+    }
+    if (hit.fn !== undefined && scope.lookup(hit.headName) === undefined) {
+      const args: Value[] = [];
+      const named: Record<string, Value> = {};
+      for (const d of ds) {
+        const v = jitMatArg(state, run, ctx, d, true);
+        if (d.n !== undefined) named[d.n] = v; else args.push(v);
+      }
+      return callBuiltin(hit.fn, ctx, args, named, node);
+    }
+    const obj = evalExpr(callee.obj, frame);
+    const prop = callee.prop;
+    if (obj.kind === 'udt') {
+      const def = getUdtMethod(obj.v.typeName, prop);
+      if (def) {
+        const bound = bindArgsJit(state, run, ctx, node.args, ds, def.params.slice(1));
+        return callUdtMethod(obj.v, prop, bound, ctx);
+      }
+    } else {
+      const b = kindBuiltin(obj.kind, prop);
+      if (b) {
+        const args: Value[] = [obj];
+        const named: Record<string, Value> = {};
+        for (const d of ds) {
+          const v = jitMatArg(state, run, ctx, d, true);
+          if (d.n !== undefined) named[d.n] = v; else args.push(v);
+        }
+        return callBuiltin(b, ctx, args, named, node);
+      }
+      const prim = getUdtMethod(obj.kind, prop);
+      if (prim) {
+        const bound = bindArgsJit(state, run, ctx, node.args, ds, prim.params.slice(1));
+        return callUdtMethod(obj, prop, bound, ctx);
+      }
+    }
+    if (obj.kind === 'na') return NA;
+    warn(run, ctx, `no method '${prop}' on ${obj.kind}`);
+    return NA;
+  }
+  if (callee.type === 'na') {
+    const b = BUILTINS.get('na');
+    if (b) return jitBuiltinArgsInvoke(state, run, ctx, b, ds, node);
+  }
+  let fn: Value;
+  if (callee.type === 'ident') {
+    const bound = scope.lookup(callee.name);
+    const callable = bound !== undefined &&
+      ((bound as Value).kind === 'function' ||
+       ((bound as Series).cur?.()?.kind === 'function'));
+    if (!callable) {
+      const b = BUILTINS.get(callee.name);
+      if (b) return jitBuiltinArgsInvoke(state, run, ctx, b, ds, node);
+    }
+    fn = evalIdent(callee.name, frame);
+  } else {
+    fn = evalExpr(callee, frame);
+  }
+  if (fn.kind === 'function') {
+    if (typeof fn.v === 'function') return jitBuiltinArgsInvoke(state, run, ctx, fn.v as BuiltinFn, ds, node);
+    return callUdfValue(fn.v as UdfDecl, bindArgsJit(state, run, ctx, node.args, ds, fn.v.params), frame, node);
+  }
+  warn(run, ctx, `call target is not a function (${fn.kind})`);
+  return NA;
+}
+
+/** evalArg tail — wrap a plain-evaluated arg in its callsite BarSeries
+ * (callHist), mirroring evalArg's post-evalExpr path. */
+function jitArgFinish(state: JitState, run: RunState, ctx: BuiltinCtx, idx: number, v: Value): Value {
+  if (v.kind === 'series') return v;
+  if (v.kind !== 'int' && v.kind !== 'float' && v.kind !== 'bool') return v;
+  const key = siteKey(run, state.nodes[idx]!);
+  let s = run.callHist.get(key as Node);
+  if (!s) {
+    s = new BarSeries();
+    run.callHist.set(key as Node, s);
+    trackSeries(run, s);
+  }
+  s.setAt(ctx.barIndex, v);
+  __callHistWrites++;
+  return { kind: 'series', v: s };
+}
+
+/** Descriptor → Value. `litFastPath` applies LitSeries to 'l' args only —
+ * every other shape evaluates then goes through jitArgFinish, exactly like
+ * evalArg. `f` thunk missing (non-emit expr) falls back to evalExpr. */
+function jitMatArg(state: JitState, run: RunState, ctx: BuiltinCtx, d: JitArg, litFastPath: boolean): Value {
+  if (d.k === 'i') {
+    const s = seriesOf(state.cur.scope, d.i!) ?? ctxSeries(ctx, d.i!);
+    if (s) return { kind: 'series', v: s };
+    return jitArgFinish(state, run, ctx, d.x,
+      d.f ? d.f() : evalExpr(state.nodes[d.x]!, state.cur));
+  }
+  if (d.k === 'l' && litFastPath) {
+    const key = siteKey(run, state.nodes[d.x]!);
+    let ls = run.callHist.get(key as Node) as LitSeries | undefined;
+    if (!ls) {
+      ls = new LitSeries(evalExpr(state.nodes[d.x]!, state.cur), ctx.barIndex);
+      run.callHist.set(key as Node, ls);
+      trackSeries(run, ls);
+    } else {
+      ls.bump(ctx.barIndex);
+    }
+    return { kind: 'series', v: ls };
+  }
+  return jitArgFinish(state, run, ctx, d.x,
+    d.f ? d.f() : evalExpr(state.nodes[d.x]!, state.cur));
+}
+
+/** `X.new` arg flavor — raw evalExpr on the arg's value node (evalCallDispatch
+ * does not run evalArg on construction args). */
+function jitMatArgExpr(state: JitState, d: JitArg): Value {
+  return d.f ? d.f() : evalExpr(state.nodes[d.x]!, state.cur);
+}
+
+/** bindCallArgs on descriptor args — named first, positionals fill gaps, then
+ * defaults. Uses jitMatArg(false) — UDF params never take the LitSeries path. */
+function bindArgsJit(state: JitState, run: RunState, ctx: BuiltinCtx,
+                     callArgs: Arg[], ds: JitArg[], params: Param[]): Value[] {
+  const out: Value[] = new Array<Value>(params.length);
+  const filled = new Set<number>();
+  const positionals: { a: Arg; d: JitArg }[] = [];
+  callArgs.forEach((a, i) => {
+    const d = ds[i]!;
+    if (a.name !== undefined) {
+      const p = params.findIndex(pp => pp.name === a.name);
+      if (p >= 0 && !filled.has(p)) { out[p] = jitMatArg(state, run, ctx, d, false); filled.add(p); return; }
+    }
+    positionals.push({ a, d });
+  });
+  let p = 0;
+  for (const { d } of positionals) {
+    while (p < params.length && filled.has(p)) p++;
+    if (p >= params.length) break;
+    out[p] = jitMatArg(state, run, ctx, d, false);
+    filled.add(p); p++;
+  }
+  for (let i = 0; i < params.length; i++) {
+    if (!filled.has(i)) {
+      const dfl = params[i]!.default;
+      out[i] = dfl !== undefined ? evalExpr(dfl, state.cur) : NA;
+    }
+  }
+  return out;
+}
+
+function jitBuiltinArgsInvoke(state: JitState, run: RunState, ctx: BuiltinCtx,
+                              b: BuiltinFn, ds: JitArg[], node: Call): Value {
+  const args: Value[] = [];
+  const named: Record<string, Value> = {};
+  for (const d of ds) {
+    const v = jitMatArg(state, run, ctx, d, true);
+    if (d.n !== undefined) named[d.n] = v; else args.push(v);
+  }
+  return callBuiltin(b, ctx, args, named, node);
+}
+
 // ── runScript ────────────────────────────────────────────────────────────────
 
 export interface RunOptions {
@@ -2104,6 +2481,32 @@ async function runScriptInner(
   // evalExpr; topStmtIdx bookkeeping is identical either way.
   const compiledBody: CompiledStmt[] | null =
     compiledEnabled() ? body.map(compile) : null;
+
+  // Slice-E: JIT path — transpile body to JS once; each bar invokes the same
+  // compiled fn. Falls back to the compiled/interpreted path on any setup
+  // failure (transpile throw, new Function CSP, malformed node table).
+  let jit: JitState | null = null;
+  let jitR: ReturnType<typeof jitRuntime> | null = null;
+  if (jitEnabled()) {
+    try {
+      const t = nowMs();
+      const { src, nodeTable, native, fallback } = jitCompile(body);
+      __pineJitStats.compileMs += nowMs() - t;
+      __pineJitStats.native += native;
+      __pineJitStats.fallback += fallback;
+      // `new Function` keeps the body a real function (CSP: same rules as
+      // eval — workers/pages need unsafe-eval either way; vitest + vite dev
+      // both allow it).
+      const fn = new Function('R', 'run', 'nodes', `"use strict";\n${src}`) as JitState['fn'];
+      jit = { fn, nodes: nodeTable, cur: frame0, scopeStack: [scope], save: [] };
+      jitR = jitRuntime(jit, run, ctx);
+      __pineJitStats.runs++;
+    } catch (e) {
+      console.warn('[pine-jit] setup failed, using interpreter:', e instanceof Error ? e.message : e);
+      jit = null;
+      jitR = null;
+    }
+  }
   for (let bar = 0; bar < bars.length; bar++) {
     if (bar > 0) barCtx.seek(bar);
     try {
@@ -2112,7 +2515,9 @@ async function runScriptInner(
       // (topStmtIdx < pruneCutoff only; see the scan above).
       run.topLevelBody = true;
       try {
-        if (compiledBody) {
+        if (jit && jitR) {
+          jit.fn(jitR, run, jit.nodes);
+        } else if (compiledBody) {
           for (let i = 0; i < body.length; i++) {
             run.topStmtIdx = i;
             const c = compiledBody[i]!;
