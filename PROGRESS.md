@@ -181,3 +181,21 @@
     top-level transpile's one-shot doesn't. K4.55 still interp-fastest overall;
     both JITs stay opt-in.
   * Next real wins remain R11 (a)+(b): ensureList compaction, evalArg callHist.
+
+- 2026-10-11 R12b — ensureList compaction (e70f785): −38% interp on K4.55.
+  * Root cause: bindDeclared L504 tracked every series an alias decl pointed at.
+    LiftedSeries (nz/math.max pointwise kernels) are per-call-fresh objects —
+    each new one entered ensureList permanently. Measured: 24,228 'alias'
+    registrations of 25,999 total → 4.87M ensureBar calls/935 bars, 83.6%
+    early-return no-ops.
+  * Fix: delete the trackSeries(run, v.v) line. Alias targets are already
+    tracked by their own binding site or written every bar; densifying them
+    through the alias is redundant.
+  * Numbers: ensureCalls 4.87M→1.27M, fills 781k→782k (unchanged, real work
+    preserved), interp 2.76→1.70 ms/bar, jit 2.59→2.20, compiled 2.30→1.78.
+  * Verification: 9-UDF corpus + alias-hist probe (x[1]/x[2] rebind, conditional
+    y, var z=nz) identical; suite 762 pass/1 skip.
+  * Residual: decl 1218 / arg 426 / lit 311 still legit conditional-or-arg
+    registrations; further win = skip ensureBar calls when the same callsite
+    already setAt(bar) this bar (would need a per-bar dirtied flag — deferred,
+    fillRate now 61% so remaining no-op share is smaller).
