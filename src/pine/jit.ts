@@ -102,46 +102,54 @@ function arg(a: Arg): Emit {
   return { ok: true, code: `{k:'e',x:${N(v)},f:()=>${e.code}${name}}` };
 }
 
-function stmt(n: Node, depth: number): Emit {
+/** Emit one statement. When `ret` is set the code assigns the stmt's Pine
+ * value to it (evalExpr result) so a UDF body can capture last-value
+ * semantics; stmt helpers (R.decl/set/varDecl) return their bound Value.
+ * Non-emit statements fall back to R.evalStmt which returns the same Value. */
+function stmt(n: Node, depth: number, ret?: string): Emit {
   const pad = '  '.repeat(depth);
+  const A = ret ? `${ret}=` : '';
   switch (n.type) {
     case 'assign': case 'let': case 'const': {
       const v = expr(n.value);
       if (!v.ok) return v;
-      return { ok: true, code: `${pad}R.decl(${N(n)},${JSON.stringify(n.name)},()=>${v.code});` };
+      return { ok: true, code: `${pad}${A}R.decl(${N(n)},${JSON.stringify(n.name)},()=>${v.code});` };
     }
     case 'typed': {
-      if (n.value === undefined) return { ok: true, code: `${pad}R.declNa(${N(n)},${JSON.stringify(n.name)});` };
+      if (n.value === undefined) return { ok: true, code: `${pad}${A}R.declNa(${N(n)},${JSON.stringify(n.name)});` };
       const v = expr(n.value);
       if (!v.ok) return v;
-      return { ok: true, code: `${pad}R.decl(${N(n)},${JSON.stringify(n.name)},()=>${v.code});` };
+      return { ok: true, code: `${pad}${A}R.decl(${N(n)},${JSON.stringify(n.name)},()=>${v.code});` };
     }
     case 'var': {
       if (n.multi && n.multi.length) return no;
       const v = expr(n.value);
       if (!v.ok) return v;
-      return { ok: true, code: `${pad}R.varDecl(${N(n)},${JSON.stringify(n.name)},()=>${v.code});` };
+      return { ok: true, code: `${pad}${A}R.varDecl(${N(n)},${JSON.stringify(n.name)},()=>${v.code});` };
     }
     case 'reassign': {
       if (n.target.type !== 'ident') return no;
       const v = expr(n.value);
       if (!v.ok) return v;
-      return { ok: true, code: `${pad}R.set(${N(n)},${JSON.stringify(n.target.name)},()=>${v.code});` };
+      return { ok: true, code: `${pad}${A}R.set(${N(n)},${JSON.stringify(n.target.name)},()=>${v.code});` };
     }
     case 'if': {
       const T = expr(n.test);
       if (!T.ok) return T;
-      let code = `${pad}if(R.truth(${T.code})){\n${arm(n.then, depth + 1)}\n${pad}}`;
+      // stmt `if` yields void when no arm runs; ifexpr yields NA. `if` here is
+      // always a stmt (ifexpr reaches expr() only inside a value position).
+      let code = ret ? `${pad}${ret}=R.VOID;\n` : '';
+      code += `${pad}if(R.truth(${T.code})){\n${arm(n.then, depth + 1, ret)}\n${pad}}`;
       for (const e of n.elseIfs) {
         const ET = expr(e.test);
         if (!ET.ok) return ET;
-        code += ` else if(R.truth(${ET.code})){\n${arm(e.body, depth + 1)}\n${pad}}`;
+        code += ` else if(R.truth(${ET.code})){\n${arm(e.body, depth + 1, ret)}\n${pad}}`;
       }
-      if (n.else) code += ` else{\n${arm(n.else, depth + 1)}\n${pad}}`;
+      if (n.else) code += ` else{\n${arm(n.else, depth + 1, ret)}\n${pad}}`;
       return { ok: true, code };
     }
     case 'seq': {
-      const inner = n.stmts.map(s => stmt(s, depth));
+      const inner = n.stmts.map(s => stmt(s, depth, ret));
       if (inner.some(i => !i.ok)) return no;
       return { ok: true, code: inner.map(i => i.ok ? i.code : '').join('\n') };
     }
@@ -154,7 +162,10 @@ function stmt(n: Node, depth: number): Emit {
     }
     default: {
       const e = expr(n);
-      if (e.ok) return { ok: true, code: `${pad}${e.code};` };
+      if (e.ok) return { ok: true, code: `${pad}${A}${e.code};` };
+      // No emit — evalStmt returns the stmt's Pine value, so ret mode still
+      // captures last-executed semantics for for/while/switch/func bodies.
+      if (ret) return { ok: true, code: `${pad}${ret}=R.evalStmt(${N(n)});` };
       return no;
     }
   }
@@ -162,15 +173,16 @@ function stmt(n: Node, depth: number): Emit {
 
 /** Nested block: push a real child Scope, run stmts, pop. Mirrors evalBlock's
  *  blockFrame + scopeDepth/topLevelBody bookkeeping (done inside R.pushScope). */
-function arm(stmts: Node[], depth: number): string {
+function arm(stmts: Node[], depth: number, ret?: string): string {
   const pad = '  '.repeat(depth);
-  return `${pad}R.pushScope();\n${pad}try{\n${block(stmts, depth + 1)}\n${pad}}finally{R.popScope();}`;
+  return `${pad}R.pushScope();\n${pad}try{\n${block(stmts, depth + 1, ret)}\n${pad}}finally{R.popScope();}`;
 }
 
-function block(stmts: Node[], depth: number): string {
+function block(stmts: Node[], depth: number, ret?: string): string {
   return stmts.map(s => {
-    const e = stmt(s, depth);
-    const body = e.ok ? e.code : `${'  '.repeat(depth)}R.evalStmt(${N(s)});`;
+    const e = stmt(s, depth, ret);
+    const body = e.ok ? e.code :
+      `${'  '.repeat(depth)}${ret ? `${ret}=` : ''}R.evalStmt(${N(s)});`;
     // Per-stmt error wrap preserves wrapPineError(node) attribution.
     return `${'  '.repeat(depth)}try{\n${body}\n${'  '.repeat(depth)}}catch(e){R.stmtErr(e,${N(s)});}`;
   }).join('\n');
@@ -215,5 +227,28 @@ export function jitCompile(body: Node[]): JitCompileResult {
   }).join('\n');
   let native = 0, fallback = 0;
   for (const s of body) (stmt(s, 0).ok ? native++ : fallback++);
+  return { src, nodeTable: table, native, fallback };
+}
+
+/** UDF body compile — same codegen as jitCompile but emits `__ret` capture so
+ * the body's last-executed-statement value is the function result, matching
+ * evalBlock semantics. `run.topStmtIdx` stays -1 throughout (UDF decls always
+ * register for ensureBar). Single-expr bodies emit a bare `return`. */
+export function jitCompileUdf(body: Node | Node[]): JitCompileResult {
+  nextIdx = 0;
+  if (!Array.isArray(body)) {
+    const table = collectAll([body]);
+    const e = expr(body);
+    const src = e.ok ? `return ${e.code};` : `return R.evalStmt(${N(body)});`;
+    return { src, nodeTable: table, native: e.ok ? 1 : 0, fallback: e.ok ? 0 : 1 };
+  }
+  const table = collectAll(body);
+  const src = `let __ret=R.VOID;\n` + body.map(s => {
+    const e = stmt(s, 0, '__ret');
+    const inner = e.ok ? e.code : `__ret=R.evalStmt(${N(s)});`;
+    return `try{\n${inner}\n}catch(e){R.stmtErr(e,${N(s)});}`;
+  }).join('\n') + `\nreturn __ret;`;
+  let native = 0, fallback = 0;
+  for (const s of body) (stmt(s, 0, '__ret').ok ? native++ : fallback++);
   return { src, nodeTable: table, native, fallback };
 }

@@ -72,7 +72,7 @@ import {
   registerType,
   setField,
 } from './udt';
-import { jitCompile } from './jit';
+import { jitCompile, jitCompileUdf } from './jit';
 
 export type { Frame } from './scope';
 export { PineRuntimeError } from './errors';
@@ -155,6 +155,8 @@ interface RunState {
   tupleKeys: Map<Node, Map<string, object>>;
   /** callsite key → param name → persistent CowSeries (UDF-local series carry bar history). */
   paramCows: Map<object, Map<string, CowSeries>>;
+  /** UDF body Node[] → compiled JitState (lazy; undefined until first use). */
+  udfJit: WeakMap<Node[], JitState>;
 }
 
 const runStates = new WeakMap<BuiltinCtx, RunState>();
@@ -183,6 +185,7 @@ function runOf(ctx: BuiltinCtx): RunState {
       misc: new Map(),
       tupleKeys: new Map(),
       paramCows: new Map(),
+      udfJit: new WeakMap(),
     };
     runStates.set(ctx, r);
   }
@@ -1408,6 +1411,24 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
   const wasTop = run.topLevelBody, wasIdx = run.topStmtIdx;
   run.topLevelBody = false; run.topStmtIdx = -1;
   try {
+    if (udfJitEnabled() && Array.isArray(fn.body)) {
+      const js = udfJitState(fn.body, run, ctx);
+      if (js) {
+        // Swap the JitState's frame to this call's scope — R bindings read
+        // state.cur live, so nesting/recursion save+restore around the call.
+        const prevCur = js.cur;
+        js.cur = callFr;
+        js.scopeStack.length = 0;
+        js.scopeStack.push(callScope);
+        js.save.length = 0;
+        try {
+          __pineJitStats.udfRuns++;
+          return js.fn(js.udfR, run, js.nodes);
+        } finally {
+          js.cur = prevCur;
+        }
+      }
+    }
     if (Array.isArray(fn.body)) return evalBlock(fn.body, callFr);
     return evalExpr(fn.body, callFr);
   } catch (e) {
@@ -1938,6 +1959,39 @@ function jitEnabled(): boolean {
   return false;
 }
 
+/** `__pineJitUdf` — UDF-body JIT, gated separately because it measures
+ * POSITIVE where the top-level transpile doesn't: UDF bodies re-evaluate per
+ * call, so per-node dispatch is real amortizable overhead (micro-bench
+ * 2026-10-11, 14 UDF calls/bar: 0.35ms/bar jit vs 0.44 interp, ~22% win).
+ * `__pineJit` implies it — one flag means "everything". */
+function udfJitEnabled(): boolean {
+  const g = globalThis as Record<string, unknown>;
+  if (g.__pineJitUdf === true || g.__pineJit === true) return true;
+  if (typeof process !== 'undefined' && (process.env?.PINE_JIT_UDF === '1' || process.env?.PINE_JIT === '1')) return true;
+  return false;
+}
+
+/** Compile-or-fetch the per-UDF-body JitState. Cached on run.udfJit keyed by
+ * the body Node[] (stable parse object). `udfR` (the jitRuntime object) is
+ * built once alongside — per-call cost is then just scope swap + js.fn. */
+function udfJitState(body: Node[], run: RunState, ctx: BuiltinCtx): JitState | null {
+  let js = run.udfJit.get(body);
+  if (js !== undefined) return js;
+  try {
+    const { src, nodeTable } = jitCompileUdf(body);
+    const fn = new Function('R', 'run', 'nodes', `"use strict";\n${src}`) as JitState['fn'];
+    js = { fn, nodes: nodeTable, cur: null as unknown as Frame, scopeStack: [], save: [], udfR: undefined };
+    js.udfR = jitRuntime(js, run, ctx);
+    run.udfJit.set(body, js);
+    __pineJitStats.udfCompiled++;
+    return js;
+  } catch (e) {
+    if (!(globalThis as Record<string, unknown>).__pineJitQuiet)
+      console.error('[udf-jit] compile failed:', e instanceof Error ? e.message : e);
+    return null; // compile failure → interpreted path keeps semantics
+  }
+}
+
 /** Bench instrumentation — per-run native/fallback stmt counts. */
 /** JIT arg descriptor — jit.ts emits these inline at callsites so the callee's
  * evalArg flavor is chosen after dispatch resolves:
@@ -1945,14 +1999,17 @@ function jitEnabled(): boolean {
  * litFastPath), `e` deferred expr thunk, `x` nodeTable idx for callHist keys. */
 type JitArg = { k: 'i' | 'l' | 'e'; x: number; i?: string; n?: string; f?: () => Value };
 
-export const __pineJitStats = { runs: 0, native: 0, fallback: 0, compileMs: 0 };
+export const __pineJitStats = { runs: 0, native: 0, fallback: 0, compileMs: 0, udfRuns: 0, udfCompiled: 0 };
 
 interface JitState {
-  fn: (R: unknown, run: RunState, nodes: Node[]) => void;
+  fn: (R: unknown, run: RunState, nodes: Node[]) => Value;
   nodes: Node[];
   cur: Frame;                      // mutable — pushScope rewrites .scope
   scopeStack: Scope[];             // [0] = top-level frame scope
   save: { topLevelBody: boolean; topStmtIdx: number }[];
+  /** jitRuntime object for UDF bodies — bound at udfJitState creation; the
+   *  top-level path leaves it undefined and holds the object externally. */
+  udfR?: unknown;
 }
 
 function jitRuntime(state: JitState, run: RunState, ctx: BuiltinCtx) {
@@ -2042,27 +2099,30 @@ function jitRuntime(state: JitState, run: RunState, ctx: BuiltinCtx) {
         rt.callsite = prevSite;
       }
     },
-    decl: (idx: number, name: string, init: () => Value): void => {
+    decl: (idx: number, name: string, init: () => Value): Value => {
       const v = init();
       bindDeclared(run, siteKey(run, state.nodes[idx]!), state.cur.scope, name, v, ctx.barIndex);
+      return v.kind === 'series' ? v.v.cur() : v;
     },
-    declNa: (idx: number, name: string): void => {
+    declNa: (idx: number, name: string): Value => {
       slotFor(run, siteKey(run, state.nodes[idx]!), state.cur.scope, name).setAt(ctx.barIndex, NA);
+      return NA;
     },
     // var single-name: same twoPhase logic as compileStmt's var arm.
-    varDecl: (idx: number, name: string, init: () => Value): void => {
+    varDecl: (idx: number, name: string, init: () => Value): Value => {
       const node = state.nodes[idx]!;
       const key = siteKey(run, node);
       if (!run.declSlots.has(key)) {
         const v = init();
         bindDeclared(run, key, state.cur.scope, name, v, ctx.barIndex, /*persistent*/ true);
-      } else {
-        const s = run.declCows.get(key) ?? run.declSlots.get(key)!;
-        state.cur.scope.define(name, s);
+        return v.kind === 'series' ? v.v.cur() : v;
       }
+      const s = run.declCows.get(key) ?? run.declSlots.get(key)!;
+      state.cur.scope.define(name, s);
+      return valueAt(s, ctx.barIndex);
     },
     // `:=` on an ident — evalReassign's ident arm verbatim.
-    set: (idx: number, name: string, init: () => Value): void => {
+    set: (idx: number, name: string, init: () => Value): Value => {
       const scope = state.cur.scope;
       const slot = scope.lookup(name);
       if (slot === undefined) throw pineErr(state.nodes[idx]!, `cannot reassign undeclared variable '${name}'`);
@@ -2075,6 +2135,7 @@ function jitRuntime(state: JitState, run: RunState, ctx: BuiltinCtx) {
       const v = unseries(init());
       if (slot instanceof BarSeries) slot.setAt(ctx.barIndex, v);
       else throw pineErr(state.nodes[idx]!, `'${name}' is not a mutable variable`);
+      return v;
     },
     pushScope: (): void => {
       state.save.push({ topLevelBody: run.topLevelBody, topStmtIdx: run.topStmtIdx });
