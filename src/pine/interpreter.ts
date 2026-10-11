@@ -501,10 +501,9 @@ function bindDeclared(
     // wrappers captured into arrays must keep their inner), and
     // non-persistent decls re-seed the shared copy with the current value —
     // `x = e` re-inits every bar, so a carried `:=` value must not survive.
-    // trackSeries(run, v.v, 'alias'); — REMOVED R12: every alias target is
-    // already tracked by its own binding site or written every bar; tracking
-    // here registered per-bar-fresh LiftedSeries (nz/math.max/…) permanently,
-    // 24k entries → 83% no-op ensureBar calls.
+    // trackSeries(run, v.v); — REMOVED R12: alias targets are already tracked
+    // by their own binding site or written every bar; registering per-bar-fresh
+    // LiftedSeries here permanently grew ensureList to 24k (83% no-op calls).
     run.declSlots.set(key, v.v);
     run.declAliased.add(key);
     let cow = run.declCows.get(key);
@@ -1962,16 +1961,18 @@ function jitEnabled(): boolean {
   return false;
 }
 
-/** `__pineJitUdf` — UDF-body JIT, gated separately because it measures
- * POSITIVE where the top-level transpile doesn't: UDF bodies re-evaluate per
- * call, so per-node dispatch is real amortizable overhead (micro-bench
- * 2026-10-11, 14 UDF calls/bar: 0.35ms/bar jit vs 0.44 interp, ~22% win).
- * `__pineJit` implies it — one flag means "everything". */
+/** UDF-body JIT — default ON. R12 re-measured on the REAL K4.55 workload
+ * (all 195 builtins; earlier benches ran a builtins-less bundle so both the
+ * R11 "jit loses" verdict and R12b's −38% were artifacts): jitUdf
+ * 9.94–10.98ms/bar vs interp 12.8–14.5 (~20–25% win), K4.55 plot output
+ * bit-identical, UDF-heavy micro-bench ~60% win, full suite green.
+ * Opt out via `__pineNoJitUdf=true` / PINE_JIT_UDF=0. `__pineJit` implies it.
+ * Compile failures silently fall back to the interpreted body. */
 function udfJitEnabled(): boolean {
   const g = globalThis as Record<string, unknown>;
-  if (g.__pineJitUdf === true || g.__pineJit === true) return true;
-  if (typeof process !== 'undefined' && (process.env?.PINE_JIT_UDF === '1' || process.env?.PINE_JIT === '1')) return true;
-  return false;
+  if (g.__pineNoJitUdf === true) return false;
+  if (typeof process !== 'undefined' && process.env?.PINE_JIT_UDF === '0') return false;
+  return true;
 }
 
 /** Compile-or-fetch the per-UDF-body JitState. Cached on run.udfJit keyed by

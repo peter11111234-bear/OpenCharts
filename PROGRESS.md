@@ -199,3 +199,18 @@
     registrations; further win = skip ensureBar calls when the same callsite
     already setAt(bar) this bar (would need a per-bar dirtied flag — deferred,
     fillRate now 61% so remaining no-op share is smaller).
+
+- 2026-10-11 R12c — BENCH 打假 + UDF JIT 預設 ON:
+  * 發現 scripts/scratch/bench-jit.ts 從未 import builtins/mtf → bundle 只註冊
+    52 個 drawing builtin,ta.*/input/math/plot/request.security 全部 short-circuit
+    NA 且連 arg 都不評估。「interp 1.8ms/bar」「jit 2.59 較慢」「R12b −38%」全是
+    空殼數字(degenerate workload)。真實 interp ~13-15ms/bar。
+  * 4-agent 交叉驗證:__pineEvalCount 排除(只加 overhead)、order 排除、
+    prefetchSecurity 0.1-1.8ms 排除、security 在 dash_needed ternary 後根本不執行。
+    vc-nobuiltins.mjs 復現 1.5-2.5ms 證明缺 builtins 是 8x 差距主因。
+  * 真實對照(K4.55, 935 bars, full builtins):
+      interp 12.8-14.5 | jitUdf 9.94-10.98 (−20~25%) | 全 jit ~11.5 | compiled ~17.4
+    alias removal 真實增益 −5~6%(非 −38%)。UDF JIT 是最大單一收益。
+  * 修正:__pineJitUdf 改預設 ON(opt-out __pineNoJitUdf/PINE_JIT_UDF=0);
+    K4.55 plot 輸出 jitUdf vs interp 逐 bit 一致;__pineJit(top-level)維持 opt-in。
+  * bench-jit.ts 已補 import builtins+mtf — 之後的 bench 都是真 workload。
