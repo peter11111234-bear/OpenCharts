@@ -159,3 +159,25 @@
   * CPU profile (node --cpu-prof, esbuild bundle): compute 20s/935bar; ensureBar 7.4% + setAt 8.9% (BarSeries fill/trim on ensureList), call-path (evalArg+bindArgs+siteKey+bindCallArgs+invokeBuiltin+callBuiltin) ~8%, getUdtMethod 2.2%, UDF 204ms. Dispatch (evalNode+evalExpr+evalCallDispatch+evalIdent+member+siteKey) ~14% — JIT was aiming at the wrong 14%.
   * jitEnabled(): default OFF — __pineJit=true / PINE_JIT=1 opt-in; __pineInterp unchanged. interp is still fastest default.
   * Next real wins (ordered): (a) ensureList compaction — slotFor's 'top-level non-var decl' skip exists but pruneCutoff/conditional arms still register hundreds; batch ensureBar or skip no-op members; (b) evalArg callHist — scalar args already LitSeries-fasted; extend to common expr-arg shapes or cache siteKey; (c) UDF body JIT (callUdfValue→compiled body) — UDF ~13% of interp time, single biggest contained unit.
+
+- 2026-10-11 R12 — UDF-body JIT (a8eb0cf): option (c) from R11 done, and it PAYS.
+  * jit.ts: stmt() gains `ret` target mode — decl/varDecl/set assign into `__ret`,
+    `if` emits __ret-initialized IIFE, `return` emits natively, unemittable stmts
+    fall back to `__ret=R.evalStmt(N)` (evalStmt returns the Pine Value →
+    last-executed semantics preserved inside for/while/switch bodies).
+  * jitCompileUdf(): top-level codegen minus topStmtIdx + `let __ret=R.VOID` /
+    `return __ret` tail — body's last stmt value = call result (evalBlock parity).
+  * interpreter: callUdfValue JIT branch behind udfJitEnabled() — flag
+    `__pineJitUdf` / PINE_JIT_UDF=1 (`__pineJit`/`PINE_JIT` implies). JitState
+    cached on run.udfJit keyed by body Node[]; per-call = callScope swap + js.fn,
+    js.cur/scopeStack/save restored → nesting/recursion safe. R.decl/declNa/
+    varDecl/set now return bound Value; udfJitState surfaces compile errors
+    (unless __pineJitQuiet); __pineJitStats +udfRuns/udfCompiled.
+  * Verified: 9-UDF corpus (early return, var accum, x[1], nested, for, switch,
+    no-branch na, tuple) snapshot-identical jit vs interp, udfRuns=2200;
+    suite 762 pass / 1 skip.
+  * Measured (935 bars): UDF-heavy script 0.28–0.35ms/bar jit vs 0.35–0.44 interp
+    (~22% win) — UDF bodies re-eval per call so dispatch overhead amortizes where
+    top-level transpile's one-shot doesn't. K4.55 still interp-fastest overall;
+    both JITs stay opt-in.
+  * Next real wins remain R11 (a)+(b): ensureList compaction, evalArg callHist.
