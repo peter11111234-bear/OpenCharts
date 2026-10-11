@@ -214,3 +214,10 @@
   * 修正:__pineJitUdf 改預設 ON(opt-out __pineNoJitUdf/PINE_JIT_UDF=0);
     K4.55 plot 輸出 jitUdf vs interp 逐 bit 一致;__pineJit(top-level)維持 opt-in。
   * bench-jit.ts 已補 import builtins+mtf — 之後的 bench 都是真 workload。
+  * R12d follow-ups: (a) getUdtMethod memoized per (callsite,selfType) —
+    udtMethodAt in interpreter.ts, 91f95ce (UDT-heavy ~2%; K4.55 neutral).
+    (b) loop JIT DEFERRED — ta.* window builtins are the real cost (~8ms/bar),
+    loop-stmt emit is risky (loopVar BarSeries/break semantics) for small gain.
+    (c) ensureList residual audited — decl 1218/arg 426/lit 311 all legit
+    conditional registrations; top-level 'arg' skip is UNSAFE (ternary arms
+    keep topLevelBody=true while not evaluating every bar).
