@@ -1241,7 +1241,9 @@ reg('dmi', (ctx, args, named) => {
 
 // TV signature: ta.kc(source, length, mult, useTrueRange) — basis = ma(src, L),
 // range = ma(useTrueRange ? ta.tr : high - low, L), both EMA (kc) or WMA (kcW).
-function kcImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>, useWma: boolean): Value {
+// ta.kcw is the scalar width (upper-lower)/basis of the EMA kc — matches the
+// bb/bbw pair and the pinets port; not to be confused with tuple kcW.
+function kcParts(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>, useWma: boolean) {
   const b = bindArgs(args, named, ['source', 'length', 'mult', 'useTrueRange']);
   const src = srcOf(ctx, b) ?? vsOf(ctx, { kind: 'series', v: ctx.close }, 'close');
   const L = lenOf(b) ?? 20;
@@ -1261,6 +1263,10 @@ function kcImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>, us
   const rng = useWma
     ? vseries(ctx, ['kc-r', ...tag], (bb) => wmaWin(ctx, rngSrc, bb, L))
     : emaVs(ctx, rngSrc, L, ['kc-r', ...tag]);
+  return { basis, rng, mult };
+}
+function kcImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>, useWma: boolean): Value {
+  const { basis, rng, mult } = kcParts(ctx, args, named, useWma);
   const bar = ctx.barIndex;
   const base = basis.get(bar), r = rng.get(bar);
   if (base === undefined || r === undefined) return arr(NA, NA, NA);
@@ -1268,7 +1274,13 @@ function kcImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>, us
 }
 reg('kc', (ctx, a, n) => kcImpl(ctx, a, n, false));
 reg('kcW', (ctx, a, n) => kcImpl(ctx, a, n, true));
-reg('kcw', (ctx, a, n) => kcImpl(ctx, a, n, true));
+reg('kcw', (ctx, a, n) => {
+  const { basis, rng, mult } = kcParts(ctx, a, n, false);
+  const bar = ctx.barIndex;
+  const base = basis.get(bar), r = rng.get(bar);
+  if (base === undefined || r === undefined) return NA;
+  return fl(base === 0 ? NaN : (2 * r * mult) / base);
+});
 
 // ── fisher transform ─────────────────────────────────────────────────────────
 // LuxAlgo-style: [fisher, trigger] where trigger = fisher[1]. Value = normalized

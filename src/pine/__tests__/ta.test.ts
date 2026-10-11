@@ -641,8 +641,14 @@ describe('fix regressions', () => {
     expect(numv(v[0]!)).toBeGreaterThan(numv(v[2]!));
   });
 
-  it('ta.kcw alias registered', () => {
-    expect(BUILTINS.has('ta.kcw')).toBe(true);
+  it('ta.kcw returns scalar width (upper-lower)/basis of ta.kc', () => {
+    const bars = mkBars(40);
+    const kc = runBars(bars, (c) => call('kc', c, [ser(c.close), iv(20), fv(2)]));
+    const kcw = runBars(bars, (c) => call('kcw', c, [ser(c.close), iv(20), fv(2)]));
+    const v = arrv(kc[39]!);
+    const w = kcw[39]!;
+    if (w.kind !== 'float' && w.kind !== 'int') throw new Error(`kcw not scalar: ${w.kind}`);
+    expect(numv(w)).toBeCloseTo((numv(v[1]!) - numv(v[2]!)) / numv(v[0]!), 8);
   });
 
   it('ta.correlation alias matches ta.cor', () => {

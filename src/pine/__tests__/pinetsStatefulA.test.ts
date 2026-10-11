@@ -13,9 +13,10 @@
 //                builtin recurs from bar 0. Semantic test instead of parity.
 //   dmi, kc    — same SMA-vs-recursive seeding gap (and bar-0 tr in kc's span);
 //                semantic tests.
-//   kcw        — name collides with the existing builtin which is TV's kcW
-//                (WMA Keltner tuple); pinets kcw is the scalar KC width — a
-//                genuine semantic mismatch, verified against ported ta.kc.
+//   kcw        — canonical scalar width: builtin `ta.kcw` now computes
+//                (upper-lower)/basis of EMA kc (bb/bbw convention; `ta.kcW`
+//                stays the WMA tuple). The port overwrites with identical
+//                semantics — verified against ported ta.kc below.
 //   accdist, alma, barssince, falling — no existing builtin: smoke tests.
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
