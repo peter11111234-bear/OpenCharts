@@ -221,3 +221,21 @@
     (c) ensureList residual audited — decl 1218/arg 426/lit 311 all legit
     conditional registrations; top-level 'arg' skip is UNSAFE (ternary arms
     keep topLevelBody=true while not evaluating every bar).
+ * R13 A-list (interp arg/series plumbing): 5 recon scouts → 3 landed, 2 closed.
+ * 410dac9 BarSeries firstBar virtualize (leading-NA zone no longer
+   materialized): buf pushes 77M → 4.9M (-94%), K4.55 min run/bar 2.08→1.83
+   (-12%). LiftedSeries.materialize anchors firstBar so rLen stays n.
+ * 61e01e4 siteCtx stack: pushSite walks the trie once per callsite push;
+   siteKey drops to 1 Map.get (was depth+2 + nodeIds hash ~800×/bar).
+ * 56036ba call-site alloc cuts: all-positional bindCallArgs/bindArgsJit
+   skip Set+positionals; cow.rebind skipped when inner===arg (CowSeries.
+   source); seed thunk skipped while isDirty=false.
+ * e164a76 paramFlags needsHist/mut: evalArg/jitArgFinish noHist drops
+   callHist writes for params that never read x[n]; callUdfValue binds
+   !hist&&!mut params directly (no CowSeries, no seed BarSeries).
+   callHistWrites 222→125.8/bar (-43%). Parity interp≡jitUdf IDENTICAL.
+ * A1 ta-kernel: CLOSED — winAgg already O(1); earlier 8ms attribution was
+   misread (evalArg/callUdfValue marshalling, not window scan).
+ * Remaining: ~110/bar builtin-side callHist writes (array.set, math.*,
+   fill, nz, plot/plotshape literals) — need per-builtin reads-arg-history
+   table; only ta.* source-args actually need history.
