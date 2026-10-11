@@ -189,6 +189,7 @@ const PROP_TABLES: Record<string, Record<string, PropType>> = {
     x: 'num', y: 'num', text: 'str', xloc: 'str', yloc: 'str',
     color: 'str', style: 'str', textcolor: 'str', size: 'str',
     textalign: 'str', tooltip: 'str',
+    text_font_family: 'str', text_formatting: 'str',
   },
   box: {
     left: 'num', top: 'num', right: 'num', bottom: 'num',
@@ -196,6 +197,12 @@ const PROP_TABLES: Record<string, Record<string, PropType>> = {
     extend: 'str', xloc: 'str', bgcolor: 'str',
     text: 'str', text_size: 'str', text_color: 'str',
     text_halign: 'str', text_valign: 'str', text_wrap: 'str',
+    text_font_family: 'str', text_formatting: 'str',
+  },
+  // TV exposes set_* only; the generated get_* are a harmless superset.
+  table: {
+    position: 'str', bgcolor: 'str', border_color: 'str', border_width: 'num',
+    frame_color: 'str', frame_width: 'num',
   },
 };
 
@@ -223,6 +230,7 @@ registerBuiltin('line', 'new', (c, args, named) => {
   const ctx = c as RtCtx;
   const bound = bindArgs(args, named, [
     'x1', 'y1', 'x2', 'y2', 'xloc', 'extend', 'color', 'style', 'width',
+    'force_overlay',
   ] as const);
   const props: Record<string, unknown> = {
     x1: numArg(bound, 'x1', 0), y1: numArg(bound, 'y1', 0),
@@ -234,6 +242,9 @@ registerBuiltin('line', 'new', (c, args, named) => {
     style: strArg(bound, 'style', 'line.style_solid'),
     width: numArg(bound, 'width', 1),
   };
+  // Upstream: constructor-only, no set_force_overlay. Omit the key when
+  // unset — `undefined` serializes to null and diffs against goldens.
+  if (bound.has('force_overlay')) props.force_overlay = boolArg(bound, 'force_overlay', false);
   const obj = created(ctx, 'line', props);
   return { kind: 'line', v: obj };
 });
@@ -246,6 +257,27 @@ registerBuiltin('line', 'set_xy1', (c, args) => {
 registerBuiltin('line', 'set_xy2', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) drawSink(c as RtCtx).update(obj, { x2: asNum(args[1] ?? NA), y2: asNum(args[2] ?? NA) });
+  return { kind: 'void' };
+});
+registerBuiltin('line', 'set_first_point', (c, args) => {
+  const obj = asObj(args[0]);
+  const p = pointXY(unwrapped(args[1]), String(obj?.props.xloc ?? 'xloc.bar_index'));
+  if (obj && p) drawSink(c as RtCtx).update(obj, { x1: p.x, y1: p.y });
+  return { kind: 'void' };
+});
+registerBuiltin('line', 'set_second_point', (c, args) => {
+  const obj = asObj(args[0]);
+  const p = pointXY(unwrapped(args[1]), String(obj?.props.xloc ?? 'xloc.bar_index'));
+  if (obj && p) drawSink(c as RtCtx).update(obj, { x2: p.x, y2: p.y });
+  return { kind: 'void' };
+});
+// TV signature (id, x1, x2, xloc) — writes both endpoints too; overrides the
+// prop-table generated setter which only stored xloc.
+registerBuiltin('line', 'set_xloc', (c, args) => {
+  const obj = asObj(args[0]);
+  if (obj) drawSink(c as RtCtx).update(obj, {
+    x1: asNum(args[1] ?? NA), x2: asNum(args[2] ?? NA), xloc: asStr(args[3] ?? NA),
+  });
   return { kind: 'void' };
 });
 
@@ -281,6 +313,7 @@ registerBuiltin('label', 'new', (c, args, named) => {
   const bound = bindArgs(args, named, [
     'x', 'y', 'text', 'xloc', 'yloc', 'color', 'style',
     'textcolor', 'size', 'textalign', 'tooltip',
+    'text_font_family', 'text_formatting', 'force_overlay',
   ] as const);
   const props: Record<string, unknown> = {
     x: numArg(bound, 'x', 0), y: numArg(bound, 'y', 0),
@@ -294,6 +327,11 @@ registerBuiltin('label', 'new', (c, args, named) => {
     textalign: strArg(bound, 'textalign', 'text.align_left'),
     tooltip: bound.has('tooltip') ? strArg(bound, 'tooltip', '') : undefined,
   };
+  // Stored-only fields (no downstream reader yet) and constructor-only
+  // force_overlay — omit keys when unset; `undefined` diffs against goldens.
+  if (bound.has('text_font_family')) props.text_font_family = strArg(bound, 'text_font_family', 'font.family_default');
+  if (bound.has('text_formatting')) props.text_formatting = strArg(bound, 'text_formatting', 'format.none');
+  if (bound.has('force_overlay')) props.force_overlay = boolArg(bound, 'force_overlay', false);
   const obj = created(ctx, 'label', props);
   return { kind: 'label', v: obj };
 });
@@ -301,6 +339,19 @@ registerBuiltin('label', 'new', (c, args, named) => {
 registerBuiltin('label', 'set_xy', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) drawSink(c as RtCtx).update(obj, { x: asNum(args[1] ?? NA), y: asNum(args[2] ?? NA) });
+  return { kind: 'void' };
+});
+registerBuiltin('label', 'set_point', (c, args) => {
+  const obj = asObj(args[0]);
+  const p = pointXY(unwrapped(args[1]), String(obj?.props.xloc ?? 'xloc.bar_index'));
+  if (obj && p) drawSink(c as RtCtx).update(obj, { x: p.x, y: p.y });
+  return { kind: 'void' };
+});
+// TV signature (id, x, xloc) — also writes the coordinate; overrides the
+// prop-table generated setter which only stored xloc.
+registerBuiltin('label', 'set_xloc', (c, args) => {
+  const obj = asObj(args[0]);
+  if (obj) drawSink(c as RtCtx).update(obj, { x: asNum(args[1] ?? NA), xloc: asStr(args[2] ?? NA) });
   return { kind: 'void' };
 });
 
@@ -325,6 +376,7 @@ registerBuiltin('box', 'new', (c, args, named) => {
     'left', 'top', 'right', 'bottom', 'xloc', 'extend', 'border_color',
     'border_width', 'border_style', 'bgcolor', 'text', 'text_size',
     'text_color', 'text_halign', 'text_valign', 'text_wrap',
+    'text_font_family', 'text_formatting', 'force_overlay',
   ] as const);
   const props: Record<string, unknown> = {
     left: numArg(bound, 'left', 0), top: numArg(bound, 'top', 0),
@@ -342,6 +394,9 @@ registerBuiltin('box', 'new', (c, args, named) => {
     text_valign: strArg(bound, 'text_valign', 'text.align_center'),
     text_wrap: strArg(bound, 'text_wrap', 'text.wrap_none'),
   };
+  if (bound.has('text_font_family')) props.text_font_family = strArg(bound, 'text_font_family', 'font.family_default');
+  if (bound.has('text_formatting')) props.text_formatting = strArg(bound, 'text_formatting', 'format.none');
+  if (bound.has('force_overlay')) props.force_overlay = boolArg(bound, 'force_overlay', false);
   const obj = created(ctx, 'box', props);
   return { kind: 'box', v: obj };
 });
@@ -354,6 +409,27 @@ registerBuiltin('box', 'set_lefttop', (c, args) => {
 registerBuiltin('box', 'set_rightbottom', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) drawSink(c as RtCtx).update(obj, { right: asNum(args[1] ?? NA), bottom: asNum(args[2] ?? NA) });
+  return { kind: 'void' };
+});
+registerBuiltin('box', 'set_top_left_point', (c, args) => {
+  const obj = asObj(args[0]);
+  const p = pointXY(unwrapped(args[1]), String(obj?.props.xloc ?? 'xloc.bar_index'));
+  if (obj && p) drawSink(c as RtCtx).update(obj, { left: p.x, top: p.y });
+  return { kind: 'void' };
+});
+registerBuiltin('box', 'set_bottom_right_point', (c, args) => {
+  const obj = asObj(args[0]);
+  const p = pointXY(unwrapped(args[1]), String(obj?.props.xloc ?? 'xloc.bar_index'));
+  if (obj && p) drawSink(c as RtCtx).update(obj, { right: p.x, bottom: p.y });
+  return { kind: 'void' };
+});
+// TV signature (id, left, right, xloc) — writes both edges too; overrides the
+// prop-table generated setter which only stored xloc.
+registerBuiltin('box', 'set_xloc', (c, args) => {
+  const obj = asObj(args[0]);
+  if (obj) drawSink(c as RtCtx).update(obj, {
+    left: asNum(args[1] ?? NA), right: asNum(args[2] ?? NA), xloc: asStr(args[3] ?? NA),
+  });
   return { kind: 'void' };
 });
 
@@ -387,6 +463,7 @@ registerBuiltin('table', 'new', (c, args, named) => {
   const bound = bindArgs(args, named, [
     'position', 'columns', 'rows', 'bgcolor',
     'frame_color', 'frame_width', 'border_color', 'border_width',
+    'force_overlay',
   ] as const);
   const props: Record<string, unknown> = {
     position: strArg(bound, 'position', 'position.top_center'),
@@ -398,6 +475,7 @@ registerBuiltin('table', 'new', (c, args, named) => {
     border_color: colorArg(bound, 'border_color'),
     border_width: numArg(bound, 'border_width', 0),
   };
+  if (bound.has('force_overlay')) props.force_overlay = boolArg(bound, 'force_overlay', false);
   const obj = created(ctx, 'table', props);
   return { kind: 'table', v: obj };
 });
@@ -406,6 +484,7 @@ registerBuiltin('table', 'cell', (c, args, named) => {
   const bound = bindArgs(args, named, [
     'table_id', 'column', 'row', 'text', 'width', 'height', 'text_color',
     'text_halign', 'text_valign', 'text_size', 'bgcolor', 'tooltip',
+    'text_font_family', 'text_formatting',
   ] as const);
   const obj = asObj(bound.get('table_id') ?? bound.get('table'));
   if (!obj) return { kind: 'void' };
@@ -422,6 +501,8 @@ registerBuiltin('table', 'cell', (c, args, named) => {
   if (bound.has('text_valign')) cell.text_valign = strArg(bound, 'text_valign', 'text.align_center');
   if (bound.has('text_size')) cell.text_size = strArg(bound, 'text_size', 'size.normal');
   if (bound.has('tooltip')) cell.tooltip = strArg(bound, 'tooltip', '');
+  if (bound.has('text_font_family')) cell.text_font_family = strArg(bound, 'text_font_family', 'font.family_default');
+  if (bound.has('text_formatting')) cell.text_formatting = strArg(bound, 'text_formatting', 'format.none');
   cellsOf(obj).set(`${col},${row}`, cell);
   drawSink(c as RtCtx).update(obj, {});
   return { kind: 'void' };
@@ -482,6 +563,12 @@ cellSetter('text_color', v => asColor(v));
 cellSetter('text_size', v => asStr(v));
 cellSetter('bgcolor', v => asColor(v));
 cellSetter('tooltip', v => asStr(v));
+cellSetter('text_halign', v => asStr(v));
+cellSetter('text_valign', v => asStr(v));
+cellSetter('width', v => asNum(v));
+cellSetter('height', v => asNum(v));
+cellSetter('text_font_family', v => asStr(v));
+cellSetter('text_formatting', v => asStr(v));
 
 registerBuiltin('table', 'delete', (c, args) => {
   const ctx = c as RtCtx;

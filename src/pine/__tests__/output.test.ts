@@ -565,6 +565,75 @@ describe('drawings', () => {
     call(ctx, 'line.delete', '#2', [l1]);
     expect(arrOf(getConstant('line.all', ctx)!)).toHaveLength(1);
   });
+
+  it('chart.point setters resolve x via object xloc', () => {
+    const ctx = mkCtx(1);
+    const mkPt = (index: number, price: number): Value => ({ kind: 'udt', v: { typeName: 'chart.point', fields: new Map<string, Value>([
+      ['index', f(index)], ['price', f(price)], ['time', { kind: 'int', v: 999 }],
+    ]) } });
+    const l = call(ctx, 'line.new', '#0', [f(0), f(0), f(1), f(1)]);
+    const obj = drawObjOf(l);
+    call(ctx, 'line.set_first_point', '#1', [l, mkPt(3, 30)]);
+    call(ctx, 'line.set_second_point', '#2', [l, mkPt(7, 70)]);
+    expect(obj.props).toMatchObject({ x1: 3, y1: 30, x2: 7, y2: 70 });
+    const lb = call(ctx, 'label.new', '#3', [f(0), f(0)]);
+    call(ctx, 'label.set_point', '#4', [lb, mkPt(5, 55)]);
+    expect(drawObjOf(lb).props).toMatchObject({ x: 5, y: 55 });
+    const bx = call(ctx, 'box.new', '#5', [f(0), f(0), f(1), f(1)]);
+    call(ctx, 'box.set_top_left_point', '#6', [bx, mkPt(2, 90)]);
+    call(ctx, 'box.set_bottom_right_point', '#7', [bx, mkPt(8, 10)]);
+    expect(drawObjOf(bx).props).toMatchObject({ left: 2, top: 90, right: 8, bottom: 10 });
+  });
+
+  it('set_xloc TV signatures write coordinates and xloc together', () => {
+    const ctx = mkCtx(1);
+    const l = call(ctx, 'line.new', '#0', [f(0), f(0), f(1), f(1)]);
+    call(ctx, 'line.set_xloc', '#1', [l, f(4), f(9), s('xloc.bar_time')]);
+    expect(drawObjOf(l).props).toMatchObject({ x1: 4, x2: 9, xloc: 'xloc.bar_time' });
+    const lb = call(ctx, 'label.new', '#2', [f(0), f(0)]);
+    call(ctx, 'label.set_xloc', '#3', [lb, f(6), s('xloc.bar_time')]);
+    expect(drawObjOf(lb).props).toMatchObject({ x: 6, xloc: 'xloc.bar_time' });
+    const bx = call(ctx, 'box.new', '#4', [f(0), f(0), f(1), f(1)]);
+    call(ctx, 'box.set_xloc', '#5', [bx, f(2), f(8), s('xloc.bar_time')]);
+    expect(drawObjOf(bx).props).toMatchObject({ left: 2, right: 8, xloc: 'xloc.bar_time' });
+  });
+
+  it('table set_* + cell_set_* write props and cells', () => {
+    const ctx = mkCtx(1);
+    const t = call(ctx, 'table.new', '#0', [s('position.top_right'), f(2), f(2)], { force_overlay: b(true) });
+    const obj = drawObjOf(t);
+    expect(obj.props.force_overlay).toBe(true);
+    call(ctx, 'table.set_position', '#1', [t, s('position.bottom_left')]);
+    call(ctx, 'table.set_frame_width', '#2', [t, f(3)]);
+    expect(obj.props).toMatchObject({ position: 'position.bottom_left', frame_width: 3 });
+
+    call(ctx, 'table.cell', '#3', [t, f(0), f(0), s('A')]);
+    call(ctx, 'table.cell_set_width', '#4', [t, f(0), f(0), f(12)]);
+    call(ctx, 'table.cell_set_text_halign', '#5', [t, f(0), f(0), s('text.align_right')]);
+    call(ctx, 'table.cell_set_text_font_family', '#6', [t, f(0), f(0), s('font.family_monospace')]);
+    call(ctx, 'table.cell_set_text_formatting', '#7', [t, f(0), f(0), s('format.bold')]);
+    const cell = (obj.props.cells as Map<string, Record<string, unknown>>).get('0,0')!;
+    expect(cell).toMatchObject({
+      width: 12, text_halign: 'text.align_right',
+      text_font_family: 'font.family_monospace', text_formatting: 'format.bold',
+    });
+  });
+
+  it('label/box text_font_family + text_formatting set_* store props', () => {
+    const ctx = mkCtx(1);
+    const lb = call(ctx, 'label.new', '#0', [f(0), f(0)]);
+    call(ctx, 'label.set_text_font_family', '#1', [lb, s('font.family_monospace')]);
+    call(ctx, 'label.set_text_formatting', '#2', [lb, s('format.bold')]);
+    expect(drawObjOf(lb).props).toMatchObject({
+      text_font_family: 'font.family_monospace', text_formatting: 'format.bold',
+    });
+    const bx = call(ctx, 'box.new', '#3', [f(0), f(0), f(1), f(1)]);
+    call(ctx, 'box.set_text_font_family', '#4', [bx, s('font.family_default')]);
+    call(ctx, 'box.set_text_formatting', '#5', [bx, s('format.italic')]);
+    expect(drawObjOf(bx).props).toMatchObject({
+      text_font_family: 'font.family_default', text_formatting: 'format.italic',
+    });
+  });
 });
 
 // ── enum constants ──────────────────────────────────────────────────────────
