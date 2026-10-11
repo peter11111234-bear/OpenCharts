@@ -47,6 +47,11 @@ export class BarSeries extends Series {
   protected head = 0;
   protected capN: number;
   protected lastBar = -1;
+  /** Logical start of the recorded window. Reads before it (and in the
+   *  virtual leading-NA zone, bars < the bar of `buf[head]`) answer NA —
+   *  identical to the NA backfill a fresh series used to materialize.
+   *  LiftedSeries/LitSeries set it so `rLen` stays the logical count. */
+  protected firstBar = 0;
 
   constructor(cap = 5000) {
     super(cap);
@@ -58,9 +63,9 @@ export class BarSeries extends Series {
     return this.lastBar;
   }
 
-  /** Recorded history length. */
+  /** Recorded history length (logical window: leading NA zone counts). */
   protected rLen(): number {
-    return this.buf.length - this.head;
+    return Math.min(this.lastBar - this.firstBar + 1, this.capN);
   }
 
   /** Value at ring index k (0 = newest); undefined outside recorded history. */
@@ -86,16 +91,22 @@ export class BarSeries extends Series {
       return;
     }
     if (bar > this.lastBar) {
-      // Carry-forward fill: bars lastBar+1 .. bar-1 keep the previous value.
-      const fill = this.rAt(0) ?? NA;
-      for (let b = this.lastBar + 1; b < bar; b++) this.buf.push(fill);
+      // Empty buffer: the gap is the leading virtual-NA zone — no fill needed
+      // (reads answer NA there). Only a non-empty buffer must materialize the
+      // carry-forward gap so buf[buf.length-1] stays aligned with lastBar and
+      // a later same-bar overwrite writes the newest slot.
+      if (this.buf.length !== this.head) {
+        const fill = this.rAt(0) ?? NA;
+        for (let b = this.lastBar + 1; b < bar; b++) this.buf.push(fill);
+      }
       this.buf.push(v);
       this.lastBar = bar;
       this.trim();
       return;
     }
     // Retro-write into already-recorded history (shouldn't happen in the
-    // forward bar loop; tolerated for robustness).
+    // forward bar loop; tolerated for robustness). Writes into the virtual
+    // leading-NA zone are dropped — those bars read NA either way.
     const k = this.lastBar - bar;
     if (k < this.buf.length - this.head) this.buf[this.buf.length - 1 - k] = v;
   }
@@ -127,6 +138,9 @@ export class BarSeries extends Series {
    */
   ensureBar(bar: number): void {
     if (bar <= this.lastBar) return;
+    // Fresh series: nothing recorded to carry forward — advancing lastBar
+    // makes the whole window virtual-NA without materializing bar+1 slots.
+    if (this.buf.length === this.head) { this.lastBar = bar; return; }
     const fill = this.rAt(0) ?? NA;
     for (let b = this.lastBar + 1; b <= bar; b++) this.buf.push(fill);
     this.lastBar = bar;
@@ -163,7 +177,6 @@ export class BarSeries extends Series {
  */
 export class LitSeries extends BarSeries {
   private lit: Value;
-  private firstBar: number;
   /** false after materialize() — reads fall back to real buffer storage. */
   private virtual = true;
 
@@ -278,6 +291,9 @@ export class LiftedSeries extends BarSeries {
     this.memo = [];
     this.buf = out;
     this.head = 0;
+    // Materialized buf holds exactly n real entries with no leading-NA
+    // backfill — anchor the logical window so base rLen stays n.
+    this.firstBar = this.lastBar - n + 1;
   }
 
   override setAt(bar: number, v: Value): void {
