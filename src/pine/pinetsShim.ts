@@ -155,8 +155,11 @@ function ptGet(source: unknown, index: number): unknown {
 }
 
 /** Ported method factories; `pine.ta` exposes them bound to the facade. */
-type PtFactory = (context: PineTsCtx) => (...a: unknown[]) => unknown;
-const PORTED: Record<string, { factory: PtFactory; order: readonly string[] }> = {};
+export type PtFactory = (context: PineTsCtx) => (...a: unknown[]) => unknown;
+/** A ported slice contributes {name: {factory, order}} — merged into PORTED by
+ *  the tier files' registration below. */
+export type PtSlice = Record<string, { factory: PtFactory; order: readonly string[] }>;
+const PORTED: PtSlice = {};
 
 const FACADES = new WeakMap<BuiltinCtx, PineTsCtx>();
 
@@ -196,6 +199,12 @@ export function makePineTsCtx(ctx: BuiltinCtx): PineTsCtx {
   facade.idx = ctx.barIndex;
   facade.taState = bag; // same object each time — kept for clarity
   return facade;
+}
+
+/** Merge a ported slice into the registry — called by tier files
+ *  (pinetsStateless/stateful/composite) at import time. */
+export function registerPtSlice(slice: PtSlice): void {
+  Object.assign(PORTED, slice);
 }
 
 // ── Ported methods ──────────────────────────────────────────────────────────
