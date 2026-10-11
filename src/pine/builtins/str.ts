@@ -343,3 +343,8 @@ registerBuiltin('str', 'match', (_ctx, args, named) => {
 for (const name of ['mintick', 'price', 'percent', 'volume', 'inherit', 'time']) {
   registerConstant('format', name, { kind: 'string', v: `format.${name}` });
 }
+// Pine text_formatting constants — stored on label/box/cell props, read by
+// engine font formatting. TV uses format.* names.
+for (const name of ['bold', 'italic', 'bold_italic', 'none']) {
+  registerConstant('format', name, { kind: 'string', v: `format.${name}` });
+}

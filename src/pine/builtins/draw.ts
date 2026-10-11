@@ -38,9 +38,11 @@ enumSet('label', [
 enumSet('text', [
   'align_left', 'align_center', 'align_right',
   'align_top', 'align_bottom',
+  'format_bold', 'format_italic', 'format_none',
   'wrap_auto', 'wrap_none',
   'format_mintick', 'format_percent', 'format_volume', 'format_inherit',
 ]);
+enumSet('font', ['family_default', 'family_monospace']);
 enumSet('chart', ['point_standard', 'point_sensitive', 'point_highres']);
 registerConstant('chart', 'fg_color', { kind: 'string', v: 'chart.fg_color' });
 

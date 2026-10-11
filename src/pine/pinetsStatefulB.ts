@@ -1714,7 +1714,9 @@ function ptPivotPointLevels(context: PineTsCtx) {
         }
 
         if (!context.taState) context.taState = {};
-        const stateKey = _callId || `pivot_point_levels_${type}_${developing}`;
+        // Key by type+developing too — upstream keys on _callId alone, which
+        // shares committed period/levels across type switches mid-run.
+        const stateKey = `${_callId || 'pivot_point_levels'}_${type}_${developing}`;
         if (!context.taState[stateKey]) {
             context.taState[stateKey] = {
                 lastIdx: -1,

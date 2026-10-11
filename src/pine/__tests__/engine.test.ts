@@ -290,4 +290,17 @@ describe('regressions — R2 verification findings', () => {
       mkBars(5));
     expect(m.labels?.[0]?.text).toBe('111');
   });
+
+  it('text_font_family / text_formatting reach the model', async () => {
+    const m = await runModel(
+      `//@version=6\nindicator("a", overlay=true)\nif bar_index == 1\n    label.new(0, 1, "L", text_font_family=font.family_monospace, text_formatting=format.bold)\n    b = box.new(1, 2, 2, 3, text="B", text_font_family=font.family_monospace)\n    box.set_text_formatting(b, format.italic)\n    table.new(position.top_left, 1, 1)\n`,
+      mkBars(5));
+    const lb = m.labels?.[0];
+    expect(lb?.fontFamily).toBe('monospace');
+    expect(lb?.bold).toBe(true);
+    const bx = m.boxes?.[0];
+    expect(bx?.fontFamily).toBe('monospace');
+    expect(bx?.italic).toBe(true);
+    expect(bx?.bold).toBe(false);
+  });
 });

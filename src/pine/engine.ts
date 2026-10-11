@@ -641,6 +641,16 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
     barColors.push({ time, color: colors[colors.length - 1]! });
   }
 
+
+  // ── text_font_family / text_formatting → vela font options ──────────────
+  const fontFamilyOf = (raw: unknown): 'default' | 'monospace' =>
+    String(raw ?? '').includes('monospace') ? 'monospace' : 'default';
+  const fmtOf = (raw: unknown): { bold?: boolean; italic?: boolean } => {
+    const s = String(raw ?? '');
+    const bold = s.includes('bold'), italic = s.includes('italic');
+    return { ...(bold ? { bold: true } : {}), ...(italic ? { italic: true } : {}) };
+  };
+
   // ── drawings — x coords stay in Pine form (bar index or epoch ms), tagged
   // by xloc; the renderer resolves them against its own time scale. ──
   for (const d of r.drawings) {
@@ -670,7 +680,8 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
         size: labelSizeOf(propStr(p, 'size')),
         textAlign: alignOf(propStr(p, 'textalign')),
         tooltip: propStr(p, 'tooltip'),
-        fontFamily: 'default',
+        fontFamily: fontFamilyOf(p['text_font_family']),
+        ...fmtOf(p['text_formatting']),
       });
     } else if (d.kind === 'box') {
       const left = propNum(p, 'left'), top = propNum(p, 'top');
@@ -692,9 +703,9 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
         hAlign: alignOf(propStr(p, 'text_halign')),
         vAlign: valignOf(propStr(p, 'text_valign')),
         wrap: (propStr(p, 'text_wrap') ?? '').includes('auto'),
-        fontFamily: 'default',
-        bold: false,
-        italic: false,
+        fontFamily: fontFamilyOf(p['text_font_family']),
+        bold: !!fmtOf(p['text_formatting']).bold,
+        italic: !!fmtOf(p['text_formatting']).italic,
       });
     } else if (d.kind === 'table') {
       // props.cells is a live Map<'col,row', CellProps> — serialize to the
@@ -722,12 +733,12 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
             vAlign: valignOf(propStr(cell, 'text_valign')),
             // numeric text_size = raw pixels; named sizes map via textSizeOf.
             textSize: Number.isFinite(sizeNum) ? sizeNum : textSizeOf(rawSize),
-            fontFamily: 'default',
+            fontFamily: fontFamilyOf(cell['text_font_family']),
             tooltip: propStr(cell, 'tooltip'),
             width: propNum(cell, 'width'),
             height: propNum(cell, 'height'),
-            bold: false,
-            italic: false,
+            bold: !!fmtOf(cell['text_formatting']).bold,
+            italic: !!fmtOf(cell['text_formatting']).italic,
           };
         }
       }
