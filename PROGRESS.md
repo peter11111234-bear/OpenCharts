@@ -239,3 +239,15 @@
  * Remaining: ~110/bar builtin-side callHist writes (array.set, math.*,
    fill, nz, plot/plotshape literals) — need per-builtin reads-arg-history
    table; only ta.* source-args actually need history.
+ * R14 builtin-side hist table (histSpecHas): registerBuiltin gains `hist`
+   (true | HistSpec{idx,names} | false); HIST_NS defaults ta.* on, array.*
+   spec'd per stash-param (val/value/initial_value only), opt-outs for
+   scalar-only ta (tr/atr/supertrend/wad/pvt/nvi/pvi/dmi/sar/vortex) and
+   math.sum/nz/fixnan opt-ins. evalArg/jitMatArg skip callHist per-arg.
+   callHistWrites 125.8→17.4/bar (-86%), K4.55 run/bar 13.50→12.35 (-8.5%).
+   Golden 9/9 + corpus parity interp≡jitUdf IDENTICAL; suite 839 green.
+ * Audit basis: builtins either (a) scan arg history (ta vsOf/srcOf,
+   math.sum, fixnan) or (b) stash the arg Value as a live series (array
+   elements, nz verbatim passthrough). Everything else reads .cur() at
+   call time — callHist invisible to it. evalHistref's own call-site
+   tracking covers x[n] on builtin RESULTS, so arg tracking was pure waste.

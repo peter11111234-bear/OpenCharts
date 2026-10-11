@@ -56,7 +56,7 @@ import { FOR_IN } from './parser';
 import { BarSeries, ForwardingSeries, LitSeries, histGetAt, valueAt } from './series';
 import { Scope, blockFrame, seriesOf, type Frame } from './scope';
 import { BarCtx, MemoryDrawSink } from './context';
-import { BUILTINS, getConstant, kindBuiltin, registerConstant } from './builtins/registry';
+import { BUILTINS, HIST_BUILTINS, getConstant, histSpecHas, kindBuiltin, registerConstant } from './builtins/registry';
 import { truthy, drainBindWarnings, type RtCtx } from './builtins/util';
 import { declDrawQuotas, INDICATOR_DECL_ORDER } from './builtins/draw';
 import { strategyDecl, execsAt } from './builtins/strategy';
@@ -1215,8 +1215,12 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
       if (b) {
         const args: Value[] = [obj];
         const named: Record<string, Value> = {};
+        const spec = HIST_BUILTINS.get(b);
+        // pos starts at 1: args[0] is the receiver ('id' slot), callsite
+        // positionals bind order[1..].
+        let pos = 1;
         for (const a of node.args) {
-          const v = evalArg(a, frame, true);
+          const v = evalArg(a, frame, true, !histSpecHas(spec, a.name === undefined ? pos++ : -1, a.name));
           if (a.name) named[a.name] = v;
           else args.push(v);
         }
@@ -1269,8 +1273,10 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
 function invokeBuiltin(b: BuiltinFn, node: Call, frame: Frame): Value {
   const args: Value[] = [];
   const named: Record<string, Value> = {};
+  const spec = HIST_BUILTINS.get(b);
+  let pos = 0;
   for (const a of node.args) {
-    const v = evalArg(a, frame, true);
+    const v = evalArg(a, frame, true, !histSpecHas(spec, a.name === undefined ? pos++ : -1, a.name));
     if (a.name) named[a.name] = v;
     else args.push(v);
   }
@@ -1311,6 +1317,9 @@ export let __callHistWrites = 0; // test instrumentation
  * a real callHist BarSeries. UDF/UDT-method args MUST keep the BarSeries —
  * callUdfValue seeds param history from it and CowSeries rebinds onto it;
  * `f(20)` bodies may legitimately read `x[1]` AND mutate `x`.
+ *  A noHist arg bound to a builtin param that neither scans its history
+ *  (HIST_BUILTINS, registry.ts) nor stashes the arg Value skips callHist —
+ *  builtins unwrap args via .cur() so tracking is invisible to them.
  */
 interface ParamFlag { hist: boolean; mut: boolean }
 /** Param-array → per-name {hist: reads x[n], mut: x := / x[i] := / passed to
@@ -2295,8 +2304,10 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
     if (hit.fn !== undefined && scope.lookup(hit.headName) === undefined) {
       const args: Value[] = [];
       const named: Record<string, Value> = {};
+      const spec = HIST_BUILTINS.get(hit.fn);
       for (const d of ds) {
-        const v = jitMatArg(state, run, ctx, d, true);
+        const v = jitMatArg(state, run, ctx, d, true,
+          !histSpecHas(spec, d.n === undefined ? args.length : -1, d.n));
         if (d.n !== undefined) named[d.n] = v; else args.push(v);
       }
       return callBuiltin(hit.fn, ctx, args, named, node);
@@ -2314,8 +2325,12 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
       if (b) {
         const args: Value[] = [obj];
         const named: Record<string, Value> = {};
+        const spec = HIST_BUILTINS.get(b);
         for (const d of ds) {
-          const v = jitMatArg(state, run, ctx, d, true);
+          // args.length already counts the receiver at [0] — callsite
+          // positional j binds order index j+1 = args.length.
+          const v = jitMatArg(state, run, ctx, d, true,
+            !histSpecHas(spec, d.n === undefined ? args.length : -1, d.n));
           if (d.n !== undefined) named[d.n] = v; else args.push(v);
         }
         return callBuiltin(b, ctx, args, named, node);
@@ -2453,8 +2468,10 @@ function jitBuiltinArgsInvoke(state: JitState, run: RunState, ctx: BuiltinCtx,
                               b: BuiltinFn, ds: JitArg[], node: Call): Value {
   const args: Value[] = [];
   const named: Record<string, Value> = {};
+  const spec = HIST_BUILTINS.get(b);
   for (const d of ds) {
-    const v = jitMatArg(state, run, ctx, d, true);
+    const v = jitMatArg(state, run, ctx, d, true,
+      !histSpecHas(spec, d.n === undefined ? args.length : -1, d.n));
     if (d.n !== undefined) named[d.n] = v; else args.push(v);
   }
   return callBuiltin(b, ctx, args, named, node);

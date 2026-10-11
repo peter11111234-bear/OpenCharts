@@ -8,6 +8,28 @@
 import type { BuiltinFn, Value } from '../contracts';
 
 export const BUILTINS: Map<string, BuiltinFn> = new Map();
+
+/** Which args of a builtin need per-bar callHist history. `true` = all args
+ *  (ta.* srcOf/vsOf window scans, verbatim series passthrough like nz);
+ *  {idx,names} = only those param slots (positional index AND named-arg name
+ *  both covered, since callers may use either). Builtins that only read
+ *  `.cur()` at call time get no entry — evalArg skips their tracking. */
+export interface HistSpec { idx: readonly number[]; names: readonly string[] }
+export const HIST_BUILTINS = new Map<BuiltinFn, HistSpec | true>();
+
+/** Resolve per-arg history need. Positional args match by index (named args
+ *  don't consume positional slots); named args match by name. */
+export function histSpecHas(spec: HistSpec | true | undefined, posIdx: number, name?: string): boolean {
+  if (spec === undefined) return false;
+  if (spec === true) return true;
+  return name !== undefined ? spec.names.includes(name) : spec.idx.includes(posIdx);
+}
+
+/** Namespaces where every builtin consumes arg history as a series
+ *  (ta.* srcOf/vsOf window args). array.* is spec-per-builtin — only
+ *  element-stash params need history, index/size args don't. */
+const HIST_NS: Record<string, true> = { ta: true };
+
 /** Two-level mirror of BUILTINS for `<value.kind>.<prop>` dispatch
  *  (e.g. `arr.push` on an array receiver → kindBuiltin('array','push')).
  *  Populated by registerBuiltin — same namespacing, no string concat at
@@ -21,9 +43,14 @@ export const CONSTANTS: Map<string, Value> = new Map();
 const LAZY_CONSTANTS = new Map<string, (ctx?: unknown) => Value>();
 
 /** Register a builtin under `ns.name` (e.g. 'ta','sma' → 'ta.sma').
- *  Pass `ns === ''` for top-level functions (e.g. 'plot'). */
-export function registerBuiltin(ns: string, name: string, fn: BuiltinFn): void {
-  BUILTINS.set(ns ? `${ns}.${name}` : name, fn);
+ *  Pass `ns === ''` for top-level functions (e.g. 'plot').
+ *  `hist`: true = every arg keeps callHist; HistSpec = only those params;
+ *  undefined defaults to HIST_NS membership (ta), false opts out. */
+export function registerBuiltin(ns: string, name: string, fn: BuiltinFn, hist?: boolean | HistSpec): void {
+  const key = ns ? `${ns}.${name}` : name;
+  BUILTINS.set(key, fn);
+  const spec = hist === undefined ? (ns in HIST_NS ? true : undefined) : hist || undefined;
+  if (spec !== undefined) HIST_BUILTINS.set(fn, spec);
   let perKind = KIND_BUILTIN.get(ns);
   if (perKind === undefined) {
     perKind = new Map();

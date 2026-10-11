@@ -63,7 +63,7 @@ registerBuiltin('', 'fixnan', (_ctx, args) => {
     return NA;
   }
   return v.kind === 'na' ? NA : v;
-});
+}, true);
 
 registerBuiltin('runtime', 'error', (_ctx, args, _n) => {
   const msg = args[0] === undefined ? 'runtime error' : asStr(unser(args[0])!);

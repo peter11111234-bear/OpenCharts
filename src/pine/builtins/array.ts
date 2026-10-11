@@ -65,12 +65,13 @@ const newArray = (ctx: BuiltinCtx, args: Value[], named: Record<string, Value>) 
   const init = bound.get('initial_value');
   return arrVal(new Array<Value>(size).fill(init === undefined ? NA : init));
 };
-registerBuiltin('array', 'new', newArray);
+registerBuiltin('array', 'new', newArray, { idx: [1], names: ['initial_value'] });
 for (const name of ['new_bool', 'new_color', 'new_float', 'new_int', 'new_line', 'new_label', 'new_box', 'new_string', 'new_type']) {
-  registerBuiltin('array', name, newArray);
+  registerBuiltin('array', name, newArray, { idx: [1], names: ['initial_value'] });
 }
 
-registerBuiltin('array', 'from', (_ctx, args) => arrVal(args.slice()));
+// Every arg is an element — stash keeps live-series semantics.
+registerBuiltin('array', 'from', (_ctx, args) => arrVal(args.slice()), true);
 
 // ── Mutation ────────────────────────────────────────────────────────────────
 
@@ -87,12 +88,12 @@ const mut = (
 registerBuiltin('array', 'push', mut(['id', 'val'], (a, b) => {
   a.push(b.get('val') ?? NA);
   return VOID;
-}));
+}), { idx: [1], names: ['val'] });
 
 registerBuiltin('array', 'unshift', mut(['id', 'val'], (a, b) => {
   a.unshift(b.get('val') ?? NA);
   return VOID;
-}));
+}), { idx: [1], names: ['val'] });
 
 registerBuiltin('array', 'pop', mut(['id'], (a) => (a.length === 0 ? NA : a.pop()!)));
 registerBuiltin('array', 'shift', mut(['id'], (a) => (a.length === 0 ? NA : a.shift()!)));
@@ -100,12 +101,12 @@ registerBuiltin('array', 'shift', mut(['id'], (a) => (a.length === 0 ? NA : a.sh
 registerBuiltin('array', 'set', mut(['id', 'index', 'value'], (a, b) => {
   a[resolveIdx(b, 'index', a.length, a.length - 1)] = b.get('value') ?? NA;
   return VOID;
-}));
+}), { idx: [2], names: ['value'] });
 
 registerBuiltin('array', 'insert', mut(['id', 'index', 'value'], (a, b) => {
   a.splice(resolveIdx(b, 'index', a.length, a.length), 0, b.get('value') ?? NA);
   return VOID;
-}));
+}), { idx: [2], names: ['value'] });
 
 registerBuiltin('array', 'remove', mut(['id', 'index'], (a, b) => {
   const [r] = a.splice(resolveIdx(b, 'index', a.length, a.length - 1), 1);
@@ -119,7 +120,7 @@ registerBuiltin('array', 'fill', mut(['id', 'value', 'index', 'length'], (a, b) 
   const len = lenV === undefined || lenV.kind === 'na' ? a.length - start : Math.trunc(asNum(lenV));
   for (let i = start; i < Math.min(a.length, start + len); i++) a[i] = v;
   return VOID;
-}));
+}), { idx: [1], names: ['value'] });
 
 registerBuiltin('array', 'clear', mut(['id'], (a) => {
   a.length = 0;
@@ -214,7 +215,7 @@ registerBuiltin('array', 'includes', (_ctx, args, named) => {
   const v = bound.get('value');
   if (a === null || v === undefined) return NA;
   return { kind: 'bool', v: a.some((e) => valueEq(e, v)) };
-});
+}, { idx: [1], names: ['value'] });
 const indexOfFn =
   (fromEnd: boolean): BuiltinFn =>
   (_ctx, args, named) => {
@@ -234,8 +235,8 @@ const indexOfFn =
     }
     return { kind: 'int', v: found };
   };
-registerBuiltin('array', 'indexof', indexOfFn(false));
-registerBuiltin('array', 'lastindexof', indexOfFn(true));
+registerBuiltin('array', 'indexof', indexOfFn(false), { idx: [1], names: ['value'] });
+registerBuiltin('array', 'lastindexof', indexOfFn(true), { idx: [1], names: ['value'] });
 
 // ── Sort / binary search ────────────────────────────────────────────────────
 
@@ -295,9 +296,9 @@ const binSearch =
     }
     return { kind: 'int', v: -(ins + 1) };
   };
-registerBuiltin('array', 'binary_search', binSearch('any'));
-registerBuiltin('array', 'binary_search_leftmost', binSearch('left'));
-registerBuiltin('array', 'binary_search_rightmost', binSearch('right'));
+registerBuiltin('array', 'binary_search', binSearch('any'), { idx: [1], names: ['val'] });
+registerBuiltin('array', 'binary_search_leftmost', binSearch('left'), { idx: [1], names: ['val'] });
+registerBuiltin('array', 'binary_search_rightmost', binSearch('right'), { idx: [1], names: ['val'] });
 
 // ── Numeric stats ───────────────────────────────────────────────────────────
 

@@ -520,8 +520,8 @@ function srcLen(ctx: BuiltinCtx, bound: Map<string, Value>, defSrc: Series, defN
 
 // ── builtin implementations ──────────────────────────────────────────────────
 
-function reg(name: string, fn: (ctx: BuiltinCtx, args: Value[], named: Record<string, Value>) => Value): void {
-  registerBuiltin('ta', name, fn);
+function reg(name: string, fn: (ctx: BuiltinCtx, args: Value[], named: Record<string, Value>) => Value, hist = true): void {
+  registerBuiltin('ta', name, fn, hist);
 }
 
 // simple strict rolling mean
@@ -635,14 +635,14 @@ reg('tr', (ctx, args, named) => {
   // actually governs (else Math.max propagates NaN → na even under true).
   if (pc === undefined || !Number.isFinite(pc)) return handleNa ? fl(h - l) : NA;
   return fl(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
-});
+}, false);
 
 reg('atr', (ctx, args, named) => {
   const b = bindArgs(args, named, ['length']);
   const L = lenOf(b);
   if (L === undefined) return NA;
   return fl(rmaVs(ctx, trVs(ctx), L, 'atr').get(ctx.barIndex));
-});
+}, false);
 
 reg('stdev', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length', 'biased']);
@@ -978,7 +978,7 @@ reg('supertrend', (ctx, args, named) => {
   }
   lastBar.n = bar;
   return out === undefined ? arr(NA, NA) : arr(fl(out[0]), { kind: 'float', v: out[1] });
-});
+}, false);
 
 function hl2At(ctx: BuiltinCtx, b: number): number | undefined {
   const off = ctx.barIndex - b;
@@ -1037,7 +1037,7 @@ reg('wad', (ctx, args, named) => {
   bindArgs(args, named, []);
   const rt = ctx as RtCtx;
   return fl(wadVs(ctx, ['wad', rt.callsite ?? 'g']).get(ctx.barIndex));
-});
+}, false);
 
 reg('obv', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source']);
@@ -1069,7 +1069,7 @@ reg('pvt', (ctx, args, named) => {
   bindArgs(args, named, []);
   const rt = ctx as RtCtx;
   return fl(pvtVs(ctx, ['pvt', rt.callsite ?? 'g']).get(ctx.barIndex));
-});
+}, false);
 
 function nviPviVs(ctx: BuiltinCtx, useVolumeDown: boolean, key: Key) {
   const acc = vstate(ctx, key, (bb) => {
@@ -1091,8 +1091,8 @@ function nviPvi(ctx: BuiltinCtx, useVolumeDown: boolean): Value {
   const name = useVolumeDown ? 'nvi' : 'pvi';
   return fl(nviPviVs(ctx, useVolumeDown, [name, rt.callsite ?? 'g']).get(ctx.barIndex));
 }
-reg('nvi', (ctx) => nviPvi(ctx, true));
-reg('pvi', (ctx) => nviPvi(ctx, false));
+reg('nvi', (ctx) => nviPvi(ctx, true), false);
+reg('pvi', (ctx) => nviPvi(ctx, false), false);
 
 // ── cci / cmo / cog / mfi / wpr / linreg / cor helpers ────────────────────────
 
@@ -1235,7 +1235,7 @@ reg('dmi', (ctx, args, named) => {
   const p = t === undefined ? undefined : (pS.get(bar) === undefined ? undefined : (t === 0 ? 0 : 100 * pS.get(bar)! / t));
   const m = t === undefined ? undefined : (mS.get(bar) === undefined ? undefined : (t === 0 ? 0 : 100 * mS.get(bar)! / t));
   return arr(fl(p), fl(m), fl(adx.get(bar)));
-});
+}, false);
 
 // ── kc / kcW ────────────────────────────────────────────────────────────────
 
@@ -1408,7 +1408,7 @@ reg('sar', (ctx, args, named) => {
   }
   lastBar.n = bar;
   return fl(out);
-});
+}, false);
 
 // ── tsi ──────────────────────────────────────────────────────────────────────
 
@@ -1526,7 +1526,7 @@ reg('vortex', (ctx, args, named) => {
   }
   if (trs === 0) return arr(NA, NA);
   return arr(fl(vip / trs), fl(vim / trs));
-});
+}, false);
 
 // ── stoch / valuewhen ────────────────────────────────────────────────────────
 

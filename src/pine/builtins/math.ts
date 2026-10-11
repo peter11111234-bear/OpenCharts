@@ -219,7 +219,7 @@ registerBuiltin('math', 'sum', (_ctx, args, named) => {
   const rd = freezeReader(src.v);
   if (rd) return seriesFromOffsets(_ctx, hist, sumWith(rd), true);
   return seriesFromOffsets(_ctx, hist, sumWith((k) => src.v.get(k)));
-});
+}, true);
 
 // nz(source, replacement=0) — unwrap na. Registered both namespaced and bare.
 const nzFn: BuiltinFn = (_ctx, args, named) => {
@@ -250,8 +250,8 @@ const nzFn: BuiltinFn = (_ctx, args, named) => {
     return u.kind === 'na' ? repAt(i) : u;
   });
 };
-registerBuiltin('math', 'nz', nzFn);
-registerBuiltin('', 'nz', nzFn);
+registerBuiltin('math', 'nz', nzFn, true);
+registerBuiltin('', 'nz', nzFn, true);
 
 registerBuiltin('math', 'tonumber', (_ctx, args, named) => {
   const bound = bindArgs(args, named, ['v']);
