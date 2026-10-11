@@ -71,6 +71,7 @@ import {
   registerMethod,
   registerType,
   setField,
+  type UdtMethodDef,
 } from './udt';
 import { jitCompile, jitCompileUdf } from './jit';
 
@@ -157,6 +158,9 @@ interface RunState {
   paramCows: Map<object, Map<string, CowSeries>>;
   /** UDF body Node[] → compiled JitState (lazy; undefined until first use). */
   udfJit: WeakMap<Node[], JitState>;
+ /** Call node → selfType → resolved UdtMethodDef (null = none). Registry
+  *  resets per runScript, so the cache lives on RunState, not module level. */
+ udtMethodCache: WeakMap<Node, Map<string, UdtMethodDef | null>>;
 }
 
 const runStates = new WeakMap<BuiltinCtx, RunState>();
@@ -186,6 +190,7 @@ function runOf(ctx: BuiltinCtx): RunState {
       tupleKeys: new Map(),
       paramCows: new Map(),
       udfJit: new WeakMap(),
+      udtMethodCache: new WeakMap(),
     };
     runStates.set(ctx, r);
   }
@@ -1104,6 +1109,21 @@ function evalCall(node: Call, frame: Frame): Value {
 // after the first dispatch of a given callsite.
 const RESOLVED_BUILTIN = new WeakMap<Call, { headName: string; fn: BuiltinFn | undefined }>();
 
+/** getUdtMethod memoized per (callsite node, selfType) — a call node's method
+ * name and its receiver's runtime type are bar-stable; caching skips
+ * normalizeSelfType + map-key allocation per invocation (~2% UDT-heavy). */
+function udtMethodAt(run: RunState, node: Call, selfType: string, name: string): UdtMethodDef | undefined {
+  let byType = run.udtMethodCache.get(node);
+  if (!byType) { byType = new Map(); run.udtMethodCache.set(node, byType); }
+  const key = `${selfType}.${name}`;
+  let hit = byType.get(key);
+  if (hit === undefined) {
+    hit = getUdtMethod(selfType, name) ?? null;
+    byType.set(key, hit);
+  }
+  return hit ?? undefined;
+}
+
 
 function evalCallDispatch(node: Call, frame: Frame): Value {
   const { scope, ctx } = frame;
@@ -1178,7 +1198,7 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
     const obj = evalExpr(callee.obj, frame);
     const prop = callee.prop;
     if (obj.kind === 'udt') {
-      const def = getUdtMethod(obj.v.typeName, prop);
+      const def = udtMethodAt(run, node, obj.v.typeName, prop);
       if (def) {
         const bound = bindCallArgs(node.args, def.params.slice(1), frame);
         return callUdtMethod(obj.v, prop, bound, ctx);
@@ -1195,7 +1215,7 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
         }
         return callBuiltin(b, ctx, args, named, node);
       }
-      const prim = getUdtMethod(obj.kind, prop);
+      const prim = udtMethodAt(run, node, obj.kind, prop);
       if (prim) {
         const bound = bindCallArgs(node.args, prim.params.slice(1), frame);
         return callUdtMethod(obj, prop, bound, ctx);
@@ -1206,6 +1226,7 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
     warn(run, ctx, `no method '${prop}' on ${obj.kind}`);
     return NA;
   }
+
 
   // Bare callee → builtin or UDF. `na` parses as a literal, not an ident —
   // dispatch na(x) through the registered builtin before generic callee eval.
@@ -2211,7 +2232,7 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
     const obj = evalExpr(callee.obj, frame);
     const prop = callee.prop;
     if (obj.kind === 'udt') {
-      const def = getUdtMethod(obj.v.typeName, prop);
+      const def = udtMethodAt(run, node, obj.v.typeName, prop);
       if (def) {
         const bound = bindArgsJit(state, run, ctx, node.args, ds, def.params.slice(1));
         return callUdtMethod(obj.v, prop, bound, ctx);
@@ -2227,7 +2248,7 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
         }
         return callBuiltin(b, ctx, args, named, node);
       }
-      const prim = getUdtMethod(obj.kind, prop);
+      const prim = udtMethodAt(run, node, obj.kind, prop);
       if (prim) {
         const bound = bindArgsJit(state, run, ctx, node.args, ds, prim.params.slice(1));
         return callUdtMethod(obj, prop, bound, ctx);
