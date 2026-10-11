@@ -475,7 +475,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
   const openPoint = { x: lastPointer.x, y: lastPointer.y };
   const doc = ctx.host.ownerDocument;
 
-  type Item = { label: string; disabled?: boolean; primary?: boolean; sep?: boolean; sub?: (anchorBtn: HTMLElement) => void; run?: () => void };
+  type Item = { label: string; disabled?: boolean; primary?: boolean; sep?: boolean; tip?: string; sub?: (anchorBtn: HTMLElement) => void; run?: () => void };
   const isPine = typeof ind.source === 'string' && ind.source.length > 0;
   const items: Item[] = [
     { label: `為 ${ind.title} 新增快訊…`, disabled: true },
@@ -519,7 +519,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     { label: '視覺順序', disabled: true },
     { label: '時間週期的可見性', disabled: true },
     { label: '移動到 ▸', sub: (btn) => openMoveSubMenu(btn) },
-    { label: '固定至刻度', disabled: true },
+    { label: '固定至刻度', disabled: true, tip: 'vela 無刻度指派 API' },
     { label: '', sep: true },
     isPine
       ? { label: '原始碼…', primary: true, run: () => {
@@ -578,16 +578,28 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     let panes: PaneRow[] = [];
     try { panes = chart.panes.list(); } catch { /* renderer without pane mgmt */ }
     const cur = panes.find(p => p.indicators.some(x => x.id === ind.id));
+    const idx = cur ? panes.indexOf(cur) : -1;
+    const above = idx > 0 ? panes[idx - 1] : undefined;
+    const below = idx >= 0 && idx < panes.length - 1 ? panes[idx + 1] : undefined;
+    // Vela has no merge-vs-move distinction: moveTo({pane}) IS the merge (it
+    // lands with its own scale column) — same call TV's mergeToPane reaches.
+    const targetFor = (p: PaneRow): 'price' | { pane: string } => p.kind === 'price' ? 'price' : { pane: p.id };
     type Entry = { label: string; current?: boolean; run?: () => void };
-    const entries: Entry[] = [
+    const entries: Entry[] = [];
+    // TV "merge up"/"merge down" — merge into the adjacent pane, offered only
+    // when one exists in that direction.
+    if (above) entries.push({ label: '向上合併', run: () => h.moveTo(targetFor(above)) });
+    if (below) entries.push({ label: '向下合併', run: () => h.moveTo(targetFor(below)) });
+    entries.push(
       { label: '價格窗格', current: cur?.kind === 'price', run: () => h.moveTo('price') },
       { label: '新窗格', run: () => h.moveTo({ newPane: true }) },
+      // TV "merge to pane…" — one row per existing study pane.
       ...panes.filter(p => p.kind !== 'price').map(p => ({
-        label: p.indicators[0]?.title ?? `窗格 ${p.order}`,
+        label: `合併至 ${p.indicators[0]?.title ?? `窗格 ${p.order}`}`,
         current: cur?.id === p.id,
         run: () => h.moveTo({ pane: p.id }),
       })),
-    ];
+    );
     const sub = doc.createElement('div');
     sub.style.cssText =
       'position:fixed;z-index:10002;min-width:160px;padding:4px;background:#1e222d;' +
@@ -627,6 +639,7 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     }
     const b = doc.createElement('button');
     b.textContent = it.label;
+    if (it.tip) b.title = it.tip;
     b.style.cssText =
       'display:block;width:100%;text-align:left;padding:5px 12px;border:0;border-radius:4px;' +
       'background:transparent;color:' + (it.disabled ? '#5d606b' : it.primary ? '#2962ff' : '#d5d8e0') + ';' +
