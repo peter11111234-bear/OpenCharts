@@ -142,3 +142,11 @@
   * Verify: 830 pass / 1 skip / 47 files; tsc clean on all touched files; live CDP confirm pine-more button renders on TRIS390 chart.
   * Inventories (scout-produced, .scratch/): pinets-ta-inventory.md (68-method tiering), drawing-accessor-inventory.md (64 have / 10 trivial-add / 16 model-missing set_/get_ accessors — next port target).
   * 代辦: (a) pinetsAll→builtins 上線切換 decision + kcw canonical naming; (b) drawing accessor 10 trivial-add + 16 model-missing (chart.point setters 優先 — reuse pointXY); (c) array type for facade → unblock pivot_point_levels; (d) REA Ghidra/Hopper env vars 未配 (JS/Web only today).
+
+- 2026-10-11 R10 — drawing accessors + kcw canonical + pivot_point_levels + REA env:
+  * draw.ts: 10 trivial-add (table PROP_TABLE set_×6, cellSetter halign/valign/width/height) + 5 chart.point setters via pointXY + force_overlay (ctor-only, conditional write — golden-safe) + text_font_family/text_formatting (ctor + prop-table set_* on label/box, cellSetter on table.cell) + 3 set_xloc semantic-gap overrides (TV writes coords too). +4 tests in output.test.ts.
+  * ta.kcw canonical: scalar width (upper−lower)/basis of EMA kc — bb/bbw convention; `ta.kcW` keeps the WMA tuple. kcParts() shared between kc/kcW/kcw. Semantic test replaces alias-registration smoke.
+  * pivot_point_levels: ported into pinetsStatefulB (22nd) — plain number[] round-trips toValue → {kind:'array'}; PineArrayObject was a marker only. `anchor` param = caller bool series. 3 tests (freeze/developing/error paths).
+  * pinetsAll→builtins flip: DEFERRED — ports carry documented na-seed/scale divergences (ema/dmi/kc seeding, bbw ×100, nvi/pvi seed, tsi/sar scale); default-on would change production scripts. registerPortedTa stays opt-in.
+  * REA: Ghidra 12.1.4 + Temurin JDK 21 installed to C:/tools, GHIDRA_INSTALL_DIR/JAVA_HOME user env set — rea doctor ghidra 9/9 healthy. Native decompile/xref available. hopper/ida still unconfigured.
+  * Verify: suite green (statefulB 23 + output 40 + ta tests incl. kcw); golden 9/10 (MACD701 etc. — force_overlay conditional write restored goldens); tsc clean on touched files.
