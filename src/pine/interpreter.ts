@@ -1207,7 +1207,7 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
     if (obj.kind === 'udt') {
       const def = udtMethodAt(run, node, obj.v.typeName, prop);
       if (def) {
-        const bound = bindCallArgs(node.args, def.params.slice(1), frame);
+        const bound = bindCallArgs(node.args, def.params.slice(1), frame, paramFlags(def.params, def.body));
         return callUdtMethod(obj.v, prop, bound, ctx);
       }
     } else {
@@ -1224,7 +1224,7 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
       }
       const prim = udtMethodAt(run, node, obj.kind, prop);
       if (prim) {
-        const bound = bindCallArgs(node.args, prim.params.slice(1), frame);
+        const bound = bindCallArgs(node.args, prim.params.slice(1), frame, paramFlags(prim.params, prim.body));
         return callUdtMethod(obj, prop, bound, ctx);
       }
     }
@@ -1312,7 +1312,41 @@ export let __callHistWrites = 0; // test instrumentation
  * callUdfValue seeds param history from it and CowSeries rebinds onto it;
  * `f(20)` bodies may legitimately read `x[1]` AND mutate `x`.
  */
-function evalArg(a: Arg, frame: Frame, litFastPath = false): Value {
+interface ParamFlag { hist: boolean; mut: boolean }
+/** Param-array → per-name {hist: reads x[n], mut: x := / x[i] := / passed to
+ *  a call}. Computed once per decl — params arrays are shared objects. */
+const PARAM_FLAGS = new WeakMap<Param[], Map<string, ParamFlag>>();
+function paramFlags(params: Param[], body: Node | Node[] | undefined): Map<string, ParamFlag> {
+  let f = PARAM_FLAGS.get(params);
+  if (f) return f;
+  const names = new Set(params.map(p => p.name));
+  f = new Map(params.map(p => [p.name, { hist: false, mut: false }]));
+  walkNodes(body, (n) => {
+    if (n.type === 'histref') {
+      const o = (n as HistRef).obj;
+      if (o.type === 'ident' && names.has((o as { name: string }).name))
+        f!.get((o as { name: string }).name)!.hist = true;
+    } else if (n.type === 'reassign') {
+      const t = (n as Reassign).target;
+      const nm = t.type === 'ident' ? (t as { name: string }).name
+        : t.type === 'histref' && (t as HistRef).obj.type === 'ident'
+          ? ((t as HistRef).obj as { name: string }).name : undefined;
+      if (nm && names.has(nm)) f!.get(nm)!.mut = true;
+    } else if (n.type === 'call') {
+      // Param passed into another call may be history-read/mutated inside —
+      // treat as needing full tracking (conservative).
+      for (const a of (n as Call).args)
+        if (a.value?.type === 'ident' && names.has((a.value as { name: string }).name)) {
+          f!.get((a.value as { name: string }).name)!.hist = true;
+          f!.get((a.value as { name: string }).name)!.mut = true;
+        }
+    }
+  });
+  PARAM_FLAGS.set(params, f);
+  return f;
+}
+
+function evalArg(a: Arg, frame: Frame, litFastPath = false, noHist = false): Value {
   const { scope, ctx } = frame;
   const run = runOf(ctx);
   if (a.value.type === 'ident') {
@@ -1342,6 +1376,9 @@ function evalArg(a: Arg, frame: Frame, litFastPath = false): Value {
   // Arrays, maps, UDTs, strings, colors and drawings pass through untouched so
   // builtins receive the real value instead of a fresh BarSeries wrapper.
   if (v.kind !== 'int' && v.kind !== 'float' && v.kind !== 'bool') return v;
+  // Param never reads its own history and isn't history-passed — the arg's
+  // scalar lands in a throwaway param slot; callHist tracking is waste.
+  if (noHist) return v;
   // Track scalar/expr args in a per-(node,callsite) BarSeries so `x[1]` inside
   // UDFs and ta.* source windows see per-bar history, matching Pine semantics.
   const key = siteKey(run, a.value);
@@ -1356,14 +1393,18 @@ function evalArg(a: Arg, frame: Frame, litFastPath = false): Value {
   return { kind: 'series', v: s };
 }
 
-/** Bind callsite args (named first, then positional) against a param list. */
-function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame): Value[] {
+/** Bind callsite args (named first, then positional) against a param list.
+ *  `flags` = paramFlags(params, body) — when given, scalar args bound to a
+ *  param that never reads history skip callHist (evalArg noHist). */
+function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame,
+                      flags?: Map<string, ParamFlag>): Value[] {
   const out: Value[] = new Array<Value>(params.length);
+  const noHist = (p: Param) => flags !== undefined && flags.get(p.name)?.hist === false;
   // Fast path: all-positional calls (the common case) skip the Set +
   // positionals staging array — eval args straight into param order.
   if (!callArgs.some(a => a.name !== undefined)) {
     const n = Math.min(callArgs.length, params.length);
-    for (let i = 0; i < n; i++) out[i] = evalArg(callArgs[i]!, frame);
+    for (let i = 0; i < n; i++) out[i] = evalArg(callArgs[i]!, frame, false, noHist(params[i]!));
     for (let i = n; i < params.length; i++) {
       const d = params[i]!.default;
       out[i] = d !== undefined ? evalExpr(d, frame) : NA;
@@ -1376,7 +1417,7 @@ function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame): Value[] {
     if (a.name !== undefined) {
       const i = params.findIndex(p => p.name === a.name);
       if (i >= 0 && !filled.has(i)) {
-        out[i] = evalArg(a, frame);
+        out[i] = evalArg(a, frame, false, noHist(params[i]!));
         filled.add(i);
         continue;
       }
@@ -1387,7 +1428,7 @@ function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame): Value[] {
   for (const a of positionals) {
     while (p < params.length && filled.has(p)) p++;
     if (p >= params.length) break;
-    out[p] = evalArg(a, frame);
+    out[p] = evalArg(a, frame, false, noHist(params[p]!));
     filled.add(p);
     p++;
   }
@@ -1401,7 +1442,7 @@ function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame): Value[] {
 }
 
 function invokeUdf(fn: UdfDecl, node: Call, frame: Frame): Value {
-  return callUdfValue(fn, bindCallArgs(node.args, fn.params, frame), frame, node);
+  return callUdfValue(fn, bindCallArgs(node.args, fn.params, frame, paramFlags(fn.params, fn.body)), frame, node);
 }
 
 /** Bind evaluated args into a call scope. `{kind:'series'}` args alias the
@@ -1415,9 +1456,14 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
   const run = runOf(ctx);
   const callScope = new Scope(fn.closure);
   const cowKey = callNode ? (siteKey(run, callNode) as object) : null;
+  const flags = paramFlags(fn.params, fn.body);
   fn.params.forEach((p, i) => {
     const a = args[i] ?? NA;
     if (a.kind === 'series') {
+      // Param never reads its own history and is never rebound — it can bind
+      // the caller's series directly; no CowSeries wrapper, no paramCows slot.
+      const pf = flags.get(p.name);
+      if (pf && !pf.hist && !pf.mut) { callScope.define(p.name, a.v); return; }
       if (cowKey) {
         let byParam = run.paramCows.get(cowKey);
         if (!byParam) { byParam = new Map(); run.paramCows.set(cowKey, byParam); }
@@ -1441,6 +1487,10 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
         callScope.define(p.name, new CowSeries(a.v));
       }
     } else {
+      // !hist && !mut — the param never reads x[n] and never rebinds:
+      // bind the raw value; scalar x[1] is unreachable and `:=` can't fire.
+      const pf = flags.get(p.name);
+      if (pf && !pf.hist && !pf.mut) { callScope.define(p.name, a); return; }
       const s = new BarSeries();
       s.setAt(bar, a);
       callScope.define(p.name, s);
@@ -2256,7 +2306,7 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
     if (obj.kind === 'udt') {
       const def = udtMethodAt(run, node, obj.v.typeName, prop);
       if (def) {
-        const bound = bindArgsJit(state, run, ctx, node.args, ds, def.params.slice(1));
+        const bound = bindArgsJit(state, run, ctx, node.args, ds, def.params.slice(1), paramFlags(def.params, def.body));
         return callUdtMethod(obj.v, prop, bound, ctx);
       }
     } else {
@@ -2272,7 +2322,7 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
       }
       const prim = udtMethodAt(run, node, obj.kind, prop);
       if (prim) {
-        const bound = bindArgsJit(state, run, ctx, node.args, ds, prim.params.slice(1));
+        const bound = bindArgsJit(state, run, ctx, node.args, ds, prim.params.slice(1), paramFlags(prim.params, prim.body));
         return callUdtMethod(obj, prop, bound, ctx);
       }
     }
@@ -2300,7 +2350,7 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
   }
   if (fn.kind === 'function') {
     if (typeof fn.v === 'function') return jitBuiltinArgsInvoke(state, run, ctx, fn.v as BuiltinFn, ds, node);
-    return callUdfValue(fn.v as UdfDecl, bindArgsJit(state, run, ctx, node.args, ds, fn.v.params), frame, node);
+    return callUdfValue(fn.v as UdfDecl, bindArgsJit(state, run, ctx, node.args, ds, fn.v.params, paramFlags(fn.v.params, fn.v.body)), frame, node);
   }
   warn(run, ctx, `call target is not a function (${fn.kind})`);
   return NA;
@@ -2308,9 +2358,10 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
 
 /** evalArg tail — wrap a plain-evaluated arg in its callsite BarSeries
  * (callHist), mirroring evalArg's post-evalExpr path. */
-function jitArgFinish(state: JitState, run: RunState, ctx: BuiltinCtx, idx: number, v: Value): Value {
+function jitArgFinish(state: JitState, run: RunState, ctx: BuiltinCtx, idx: number, v: Value, noHist = false): Value {
   if (v.kind === 'series') return v;
   if (v.kind !== 'int' && v.kind !== 'float' && v.kind !== 'bool') return v;
+  if (noHist) return v;
   const key = siteKey(run, state.nodes[idx]!);
   let s = run.callHist.get(key as Node);
   if (!s) {
@@ -2326,12 +2377,12 @@ function jitArgFinish(state: JitState, run: RunState, ctx: BuiltinCtx, idx: numb
 /** Descriptor → Value. `litFastPath` applies LitSeries to 'l' args only —
  * every other shape evaluates then goes through jitArgFinish, exactly like
  * evalArg. `f` thunk missing (non-emit expr) falls back to evalExpr. */
-function jitMatArg(state: JitState, run: RunState, ctx: BuiltinCtx, d: JitArg, litFastPath: boolean): Value {
+function jitMatArg(state: JitState, run: RunState, ctx: BuiltinCtx, d: JitArg, litFastPath: boolean, noHist = false): Value {
   if (d.k === 'i') {
     const s = seriesOf(state.cur.scope, d.i!) ?? ctxSeries(ctx, d.i!);
     if (s) return { kind: 'series', v: s };
     return jitArgFinish(state, run, ctx, d.x,
-      d.f ? d.f() : evalExpr(state.nodes[d.x]!, state.cur));
+      d.f ? d.f() : evalExpr(state.nodes[d.x]!, state.cur), noHist);
   }
   if (d.k === 'l' && litFastPath) {
     const key = siteKey(run, state.nodes[d.x]!);
@@ -2346,7 +2397,7 @@ function jitMatArg(state: JitState, run: RunState, ctx: BuiltinCtx, d: JitArg, l
     return { kind: 'series', v: ls };
   }
   return jitArgFinish(state, run, ctx, d.x,
-    d.f ? d.f() : evalExpr(state.nodes[d.x]!, state.cur));
+    d.f ? d.f() : evalExpr(state.nodes[d.x]!, state.cur), noHist);
 }
 
 /** `X.new` arg flavor — raw evalExpr on the arg's value node (evalCallDispatch
@@ -2358,12 +2409,14 @@ function jitMatArgExpr(state: JitState, d: JitArg): Value {
 /** bindCallArgs on descriptor args — named first, positionals fill gaps, then
  * defaults. Uses jitMatArg(false) — UDF params never take the LitSeries path. */
 function bindArgsJit(state: JitState, run: RunState, ctx: BuiltinCtx,
-                     callArgs: Arg[], ds: JitArg[], params: Param[]): Value[] {
+                     callArgs: Arg[], ds: JitArg[], params: Param[],
+                     flags?: Map<string, ParamFlag>): Value[] {
   const out: Value[] = new Array<Value>(params.length);
+  const noHist = (p: Param) => flags !== undefined && flags.get(p.name)?.hist === false;
   // All-positional fast path: skip Set + positionals staging entirely.
   if (!callArgs.some(a => a.name !== undefined)) {
     const n = Math.min(callArgs.length, params.length);
-    for (let i = 0; i < n; i++) out[i] = jitMatArg(state, run, ctx, ds[i]!, false);
+    for (let i = 0; i < n; i++) out[i] = jitMatArg(state, run, ctx, ds[i]!, false, noHist(params[i]!));
     for (let i = n; i < params.length; i++) {
       const dfl = params[i]!.default;
       out[i] = dfl !== undefined ? evalExpr(dfl, state.cur) : NA;
@@ -2376,7 +2429,7 @@ function bindArgsJit(state: JitState, run: RunState, ctx: BuiltinCtx,
     const d = ds[i]!;
     if (a.name !== undefined) {
       const p = params.findIndex(pp => pp.name === a.name);
-      if (p >= 0 && !filled.has(p)) { out[p] = jitMatArg(state, run, ctx, d, false); filled.add(p); return; }
+      if (p >= 0 && !filled.has(p)) { out[p] = jitMatArg(state, run, ctx, d, false, noHist(params[p]!)); filled.add(p); return; }
     }
     positionals.push({ a, d });
   });
@@ -2384,7 +2437,7 @@ function bindArgsJit(state: JitState, run: RunState, ctx: BuiltinCtx,
   for (const { d } of positionals) {
     while (p < params.length && filled.has(p)) p++;
     if (p >= params.length) break;
-    out[p] = jitMatArg(state, run, ctx, d, false);
+    out[p] = jitMatArg(state, run, ctx, d, false, noHist(params[p]!));
     filled.add(p); p++;
   }
   for (let i = 0; i < params.length; i++) {
