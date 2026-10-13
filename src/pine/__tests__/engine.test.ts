@@ -392,3 +392,37 @@ describe('adaptive tick policy', () => {
     session.stop();
   });
 });
+
+describe('compile gate at prepare()', () => {
+  // TV refuses to save these scripts; running them would be a silent divergence
+  // (the runtime CE10188 guard only warns-and-skips). prepare() is the compile
+  // boundary, so the error must surface here, source-located for the editor.
+  const engine = new PineInterpreterEngine();
+
+  it('rejects a TV-invalid script with a LINE:COL error', async () => {
+    await expect(engine.prepare('//@version=6\nindicator("t")\nif close > open\n    plot(close)\n', 'g1'))
+      .rejects.toThrow(/^4:5: Cannot use 'plot' in local scope \[plot-scope\]$/);
+  });
+
+  it('rejects a global write from a function body', async () => {
+    await expect(engine.prepare('//@version=6\nindicator("t")\ntotal = 0.0\nf() =>\n    total := 1.0\nplot(f())\n', 'g2'))
+      .rejects.toThrow(/Cannot modify global variable 'total' in a function/);
+  });
+
+  it('carries the static host requirements on the token', async () => {
+    const src = '//@version=6\nindicator("t")\na = input.int(1, "n")\ns = request.security("X", "D", close)\nplot(s + a)';
+    const prepared = await engine.prepare(src, 'g3');
+    const token = prepared.token as { requirements?: Record<string, boolean> };
+    expect(token.requirements).toMatchObject({
+      inputs: true, security: true, plots: true,
+      orders: false, drawings: false, alerts: false, viewport: false,
+    });
+  });
+
+  it('derives reactsToViewport from the script instead of a constant', async () => {
+    const plain = await engine.prepare('//@version=6\nindicator("t")\nplot(close)', 'g4');
+    expect(plain.reactsToViewport).toBe(false);
+    const viewport = await engine.prepare('//@version=6\nindicator("t")\nplot(chart.left_visible_bar_time)', 'g5');
+    expect(viewport.reactsToViewport).toBe(true);
+  });
+});

@@ -241,7 +241,7 @@ describe('MTF cache invariance (promoted QA sweeps)', () => {
       'plot(a, "a")',
     ].join('\n');
     const s0 = snap();
-    const res = await run(src);
+    await run(src);
     expect(__mtfStats.gateFail - s0.gateFail).toBeGreaterThanOrEqual(1);
     // The inner call is served per-caller (its own eval) — never through
     // the shared agnostic cache for the nested node.

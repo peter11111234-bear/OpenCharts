@@ -56,10 +56,12 @@ class Parser {
   // ── token plumbing ─────────────────────────────────────────────────────────
 
   private peek(k = 0): Token {
-    return this.toks[Math.min(this.pos + k, this.toks.length - 1)];
+    // The lexer always terminates the stream with `eof`, so the clamped index
+    // is always in range.
+    return this.toks[Math.min(this.pos + k, this.toks.length - 1)]!;
   }
   private next(): Token {
-    const t = this.toks[this.pos];
+    const t = this.toks[this.pos]!;
     if (t.type !== 'eof') this.pos++;
     return t;
   }
@@ -119,7 +121,7 @@ class Parser {
     const close = open === '(' ? ')' : ']';
     let depth = 0;
     for (let i = openIdx; i < this.toks.length; i++) {
-      const t = this.toks[i];
+      const t = this.toks[i]!;
       if (t.type === 'op' && t.v === open) depth++;
       else if (t.type === 'op' && t.v === close) {
         depth--;
@@ -221,8 +223,8 @@ class Parser {
       // `[a, b] = f()` is a tuple destructure; a bare `[…]` (UDF last-value,
       // expr statement) is an ArrayLit. Distinguish by `]=` after the bracket.
       const after = this.matchBracket(this.pos, '[');
-      if (after > 0 && this.toks[after].type === 'op' &&
-          this.toks[after].v === '=') {
+      if (after > 0 && this.toks[after]!.type === 'op' &&
+          this.toks[after]!.v === '=') {
         return this.tupleAssign();
       }
     }
@@ -231,8 +233,8 @@ class Parser {
       // `f(params) => …` — UDF declaration
       if (this.peek(1).type === 'op' && this.peek(1).v === '(') {
         const after = this.matchBracket(this.pos + 1, '(');
-        if (after > 0 && this.toks[after].type === 'op' &&
-            this.toks[after].v === '=>') {
+        if (after > 0 && this.toks[after]!.type === 'op' &&
+            this.toks[after]!.v === '=>') {
           return this.funcDecl();
         }
       }
@@ -279,7 +281,7 @@ class Parser {
     if (t1.type === 'op' && t1.v === '<') {
       let depth = 0;
       for (let i = this.pos + 1; i < this.toks.length; i++) {
-        const tk = this.toks[i];
+        const tk = this.toks[i]!;
         if (tk.type === 'op' && tk.v === '<') depth++;
         else if (tk.type === 'op' && tk.v === '>') {
           depth--;
@@ -335,7 +337,7 @@ class Parser {
       // `var`/`let`/`const` may repeat after the comma: `var a=1, var float b=na`
       if (this.atKw('var') || this.atKw('let') || this.atKw('const')) this.next();
     }
-    const first = parts[0];
+    const first = parts[0]!;
     const node: VarDecl = { type: 'var', name: first.name, value: first.value, loc };
     if (varip) node.varip = true;
     if (first.typeAnn) node.typeAnn = first.typeAnn;
@@ -479,7 +481,7 @@ class Parser {
         this.next();
       }
       if (words.length === 0) this.err('empty parameter');
-      const p: Param = { name: words[words.length - 1].v };
+      const p: Param = { name: words[words.length - 1]!.v };
       if (words.length > 1) {
         p.typeAnn = words.slice(0, -1).map(w => w.v).join(' ')
           .replace(/\s*([<>\[\],])\s*/g, '$1');
@@ -690,7 +692,7 @@ class Parser {
     // name = last non-numeric segment (skips version suffix like /2)
     let name = '';
     for (let i = segs.length - 1; i >= 0; i--) {
-      if (/^[A-Za-z_]/.test(segs[i])) { name = segs[i]; break; }
+      if (/^[A-Za-z_]/.test(segs[i]!)) { name = segs[i]!; break; }
     }
     const n: ImportDecl = {
       type: 'import', ns: segs.join(''), name: name || segs.join(''),
@@ -852,7 +854,7 @@ class Parser {
   private histrefAhead(): boolean {
     let depth = 1;
     for (let i = this.pos + 1; i < this.toks.length; i++) {
-      const t = this.toks[i];
+      const t = this.toks[i]!;
       if (t.type !== 'op') {
         if (t.type === 'newline' || t.type === 'indent' ||
             t.type === 'dedent' || t.type === 'eof') return true; // unterminated: treat as histref so expr reports it
@@ -874,7 +876,7 @@ class Parser {
   private typeArgsAhead(): boolean {
     let depth = 0;
     for (let i = this.pos; i < this.toks.length; i++) {
-      const t = this.toks[i];
+      const t = this.toks[i]!;
       if (t.type === 'op' && t.v === '<') depth++;
       else if (t.type === 'op' && t.v === '>') {
         depth--;
@@ -981,8 +983,8 @@ class Parser {
       case 'op':
         if (t.v === '(') {
           const after = this.matchBracket(this.pos, '(');
-          if (after > 0 && this.toks[after].type === 'op' &&
-              this.toks[after].v === '=>') {
+          if (after > 0 && this.toks[after]!.type === 'op' &&
+              this.toks[after]!.v === '=>') {
             const params = this.params();
             this.expectOp('=>');
             return {

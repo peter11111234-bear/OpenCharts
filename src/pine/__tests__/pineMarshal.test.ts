@@ -147,6 +147,7 @@ describe('sanitizeRunResult', () => {
       barcolors: new Map(),
       alerts: [{ id: 'a', msg: 'm' }],
       alertconditions: [{ title: 't', msg: 'm' }],
+      logs: [],
       warnings: ['w'],
       inputs: [{ id: 'i', name: 'n', type: 'int', defval: 1 }],
       props: [],
@@ -170,7 +171,7 @@ describe('sanitizeRunResult', () => {
     const r: RunResult = {
       plots: new Map([['p', { index: 0, time: [], values: [fval], opts: {}, colors: [] }]]),
       drawings: [], fills: [], bgcolors: new Map(), barcolors: new Map(),
-      alerts: [], alertconditions: [], warnings: [], inputs: [], props: [],
+      alerts: [], alertconditions: [], logs: [], warnings: [], inputs: [], props: [],
       title: '', overlay: false,
     };
     expect(() => structuredClone(r)).toThrow();

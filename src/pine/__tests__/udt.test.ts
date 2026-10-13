@@ -71,7 +71,7 @@ function mkCtx(): BuiltinCtx {
     barIndex: 0, barCount: 1,
     open: s, high: s, low: s, close: s, volume: s,
     time: s, hl2: s, hlc3: s, ohlc4: s, hlcc4: s,
-    plots: [], drawings: [], warnings: [], alerts: [],
+    plots: [], drawings: [], warnings: [], alerts: [], logs: [],
     syminfo: {},
     timeframe: { period: '1D', multiplier: 1, isseconds: false, isminutes: false, isdaily: true, isweekly: false, ismonthly: false, isintraday: false },
     callUdf: callUdfSpy,

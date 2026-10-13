@@ -1,13 +1,13 @@
 // Round-2 alias write-through regression tests — locks A1 (`x[1]` after
 // scalar `:=`), A2 (mixed-kind decl foreign-slot write-through), A4 (tuple
 // scalar-store), and the non-var/var accumulation boundary. Do not delete.
-import { describe, expect, it } from 'vitest';
+import { expect, it } from 'vitest';
 import { parse } from '../parser';
 import { runScript } from '../interpreter';
 import '../builtins/index';
 
 const bars = Array.from({ length: 5 }, (_, i) => ({
-  time: 1_700_000_000_000 + i * 60_000,
+  openTime: 1_700_000_000_000 + i * 60_000,
   open: i, high: i + 1, low: i - 1, close: 100 + i, volume: 1,
 }));
 

@@ -9,7 +9,7 @@ import { parse } from '../parser';
 import { resetMtf } from '../mtf';
 import { PineInterpreterEngine } from '../engine';
 import type { BarData } from '../contracts';
-import type { ExecutionRequest, IndicatorModel, OHLCV, PreparedScript } from '@luxalgo/vela';
+import type { ExecutionRequest, IndicatorModel, OHLCV } from '@luxalgo/vela';
 import '../builtins/index';
 import '../mtf';
 
@@ -154,7 +154,7 @@ describe('S3: deferred backfill', () => {
     const prepared = await engine.prepare(SEC_SRC, 'qa-def2');
     const gate = Promise.withResolvers<void>();
     let fetchCalls = 0;
-    const { models, onModel, waitFor } = collect();
+    const { models, onModel } = collect();
     const req: ExecutionRequest = {
       prepared, market: { symbol: 'T', timeframe: '15' }, bars: mkOhlcv(4), mode: 'static',
       historyState: 'backfill',
@@ -184,7 +184,7 @@ describe('S4: getBars pending overwrite — stale in-flight emit', () => {
     const gate = Promise.withResolvers<void>();
     let fetchCalls = 0;
     let current = mkOhlcv(6);
-    const { models, onModel, waitFor } = collect();
+    const { models, onModel } = collect();
     const req: ExecutionRequest = {
       prepared, market: { symbol: 'T', timeframe: '15' }, bars: current, mode: 'static',
       getBars: () => current,

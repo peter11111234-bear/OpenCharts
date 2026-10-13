@@ -29,9 +29,9 @@ plot(ta.pvi, "pvi")
     const titles = [...r.plots.keys()];
     expect(titles).toEqual(['wad', 'wad1', 'pvt', 'nvi', 'pvi']);
     const values = (t: string) => r.plots.get(t)!.values;
-    expect(values('wad')[0]?.v).toBe(0);
+    expect((values('wad')[0] as { v: number } | undefined)?.v).toBe(0);
     expect(values('wad1')[0]?.kind).toBe('na');
     expect(values('nvi')[0]?.kind).toBe('na'); // bar 0: no prev close → accumulator not seeded
-    expect(values('nvi')[29]?.v).toBeGreaterThanOrEqual(1000); // seeded at base 1000
+    expect((values('nvi')[29] as { v: number } | undefined)?.v).toBeGreaterThanOrEqual(1000); // seeded at base 1000
   }, 30000);
 });

@@ -82,6 +82,7 @@ function mkCtx(bars: BarData[], i: number, tf: string, opts?: {
     plots: [], drawings: [],
     warnings: opts?.warnings ?? [],
     alerts: [],
+    logs: [],
     syminfo: { tickerid: { kind: 'string', v: 'TEST' } },
     timeframe: tfFlags(tf),
     callUdf: () => NA,

@@ -14,15 +14,6 @@ const mkBarData = (n: number, tfMs = 60_000): BarData[] =>
     openTime: i * tfMs, open: i + 1, high: i + 2, low: i, close: i + 1, volume: 1000 + i,
   }));
 
-// One event-loop macrotask turn — mirrors turn() in qa_yield_c560c0f.test.ts.
-const turn = (): Promise<void> => {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  const ch = new MessageChannel();
-  ch.port1.onmessage = () => { ch.port1.close(); ch.port2.close(); resolve(); };
-  ch.port2.postMessage(null);
-  return promise;
-};
-
 const SEC_SRC = 'indicator("s")\nh = request.security(syminfo.tickerid, "60", close)\nplot(h)';
 
 describe('QA4: prefetch failure modes', () => {

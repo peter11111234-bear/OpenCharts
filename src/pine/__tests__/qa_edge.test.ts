@@ -36,6 +36,7 @@ const mkCtx = (over: Partial<BuiltinCtx> = {}): BuiltinCtx => ({
   drawings: [],
   warnings: [],
   alerts: [],
+  logs: [],
   syminfo: { timezone: { kind: 'string', v: 'UTC' } },
   timeframe: {
     period: 'D',
@@ -64,7 +65,7 @@ const call = (name: string, args: Value[] = [], named: Record<string, Value> = {
 const plotVals = (r: RunResult, i = 0): unknown[] => {
   const plot = Array.from(r.plots.values())[i];
   if (!plot) throw new Error(`plot[${i}] missing — have ${r.plots.size}`);
-  return plot.values.map(v => (v.kind === 'na' ? 'na' : v.v));
+  return plot.values.map(v => (v.kind === 'na' ? 'na' : 'v' in v ? v.v : undefined));
 };
 
 // ── 1. calendar fields on NA ctx.time → na (never 0) ────────────────────────

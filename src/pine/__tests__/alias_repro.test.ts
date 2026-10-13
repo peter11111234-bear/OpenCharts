@@ -10,7 +10,7 @@ import { runScript } from '../interpreter';
 import '../builtins/index';
 
 const bars = Array.from({ length: 5 }, (_, i) => ({
-  time: 1_700_000_000_000 + i * 60_000,
+  openTime: 1_700_000_000_000 + i * 60_000,
   open: i, high: i + 1, low: i - 1, close: 100 + i, volume: 1,
 }));
 

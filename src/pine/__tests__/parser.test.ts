@@ -13,7 +13,7 @@ const body = (src: string) => parse(src).body;
 const one = (src: string) => {
   const b = body(src);
   expect(b).toHaveLength(1);
-  return b[0];
+  return b[0]!;
 };
 
 describe('script declarations', () => {
@@ -22,7 +22,7 @@ describe('script declarations', () => {
       '//@version=6\nindicator("x", overlay=true)\nplot(close)\n');
     expect(decl?.type).toBe('indicator');
     const d = decl as IndicatorDecl;
-    expect(d.args[0].value).toMatchObject({ type: 'str', v: 'x' });
+    expect(d.args[0]!.value).toMatchObject({ type: 'str', v: 'x' });
     expect(d.args[1]).toMatchObject({
       name: 'overlay', value: { type: 'bool', v: true },
     });
@@ -50,7 +50,7 @@ describe('script declarations', () => {
     const callee = (s as Call).callee as Member;
     expect(callee).toMatchObject({ type: 'member', prop: 'entry' });
     expect(callee.obj).toMatchObject({ type: 'ident', name: 'strategy' });
-    expect((s as Call).args[2].name).toBe('qty');
+    expect((s as Call).args[2]!.name).toBe('qty');
   });
 });
 
@@ -176,9 +176,9 @@ describe('functions / methods / types', () => {
   it('params carry type anns + defaults', () => {
     const s = one('g(float src, int len = 14) => src') as FuncDecl;
     expect(s.params[0]).toMatchObject({ name: 'src', typeAnn: 'float' });
-    expect(s.params[1].name).toBe('len');
-    expect(s.params[1].typeAnn).toBe('int');
-    expect(s.params[1].default).toMatchObject({ type: 'num', v: 14 });
+    expect(s.params[1]!.name).toBe('len');
+    expect(s.params[1]!.typeAnn).toBe('int');
+    expect(s.params[1]!.default).toMatchObject({ type: 'num', v: 14 });
   });
 
   it('method m(T self, x) → MethodDecl, self preserved in params[0]', () => {
@@ -199,7 +199,7 @@ describe('functions / methods / types', () => {
     expect(s.fields.map(f => [f.name, f.typeAnn])).toEqual([
       ['x', 'float'], ['y', 'float'], ['tag', 'string'],
     ]);
-    expect(s.fields[1].default).toMatchObject({ type: 'num', v: 0 });
+    expect(s.fields[1]!.default).toMatchObject({ type: 'num', v: 0 });
   });
 });
 
@@ -215,7 +215,7 @@ describe('control flow', () => {
     expect(s.type).toBe('if');
     expect(s.then).toHaveLength(1);
     expect(s.elseIfs).toHaveLength(1);
-    expect(s.elseIfs[0].body).toHaveLength(1);
+    expect(s.elseIfs[0]!.body).toHaveLength(1);
     expect(s.else).toHaveLength(1);
   });
 
@@ -260,8 +260,8 @@ describe('control flow', () => {
     expect(sw.type).toBe('switch');
     expect(sw.subject).toMatchObject({ type: 'ident', name: 'tf' });
     expect(sw.cases).toHaveLength(3);
-    expect(sw.cases[0].test).toMatchObject({ type: 'str', v: 'D' });
-    expect(sw.cases[2].test).toBeUndefined();
+    expect(sw.cases[0]!.test).toMatchObject({ type: 'str', v: 'D' });
+    expect(sw.cases[2]!.test).toBeUndefined();
   });
 
   it('bare-condition switch', () => {
@@ -272,21 +272,21 @@ describe('control flow', () => {
       '    => 0') as SwitchStmt;
     expect(s.type).toBe('switch');
     expect(s.subject).toBeUndefined();
-    expect(s.cases[0].test).toMatchObject({ type: 'binary', op: '>' });
+    expect(s.cases[0]!.test).toMatchObject({ type: 'binary', op: '>' });
   });
 
   it('break / continue inside loop', () => {
     const s = one(
       'for i = 0 to 9\n    if i > 5\n        break\n    continue') as ForStmt;
     const inner = s.body[0] as IfStmt;
-    expect(inner.then[0].type).toBe('break');
-    expect(s.body[1].type).toBe('continue');
+    expect(inner.then[0]!.type).toBe('break');
+    expect(s.body[1]!.type).toBe('continue');
   });
   it('switch arm body can be an array literal', () => {
     const s = one(
       'x = switch c\n    true => f(1)\n    false => [na, int(na)]') as Assign;
     const sw = s.value as SwitchStmt;
-    expect(sw.cases[1].body[0].type).toBe('arraylit');
+    expect(sw.cases[1]!.body[0]!.type).toBe('arraylit');
   });
 
   it('compound assign += desugars to reassign', () => {
@@ -299,8 +299,8 @@ describe('control flow', () => {
   it('comma-separated statements on one line', () => {
     const b = body('x := 1, y := 2');
     expect(b).toHaveLength(2);
-    expect(b[0].type).toBe('reassign');
-    expect(b[1].type).toBe('reassign');
+    expect(b[0]!.type).toBe('reassign');
+    expect(b[1]!.type).toBe('reassign');
   });
 
   it('deeper-indented line starting with `and` continues the expression', () => {
@@ -315,7 +315,7 @@ describe('control flow', () => {
   it('bare [a, b, c] statement is an ArrayLit (UDF last value)', () => {
     const f = one('f(x) =>\n    y = x + 1\n    [y, x]') as FuncDecl;
     const b = f.body as Node[];
-    expect(b[1].type).toBe('arraylit');
+    expect(b[1]!.type).toBe('arraylit');
   });
 
   it('keyword used as identifier: f(cond, indicator)', () => {
@@ -381,7 +381,7 @@ describe('expressions', () => {
     const b = body('a[1, 2]');
     expect(b).toHaveLength(2);
     expect(b[0]).toMatchObject({ type: 'ident', name: 'a' });
-    expect(b[1].type).toBe('arraylit');
+    expect(b[1]!.type).toBe('arraylit');
   });
 
 
@@ -404,8 +404,8 @@ describe('expressions', () => {
     const s = one('plot(close, "C", color=color.red, linewidth=2)') as Call;
     expect(s.args).toHaveLength(4);
     expect(s.args[2]).toMatchObject({ name: 'color' });
-    expect((s.args[2].value as Member).prop).toBe('red');
-    expect(s.args[3].name).toBe('linewidth');
+    expect((s.args[2]!.value as Member).prop).toBe('red');
+    expect(s.args[3]!.name).toBe('linewidth');
   });
 
   it('multi-line call args parse to one Call', () => {
@@ -418,9 +418,9 @@ describe('expressions', () => {
     const a = one('x = [1, 2, 3]') as Assign;
     expect((a.value as ArrayLit).items).toHaveLength(3);
     const c = one('a.map(a, (v) => v * 2)') as Call;
-    const arrow = c.args[1].value as ArrowFunc;
+    const arrow = c.args[1]!.value as ArrowFunc;
     expect(arrow.type).toBe('arrow');
-    expect(arrow.params[0].name).toBe('v');
+    expect(arrow.params[0]!.name).toBe('v');
   });
 
   it('import / export', () => {

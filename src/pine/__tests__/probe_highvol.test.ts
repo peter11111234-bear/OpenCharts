@@ -5,7 +5,7 @@ import { runScript } from '../interpreter';
 import '../builtins/index';
 import '../mtf';
 import { mkBars, fetchTf } from './golden';
-import { __mtfStats, resetMtf } from '../mtf';
+import { __mtfStats } from '../mtf';
 
 import type { BarData } from '../contracts';
 

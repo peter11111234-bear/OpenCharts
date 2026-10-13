@@ -45,7 +45,7 @@ function newCtx(bars: BarData[]): BuiltinCtx {
     open: new Series(), high: new Series(), low: new Series(), close: new Series(),
     volume: new Series(), time: new Series(),
     hl2: new Series(), hlc3: new Series(), ohlc4: new Series(), hlcc4: new Series(),
-    plots: [], drawings: [], warnings: [], alerts: [],
+    plots: [], drawings: [], warnings: [], alerts: [], logs: [],
     syminfo: {},
     timeframe: { period: '1', multiplier: 1, isseconds: false, isminutes: true, isdaily: false, isweekly: false, ismonthly: false, isintraday: true },
     callUdf: () => { throw new Error('no udf in tests'); },

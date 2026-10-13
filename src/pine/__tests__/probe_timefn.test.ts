@@ -13,10 +13,10 @@ describe('probe: time("60") builtin vs time series shadow', () => {
     const r = await runScript(parse(src), mkBars(130), { symbol: 'T', timeframe: '1' });
     const vals = r.plots.get('b')!.values;
     expect(vals[0]?.kind).not.toBe('na');
-    expect(vals[0]?.v).toBe(0);
+    expect((vals[0] as { v: number } | undefined)?.v).toBe(0);
     expect(vals[1]?.kind).toBe('na');
-    expect(vals[60]?.v).toBe(3600000);
-    expect(vals[120]?.v).toBe(7200000);
+    expect((vals[60] as { v: number } | undefined)?.v).toBe(3600000);
+    expect((vals[120] as { v: number } | undefined)?.v).toBe(7200000);
     expect(r.warnings.filter(w => /not a function/.test(w))).toHaveLength(0);
   }, 30000);
 });

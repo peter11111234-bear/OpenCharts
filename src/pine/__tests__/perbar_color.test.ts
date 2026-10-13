@@ -28,7 +28,7 @@ describe('per-bar plot color', () => {
       'plot(h, "h", style=plot.style_columns, color = h >= 0 ? #00FF00 : #FF0000)',
     ].join('\n');
     const bars = mkBars(8);
-    const r = await runScript(parse(src), bars.map(b => ({ openTime: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume })), { symbol: 'TEST', timeframe: '60' });
+    const r = await runScript(parse(src), bars.map(b => ({ openTime: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0 })), { symbol: 'TEST', timeframe: '60' });
     const plot = r.plots.get('h')!;
     expect(plot.colors.slice(0, 4)).toEqual(['#ff0000', '#ff0000', '#ff0000', '#00ff00']);
 

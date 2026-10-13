@@ -17,7 +17,7 @@ describe('indicator probes', () => {
     it(c.name, async () => {
       const src = readFileSync(c.file, 'utf8').replace(/^﻿/, '');
       const parsed = parse(src);
-      console.log(`[${c.name}] stmts=${parsed.body.length} decl=${parsed.decl?.title ?? 'n/a'}`);
+      console.log(`[${c.name}] stmts=${parsed.body.length} decl=${(parsed.decl as { title?: string } | null | undefined)?.title ?? 'n/a'}`);
       const t0 = Date.now();
       const r = await runScript(parsed, c.bars, { symbol: '2330', timeframe: c.tf });
       console.log(`[${c.name}] run=${Date.now() - t0}ms warnings=${JSON.stringify(r.warnings.slice(0, 8))}`);

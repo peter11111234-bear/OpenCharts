@@ -179,7 +179,7 @@ describe('PineRunClient', () => {
         void this.gate.promise.then(() => this.onmessage?.({
           data: { t: 'done', id: msg.id, result: {
             plots: new Map(), drawings: [], fills: [], bgcolors: new Map(),
-            barcolors: new Map(), alerts: [], alertconditions: [], warnings: [],
+            barcolors: new Map(), alerts: [], alertconditions: [], logs: [], warnings: [],
             inputs: [], props: [], title: '', overlay: false,
           } } satisfies FromWorker,
         }));
@@ -208,7 +208,7 @@ describe('PineRunClient', () => {
         this.onmessage?.({
           data: { t: 'done', id: msg.id, result: {
             plots: new Map(), drawings: [], fills: [], bgcolors: new Map(),
-            barcolors: new Map(), alerts: [], alertconditions: [], warnings: [],
+            barcolors: new Map(), alerts: [], alertconditions: [], logs: [], warnings: [],
             inputs: [], props: [], title: 'real', overlay: false,
           } } satisfies FromWorker,
         });

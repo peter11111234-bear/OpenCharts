@@ -120,7 +120,7 @@ if close > 105
   it('request.security: tick parity through the MTF checkpoint surface', async () => {
     // Higher-tf fetch mock: 5-minute bars aggregating the 1-minute tape.
     let fetches = 0;
-    const fetchSeries = async (sym: string, tf: string): Promise<BarData[]> => {
+    const fetchSeries = async (_sym: string, tf: string): Promise<BarData[]> => {
       fetches++;
       if (tf !== '5') return [];
       const out: BarData[] = [];

@@ -40,6 +40,7 @@ export function mkCtx(over: Partial<BuiltinCtx> = {}): BuiltinCtx {
     drawings: [],
     warnings: [],
     alerts: [],
+    logs: [],
     syminfo: { mintick: { kind: 'float', v: 0.01 } },
     timeframe: {
       period: 'D',

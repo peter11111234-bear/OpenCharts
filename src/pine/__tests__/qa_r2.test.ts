@@ -23,7 +23,7 @@ const bar = (openTime: number, c = 1) => ({ openTime, open: c, high: c + 1, low:
 const plotVals = (r: RunResult, i = 0): unknown[] => {
   const plot = Array.from(r.plots.values())[i];
   if (!plot) throw new Error(`plot[${i}] missing — have ${r.plots.size}`);
-  return plot.values.map(v => (v.kind === 'na' ? 'na' : v.v));
+  return plot.values.map(v => (v.kind === 'na' ? 'na' : 'v' in v ? v.v : undefined));
 };
 
 // ── 1. timestamp DST gap + dayofweek on explicit ms ──────────────────────────
@@ -87,7 +87,7 @@ describe('ta.supertrend per-callsite state isolation', () => {
     ].join('\n');
     const r = await runScript(parse(src), bars);
     const s10a = plotVals(r, 0), d10a = plotVals(r, 1);
-    const s14 = plotVals(r, 2), d14 = plotVals(r, 3);
+    const s14 = plotVals(r, 2);
     const s10b = plotVals(r, 4), d10b = plotVals(r, 5);
     // Identical params at a second callsite → identical output. Shared-key
     // contamination would double-feed the window and diverge.

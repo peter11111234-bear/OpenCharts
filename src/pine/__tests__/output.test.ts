@@ -30,7 +30,7 @@ function mkCtx(barCount: number): RtCtx {
     barCount,
     open: s(), high: s(), low: s(), close: s(),
     volume: s(), time: s(), hl2: s(), hlc3: s(), ohlc4: s(), hlcc4: s(),
-    plots: [], drawings: [], warnings: [], alerts: [],
+    plots: [], drawings: [], warnings: [], alerts: [], logs: [],
     syminfo: {},
     timeframe: {
       period: '1', multiplier: 1, isseconds: false, isminutes: true,
