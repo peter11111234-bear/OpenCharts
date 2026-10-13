@@ -13,6 +13,7 @@
 | §7 | 「缺 312」的真實分解 ＋ 對齊報告改量 backlog | `3f7a95f` |
 | §8 | `ta.*` 13 ＋ 常數 75（backlog 238 → 150） | `962df6d` |
 | §9 | **交接清單：未完成事項**（先讀這節） | `962df6d` |
+| §10 | 追加：`map.*`、A 四項、B 三項、TS 技術債 ＋**對 §9.2 三處前提的更正** | `a66631b` |
 
 ---
 
@@ -366,3 +367,135 @@ constants 189→193、strategy_builtins 21→47）。
 1. **`map.*` 10 個**（Pine v6 腳本會用、`Value` kind 已存在、可獨立驗證）。
 2. **PyneCore A 級第 3 項（保留名守衛）**：最便宜、修的是可觸發的靜默錯誤。
 3. **A 級第 1+2 項合併**（同一次 AST 走訪）：使用者貼腳本時立刻報錯，是「對齊 TV」最直接的可見收益。
+
+---
+
+## 10. 2026-10-13 追加：map.\*、A 四項、B 三項、TS 技術債（S8）
+
+§9.4 三刀全做完，另外做掉 §6 的 A+B 與 TypeScript 技術債。本節是驗證紀錄，
+並且**更正舊交接三處前提**（都附反證）。
+
+### 10.1 落地（commit）
+
+| commit | 內容 | 驗證 |
+|---|---|---|
+| `3fe3ab6` | `map.*` 10 個（backlog 150 → 140） | `map.test.ts` 8 |
+| `28b2c2d` | 編譯期檢查（PlotScope／OuterWrite／ExportCapture／SecurityDrawings）＋ ScriptRequirements ＋ 保留名登錄 ＋ mtf 合成節點 loc | `checks` 18／`checks_equivalence` 3／`internal_names` 5 |
+| `1ca17fe` | `debugFlags` 單一開關入口 ＋ qualifier 推論 ＋ input 常數性閘 ＋ `astWalk` 共用走訪 | `debug_flags` 4／`qualifiers` 9 |
+| `a66631b` | demo api facade 契約（`tsc` 275 → 27） | §10.4 |
+
+全套 `npx vitest run src/pine` 在 `28b2c2d` 後是 53 檔 / 881 passed（1 skipped）。
+
+### 10.2 A 段四項
+
+- **編譯期語言規則**：新增 `src/pine/checks.ts`；`engine.prepare()` 呼叫 `assertScript()`，
+  所以**貼進編輯器就在存檔前**拿到 `LINE:COL:` 錯誤（沿用 `ParseError` 格式，
+  `pineMonaco.parseErrorLocation` 直接吃得下）。四條規則的出處寫在檔頭
+  （TV user-defined-functions 文件、TV「Cannot use 'plot' in local scope」、PyneCore v6.10.8 release notes）。
+  `plot()` 的 CE10188 執行期 warn-and-skip **保留**（直接呼叫 `runScript` 的測試／CLI 仍要護欄）。
+  融合 vs 逐條兩種模式在 `checks_equivalence.test.ts` 對 12 個真實腳本 ＋ 一個規則陷阱腳本
+  斷言診斷與 requirements 全等（`PINE_AST_SEQUENTIAL=1`，或 PyneCore 拼法 `PYNE_AST_SEQUENTIAL=1`）。
+- **ScriptRequirements 靜態偵測**：`checkScript()` 回傳 `{security, externalData, orders, drawings,
+  alerts, inputs, plots, viewport}`；`prepare()` 用它設 `reactsToViewport`（Vela 的 `PreparedScript`
+  註解明說這欄位就是「Detected statically at prepare」），並放進 `PineToken.requirements`
+  給實盤路徑當閘。
+  ⚠️ **更正 §9.2.B.1 的前提**：`capabilities` 在 Vela port 裡是**每個引擎**的常數（
+  `EngineCapabilities` 註解：「lets the orchestrator route without engine-specific checks」），
+  不可能是每支腳本掃 AST 得出。能掃的是 `reactsToViewport` ＋ 上面的 requirements，
+  `engine.ts:229` 已寫明。
+- **保留識別字**：新增 `src/pine/internalNames.ts`（名字 → 為什麼是引擎的）＋
+  `internal_names.test.ts` 掃原始碼：任何 `__` 開頭的字都必須登記（PyneCore
+  `test_129_pipeline_names.py` 的等價物）；同一支測試也掃 `jitCompile`／`jitCompileUdf` 的
+  **產出原始碼**，只准出現已登記的名字。
+  ⚠️ **更正 §9.2.B.3 的「可觸發靜默錯誤」**：JIT 的使用者變數一律走
+  `R.decl(node, "x")`（名字是字串，不是 JS 識別字），所以 `f() => __ret = 5` **不會**覆寫
+  UDF 回傳值。已用 `PINE_JIT_UDF=1` 實測釘住（斷言 `__pineJitStats.udfCompiled` 必須增加，
+  證明真的走了 JIT —— 否則測試會因為 UDF-JIT 的 8-stmt／native 閘而變成空測）。
+  守衛的價值在**未來**：codegen 哪天把使用者名字當 JS 識別字用，這支測試會先紅。
+- **合成節點 loc**：`mtf.ts` 三處補來源 `loc`（`declAsWrite` 的合成 reassign、
+  未初始化 `float x` 的 na 節點、`runConst` 的 str 節點）。
+
+### 10.3 B 段三項
+
+- **統一除錯開關**：新增 `src/pine/debugFlags.ts` —— 所有開關（`interp`／`jit`／`jitUdf`／
+  `noJitUdf`／`jitQuiet`／`evalCount`／`astSequential`／`stage`／`runLog`）在這裡同時定義
+  globalThis 把手與環境變數；interpreter／engine／checks 全改走
+  `debugFlag()`／`markStage()`／`recordRunTiming()`。`debug_flags.test.ts` 驗兩件事：
+  語意（strict 只認 `true`／`1`、`noJitUdf` 優先於 `jitUdf`）＋ **原始碼掃描**（除這個檔，
+  任何地方再直接讀 `process.env.PINE_*` 或 `.__pine*` 就紅）。環境變數名刻意不變，
+  所以 `scripts/scratch/bench-*.mjs` 與舊筆記不用改。
+- **型別 stamp（做）／常數摺疊（刻意不做）**：`src/pine/qualifiers.ts` 的 `provenSeries()` 是
+  單向保守推論——只回 true 當「值證明每 bar 會變」（bar globals、`ta.*`／`request.*`／`strategy.*`
+  呼叫、任何 series 當引數的呼叫、`x[1]`、會被重塑的全域、`var`/`varip`/被 `:=` 改的全域），
+  其餘一律 false，所以「不確定」永遠不會擋掉能跑的腳本。目前只有一個使用者：
+  `input.*` 的 `defval` 被證明是 series → 編譯期錯誤（TV 文件：除 `input.source` 外都是 `const`；
+  這裡會**靜默記錯預設值**）。12 個真實腳本 0 診斷。
+  **沒做常數摺疊的理由**：本引擎的運算子語意不是 JavaScript 的（int/int 除法、`%` 取模方向、
+  na 傳播、容差相等），折疊器必須重用 evaluator 的運算子才算對，否則就是本輪一直在消滅的
+  「靜默分歧」；而收益很小（常數每 bar 只花幾個 node dispatch）。要做的正確形狀是
+  「session 建立時用 evaluator 對 literal-only 初始式求值一次」，不是另寫一套常數算術。
+  **`request.security` 的 tf 也刻意不擋**：`mtf.ts` 有一條 DYNAMIC 路徑，動態 sym/tf 是
+  **刻意支援**的功能，擋掉等於刪掉一個能跑的功能（TV 會拒絕）。
+- **broker plugin 介面（沒做，附反證）**：`src/services/shioaji/api.ts`（含五個
+  `getOrderMode() === "sim" ? …` 的分支）全 repo **零 import**、`setOrderMode()` 零呼叫、
+  `src/services/shioaji/*` 唯一的對外使用者是 `VelaPage.tsx` 取 `instruments.ts` 的商品清單。
+  所以現在定義 BrokerPort 會有**零個使用者**。設計已定（~40 行：
+  `BrokerPort {placeOrder,cancelOrder,modifyOrder,cancelAllOrders,listOrders}` ＋
+  `paperBroker`（包 `demoApi`）／`simBroker`（包 `placeLiveOrder` 等）＋ `activeBroker()`
+  取代那五個 inline 三元；`PlaceOrderInput` 與 `demo.engine.PlaceOrderArgs` 欄位相同，
+  不需要 cast），等實盤路徑真的接上再做。
+
+### 10.4 TypeScript 技術債（275 → 0）
+
+**共同根因**（不是各自的簽章問題）：`src/services/api.ts` 的 facade 型別
+`typeof demoApi & Record<string, (...args: never[]) => Promise<unknown>>` —— `never[]`
+讓所有 proxy 方法不可呼叫（TS2554／TS2345），`noUncheckedIndexedAccess` 又讓每個 miss 變成
+`… | undefined`（TS2722）。這是 queries 78 顆、store 7、replay 10、ChartPanel／OrderModifyDialog
+各 1 顆的來源，兩顆 agent 各自診斷出來、TsState 甚至先加了 per-file 補丁又被中央修法還原。
+
+**修法（單一契約，`a66631b`）**：
+- `WidenArgs<typeof demoApi>`：payload 型別不動，參數放寬（demo 的 stub 本來就忽略引數）。
+- `BackofficeApi`：58 個 back-office 方法（competition／leaderboard／firm／bots／payouts／
+  analytics／push／tickets／profiles ＋ `getPreferences`）逐條宣告成
+  `(...args: unknown[]) => Promise<unknown>`。**不用 index signature**：在
+  `noUncheckedIndexedAccess` 下它會讓每個 miss 變 `Stub | undefined`，逼出 ~50 個無意義的
+  `possibly undefined` 防禦。payload 保持 `unknown`（與修法前一致，所以不會製造新錯誤），
+  註解寫明 Proxy 在執行期回 `null`。
+
+**分派結果**（5 個 agent ＋ 1 個根因修法，全部歸零）：parser.ts 58→0、`src/pine/__tests__/*`
+71→0（26 檔，多為 `mkCtx` 少 `logs: []`、`time:` 應為 `openTime:`）、store＋hook 9→0（TsState
+的 per-file 補丁在中央修法後**還原成 0 diff**）、queries.ts 126→0、replay 13 ＋
+ChartPanel／OrderModifyDialog 各 1 →0（TsTradeUi **沒有改任何一行**：那 13 顆的根在
+queries.ts 的 hook payload，中央修法讓它們自己消失）。
+queries.ts 的最終形狀：一個 `callEndpoint<T>(endpoint, ...args)` helper（單一、有註解的
+payload 具名點，11 處使用；demo 層的 terminal stub 給的是 `never[]`／`null` placeholder，
+back-office 給 `unknown`，所以 payload 只能在呼叫點指名）＋ `api/accounts.ts` 新增
+具名的 `ReplaySessionResponse`（取代 `Awaited<ReturnType<…>>`，符合 repo 的
+no-ReturnType-contracts 規則）。
+`npx tsc --noEmit`（＝既有的 `npm run typecheck`）現在 **0 錯誤**。
+
+### 10.5 環境陷阱（本輪新增）
+
+- **可以派子代理了**（§0 第 3 點那批「No model selected」沒再現）：本輪用了 5 個 `task` agent
+  切不同檔案，互不衝突；`api.ts` 這種**共用根因**要指定**單一 owner**（我拿），否則兩個 agent
+  會各自加 per-file 補丁。
+- **原始碼掃描型的守衛測試不能隨便去註解**：`/\/\*[\s\S]*?\*\//` 會被註解裡的 glob
+  （`src/**/*.ts`）誤開一個永不結束的區塊註解，把檔案後半整段吃掉（實測讓兩個名字從掃描消失）。
+  正解是 `src/pine/__tests__/sourceScan.ts` 裡逐字元的引號感知掃描器（跳過字串／樣板內的註解符號）。
+- **`Record<string, X>` ＋ `noUncheckedIndexedAccess`**：miss 會得到 `X | undefined`，
+  動態 facade 不要用 index signature，逐條宣告。
+- `map.*` 的 key 是**有型別的**：`Map<string,Value>` 內部用可逆編碼（字串裸存、其他 kind 加
+  `\u0001` tag ＋ 逃脫），所以 `map<int,..>` 的 1 與 `map<string,..>` 的 `"1"` 不會撞；
+  非原生 key 直接丟 `PineRuntimeError`，不靜默存。
+
+### 10.6 還沒做（下一步）
+
+1. **TS 已歸零**（§10.4）：`npm run typecheck` script **本來就在**（不是本輪新增），repo 沒有
+   `.github/workflows`、也沒有 husky／pre-commit，所以「防回歸」要自己選：掛 pre-commit
+   （每次 commit ~40–80s）或等有 CI 再掛。`docs/superpowers/plans/2026-10-13-typescript-debt-remediation.md`
+   的 Phase 3 講的就是這件事（該計畫的 Phase 2 現在 100% 完成）。
+2. **§9.2.A 剩下的 140**：`matrix.*` 48（本 repo 真實腳本 0 使用，最後做）、`syminfo` 27 欄位
+   （等基本面資料源）、`footprint`／`ticker`／`volume_row`／`earnings`／`dividends`／`request`／
+   `splits` 45（註冊成 stub ＋ warn，照 `request.ts:38-42`）、`(global)` 6、小刀 12。
+3. **常數摺疊**（正確形狀見 §10.3）與**broker port**（設計見 §10.3），等對應前提成熟。
+4. `scratch/vela_*.png` ×6 仍未追蹤（§9.2.D）。
