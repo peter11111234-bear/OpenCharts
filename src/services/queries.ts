@@ -1,9 +1,8 @@
 import { useQuery, useMutation, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "./api";
-import type { AllPayoutsResponse, ReplaySessionResponse } from "./api/accounts";
+import type { ReplaySessionResponse } from "./api/accounts";
 import type { CreateJournalEntryInput, JournalEntriesResponse } from "./api/journal";
 import type { MarketDataCandlesPayload } from "./api/market-data";
-import type { PnlCalendarResponse } from "@propsim/types";
 import type {
   Account,
   AccountStats,
@@ -223,16 +222,6 @@ export function useFillQuality(accountId: string | null) {
     queryFn: () => callEndpoint<FillQuality>(api.getFillQuality, accountId!),
     enabled: !!accountId,
     staleTime: 60_000,
-  });
-}
-
-// ── Payout Queries ─────────────────────────────────────
-export function useAllPayouts() {
-  return useQuery<AllPayoutsResponse>({
-    queryKey: ["allPayouts"],
-    queryFn: () => callEndpoint<AllPayoutsResponse>(api.getAllPayouts),
-    staleTime: 15_000,
-    refetchInterval: 30_000,
   });
 }
 
@@ -1132,20 +1121,6 @@ export function useReplaySession(accountId: string | null, sessionDate: string |
     // and candles recorded since the previous run.
     staleTime: 30_000,
     gcTime: 5 * 60 * 1000,
-  });
-}
-
-// ── Daily PNL Calendar ─────────────────────────────────
-export function useDailyPnl(
-  accountIds: string[],
-  from: string,
-  to: string,
-): ReturnType<typeof useQuery<PnlCalendarResponse>> {
-  return useQuery<PnlCalendarResponse>({
-    queryKey: ["daily-pnl", accountIds.slice().sort().join(","), from, to],
-    queryFn: () => callEndpoint<PnlCalendarResponse>(api.getDailyPnl, accountIds, from, to),
-    enabled: accountIds.length > 0 && !!from && !!to,
-    staleTime: 60_000,
   });
 }
 
