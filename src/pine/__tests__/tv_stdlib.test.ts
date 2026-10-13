@@ -5,11 +5,17 @@
 // engine registers another is a silent "identifier not found" for the user, so
 // the namespaces this engine implements are pinned against the oracle here.
 //
-// The gap summary printed at the end is informational — it lists the TV names
-// still absent from the registry, which is the alignment backlog.
+// The gap summary printed at the end is informational. Its number is the
+// alignment backlog, so it subtracts the two classes that are not gaps:
+// names the interpreter answers from ctx (resolvesFromCtx) and the names the
+// reference documents as "functions" but Pine treats as syntax.
 
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
+import type { BarData, BuiltinCtx } from '../contracts';
+import { BarCtx } from '../context';
+import { parse } from '../parser';
+import { resolvesFromCtx, runScript } from '../interpreter';
 import { BUILTINS, getConstant } from '../builtins/registry';
 import '../builtins/index';
 
@@ -34,6 +40,33 @@ const IMPLEMENTED_EXACT = [
   'runtime.error', 'time', 'time_close',
 ];
 
+/** Language-level names the reference lists among the "functions" but that are
+ *  not values in Pine: keywords, declaration statements, namespace roots and
+ *  parameter names. They have no registry entry by design, and using one as an
+ *  expression correctly reports "identifier 'x' not found". */
+const SYNTAX_NAMES = new Set([
+  // keywords / operators
+  'and', 'or', 'not', 'if', 'switch', 'for', 'for...in', 'while', 'once',
+  'var', 'varip', 'const', 'simple', 'series', 'enum', 'export', 'import',
+  'type', 'method',
+  // declaration statements
+  'indicator', 'strategy', 'library',
+  // namespace roots (only the dotted members are values)
+  'array', 'matrix', 'map', 'polyline', 'linefill', 'footprint', 'volume_row',
+  // parameter names documented as their own entries
+  'max_bars_back', 'size', 'initial_value', 'rows', 'columns',
+]);
+
+const probeBars: BarData[] = [{ openTime: 0, open: 1, high: 1, low: 1, close: 1, volume: 1 }];
+const probeCtx = new BarCtx(probeBars, { market: 'D' }).seek(0) as BuiltinCtx;
+
+/** TV names with no registry entry AND no other resolution path. */
+const backlog = (): string[] =>
+  [...tvNames]
+    .filter((n) => !BUILTINS.has(n) && getConstant(n) === undefined)
+    .filter((n) => !resolvesFromCtx(probeCtx, n) && !SYNTAX_NAMES.has(n))
+    .sort();
+
 describe('TV stdlib name alignment', () => {
   it('registers every TV name in the namespaces this engine implements', () => {
     const missing: string[] = [];
@@ -44,8 +77,24 @@ describe('TV stdlib name alignment', () => {
     expect(missing).toEqual([]);
   });
 
+  it('resolvesFromCtx agrees with the interpreter', async () => {
+    // One name per path, plus the negative cases that must stay gaps.
+    const cases: [string, boolean][] = [
+      ['close', true], ['bar_index', true], ['hlc3', true],
+      ['syminfo.currency', true], ['timeframe.multiplier', true], ['barstate.islast', true],
+      ['syminfo.country', false], ['currency.AED', false], ['ta.barssince', false],
+    ];
+    for (const [name, expected] of cases) {
+      expect(resolvesFromCtx(probeCtx, name), `resolvesFromCtx(${name})`).toBe(expected);
+      const r = await runScript(parse(`x = ${name}\nplot(x, "x")`), probeBars, { symbol: 'TEST', timeframe: 'D' });
+      const warned = /not found|unknown constant/.test(r.warnings.join('\n'));
+      expect(warned, `engine disagreement on ${name}: ${r.warnings.join(' | ')}`).toBe(!expected);
+    }
+  });
+
   it('reports the remaining alignment gap by namespace', () => {
-    const missing = [...tvNames].filter((n) => !BUILTINS.has(n) && getConstant(n) === undefined).sort();
+    const registryAbsent = [...tvNames].filter((n) => !BUILTINS.has(n) && getConstant(n) === undefined);
+    const missing = backlog();
     const byNs = new Map<string, string[]>();
     for (const m of missing) {
       const ns = m.includes('.') ? m.split('.')[0]! : '(global)';
@@ -54,7 +103,11 @@ describe('TV stdlib name alignment', () => {
       byNs.set(ns, list);
     }
     const rows = [...byNs.entries()].sort((a, b) => b[1].length - a[1].length);
-    console.log(`TV names: ${tvNames.size} | registered: ${tvNames.size - missing.length} | missing: ${missing.length}`);
+    console.log(
+      `TV names: ${tvNames.size} | registered: ${tvNames.size - registryAbsent.length}` +
+      ` | absent from registry: ${registryAbsent.length}` +
+      ` | alignment backlog: ${missing.length}`,
+    );
     for (const [ns, list] of rows) {
       console.log(`  ${ns} (${list.length}): ${list.slice(0, 12).join(', ')}${list.length > 12 ? ', …' : ''}`);
     }

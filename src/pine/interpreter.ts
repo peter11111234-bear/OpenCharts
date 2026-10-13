@@ -648,6 +648,30 @@ function ctxSeries(ctx: BuiltinCtx, name: string): Series | undefined {
   }
 }
 
+/**
+ * True when the interpreter answers `name` from ctx with neither a scope
+ * binding nor a registry entry — the bar globals and the ctx-backed records
+ * (syminfo / timeframe / barstate). Mirrors the non-registry branches of
+ * evalIdent and evalMember so the two cannot drift: the stdlib-alignment
+ * report (tv_stdlib.test.ts) calls it to tell a real gap from a name that
+ * resolves through another path.
+ */
+export function resolvesFromCtx(ctx: BuiltinCtx, name: string): boolean {
+  if (ctxSeries(ctx, name) !== undefined) return true;
+  if (name === 'bar_index' || name === 'last_bar_index') return true;
+  const dot = name.indexOf('.');
+  if (dot < 0) return false;
+  const head = name.slice(0, dot);
+  const prop = name.slice(dot + 1);
+  if (prop.includes('.')) return false;
+  switch (head) {
+    case 'syminfo': return ctx.syminfo[prop] !== undefined;
+    case 'timeframe': return timeframeFields(ctx).has(prop);
+    case 'barstate': return barstateUdt(ctx).fields.has(prop);
+    default: return false;
+  }
+}
+
 // Perf instrumentation — counts evalNode hits per type for scratch benches.
 // Zero cost in prod (guarded by global flag, lazily attached).
 export const __evalNodeCounts = new Map<string, number>();

@@ -173,3 +173,45 @@ npx vitest run src/pine/__tests__/tv_stdlib.test.ts
 `strategy.test.ts` 的 `strategy metrics` 區塊（含 margin_liquidation_price 與追繳條件的一致性斷言）。
 `docs/pynecore-conformance.{json,html}` 的 `ours_measured` 已同步（builtins 412→449、
 constants 189→193、strategy_builtins 21→47）。
+
+---
+
+## 7. 2026-10-13 追加：312 的真實分解（度量修正）
+
+第 4.2 節那個「缺 312」是 **registry 原始 diff**，不是待辦數。用
+`scratch/_gap_class.ts` 把 887 個名字逐個真的跑一遍，得到：
+
+| 分類 | 數量 | 內容 | 判定 |
+|---|---|---|---|
+| 走別的路徑解析 | 40 | 全域 11（`close`/`high`/`volume`/`bar_index`/`hlc3`…）、`syminfo` 13、`timeframe` 9、`barstate` 7 | **不是缺口** —— 走 `ctxSeries` / `ctx.syminfo` / `timeframeFields` / `barstateUdt` |
+| 語言語法 | 34 | 關鍵字（`and`/`or`/`for`/`while`/`var`/`enum`/`type`/`import`/`export`/`simple`/`series`/`const`/`method`/`once`/`varip`）、宣告語句（`indicator`/`strategy`/`library`）、namespace 根（`array`/`matrix`/`map`/`polyline`/`linefill`/`footprint`/`volume_row`）、參數名（`max_bars_back`/`size`/`initial_value`/`rows`/`columns`）、`not`/`if`/`switch`/`for...in` | **不是缺口** —— 當值用本來就該報錯 |
+| **真實缺口** | **238** | 見下 | 待辦 |
+
+**312 = 40 + 34 + 238**（`registryAbsent` → `alignment backlog`）。
+
+`tv_stdlib.test.ts` 已改成印兩個數字，並新增一個測試用 9 個代表名（正反案例）
+驗證 `resolvesFromCtx()`（新匯出於 `interpreter.ts`，與 `evalIdent`/`evalMember`
+的非 registry 分支同源）跟引擎的實際行為一致 —— 度量本身現在是可驗證的。
+
+### 238 個真實缺口，按價值分四批
+
+| 批次 | 數量 | 內容 | 成本 |
+|---|---|---|---|
+| A. 純常數 | ~70 | `currency` 43、`plot` 4、`dayofweek` 7、`adjustment` 3、`scale` 3、`backadjustment` 3、`settlement_as_close` 3、`display` 1、`input` 1、`chart` 的部分 | 半天，機械 |
+| B. stub + warn | ~45 | `footprint` 9、`volume_row` 8、`ticker` 9、`earnings` 7、`dividends` 5、`request` 5、`splits` 2（照 `request.ts:38-42` 既有模式） | 半天 |
+| C. 真函式 | ~72 | `ta` 13（**優先**，有腳本在用）、`map` 10、`matrix` 48（沒腳本在用，最後）、`array.copy`/`label.copy`/`box.copy`/`line.copy` | 1–2 天 |
+| D. 需資料源 | 27+6 | `syminfo` 缺的 27 個欄位（多為基本面／分析師資料）、全域 `ask`/`bid`/`timenow`/`time_tradingday`/`weekofyear`/`last_bar_time` | 有資料源才做 |
+
+**注意**：`syminfo` 那 27 個欄位補成 na 會**蓋掉**現在有用的 `unknown constant` 警告
+卻不給資料 —— 沒有資料源之前，維持警告比回 na 誠實。
+
+### 一個被推翻的中間結論（留著當教訓）
+
+第一次探測時我用 `/not found/` 篩警告，得出「124 個值類名稱靜默回 na、不報警告」，
+準備去修「靜默失敗」。**那是探測器的 bug**：member 解析失敗的訊息是
+`unknown constant 'currency.AED'`，不含 "not found"，所以被誤判成「沒有警告」。
+改成 `/not found|unknown constant/` 後 silent = 0。
+
+**本引擎沒有靜默失敗這一類**：未註冊的 `ns.member` 一律 `unknown constant`、
+未註冊的裸名／namespace 根一律 `identifier 'x' not found`，都是每 run 一次的警告。
+寫探測器時，斷言「沒有輸出」比斷言「有錯誤」更容易誤判 —— 要用實際產生的值／訊息全文。
