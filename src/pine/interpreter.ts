@@ -60,7 +60,7 @@ import { Scope, blockFrame, seriesOf, type Frame } from './scope';
 import { BarCtx, MemoryDrawSink, type DrawSnap } from './context';
 import { BUILTINS, HIST_BUILTINS, getConstant, histSpecHas, kindBuiltin, registerConstant } from './builtins/registry';
 import { truthy, drainBindWarnings, type RtCtx } from './builtins/util';
-import { declDrawQuotas, INDICATOR_DECL_ORDER } from './builtins/draw';
+import { declDrawQuotas, INDICATOR_DECL_ORDER, warnUnsupportedIndicatorParams } from './builtins/draw';
 import { strategyDecl, execsAt } from './builtins/strategy';
 import {
   UDT_REGISTRY,
@@ -863,6 +863,7 @@ function evalNode(node: Node, frame: Frame): Value {
 
     case 'indicator':
       declDrawQuotas(ctx, node.args, INDICATOR_DECL_ORDER);
+      warnUnsupportedIndicatorParams(ctx, node.args);
       return { kind: 'void' };
     case 'strategy':
       strategyDecl(ctx, node);
@@ -991,10 +992,13 @@ function evalBinary(op: string, l: Value, r: Value, run: RunState, ctx: BuiltinC
         if (r.v === 0) return NA;
         return numVal(l.v - r.v * Math.floor(l.v / r.v), bothInt);
       }
-      case '<': return l.v < r.v ? VTRUE : VFALSE;
-      case '>': return l.v > r.v ? VTRUE : VFALSE;
-      case '<=': return l.v <= r.v ? VTRUE : VFALSE;
-      case '>=': return l.v >= r.v ? VTRUE : VFALSE;
+      // Tolerant orderings: ints compare exactly, floats count a difference
+      // within CMP_EPSILON as equal. `<=`/`>=` keep the raw comparison in front
+      // — two equal infinities have a nan difference, which would be false.
+      case '<': return (bothInt ? l.v < r.v : l.v - r.v < -CMP_EPSILON) ? VTRUE : VFALSE;
+      case '>': return (bothInt ? l.v > r.v : l.v - r.v > CMP_EPSILON) ? VTRUE : VFALSE;
+      case '<=': return (bothInt ? l.v <= r.v : l.v <= r.v || l.v - r.v <= CMP_EPSILON) ? VTRUE : VFALSE;
+      case '>=': return (bothInt ? l.v >= r.v : l.v >= r.v || l.v - r.v >= -CMP_EPSILON) ? VTRUE : VFALSE;
     }
   }
 
@@ -1015,10 +1019,22 @@ function evalBinary(op: string, l: Value, r: Value, run: RunState, ctx: BuiltinC
   return NA;
 }
 
+/** Pine's comparison tolerance: `<`, `>`, `<=`, `>=`, `==`, `!=` treat float
+ *  operands closer than this as equal (absolute, measured on TradingView — the
+ *  boundary value itself counts as equal). Integers need no guard: int±int
+ *  differences are 0 or at least 1, so the tolerance can never bridge them. */
+const CMP_EPSILON = 1e-10;
+
 function valueEq(l: Value, r: Value): boolean {
   const a = unseries(l);
   const b = unseries(r);
-  if (isNum(a) || isNum(b)) return isNum(a) && isNum(b) && a.v === b.v;
+  if (isNum(a) || isNum(b)) {
+    if (!isNum(a) || !isNum(b)) return false;
+    // The tolerant branch is reachable only when a real float is involved;
+    // strings, colors, booleans and object references keep exact equality.
+    if (a.kind === 'int' && b.kind === 'int') return a.v === b.v;
+    return Math.abs(a.v - b.v) <= CMP_EPSILON;
+  }
   if (a.kind !== b.kind) return false;
   if (a.kind === 'bool' && b.kind === 'bool') return a.v === b.v;
   if ((a.kind === 'string' || a.kind === 'color') && a.kind === b.kind) {
@@ -2713,7 +2729,10 @@ async function buildSess(
   // (max_lines_count / max_labels_count / max_boxes_count) must be read here —
   // otherwise every drawing kind falls back to DEFAULT_QUOTA=50 and scripts
   // declaring 500 lose most of their lines/labels/boxes (見高K zigzag case).
-  else if (decl?.type === 'indicator') declDrawQuotas(ctx, decl.args, INDICATOR_DECL_ORDER);
+  else if (decl?.type === 'indicator') {
+    declDrawQuotas(ctx, decl.args, INDICATOR_DECL_ORDER);
+    warnUnsupportedIndicatorParams(ctx, decl.args);
+  }
 
   // Bind context series + globals into the top scope.
   const bound: Record<string, Series> = {

@@ -12639,5 +12639,7 @@
       "msg": "[TD+BB] {{ticker}} Sell 9 觸及布林上軌，高勝率回調！價格 {{close}}"
     }
   ],
-  "warnings": []
+  "warnings": [
+    "indicator(): 'max_bars_back' declared but not implemented — the run ignores it"
+  ]
 }

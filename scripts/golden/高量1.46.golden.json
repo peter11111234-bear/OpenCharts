@@ -2665,5 +2665,7 @@
   "execs": [],
   "alerts": [],
   "alertconditions": [],
-  "warnings": []
+  "warnings": [
+    "indicator(): 'max_bars_back' declared but not implemented — the run ignores it"
+  ]
 }

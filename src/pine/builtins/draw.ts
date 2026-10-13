@@ -131,6 +131,23 @@ export const INDICATOR_DECL_ORDER = [
   'explicit_plot_zorder', 'max_circles_count',
 ] as const;
 
+/** `indicator()` parameters that carry behaviour this interpreter does not
+ *  implement. The quota parameters (max_lines/labels/boxes/tables/polylines_count)
+ *  ARE consumed by declDrawQuotas and display metadata is harmless, so only the
+ *  ones that would change results or drawing capacity are listed. */
+export const INDICATOR_UNSUPPORTED_PARAMS = [
+  'max_bars_back', 'backtest_fill_limits_assumption', 'max_circles_count',
+] as const;
+
+/** Report the declared-but-unimplemented `indicator()` parameters once per run. */
+export function warnUnsupportedIndicatorParams(ctx: BuiltinCtx, args: Arg[] | undefined): void {
+  const bound = bindDeclArgs(args, INDICATOR_DECL_ORDER);
+  const ignored = INDICATOR_UNSUPPORTED_PARAMS.filter((n) => bound.has(n));
+  if (ignored.length === 0) return;
+  warnOnce(ctx, 'indicator|unsupported',
+    `indicator(): ${ignored.map((n) => `'${n}'`).join(', ')} declared but not implemented — the run ignores ${ignored.length > 1 ? 'them' : 'it'}`);
+}
+
 /**
  * Read max_lines_count/max_labels_count/max_boxes_count from an indicator() /
  * strategy() decl's args into ctx.declQuotas. `order` is the decl's Pine

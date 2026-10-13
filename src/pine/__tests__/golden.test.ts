@@ -2,7 +2,7 @@
 // drawing props, fills, colors, warnings) into scripts/golden/*.golden.json.
 // First commit generated via UPDATE_GOLDEN=1 — review the .golden.json before
 // landing. After that, any semantic change shows up as a diff.
-import { describe, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'fs';
 import type { BarData } from '../contracts';
 
@@ -10,7 +10,7 @@ import { parse } from '../parser';
 import { runScript } from '../interpreter';
 import '../builtins/index';
 import '../mtf';
-import { fetchTf, goldenCheck, mkBars } from './golden';
+import { compareSnapshots, fetchTf, goldenCheck, mkBars } from './golden';
 
 const load = (p: string) => readFileSync(p, 'utf8').replace(/^\uFEFF/, '');
 
@@ -52,4 +52,42 @@ describe('golden e2e', () => {
       goldenCheck(c.name, r);
     }, 120_000);
   }
+});
+
+// ── comparator unit tests ───────────────────────────────────────────────────
+
+describe('golden comparator', () => {
+  it('passes a sub-tolerance float difference', () => {
+    const r = compareSnapshots(
+      { plots: { a: { values: [1, 2.0000000001] } } },
+      { plots: { a: { values: [1, 2] } } },
+    );
+    expect(r.diffs).toHaveLength(0);
+    expect(r.maxAbs).toBeGreaterThan(0);
+  });
+
+  it('fails a 1e-3 difference and names the exact path', () => {
+    const r = compareSnapshots(
+      { plots: { a: { values: [1, 2.001] } } },
+      { plots: { a: { values: [1, 2] } } },
+    );
+    expect(r.diffs).toHaveLength(1);
+    expect(r.diffs[0]!.path).toBe('plots.a.values[1]');
+  });
+
+  it('never treats na (null) as zero', () => {
+    expect(compareSnapshots({ v: [null] }, { v: [0] }).diffs).toHaveLength(1);
+    expect(compareSnapshots({ v: [null] }, { v: [null] }).diffs).toHaveLength(0);
+  });
+
+  it('compares integer-valued keys exactly', () => {
+    expect(compareSnapshots({ index: 3 }, { index: 4 }).diffs).toHaveLength(1);
+    expect(compareSnapshots({ time: 1_700_000_000_000 }, { time: 1_700_000_000_001 }).diffs).toHaveLength(1);
+    expect(compareSnapshots({ plots: { p: { values: [7] } } }, { plots: { p: { values: [7.0000000001] } } }).diffs).toHaveLength(0);
+  });
+
+  it('reports a missing key as a structural diff', () => {
+    expect(compareSnapshots({ a: 1 }, { a: 1, b: 2 }).diffs).toHaveLength(1);
+    expect(compareSnapshots({ a: 1, b: 2 }, { a: 1 }).diffs).toHaveLength(1);
+  });
 });

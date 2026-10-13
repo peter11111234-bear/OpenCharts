@@ -1214,3 +1214,92 @@ describe('Slice C-3 dispatch + siteKey trie', () => {
     expect(vals[1]).toEqual([5, 5]);    // array.get builtin via kindBuiltin
   });
 });
+
+// ── Pine float comparison tolerance ─────────────────────────────────────────
+// Pine compares floats with an absolute 1e-10 tolerance (measured on
+// TradingView); the boundary value itself counts as equal, and integers are
+// exact automatically. ta.crossover and friends stay bit-exact.
+
+describe('Pine float comparison tolerance', () => {
+  const cols = async (body: string) => {
+    const r = await runScript(parse(`indicator("t")\n${body}`), mkBars(2), { symbol: 'X', timeframe: '1' });
+    return [...r.plots.values()].map((p) => nums(p.values));
+  };
+
+  it('a sub-tolerance step is equal for all six operators', async () => {
+    const [lt, gt, le, ge, eq, ne] = await cols([
+      'a = 100.0',
+      'b = 100.0 + 1e-12',
+      'plot(a < b ? 1 : 0)',
+      'plot(a > b ? 1 : 0)',
+      'plot(a <= b ? 1 : 0)',
+      'plot(a >= b ? 1 : 0)',
+      'plot(a == b ? 1 : 0)',
+      'plot(a != b ? 1 : 0)',
+    ].join('\n'));
+    expect(lt).toEqual([0, 0]);
+    expect(gt).toEqual([0, 0]);
+    expect(le).toEqual([1, 1]);
+    expect(ge).toEqual([1, 1]);
+    expect(eq).toEqual([1, 1]);
+    expect(ne).toEqual([0, 0]);
+  });
+
+  it('a supra-tolerance step compares normally', async () => {
+    const [lt, gt, le, ge, eq, ne] = await cols([
+      'a = 100.0',
+      'b = 100.0 + 1e-8',
+      'plot(a < b ? 1 : 0)',
+      'plot(a > b ? 1 : 0)',
+      'plot(a <= b ? 1 : 0)',
+      'plot(a >= b ? 1 : 0)',
+      'plot(a == b ? 1 : 0)',
+      'plot(a != b ? 1 : 0)',
+    ].join('\n'));
+    expect(lt).toEqual([1, 1]);
+    expect(gt).toEqual([0, 0]);
+    expect(le).toEqual([1, 1]);
+    expect(ge).toEqual([0, 0]);
+    expect(eq).toEqual([0, 0]);
+    expect(ne).toEqual([1, 1]);
+  });
+
+  it('the boundary difference of exactly 1e-10 counts as equal', async () => {
+    // 1e-10 and 0.0 are the same double the tolerance is written with, so the
+    // difference is exactly the bound: every operator must call it equal.
+    const [lt, gt, eq, ne] = await cols([
+      'a = 1e-10',
+      'b = 0.0',
+      'plot(a < b ? 1 : 0)',
+      'plot(a > b ? 1 : 0)',
+      'plot(a == b ? 1 : 0)',
+      'plot(a != b ? 1 : 0)',
+    ].join('\n'));
+    expect(lt).toEqual([0, 0]);
+    expect(gt).toEqual([0, 0]);
+    expect(eq).toEqual([1, 1]);
+    expect(ne).toEqual([0, 0]);
+  });
+
+  it('integers keep exact semantics', async () => {
+    const [lt, eq, ne] = await cols([
+      'plot(1 < 2 ? 1 : 0)',
+      'plot(2 == 2 ? 1 : 0)',
+      'plot(3 != 3 ? 1 : 0)',
+    ].join('\n'));
+    expect(lt).toEqual([1, 1]);
+    expect(eq).toEqual([1, 1]);
+    expect(ne).toEqual([0, 0]);
+  });
+
+  it('ta.crossover stays bit-exact (the tolerance is for operators only)', async () => {
+    // The series step up by 1e-12 between the bars — below the operator
+    // tolerance, but ta.crossover compares the raw series, so it still crosses.
+    const [xo] = await cols([
+      'a = close + (bar_index == 0 ? 0 : 1e-12)',
+      'b = close + (bar_index == 0 ? 1e-12 : 0)',
+      'plot(ta.crossover(a, b) ? 1 : 0)',
+    ].join('\n'));
+    expect(xo).toEqual([0, 1]);
+  });
+});

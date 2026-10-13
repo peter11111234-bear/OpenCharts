@@ -162,6 +162,39 @@ describe('strategyDecl', () => {
     expect(cfg.currency).toBe('currency.TWD');
   });
 
+  it('warns once about declared-but-unimplemented parameters', () => {
+    const { ctx } = mkRtCtx(mkBars(1));
+    strategyDecl(ctx, {
+      type: 'strategy',
+      args: [
+        { name: 'slippage', value: numN(1) },
+        { name: 'calc_on_every_tick', value: boolN(true) },
+        { name: 'initial_capital', value: numN(1234) },
+      ],
+    });
+    // A second declaration in the same run must not repeat the warning.
+    strategyDecl(ctx, { type: 'strategy', args: [{ name: 'slippage', value: numN(2) }] });
+    const hits = ctx.warnings.filter((w) => w.startsWith('strategy():'));
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toContain("'slippage'");
+    expect(hits[0]).toContain("'calc_on_every_tick'");
+    // Supported parameters are not reported.
+    expect(hits[0]).not.toContain("'initial_capital'");
+  });
+
+  it('does not warn for a declaration that only uses supported parameters', () => {
+    const { ctx } = mkRtCtx(mkBars(1));
+    strategyDecl(ctx, {
+      type: 'strategy',
+      args: [
+        { name: 'initial_capital', value: numN(10000) },
+        { name: 'commission_type', value: strN('strategy.commission.percent') },
+        { name: 'max_lines_count', value: numN(500) },
+      ],
+    });
+    expect(ctx.warnings.filter((w) => w.startsWith('strategy():'))).toHaveLength(0);
+  });
+
   it('applies defaults for missing args', () => {
     const { ctx } = mkRtCtx(mkBars(1));
     strategyDecl(ctx, { type: 'strategy', args: [] });

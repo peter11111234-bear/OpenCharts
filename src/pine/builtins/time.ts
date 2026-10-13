@@ -7,9 +7,9 @@
 
 import type { BuiltinCtx, Value } from '../contracts';
 import { NA, Series } from '../contracts';
-import { bindArgs, numArg } from './util';
+import { bindArgs, numArg, warnOnce } from './util';
 import { registerBuiltin, registerLazyConstant } from './registry';
-import { tfToMs } from '../mtf';
+import { tfNext, tfToMs } from '../mtf';
 
 const unser = (v: Value | undefined): number | undefined => {
   if (v === undefined) return undefined;
@@ -113,7 +113,7 @@ export const partsOf = (ms: number, tz: string): Intl.DateTimeFormatPart[] => {
     { type: 'weekday', value: ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][r.weekday - 1]! },
   ] as Intl.DateTimeFormatPart[];
 };
-const part = (ms: number, tz: string, t: Intl.DateTimeFormatPartTypes): number => {
+export const part = (ms: number, tz: string, t: Intl.DateTimeFormatPartTypes): number => {
   const r = partsRec(ms, tz);
   switch (t) {
     case 'year': return r.year;
@@ -137,7 +137,7 @@ export function tzOffsetMs(ms: number, tz: string): number {
 
 /** Wall-clock (y,mo,d,h,mi,s) expressed in `tz` → epoch ms. instant =
  *  wallUTC + tzOffsetMs(instant); iterate to the fixed point (handles DST). */
-function zonedMs(tz: string, y: number, mo: number, d: number, h: number, mi: number, s: number): number {
+export function zonedMs(tz: string, y: number, mo: number, d: number, h: number, mi: number, s: number): number {
   const wallUTC = Date.UTC(y, mo - 1, d, h, mi, s);
   let t = wallUTC;
   for (let i = 0; i < 3; i++) {
@@ -234,17 +234,123 @@ for (const [n, f] of CAL_FIELDS)
   registerLazyConstant('', n, (c) =>
     c === undefined ? NA : { kind: 'series', v: new CalSeries(c as BuiltinCtx, f as Intl.DateTimeFormatPartTypes) });
 
-// ── time / timestamp ─────────────────────────────────────────────────────────
+// ── time / time_close / timestamp ────────────────────────────────────────────
+// A Pine `session` argument is "HHMM-HHMM" or "HH:MM-HH:MM". The venue windows
+// this app knows live in session.ts; time()/time_close() need only the raw spec
+// plus the bar's timezone.
 
-// time(timeframe): na except on bars that open a new `timeframe` period; that
-// bar's open time is the period's opening time (TV semantics). No arg → bar time.
-registerBuiltin('', 'time', (_c, args, named) => {
-  const bound = bindArgs(args, named, ['timeframe'] as const);
-  const v = _c.time.get(0);
+const DAY_MS = 86_400_000;
+
+/** `"0900-1330"` / `"09:00-13:30"` → minutes since local midnight. */
+function parseSessionSpec(spec: string): { startMin: number; endMin: number } | null {
+  const m = /^(\d{1,2}):?(\d{2})\s*-\s*(\d{1,2}):?(\d{2})$/.exec(spec.trim());
+  if (!m) return null;
+  const startMin = Number(m[1]) * 60 + Number(m[2]);
+  const endMin = Number(m[3]) * 60 + Number(m[4]);
+  if (startMin >= endMin || endMin > 1440) return null;
+  return { startMin, endMin };
+}
+
+/** Session bounds (epoch ms) of the local calendar day holding `ms`. */
+function sessionWindow(ms: number, tz: string, spec: string): { startMs: number; endMs: number } | null {
+  const parsed = parseSessionSpec(spec);
+  if (parsed === null) return null;
+  const y = part(ms, tz, 'year'), mo = part(ms, tz, 'month'), d = part(ms, tz, 'day');
+  return {
+    startMs: zonedMs(tz, y, mo, d, Math.floor(parsed.startMin / 60), parsed.startMin % 60, 0),
+    endMs: zonedMs(tz, y, mo, d, Math.floor(parsed.endMin / 60), parsed.endMin % 60, 0),
+  };
+}
+
+/** The session open of the previous trading day before `startMs` — a weekday
+ *  template: Saturdays and Sundays carry no session (the venues in session.ts
+ *  all trade Monday to Friday). */
+function previousSessionStart(startMs: number, tz: string, spec: string): number {
+  const parsed = parseSessionSpec(spec);
+  if (parsed === null) return startMs;
+  for (let d = 1; d <= 5; d++) {
+    const prev = startMs - d * DAY_MS;
+    const wd = part(prev, tz, 'weekday'); // 1 = Sunday, 7 = Saturday
+    if (wd === 1 || wd === 7) continue;
+    return zonedMs(tz, part(prev, tz, 'year'), part(prev, tz, 'month'), part(prev, tz, 'day'),
+      Math.floor(parsed.startMin / 60), parsed.startMin % 60, 0);
+  }
+  return startMs;
+}
+
+/** Walk `back` bars of `tf` backwards from `t`. Intraday grids and month
+ *  arithmetic are exact. A D/W walk that crosses the turn of the year is NOT
+ *  reproduced — TradingView places that bar from the chart bar's own position
+ *  inside it (measured by PyneCore: `_tv_week_walk` / `_tv_day_walk`) — so the
+ *  plain arithmetic value is returned and the caller reports it once. */
+function gridBack(t: number, tf: string, back: number, onCrossYear: () => void): number {
+  if (back <= 0) return t;
+  const ms = tfToMs(tf);
+  if (ms !== null) return t - back * ms;
+  const m = /^(\d*)\s*([a-zA-Z]*)$/.exec(tf.trim());
+  const n = m?.[1] ? parseInt(m[1], 10) : 1;
+  const unit = (m?.[2] ?? '').toUpperCase();
+  if (unit === 'D' || unit === 'W') {
+    const out = t - back * (unit === 'W' ? 7 * n : n) * DAY_MS;
+    if (new Date(out).getUTCFullYear() !== new Date(t).getUTCFullYear()) onCrossYear();
+    return out;
+  }
+  if (unit === 'M') {
+    const d = new Date(t);
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - n * back, 1);
+  }
+  return t;
+}
+
+// time(timeframe[, session, timezone][, bars_back]):
+//   with a session → that session's opening time on bars inside it, na outside;
+//   with only a timeframe → the opening time of the bar's period (na on bars
+//   that do not open one, TV semantics); with no argument → the bar's own time.
+// time_close(timeframe[, session, timezone]) → the session's closing time.
+registerBuiltin('', 'time', (ctx, args, named) => {
+  const bound = bindArgs(args, named, ['timeframe', 'session', 'timezone', 'bars_back'] as const);
+  const v = ctx.time.get(0);
   if (v.kind !== 'int' && v.kind !== 'float') return NA;
+  const tz = unserStr(bound.get('timezone')) ?? tzOf(ctx);
+  const sessSpec = unserStr(bound.get('session'));
+  const back = Math.max(0, Math.floor(unser(bound.get('bars_back')) ?? 0));
+
+  if (sessSpec !== undefined) {
+    // Inside the session the answer is the session's own opening time for a
+    // calendar timeframe (every bar of the day shares one D/W/M period) and the
+    // bar's own open for an intraday one; outside the session it is na.
+    const win = sessionWindow(v.v, tz, sessSpec);
+    if (win === null) return NA;
+    if (v.v < win.startMs || v.v >= win.endMs) return NA;
+    const spec = unserStr(bound.get('timeframe'));
+    let day = spec !== undefined && normCalTf(spec) !== undefined ? win.startMs : v.v;
+    for (let i = 0; i < back; i++) day = previousSessionStart(day, tz, sessSpec);
+    return { kind: 'int', v: day };
+  }
+
   const spec = unserStr(bound.get('timeframe'));
-  if (spec === undefined) return v;
-  return isTfBoundary(_c, spec, _c.barIndex) ? v : NA;
+  if (spec === undefined) return { kind: 'int', v: v.v };
+  if (!isTfBoundary(ctx, spec, ctx.barIndex)) return NA;
+  return { kind: 'int', v: gridBack(v.v, spec, back, () => warnOnce(ctx, 'time|bargrid-crossyear',
+    'time(): a D/W bars_back walk across the turn of the year is not reproduced — the arithmetic value is returned')) };
+});
+
+registerBuiltin('', 'time_close', (ctx, args, named) => {
+  const bound = bindArgs(args, named, ['timeframe', 'session', 'timezone'] as const);
+  const v = ctx.time.get(0);
+  if (v.kind !== 'int' && v.kind !== 'float') return NA;
+  const sessSpec = unserStr(bound.get('session'));
+  if (sessSpec === undefined) {
+    // Without a session the bar's close is the next period's open.
+    const spec = unserStr(bound.get('timeframe')) ?? ctx.timeframe.period;
+    if (!isTfBoundary(ctx, spec, ctx.barIndex)) return NA;
+    return { kind: 'int', v: tfNext(v.v, spec) };
+  }
+  const tz = unserStr(bound.get('timezone')) ?? tzOf(ctx);
+  const win = sessionWindow(v.v, tz, sessSpec);
+  if (win === null) return NA;
+  if (v.v < win.startMs || v.v >= win.endMs) return NA;
+  return { kind: 'int', v: win.endMs };
 });
 
 // timestamp overloads:

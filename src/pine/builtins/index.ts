@@ -17,6 +17,7 @@ import './ta';
 import './draw';
 import './core';
 import './time';
+import './session';
 import './strategy';
 import './strategyEquity';
 import './util';

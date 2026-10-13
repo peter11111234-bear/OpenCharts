@@ -7955,5 +7955,7 @@
       "msg": "在 {{ticker}} 上偵測到背離"
     }
   ],
-  "warnings": []
+  "warnings": [
+    "indicator(): 'max_bars_back' declared but not implemented — the run ignores it"
+  ]
 }

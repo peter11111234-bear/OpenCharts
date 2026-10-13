@@ -178,7 +178,89 @@ export function snapshot(r: RunResult): Record<string, unknown> {
 
 // ── file IO + compare ───────────────────────────────────────────────────────
 
-export function goldenCheck(name: string, r: RunResult): void {
+/** Comparison tolerances. Two numbers are equal when their difference is within
+ *  `max(absTol, relTol · max(|a|,|b|))`. IEEE-754 leaves implementations free to
+ *  differ in the last bits, so an exact compare turns a ULP into a failure that
+ *  can only be silenced by regenerating the baseline — which stops being a
+ *  regression guard. */
+export const GOLDEN_ABS_TOL = 1e-9;
+export const GOLDEN_REL_TOL = 1e-9;
+
+/** Keys whose value is an integer by nature — compared exactly, never with a
+ *  tolerance (bar indices, counts, sizes, quantities, drawing ids, timestamps). */
+const EXACT_KEYS: Record<string, true> = {
+  index: true, id: true, bars: true, count: true, size: true,
+  qty: true, tradeId: true, bar: true, i: true, time: true,
+};
+
+export interface GoldenDiff { path: string; want: unknown; got: unknown }
+
+export interface GoldenCompareResult {
+  diffs: GoldenDiff[];
+  /** Largest absolute and relative numeric difference seen while comparing. */
+  maxAbs: number;
+  maxRel: number;
+}
+
+/** Structured compare of two snapshots. Numbers use the tolerance above unless
+ *  their key is in EXACT_KEYS; `null` (na) matches `null` only and is never
+ *  treated as 0; key order and formatting are irrelevant. */
+export function compareSnapshots(
+  want: unknown,
+  got: unknown,
+  opts: { absTol?: number; relTol?: number } = {},
+): GoldenCompareResult {
+  const absTol = opts.absTol ?? GOLDEN_ABS_TOL;
+  const relTol = opts.relTol ?? GOLDEN_REL_TOL;
+  const diffs: GoldenDiff[] = [];
+  let maxAbs = 0;
+  let maxRel = 0;
+
+  const sameNumber = (a: number, b: number, exact: boolean): boolean => {
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return Object.is(a, b);
+    const d = Math.abs(a - b);
+    if (d === 0) return true;
+    const scale = Math.max(Math.abs(a), Math.abs(b));
+    maxAbs = Math.max(maxAbs, d);
+    maxRel = Math.max(maxRel, scale === 0 ? d : d / scale);
+    return !exact && d <= Math.max(absTol, relTol * scale);
+  };
+
+  const walk = (a: unknown, b: unknown, path: string, exact: boolean): void => {
+    if (a === b) return;
+    if (typeof a === 'number' && typeof b === 'number') {
+      if (!sameNumber(a, b, exact)) diffs.push({ path, want: a, got: b });
+      return;
+    }
+    if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') {
+      diffs.push({ path, want: a, got: b });
+      return;
+    }
+    if (Array.isArray(a) || Array.isArray(b)) {
+      if (!Array.isArray(a) || !Array.isArray(b)) { diffs.push({ path, want: a, got: b }); return; }
+      if (a.length !== b.length) diffs.push({ path: `${path}.length`, want: a.length, got: b.length });
+      for (let i = 0; i < Math.max(a.length, b.length); i++) walk(a[i], b[i], `${path}[${i}]`, false);
+      return;
+    }
+    const ao = a as Record<string, unknown>;
+    const bo = b as Record<string, unknown>;
+    for (const k of [...new Set([...Object.keys(ao), ...Object.keys(bo)])].sort()) {
+      const p = path ? `${path}.${k}` : k;
+      if (!(k in ao)) { diffs.push({ path: p, want: '(absent)', got: bo[k] }); continue; }
+      if (!(k in bo)) { diffs.push({ path: p, want: ao[k], got: '(absent)' }); continue; }
+      walk(ao[k], bo[k], p, EXACT_KEYS[k] === true);
+    }
+  };
+
+  walk(want, got, '', false);
+  return { diffs, maxAbs, maxRel };
+}
+
+export function goldenCheck(
+  name: string,
+  r: RunResult,
+  opts: { absTol?: number; relTol?: number } = {},
+): void {
   const snap = snapshot(r);
   const text = JSON.stringify(snap, null, 2) + '\n';
   const gp = join(GOLDEN_DIR, `${name}.golden.json`);
@@ -198,28 +280,14 @@ export function goldenCheck(name: string, r: RunResult): void {
   // Stored goldens may carry CRLF (Windows regen via PowerShell or autocrlf);
   // normalize before comparing — a line-ending mismatch is not a golden diff.
   if (want.replace(/\r\n/g, '\n') === text) return;
+  const { diffs, maxAbs, maxRel } = compareSnapshots(JSON.parse(want), JSON.parse(text), opts);
+  // Byte-different but semantically identical (key order, spacing).
+  if (diffs.length === 0) return;
   writeFileSync(ap, text);
-  const a = JSON.parse(want) as unknown;
-  const b = JSON.parse(text) as unknown;
-  throw new Error(`golden mismatch for ${name}\nfirst diff: ${firstDiff(a, b, '')}\nactual written → ${ap}`);
-}
-
-function firstDiff(a: unknown, b: unknown, path: string): string {
-  if (a === b) return 'no diff found (should not happen)';
-  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') {
-    return `${path} :: ${JSON.stringify(a)} vs ${JSON.stringify(b)}`;
-  }
-  const ao = a as Record<string, unknown>;
-  const bo = b as Record<string, unknown>;
-  const keys = new Set([...Object.keys(ao), ...Object.keys(bo)]);
-  for (const k of [...keys].sort()) {
-    const p = path ? `${path}.${k}` : k;
-    if (!(k in ao)) return `${p} :: missing in golden (${JSON.stringify(bo[k])})`;
-    if (!(k in bo)) return `${p} :: missing in actual (${JSON.stringify(ao[k])})`;
-    if (JSON.stringify(ao[k]) !== JSON.stringify(bo[k])) {
-      const d = firstDiff(ao[k], bo[k], p);
-      if (d !== 'no diff found (should not happen)') return d;
-    }
-  }
-  return 'no diff found (should not happen)';
+  const head = diffs.slice(0, 5).map((d) => `  ${d.path} :: want ${JSON.stringify(d.want)} got ${JSON.stringify(d.got)}`);
+  throw new Error(
+    `golden mismatch for ${name}: ${diffs.length} differing path(s), max|Δ|=${maxAbs}, max relΔ=${maxRel}\n`
+    + head.join('\n')
+    + `\nactual written → ${ap}`,
+  );
 }

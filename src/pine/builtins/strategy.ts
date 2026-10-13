@@ -924,6 +924,17 @@ export const STRATEGY_DECL_ORDER = [
   'risk_free_rate', 'use_bar_magnifier',
 ] as const;
 
+/** `strategy()` parameters that carry behaviour this engine does not implement.
+ *  A declared-but-ignored parameter is reported once per run (see strategyDecl)
+ *  instead of vanishing silently: a `slippage` that disappears makes the equity
+ *  curve look better than the run actually is. Display metadata (title, format,
+ *  precision, scale) and the quota parameters declDrawQuotas reads are NOT here. */
+export const STRATEGY_UNSUPPORTED_PARAMS = [
+  'calc_on_order_fills', 'calc_on_every_tick', 'max_bars_back',
+  'backtest_fill_limits_assumption', 'slippage', 'close_entries_rule',
+  'margin_long', 'margin_short', 'risk_free_rate', 'use_bar_magnifier',
+] as const;
+
 export function strategyDecl(ctx: BuiltinCtx, node: StrategyDecl): void {
   const st = stateOf(ctx);
   if (!st) return;
@@ -958,4 +969,11 @@ export function strategyDecl(ctx: BuiltinCtx, node: StrategyDecl): void {
     pyramiding: num('pyramiding', DEFAULT_CFG.pyramiding),
   };
   st.set(CFG_KEY, cfg);
+  // Declared-but-unimplemented parameters are reported once per run instead of
+  // being dropped in silence (see STRATEGY_UNSUPPORTED_PARAMS).
+  const ignored = STRATEGY_UNSUPPORTED_PARAMS.filter((n) => bound.has(n));
+  if (ignored.length > 0) {
+    warnOnce(ctx, 'strategy|unsupported',
+      `strategy(): ${ignored.map((n) => `'${n}'`).join(', ')} declared but not implemented — the run ignores ${ignored.length > 1 ? 'them' : 'it'}`);
+  }
 }
