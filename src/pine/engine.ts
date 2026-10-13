@@ -17,6 +17,7 @@ import type {
 } from '@luxalgo/vela';
 import type { BarData, DrawObj, PlotOpts, RunResult, Value } from './contracts';
 import { parse } from './parser';
+import { assertScript, type ScriptRequirements } from './checks';
 import { collectInputs, incRun, type IncLive, type ParsedInput, type RunOptions } from './interpreter';
 import { tfFloor, tfNext } from './mtf';
 import { modelCacheGet, modelCachePut } from './modelCache';
@@ -33,6 +34,9 @@ interface PineToken {
   instanceId: string;
   /** Content-derived model id — stable across re-runs of the same source. */
   modelId: string;
+  /** Static host requirements (checks.ts) — the live-trading safety gate reads
+   *  `orders`/`security` off this instead of re-scanning the source. */
+  requirements: ScriptRequirements;
 }
 
 const numOf = (v: Value): number | null => {
@@ -222,11 +226,21 @@ const markerPosOf = (s: string | undefined): 'aboveBar' | 'belowBar' | 'inBar' =
 
 export class PineInterpreterEngine implements ScriptingEngine {
   readonly language = 'pine';
+  // Per-ENGINE abilities (the Vela port's `capabilities` is fixed per engine);
+  // what a SCRIPT needs is derived per source by checks.ts — `visibleRange`
+  // stays false because this engine has no chart-colour/visible-range source,
+  // which is why a script referencing chart.*_visible_bar_time sets
+  // `reactsToViewport` (PreparedScript) yet still reads na.
   readonly capabilities = { streaming: false, visibleRange: false, inputs: true } as const;
 
   async prepare(source: string, instanceId: string): Promise<PreparedScript> {
     const clean = source.replace(/^\uFEFF/, '');
     const parsed = parse(clean);
+    // Compile gate: TV's transform-time rejects (plot scope / outer write /
+    // export capture / security drawings) become a source-located error here,
+    // before any bar runs — TV refuses to save such a script, so running it
+    // would be a silent divergence. The requirements scan rides the same walk.
+    const requirements = assertScript(parsed);
     const body = Array.isArray(parsed) ? parsed : parsed.body;
     const inputs = collectInputs(body).map(toInputSchema);
     const declArgs = !Array.isArray(parsed) && parsed.decl ? parseDeclArgs(parsed.decl) : {};
@@ -237,6 +251,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
       parsed,
       instanceId,
       modelId: `pine-${sourceHash(clean)}`,
+      requirements,
     };
     return {
       language: 'pine',
@@ -248,7 +263,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
         precision: typeof declArgs['precision'] === 'number' ? declArgs['precision'] : undefined,
         format: typeof declArgs['format'] === 'string' ? declArgs['format'] : undefined,
       },
-      reactsToViewport: false,
+      reactsToViewport: requirements.viewport,
       token,
     };
   }

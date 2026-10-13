@@ -319,7 +319,14 @@ function declAsWrite(s: Node): Node | null {
   const d = s as { type: string; name?: string; value?: Node };
   if (!isDeclType(d.type)) return null;
   if (d.type === 'var' || !d.name || !d.value) return null;
-  return { type: 'reassign', target: { type: 'ident', name: d.name }, value: d.value } as Node;
+  // Synthesized nodes carry the source decl's loc — an MTF desugaring error
+  // must still report a line (loc is optional in the AST contract, so nothing
+  // else catches a missing one).
+  return {
+    type: 'reassign', loc: s.loc,
+    target: { type: 'ident', name: d.name, loc: s.loc },
+    value: d.value,
+  } as Node;
 }
 
 /**
@@ -374,7 +381,7 @@ function scanTopLevel(body: Node[], st: MtfStore): void {
         } else if (d.name && !d.value) {
           // `float x` — uninitialized decl; producer reads na at the tf bar.
           st.globals.set(d.name, {
-            node: { type: 'na' } as Node, once: d.type === 'var',
+            node: { type: 'na', loc: s.loc } as Node, once: d.type === 'var',
             writes: st.globals.get(d.name)?.writes ?? [],
             inBranch: inBranch || st.globals.get(d.name)?.inBranch,
           });
@@ -1990,7 +1997,7 @@ function runConst(node: Node, frame: Frame): string | null {
   // Ident whose top-level producer exists (input.timeframe/ternary/…) but
   // hasn't been bound into scope yet at prefetch time → evaluate the producer.
   const target = node.type === 'ident' && store.staticEnv.has(node.name)
-    ? { type: 'str', v: store.staticEnv.get(node.name)! } as Node
+    ? { type: 'str', v: store.staticEnv.get(node.name)!, loc: node.loc } as Node
     : node.type === 'ident' && store.globals.has(node.name)
     ? (store.globals.get(node.name)!.node ?? node)
     : node;
