@@ -9,6 +9,7 @@ export { BUILTINS, CONSTANTS, getConstant, hasConstant, registerBuiltin, registe
 import './math';
 import './str';
 import './array';
+import './map';
 import './color';
 import './request';
 import './plot';
