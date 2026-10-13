@@ -13,7 +13,7 @@
 | §7 | 「缺 312」的真實分解 ＋ 對齊報告改量 backlog | `3f7a95f` |
 | §8 | `ta.*` 13 ＋ 常數 75（backlog 238 → 150） | `962df6d` |
 | §9 | **交接清單：未完成事項**（先讀這節） | `962df6d` |
-| §10 | 追加：`map.*`、A 四項、B 三項、TS 技術債 ＋**對 §9.2 三處前提的更正** | `a66631b` |
+| §10 | 追加：`map.*`、A 四項、B 三項、TS 技術債(275→0)、45 顆資料源 stub(backlog 140→95) ＋**對 §9.2 三處前提的更正** | `a66631b`＋`6e5c6d4` |
 
 ---
 
@@ -494,8 +494,43 @@ no-ReturnType-contracts 規則）。
    `.github/workflows`、也沒有 husky／pre-commit，所以「防回歸」要自己選：掛 pre-commit
    （每次 commit ~40–80s）或等有 CI 再掛。`docs/superpowers/plans/2026-10-13-typescript-debt-remediation.md`
    的 Phase 3 講的就是這件事（該計畫的 Phase 2 現在 100% 完成）。
-2. **§9.2.A 剩下的 140**：`matrix.*` 48（本 repo 真實腳本 0 使用，最後做）、`syminfo` 27 欄位
-   （等基本面資料源）、`footprint`／`ticker`／`volume_row`／`earnings`／`dividends`／`request`／
-   `splits` 45（註冊成 stub ＋ warn，照 `request.ts:38-42`）、`(global)` 6、小刀 12。
+2. **§9.2.A 剩下的 95**（本輪補掉 45 顆，見 §10.7）：`matrix.*` 48（本 repo 真實腳本 0 使用，
+   最後做）、`syminfo` 27 欄位（等基本面資料源）、`(global)` 6、小刀 12（`timeframe` 4／
+   `array.*` 3／`label.*` 2／`box.copy`／`line.copy`／`chart.*` 3）。
 3. **常數摺疊**（正確形狀見 §10.3）與**broker port**（設計見 §10.3），等對應前提成熟。
 4. `scratch/vela_*.png` ×6 仍未追蹤（§9.2.D）。
+
+---
+
+### 10.7 2026-10-13 追加：45 顆資料源 stub（backlog 140 → 95）
+
+`docs/tv-pine-stdlib.json` 的那 7 個批次全補齊（`footprint` 9／`ticker` 9／`volume_row` 8／
+`earnings` 7／`dividends` 5／`request` 5／`splits` 2 ＝ 45），`tv_stdlib.test.ts` 印的
+alignment backlog 由 **140 → 95**（`absent from registry` 214 → 169）。
+
+檔案：
+- `src/pine/builtins/datasource.ts`（新）：31 顆函式 stub ＋ 14 顆欄位 lazy constant。
+- `src/pine/builtins/request.ts`：`STUBS` 補 5 個（`economic`／`financial`／`footprint`／
+  `quandl`／`seed`）—— `request.*` 的 stub 留在同一個檔，訊息格式沿用既有那條。
+- `src/pine/builtins/index.ts`：`import './datasource'`（builtins 是 import-time 自註冊）。
+- `src/pine/__tests__/datasource.test.ts`（新，4 顆）。
+
+兩個判斷（都不是照 §9.2 的字面抄）：
+
+1. **函式與欄位不能用同一種方式註冊**。31 顆（`footprint.*`／`ticker.*`／`volume_row.*`／
+   `request.*`）是函式 → `registerBuiltin` ＋ 警告 ＋ 回 `na`，訊息
+   `'<name>: not supported — <why>; returning na'`，每個名字每次 run 只警告一次
+   （沿用 `ctx.warnings.includes` 去重）。
+   14 顆（`earnings.*`／`dividends.*`／`splits.*`）在 TV 是**欄位選擇子**（reference 沒有呼叫語法），
+   但**不能**註冊成靜態字串常數：`plot(earnings.actual)` 會走 `asNum`，而
+   `Number('earnings.actual')` 是 NaN → 回傳 **0**，畫出一條平線且一句話都不說 —— 就是這輪在消滅的
+   靜默分歧。所以改用 `registerLazyConstant`（只有 lazy getter 拿得到帶 `warnings` 的 ctx）
+   回 `na` ＋ 警告。
+2. **`ticker.*` 選擇 stub 而不是實作**。它們表面是純函式，但 `ticker.heikinashi` 這類回的是
+   「TV 後端看得懂的 ticker id 格式」（後綴／前綴慣例）；猜錯會得到一個**無法解析卻沒有警告**的
+   symbol，比回 `na` ＋ 警告糟。等有能逐字比對的 oracle 再實作。
+
+驗證：`datasource.test.ts` 4 顆（45 個名字全註冊；一次 run 用滿 45 個 → 無 `not found`／
+`unknown constant`，每個名字恰一則警告；`earnings.actual` 是 `na` 不是 0；`footprint.poc`／
+`ticker.renko` 回 `na` 且警告具名）、`tv_stdlib.test.ts` 3 顆、`npx tsc --noEmit` **0**、
+pine 全套綠。

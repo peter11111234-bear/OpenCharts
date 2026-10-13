@@ -12,6 +12,7 @@ import './array';
 import './map';
 import './color';
 import './request';
+import './datasource';
 import './plot';
 import './input';
 import './ta';

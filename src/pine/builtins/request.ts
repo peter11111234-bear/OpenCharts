@@ -45,6 +45,10 @@ registerBuiltin('request', 'security_lower_tf', (ctx): Value => {
 
 const STUBS = [
   'currency_rate', 'dividends', 'splits', 'earnings',
+  // third-party / fundamental / footprint feeds: no data source is wired for
+  // any of these, so resolving the name and warning beats "identifier not found"
+  // (which hides the real reason) and beats a silent na.
+  'economic', 'financial', 'footprint', 'quandl', 'seed',
 ] as const;
 
 for (const name of STUBS) {
