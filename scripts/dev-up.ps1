@@ -24,8 +24,13 @@ $ViteLog   = Join-Path $LogDir "vite-dev.log"
 $RestartLog= Join-Path $Root "vite-restart.log"
 
 function Test-Vite {
+  # Probe a real TS module, NOT "/". After the vite server's esbuild child dies,
+  # "/" still answers 200 from the static index while every transform 500s
+  # ("The service is no longer running") — the app then mounts as an empty shell
+  # with no console error. src/main.tsx is the app entry and always needs a
+  # transform, so it reports the true state.
   try {
-    return (Invoke-WebRequest -Uri "http://localhost:$Port/" -UseBasicParsing -TimeoutSec 8).StatusCode -eq 200
+    return (Invoke-WebRequest -Uri "http://localhost:$Port/src/main.tsx" -UseBasicParsing -TimeoutSec 8).StatusCode -eq 200
   } catch { return $false }
 }
 
@@ -41,7 +46,22 @@ function Get-ProjectVites {
 if (Test-Vite) {
   Write-Output "vite OK on :$Port — no-op"
 } else {
-  Write-Output "vite down — starting npm run dev -- --port $Port"
+  Write-Output "vite unhealthy — starting npm run dev -- --port $Port"
+  # strictPort means a new vite CANNOT start while the old one still holds :$Port
+  # — and the dead-esbuild case leaves the listener alive while transforms 500.
+  # Reap the port owner only when it is one of THIS repo's vite processes.
+  $held = (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+           Select-Object -First 1 -ExpandProperty OwningProcess)
+  if ($held) {
+    $isOurs = @(Get-ProjectVites | Where-Object { $_.ProcessId -eq $held }).Count -gt 0
+    if ($isOurs) {
+      Write-Output "reaping unhealthy vite pid=$held holding :$Port"
+      Stop-Process -Id $held -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 2
+    } else {
+      Write-Output "port :$Port held by pid=$held (not this repo's vite) — refusing to kill"
+    }
+  }
   New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
   # fresh restart marker so watchers can correlate
   "" | Out-File $RestartLog -Encoding utf8

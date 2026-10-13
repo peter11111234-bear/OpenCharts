@@ -132,7 +132,12 @@ export class ShioajiVelaProvider implements DataProvider {
   async getBars(ticker: string, timeframe: string, range: BarRange): Promise<OHLCV[]> {
     const name = this.toInstrumentName(ticker);
     const tf = normalizeTimeframe(timeframe);
-    const candles = await getShioajiHistory(name, tf, range.limit ?? 500, {
+    // Honor Vela's requested window (it asks for roughly what fills the
+    // viewport). The old `Math.max(limit, 2000)` floor was added while
+    // chasing a phantom "missing drawings" cause and made every first paint
+    // evaluate 2000+ bars (~16ms/bar → 30s+). Drawings/history needs are met
+    // by the window Vela asks for; older bars load on demand.
+    const candles = await getShioajiHistory(name, tf, range.limit ?? 300, {
       fromMs: range.from ?? Date.now() - 29 * 86400 * 1000,
       toMs: range.to ?? Date.now(),
     });

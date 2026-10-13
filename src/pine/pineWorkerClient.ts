@@ -1,7 +1,7 @@
 // Main-thread side of the pine worker RPC. Lazy-spawns a module Worker,
 // serializes one run at a time, and proxies fetchSeries back to the caller.
 import type { BarData, RunResult } from './contracts';
-import type { RunOptions } from './interpreter';
+import type { ParsedInput, RunOptions } from './interpreter';
 import { PineRuntimeError } from './errors';
 import type { FailError, ToWorker, FromWorker } from './pineWorkerProto';
 
@@ -16,7 +16,7 @@ export interface WorkerLike {
 
 export type FetchSeriesFn = (symbol: string, tf: string) => Promise<BarData[]>;
 
-export interface ClientRunOpts extends Omit<RunOptions, 'fetchSeries' | 'shouldAbort'> {
+export interface ClientRunOpts extends Omit<RunOptions, 'fetchSeries' | 'shouldAbort' | 'incSession'> {
   fetchSeries?: FetchSeriesFn;
 }
 
@@ -94,6 +94,17 @@ export class PineRunClient {
   /** Set when the platform has no Worker or the worker dies on transport —
    *  callers fall back to in-process. Read-only for external consumers. */
   private _unavailable: boolean;
+  /** True after the last completed run left a resumable incremental session
+   *  on this client's worker — the engine reads it to keep per-tick
+   *  updates enabled for heavy scripts. */
+  incAlive = false;
+  /** Retained plot map for incremental sessions — the worker ships
+   *  `plotDelta` (tail-only) instead of recloning ~5000 values per tick, so
+   *  the client keeps the full arrays and applies the patch. Reused arrays
+   *  are engine-private; the model builder maps them into new series each
+   *  tick, so in-place truncation+append is safe. */
+  private lastPlots: RunResult['plots'] | null = null;
+
   get unavailable(): boolean { return this._unavailable; }
   private readonly factory?: () => WorkerLike;
 
@@ -133,16 +144,45 @@ export class PineRunClient {
         const p = this.pending;
         if (!p || p.id !== msg.id) return; // stale/stray result must not settle the live run
         this.pending = null;
-        // Settled cleanly → the worker is idle and stateless. Real workers go
-        // to the pool so the next session skips spawn cost; factory-supplied
-        // workers stay attached (their lifecycle is the caller's contract —
-        // tests observe terminate() only on dispose/stop).
-        if (!this.factory) {
+        // A done that kept a resumable session must NOT release its worker
+        // to the pool — pooling hands the worker to the next session with a
+        // different incKey, and this session's next tick would land on a
+        // fresh incSessions map (the whole point of the live session).
+        const keepWorker = msg.t === 'done' && msg.incAlive === true;
+        if (!this.factory && !keepWorker) {
           const w = this.worker;
           this.worker = null;
           if (w) releaseWorker(w);
         }
-        if (msg.t === 'done') p.resolve(msg.result);
+        if (msg.t === 'done') {
+          this.incAlive = msg.incAlive === true;
+          if (msg.plotDelta !== undefined) {
+            // Incremental reuse — patch the retained plot map in place.
+            const plots = this.lastPlots ?? new Map();
+            for (const d of msg.plotDelta) {
+              if (d.drop) { plots.delete(d.key); continue; }
+              const t = d.tail!;
+              const cur = plots.get(d.key);
+              if (!cur || d.from === 0) {
+                plots.set(d.key, { index: t.index, time: t.time.slice(), values: t.values.slice(), opts: t.opts, colors: t.colors.slice() });
+                continue;
+              }
+              cur.time.length = d.from;
+              cur.values.length = d.from;
+              cur.colors.length = d.from;
+              cur.time.push(...t.time);
+              cur.values.push(...t.values);
+              cur.colors.push(...t.colors);
+              cur.opts = t.opts;
+            }
+            this.lastPlots = plots;
+            p.resolve({ ...msg.result, plots });
+          } else {
+            // Full emit — retain as the new baseline for future deltas.
+            this.lastPlots = msg.result.plots;
+            p.resolve(msg.result);
+          }
+        }
         else p.reject(reviveError(msg.error));
         return;
       }
@@ -175,7 +215,7 @@ export class PineRunClient {
     }
   }
 
-  run(input: { source: string; bars: BarData[]; opts?: ClientRunOpts }): Promise<RunResult> {
+  run(input: { source?: string; parsed?: ParsedInput; bars: BarData[]; opts?: ClientRunOpts }): Promise<RunResult> {
     if (this.pending) return Promise.reject(new Error('run in flight'));
     if (this._unavailable) return Promise.reject(new Error('Worker unavailable'));
     let w: WorkerLike;
@@ -192,7 +232,7 @@ export class PineRunClient {
       try {
         w.postMessage({
           t: 'run', id,
-          source: input.source, bars: input.bars,
+          source: input.source, parsed: input.parsed, bars: input.bars,
           opts: { ...opts, hasFetch: !!fetchSeries },
         } satisfies ToWorker);
       } catch (e) {
@@ -205,6 +245,7 @@ export class PineRunClient {
   }
 
   dispose(): void {
+    this.incAlive = false;
     this.pending?.reject(new Error('disposed'));
     this.pending = null;
     this.worker?.terminate();

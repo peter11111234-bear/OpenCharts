@@ -2594,7 +2594,7 @@
       }
     },
     {
-      "id": 85,
+      "id": 18,
       "kind": "box",
       "props": {
         "bgcolor": "rgba(188, 37, 214, 0.3)",
@@ -2605,7 +2605,7 @@
         "extend": "extend.none",
         "left": 469,
         "right": 524,
-        "text": "⚠ 1m NaN",
+        "text": "⚠ 1m 0",
         "text_color": "chart.fg_color",
         "text_halign": "text.align_right",
         "text_size": "size.tiny",
@@ -2616,7 +2616,7 @@
       }
     },
     {
-      "id": 86,
+      "id": 19,
       "kind": "box",
       "props": {
         "bgcolor": "rgba(188, 37, 214, 0.3)",
@@ -2627,7 +2627,7 @@
         "extend": "extend.none",
         "left": 474,
         "right": 524,
-        "text": "⚠ 1m NaN",
+        "text": "⚠ 1m 0",
         "text_color": "chart.fg_color",
         "text_halign": "text.align_right",
         "text_size": "size.tiny",
@@ -2638,7 +2638,7 @@
       }
     },
     {
-      "id": 87,
+      "id": 20,
       "kind": "box",
       "props": {
         "bgcolor": "rgba(188, 37, 214, 0.3)",
@@ -2649,7 +2649,7 @@
         "extend": "extend.none",
         "left": 479,
         "right": 524,
-        "text": "⚠ 1m NaN",
+        "text": "⚠ 1m 0",
         "text_color": "chart.fg_color",
         "text_halign": "text.align_right",
         "text_size": "size.tiny",

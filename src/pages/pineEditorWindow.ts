@@ -1,0 +1,162 @@
+// Popout Pine editor window — a textarea + toolbar synced with the main
+// app's panel editor over BroadcastChannel. The main window owns all logic
+// (save/run/lint); this window only edits and sends commands.
+const CH = "opencharts.pine.win";
+const ch = new BroadcastChannel(CH);
+
+const ed = document.getElementById("ed") as HTMLTextAreaElement;
+const statusEl = document.getElementById("status") as HTMLSpanElement;
+const cursorEl = document.getElementById("cursor") as HTMLSpanElement;
+const nameEl = document.getElementById("nameLabel") as HTMLSpanElement;
+const dirtyEl = document.getElementById("dirty") as HTMLSpanElement;
+const menuEl = document.getElementById("menu") as HTMLDivElement;
+
+let applying = false;
+let dirty = false;
+let meta: { name?: string; dirty?: boolean; recent?: {id:string;name:string}[]; all?: {id:string;name:string}[]; versions?: {i:number;t:number}[] } | null = null;
+
+function setDirty(d: boolean): void {
+  dirty = d;
+  dirtyEl.classList.toggle("on", d);
+}
+
+function updateCursor(): void {
+  const pos = ed.selectionStart;
+  const before = ed.value.slice(0, pos);
+  cursorEl.textContent = `Line ${before.split("\n").length}, Col ${pos - before.lastIndexOf("\n")}`;
+}
+
+ed.addEventListener("input", () => {
+  if (applying) return;
+  setDirty(true);
+  ch.postMessage({ t: "value", v: ed.value });
+});
+ed.addEventListener("keyup", updateCursor);
+ed.addEventListener("click", updateCursor);
+ed.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); ch.postMessage({ t: "cmd", c: "save" }); setDirty(false); }
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); ch.postMessage({ t: "cmd", c: "run" }); }
+  if (e.key === "Tab") { // indent without focus escape
+    e.preventDefault();
+    const s = ed.selectionStart, en = ed.selectionEnd;
+    ed.setRangeText("  ", s, en, "end");
+    setDirty(true);
+    ch.postMessage({ t: "value", v: ed.value });
+  }
+});
+
+document.getElementById("btn-run")!.addEventListener("click", () => ch.postMessage({ t: "cmd", c: "run" }));
+document.getElementById("btn-save")!.addEventListener("click", () => { ch.postMessage({ t: "cmd", c: "save" }); setDirty(false); });
+document.getElementById("btn-reload")!.addEventListener("click", () => ch.postMessage({ t: "cmd", c: "reload" }));
+document.getElementById("btn-clear")!.addEventListener("click", () => {
+  ed.value = "";
+  setDirty(true);
+  ch.postMessage({ t: "value", v: "" });
+  ed.focus();
+});
+
+ch.onmessage = (e) => {
+  const m = e.data as { t?: string; v?: string; name?: string; kind?: string; dirty?: boolean;
+    recent?: {id:string;name:string}[]; all?: {id:string;name:string}[]; versions?: {i:number;t:number}[] };
+  if (m.t === "value" && typeof m.v === "string" && m.v !== ed.value) {
+    const pos = ed.selectionStart;
+    applying = true;
+    ed.value = m.v;
+    applying = false;
+    ed.selectionStart = ed.selectionEnd = Math.min(pos, m.v.length);
+  }
+  if (m.t === "status") {
+    statusEl.textContent = m.v ?? "";
+    statusEl.dataset.kind = m.kind ?? "";
+    if (m.v === "Saved" || (m.v ?? "").startsWith("Added") || (m.v ?? "").startsWith("Updated")) setDirty(false);
+  }
+  if (m.t === "name" && m.name) { nameEl.textContent = m.name; document.title = `${m.name} — Pine Editor`; }
+  if (m.t === "meta") {
+    meta = { name: m.name, dirty: m.dirty, recent: m.recent, all: m.all, versions: m.versions };
+    if (m.name) { nameEl.textContent = m.name; document.title = `${m.name} — Pine Editor`; }
+    if (typeof m.dirty === "boolean") setDirty(m.dirty);
+  }
+};
+
+// ── Name dropdown — TV-parity script menu. All actions go through the
+// parent via `cmd` messages; `meta` payloads carry the lists. ──
+const cmd = (c: string, extra: Record<string, unknown> = {}) => ch.postMessage({ t: "cmd", c, ...extra });
+
+function closeMenu(): void { menuEl.classList.remove("open"); }
+function item(label: string, key: string | null, fn: () => void): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  const l = document.createElement("span");
+  l.textContent = label;
+  b.append(l);
+  if (key) { const k = document.createElement("span"); k.className = "k"; k.textContent = key; b.append(k); }
+  b.addEventListener("click", () => { closeMenu(); fn(); });
+  return b;
+}
+function head(t: string): HTMLDivElement {
+  const d = document.createElement("div");
+  d.className = "head";
+  d.textContent = t;
+  return d;
+}
+function sep(): HTMLDivElement {
+  const d = document.createElement("div");
+  d.className = "sep";
+  return d;
+}
+function confirmDiscard(): boolean {
+  return !dirty || window.confirm("Discard unsaved changes?");
+}
+
+function renderMenu(): void {
+  menuEl.textContent = "";
+  menuEl.append(
+    item("Save script", "Ctrl+S", () => { cmd("save"); setDirty(false); }),
+    item("Make a copy…", null, () => cmd("copy")),
+    item("Rename…", null, () => {
+      const name = window.prompt("Rename script", nameEl.textContent ?? "Untitled script");
+      if (name?.trim()) cmd("rename", { name: name.trim() });
+    }),
+    sep(),
+    head("Version history"),
+  );
+  const vs = meta?.versions ?? [];
+  if (!vs.length) menuEl.append(item("(no saved versions)", null, () => {}));
+  for (const v of vs.slice(0, 10)) {
+    const d = new Date(v.t);
+    menuEl.append(item(`v${v.i + 1} — ${d.toLocaleString("zh-TW", { hour12: false })}`, null,
+      () => { if (confirmDiscard()) cmd("hist", { i: v.i }); }));
+  }
+  menuEl.append(sep(), head("Create new"));
+  for (const [k, label] of [["indicator", "Indicator"], ["strategy", "Strategy"], ["library", "Library"], ["builtin", "Built-in"]] as const) {
+    menuEl.append(item(label, "new", () => { if (confirmDiscard()) cmd("new", { k }); }));
+  }
+  const recent = meta?.recent ?? [];
+  if (recent.length) {
+    menuEl.append(sep(), head("Recently used"));
+    for (const s of recent) {
+      menuEl.append(item(s.name, null, () => { if (confirmDiscard()) cmd("open", { id: s.id }); }));
+    }
+  }
+  const rest = (meta?.all ?? []).filter((s) => !recent.some((r) => r.id === s.id)).slice(0, 10);
+  if (rest.length) {
+    menuEl.append(sep(), head("Library"));
+    for (const s of rest) {
+      menuEl.append(item(s.name, null, () => { if (confirmDiscard()) cmd("open", { id: s.id }); }));
+    }
+  }
+}
+
+document.getElementById("name")!.addEventListener("click", () => {
+  if (menuEl.classList.contains("open")) closeMenu();
+  else { renderMenu(); menuEl.classList.add("open"); }
+});
+document.addEventListener("mousedown", (e) => {
+  if (menuEl.classList.contains("open") && !menuEl.contains(e.target as Node) && e.target !== document.getElementById("name")) closeMenu();
+});
+
+// Handshake: ask the parent for the current buffer. Parent re-sends on every
+// 'hello', so popup-blocked/reload races resolve themselves.
+ch.postMessage({ t: "hello" });
+window.addEventListener("beforeunload", () => ch.postMessage({ t: "bye" }));
+ed.focus();

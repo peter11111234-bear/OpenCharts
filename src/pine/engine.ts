@@ -17,14 +17,19 @@ import type {
 } from '@luxalgo/vela';
 import type { BarData, DrawObj, PlotOpts, RunResult, Value } from './contracts';
 import { parse } from './parser';
-import { collectInputs, runScript, type RunOptions } from './interpreter';
+import { collectInputs, incRun, type IncLive, type ParsedInput, type RunOptions } from './interpreter';
 import { tfFloor, tfNext } from './mtf';
+import { modelCacheGet, modelCachePut } from './modelCache';
 import './builtins/index';
 import './mtf';
 
 /** Opaque token carried prepare → execute. */
 interface PineToken {
   source: string;
+  /** Parsed AST — prepared once here, handed to every runProgram call.
+   *  Interpreter/parse output is read-only at eval; the worker receives it
+   *  as a structured clone, killing the old parse-in-worker per run. */
+  parsed: ParsedInput;
   instanceId: string;
   /** Content-derived model id — stable across re-runs of the same source. */
   modelId: string;
@@ -229,6 +234,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
     const overlay = declArgs['overlay'] === true;
     const token: PineToken = {
       source: clean,
+      parsed,
       instanceId,
       modelId: `pine-${sourceHash(clean)}`,
     };
@@ -260,6 +266,13 @@ export class PineInterpreterEngine implements ScriptingEngine {
     // PineRunClient/worker to THIS session — a chart can host several pine
     // indicators, so several execute() sessions share one engine instance.
     const sessionCtx = this.sessionRunner();
+    // Incremental session holder — in-process runs carry the IncLive across
+    // ticks via this object (worker sessions persist inside the worker keyed
+    // by incKey; the holder stays unused there).
+    const incHolder: { live: IncLive | null; active?: boolean } = { live: null };
+    // First run of this session = the restore/add run; the model cache only
+    // serves that one (see the cacheKey block in drain()).
+    let firstRun = true;
 
     // Single-flight + coalescing: at most one run in flight per session; if a
     // re-run is requested while one is executing, only the LATEST request is
@@ -268,8 +281,25 @@ export class PineInterpreterEngine implements ScriptingEngine {
     // under a live tick stream would starve completion forever.
     let running = false;
     let pending: OHLCV[] | null = null;
-    const request = (bars: OHLCV[]) => {
+    // ── Adaptive tick policy ─────────────────────────────────────────────
+    // A full re-run per tick is fine for cheap scripts; for heavy ones the
+    // worker can never keep up and the chart appears hung. After any run
+    // takes longer than HEAVY_RUN_MS, forming-bar ticks (same tail bar, new
+    // data) are skipped — the script re-runs once per bar close instead of
+    // once per tick. update()/history transitions always force a run.
+    // The incremental path exempts itself: once a live session exists, a
+    // tick costs ~one bar of eval, not a full tape — keep updating.
+    const HEAVY_RUN_MS = 500;
+    let lastRunMs = 0;
+    // Fingerprint of the tape a run was requested with: length + last bar's
+    // time. Identical + same time → same forming bar, newer data.
+    let lastTapeKey = '';
+    const tapeKey = (b: OHLCV[]) => `${b.length}:${b[b.length - 1]?.time ?? 0}`;
+    const request = (bars: OHLCV[], force = false) => {
       if (stopped) return;
+      const key = tapeKey(bars);
+      if (!force && lastRunMs > HEAVY_RUN_MS && !incHolder.live && !incHolder.active && key === lastTapeKey) return;
+      lastTapeKey = key;
       pending = bars;
       if (!running) void drain();
     };
@@ -293,28 +323,56 @@ export class PineInterpreterEngine implements ScriptingEngine {
             // runProgram is the worker seam: PineWorkerEngine overrides it to
             // ship the run off-thread; shouldAbort stays meaningful only on the
             // in-process path (worker abort rides the client protocol).
-            const result: RunResult = await this.runProgram(token.source, barData, {
+            const si = req.market.symbolInfo ? syminfoOf(req.market.symbolInfo) : undefined;
+            // Restore-path fast lane: a page reload re-runs every indicator from
+            // scratch (~16ms/bar for heavy scripts). The built model is pure JSON
+            // and the key pins source hash + symbol/tf + inputs + the exact bar
+            // window, so a hit is byte-identical to what a run would emit. Only
+            // the FIRST run of a session (the restore) is served from cache;
+            // update()/tick runs always recompute.
+            const cacheKey = firstRun
+              ? `${token.modelId}|${req.market.symbol}|${req.market.timeframe}|${JSON.stringify(runInputs)}|${barData.length}|${barData[barData.length - 1]?.openTime ?? 0}`
+              : null;
+            firstRun = false;
+            if (cacheKey) {
+              const cached = await modelCacheGet(cacheKey);
+              if (cached) {
+                if (!stopped && myRun === runId) {
+                  handlers.onModel(cached as IndicatorModel);
+                  handlers.onDone?.();
+                }
+                continue;
+              }
+            }
+            const result: RunResult = await this.runProgram(token.parsed, barData, {
               symbol: req.market.symbol,
               timeframe: req.market.timeframe,
               fetchSeries: toFetch(req.fetchSeries, bars),
               inputValues: runInputs,
-              syminfo: req.market.symbolInfo ? syminfoOf(req.market.symbolInfo) : undefined,
+              syminfo: si,
               // Only stop() kills a run mid-flight. A superseded run still emits
               // (myRun check is only reachable via stop()) — the pending re-run
               // right after it carries the latest bars+inputs, so the stale
               // emit is one frame of lag, not a wrong final state.
               shouldAbort: () => stopped,
               sessionCtx,
+              // Content-keyed incremental session: source/modelId + symbol/tf +
+              // inputs + syminfo — an edit to any of them lands a fresh session.
+              incKey: `${token.modelId}|${req.market.symbol}|${req.market.timeframe}|${JSON.stringify(runInputs)}|${JSON.stringify(si ?? null)}`,
+              incHolder: incHolder,
             });
             // Dev-only run timing: window.__pineRunLog collects {bars, ms} per
             // run so browser QA can split prefetch vs eval cost without a
             // profiler. Zero cost when nobody reads it.
+            lastRunMs = performance.now() - __t0;
             try {
               const w = globalThis as unknown as { __pineRunLog?: Array<{ bars: number; ms: number }> };
-              (w.__pineRunLog ??= []).push({ bars: barData.length, ms: Math.round(performance.now() - __t0) });
+              (w.__pineRunLog ??= []).push({ bars: barData.length, ms: Math.round(lastRunMs) });
             } catch { /* headless */ }
             if (stopped || myRun !== runId) continue;
-            handlers.onModel(buildModel(token.modelId, req, result, barTimes, runInputs));
+            const model = buildModel(token.modelId, req, result, barTimes, runInputs);
+            if (cacheKey) void modelCachePut(cacheKey, model);
+            handlers.onModel(model);
             for (const w of result.warnings) handlers.onWarning?.({ message: w, bar: bars.length - 1 });
             for (const a of result.alerts) {
               handlers.onAlert?.({ id: a.id, message: a.msg, time: bars[bars.length - 1]?.time ?? 0, barIndex: bars.length - 1 });
@@ -348,13 +406,17 @@ export class PineInterpreterEngine implements ScriptingEngine {
       stop: () => { stopped = true; runId++; pending = null; this.abortRun(sessionCtx); },
       update: (next: Record<string, InputValue>) => {
         inputs = { ...inputs, ...next };
-        if (!deferred) request(getBars());
+        // Input changes always force a run even for heavy scripts — the user
+        // edited settings; the forming-bar skip must not swallow it.
+        if (!deferred) request(getBars(), true);
       },
       setVisibleRange: () => { /* interpreter has no viewport builtins */ },
       notifyBars: (reason) => {
         if (reason === 'backfill') return; // partial history — wait for 'complete'/tick
         if (reason === 'complete') deferred = false;
-        if (!deferred) request(getBars());
+        // 'complete' forces: the deferred first run must fire regardless of
+        // tick-skip state inherited from an earlier heavy run.
+        if (!deferred) request(getBars(), reason === 'complete');
       },
     };
   }
@@ -364,9 +426,20 @@ export class PineInterpreterEngine implements ScriptingEngine {
    *  PineRunClient so each session owns its worker. */
   protected sessionRunner(): unknown { return undefined; }
 
-  /** Parse + run in-process. PineWorkerEngine overrides to run off-thread. */
-  protected runProgram(source: string, barData: BarData[], opts: RunOptions & { sessionCtx?: unknown }): Promise<RunResult> {
-    return runScript(parse(source), barData, opts);
+  /** Run in-process on the prepared AST. PineWorkerEngine overrides to run
+   *  off-thread. The incremental path: a live session (carried by
+   *  opts.incHolder) resumes at its committed checkpoint instead of
+   *  re-evaluating every bar per tick; ineligible/absent → full run. */
+  protected async runProgram(
+    parsed: ParsedInput,
+    barData: BarData[],
+    opts: RunOptions & { sessionCtx?: unknown; incKey?: string; incHolder?: { live: IncLive | null; active?: boolean } },
+  ): Promise<RunResult> {
+    const holder = opts.incHolder ?? { live: null };
+    const out = await incRun(parsed, barData, { ...opts, incSession: holder.live });
+    holder.live = out.live;
+    if (opts.incHolder) opts.incHolder.active = out.live !== null;
+    return out.result;
   }
 
   /** Called by session stop() — worker engine disposes that session's client. */

@@ -171,7 +171,7 @@ describe('S3: deferred backfill', () => {
     await vi.waitFor(() => expect(models.length).toBe(2), { timeout: 3000 });
     await turn(); await turn();
     expect(models.length).toBe(2); // run1 + coalesced run2, not 4
-    expect(fetchCalls).toBe(2); // pending run fetched fresh bars once
+    expect(fetchCalls).toBe(1); // incremental reuse: unchanged tape → no refetch (was 2 pre-incremental)
     session.stop();
   });
 });

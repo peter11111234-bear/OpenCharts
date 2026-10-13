@@ -12,6 +12,10 @@ export default defineConfig({
   },
   build: {
     rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        pineEditor: path.resolve(__dirname, "pine-editor.html"),
+      },
       output: {
         manualChunks(id) {
           if (id.includes("node_modules")) {

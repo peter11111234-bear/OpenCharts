@@ -98,12 +98,14 @@ const nulls = (xs: (number | null)[]): xs is number[] => !xs.includes(null);
 
 registerBuiltin('math', 'abs', liftNums((xs) => (xs[0] === null ? null : Math.abs(xs[0])), 'auto'));
 
+// TV propagates na: math.max(10, na) → na (not 10). Same for min.
 registerBuiltin(
   'math',
   'max',
   liftNums((xs) => {
-    let best: number | null = null;
-    for (const x of xs) if (x !== null && (best === null || x > best)) best = x;
+    if (!nulls(xs)) return null;
+    let best = xs[0]!;
+    for (const x of xs) if (x > best) best = x;
     return best;
   }, 'auto'),
 );
@@ -112,8 +114,9 @@ registerBuiltin(
   'math',
   'min',
   liftNums((xs) => {
-    let best: number | null = null;
-    for (const x of xs) if (x !== null && (best === null || x < best)) best = x;
+    if (!nulls(xs)) return null;
+    let best = xs[0]!;
+    for (const x of xs) if (x < best) best = x;
     return best;
   }, 'auto'),
 );

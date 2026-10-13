@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parse } from '../parser';
-import { runScript } from '../interpreter';
+import type { BarData } from '../contracts';
+import { runScript, type ParsedInput, type RunOptions } from '../interpreter';
 import { PineInterpreterEngine, buildModel } from '../engine';
 import type { ExecutionRequest, IndicatorModel, OHLCV, PreparedScript } from '@luxalgo/vela';
 import '../builtins/index';
@@ -302,5 +303,92 @@ describe('regressions — R2 verification findings', () => {
     expect(bx?.fontFamily).toBe('monospace');
     expect(bx?.italic).toBe(true);
     expect(bx?.bold).toBe(false);
+  });
+});
+
+// ── adaptive tick policy ────────────────────────────────────────────────────
+// A run slower than HEAVY_RUN_MS flips the session to per-bar updates:
+// forming-bar ticks (same tail time, new data) are skipped; a new bar still
+// re-runs. Cheap scripts keep per-tick behavior. Verified by counting runs
+// through a latency-controlled runProgram subclass.
+
+class DelayedEngine extends PineInterpreterEngine {
+  runs = 0;
+  constructor(private delayMs: number) { super(); }
+  protected override runProgram(
+    parsed: ParsedInput,
+    barData: BarData[],
+    opts: RunOptions & { sessionCtx?: unknown },
+  ) {
+    this.runs++;
+    const t0 = performance.now();
+    while (performance.now() - t0 < this.delayMs) { /* spin */ }
+    return super.runProgram(parsed, barData, opts);
+  }
+}
+
+describe('adaptive tick policy', () => {
+  // strategy decls are incremental-ineligible → the session never gets a
+  // live IncLive, so the heavy-run tick skip still applies to this fixture.
+  const src = '//@version=6\nstrategy("a")\nplot(close)\n';
+
+  const exec = async (engine: PineInterpreterEngine, bars: OHLCV[]) => {
+    const prepared = await engine.prepare(src, 't1');
+    const tape = { bars };
+    const req: ExecutionRequest = {
+      prepared,
+      market: { symbol: 'TEST', timeframe: '60' },
+      bars: tape.bars,
+      getBars: () => tape.bars,
+      mode: 'live',
+    };
+    const c = collect();
+    const session = engine.execute(req, { onModel: c.onModel });
+    return { tape, session, c };
+  };
+
+  const tickSameBar = (tape: { bars: OHLCV[] }) => {
+    const same = tape.bars.slice();
+    same[same.length - 1] = { ...same[same.length - 1]!, close: 999 };
+    tape.bars = same;
+  };
+
+  it('heavy run → forming-bar ticks skipped, new bar still re-runs', async () => {
+    const engine = new DelayedEngine(600);
+    const { tape, session, c } = await exec(engine, mkBars(10));
+    await c.waitFor(1); // initial run
+    expect(engine.runs).toBe(1);
+
+    // Same tail time (forming bar), mutated close → tick: skipped. runs++
+    // executes synchronously inside runProgram, so a started run is
+    // observable the same tick notifyBars() returns — no wait needed.
+    tickSameBar(tape);
+    session.notifyBars();
+    expect(engine.runs).toBe(1);
+
+    // Input update forces a run even under the policy.
+    session.update({});
+    await c.waitFor(2);
+    expect(engine.runs).toBe(2);
+
+    // New bar (len + 1) is a bar close → re-run.
+    const grown = tape.bars.slice();
+    grown.push({ time: 10 * 3600000, open: 1, high: 2, low: 0, close: 1, volume: 1 });
+    tape.bars = grown;
+    session.notifyBars();
+    await c.waitFor(3);
+    expect(engine.runs).toBe(3);
+    session.stop();
+  });
+
+  it('cheap run → every tick re-runs (unchanged live behavior)', async () => {
+    const engine = new DelayedEngine(0);
+    const { tape, session, c } = await exec(engine, mkBars(10));
+    await c.waitFor(1);
+    tickSameBar(tape);
+    session.notifyBars();
+    await c.waitFor(2);
+    expect(engine.runs).toBe(2);
+    session.stop();
   });
 });

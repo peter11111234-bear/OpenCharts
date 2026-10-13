@@ -50,6 +50,11 @@ import type { PineEditorHandle, PineLintError } from "../pine/pineMonaco.ts";
 // persisted width). `.vela-pine-dialog` is just our body container now.
 const PINE_CSS = `
 .vela-pine-dialog{display:flex;flex-direction:column;height:100%;background:var(--vela-bg,#1e222d);color:var(--vela-fg,#d1d4dc);font:13px/1.4 sans-serif;overflow:hidden}
+.vela-pine-float{position:fixed;z-index:10001;display:flex;flex-direction:column;min-width:480px;min-height:280px;background:#1e222d;border:1px solid #363c4e;border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,.6);resize:both;overflow:hidden}
+.vela-pine-float[hidden]{display:none}
+.vela-pine-float-titlebar{display:flex;align-items:stretch;gap:2px;border-bottom:1px solid #2a2e39;background:#161a24;user-select:none}
+.vela-pine-float-drag{flex:0 0 14px;cursor:move}
+.vela-pine-float-body{flex:1;min-height:0;display:flex;flex-direction:column}
 .vela-pine-headbar{display:flex;align-items:center;gap:4px;padding:2px 4px;overflow-x:auto;white-space:nowrap}
 .vela-pine-namebtn{display:flex;align-items:center;gap:6px;background:none;border:0;color:#ddd;padding:4px 8px;font-size:13px;cursor:pointer;border-radius:4px;max-width:260px}
 .vela-pine-namebtn:hover{background:#2a2e39}
@@ -760,6 +765,11 @@ const openMenus: HTMLElement[] = [];
 // body it hands us. `panelCtx` doubles as the "mounted" latch; `pendingOpen`
 // carries content for a not-yet-mounted panel.
 const PANEL_ID = "opencharts.pine";
+let floating = false;                          // centered draggable window mode
+let floatWin: HTMLElement | null = null;       // the float wrapper holding panelRoot
+const FLOAT_POS_KEY = "opencharts.pine.float";
+let popChannel: BroadcastChannel | null = null; // BroadcastChannel to pop-out window
+let popWin: Window | null = null;
 let panelCtx: WidgetContext | null = null;
 let panelBody: HTMLElement | null = null;
 let panelRoot: HTMLElement | null = null;      // our .vela-pine-dialog node
@@ -772,23 +782,159 @@ let refreshPanel: (() => void) | null = null;  // rebuildOnChart, set by mountEd
 // flushed into monaco/textarea once the surface exists.
 let pendingValue = "";
 
-/** Open the docked panel and aim the editor at `initialSrc`. If the shell
- *  hasn't mounted the panel yet, stash the args for mount to consume. */
+/** Open the editor in its OWN browser window — user pref: the right-hand
+ *  dock crowds the chart. The side panel is NOT mounted; this module owns
+ *  buffer + editorState and answers the child's BroadcastChannel commands
+ *  directly. TV's equivalent is "Open editor in new window" detach mode —
+ *  for us it is the only mode. */
+let lastCmdCtx: WidgetContext | null = null;
+
+function popPost(m: Record<string, unknown>): void { popChannel?.postMessage(m); }
+function popStatus(text: string, kind: "" | "ok" | "err" = ""): void {
+  popPost({ t: "status", v: text, kind });
+}
+function popMeta(): void {
+  const s = editorState.currentId ? pineLibGet(editorState.currentId) : undefined;
+  popPost({ t: "meta",
+    name: s?.name ?? "Untitled script",
+    dirty: editorState.dirty,
+    recent: pineLibRecent().slice(0, 6)
+      .map((id) => pineLibGet(id)).filter(Boolean)
+      .map((e) => ({ id: e!.id, name: e!.name })),
+    all: pineLibList().map((e) => ({ id: e.id, name: e.name })),
+    versions: (s?.versions ?? []).map((v, i) => ({ i, t: v.t })).reverse(),
+  });
+}
+function popConfirmDiscard(): boolean {
+  return !editorState.dirty ||
+    !!(lastCmdCtx?.host.ownerDocument.defaultView ?? window).confirm?.("Discard unsaved changes?");
+}
+
+function popSave(): void {
+  const src = pendingValue;
+  try {
+    if (!editorState.currentId) {
+      const def = scriptTitle(src, "Untitled script");
+      const name = (lastCmdCtx?.host.ownerDocument.defaultView ?? window).prompt?.("Script name", def) ?? "";
+      if (!name.trim()) { popStatus("Save cancelled", "err"); return; }
+      const s = pineLibCreate(name.trim(), src);
+      if (pineLibWriteFailed()) { popStatus("Save failed (storage)", "err"); return; }
+      editorState.currentId = s.id;
+      popStatus(`Saved "${s.name}"`, "ok");
+    } else {
+      const s = pineLibGet(editorState.currentId);
+      if (!s) { editorState.currentId = null; popSave(); return; }
+      pineLibSave(s.id, src);
+      popStatus(`Saved "${s.name}"`, "ok");
+    }
+    editorState.dirty = false;
+  } catch (e) { popStatus(`Save failed: ${e instanceof Error ? e.message : e}`, "err"); }
+}
+async function popRun(): Promise<void> {
+  const chart = lastCmdCtx?.chart;
+  if (!chart) { popStatus("No chart context", "err"); return; }
+  const src = pendingValue;
+  popStatus("Running…");
+  try {
+    if (editorState.handleId) {
+      const handle = chart.indicators().find((h) => h.id === editorState.handleId);
+      if (handle) { handle.updateCode(src); popStatus("Updated in place", "ok"); return; }
+      editorState.handleId = undefined;
+    }
+    const r = await chart.runIndicator(src);
+    if (r && typeof r === "object" && "ok" in r && r.ok === false) {
+      popStatus(`Error: ${"error" in r ? String(r.error) : "unknown"}`, "err");
+      return;
+    }
+    editorState.handleId = chart.indicators().at(-1)?.id;
+    popStatus("Added", "ok");
+  } catch (e) { popStatus(`Error: ${e instanceof Error ? e.message : e}`, "err"); }
+}
+function popReload(): void {
+  const s = editorState.currentId ? pineLibGet(editorState.currentId) : undefined;
+  if (!s) { popStatus("Nothing to reload", "err"); return; }
+  pendingValue = s.source;
+  editorState.dirty = false;
+  popPost({ t: "value", v: s.source });
+  popStatus("Reloaded", "ok");
+}
+
+function ensurePopChannel(): void {
+  if (popChannel) return;
+  popChannel = new BroadcastChannel("opencharts.pine.win");
+  popChannel.onmessage = (e) => {
+    const m = e.data as { t?: string; v?: string; c?: string; id?: string; name?: string; k?: string; i?: number };
+    if (m.t === "hello" || m.t === "bye") { popPost({ t: "value", v: pendingValue }); popMeta(); }
+    if (m.t === "value" && typeof m.v === "string") {
+      pendingValue = m.v;
+      editorState.dirty = true;
+      popMeta();
+    }
+    if (m.t === "cmd") {
+      if (m.c === "save") popSave();
+      if (m.c === "run") void popRun();
+      if (m.c === "reload") popReload();
+      if (m.c === "copy") {
+        if (editorState.currentId) {
+          const c = pineLibDuplicate(editorState.currentId);
+          popStatus(`Copied as "${c.name}"`, "ok");
+        } else popStatus("Save the script first", "err");
+      }
+      if (m.c === "rename" && m.name && editorState.currentId) {
+        pineLibRename(editorState.currentId, m.name);
+        popStatus(`Renamed to "${m.name}"`, "ok");
+      }
+      if (m.c === "new" && m.k && m.k in TEMPLATES && popConfirmDiscard()) {
+        editorState.currentId = null;
+        editorState.handleId = undefined;
+        pendingValue = TEMPLATES[m.k as keyof typeof TEMPLATES];
+        editorState.dirty = false;
+        popPost({ t: "value", v: pendingValue });
+        popStatus("New template", "ok");
+      }
+      if (m.c === "open" && m.id && popConfirmDiscard()) {
+        const s = pineLibGet(m.id);
+        if (s) {
+          editorState.currentId = s.id;
+          editorState.handleId = undefined;
+          pendingValue = s.source;
+          editorState.dirty = false;
+          pineLibRecentPush(s.id);
+          popPost({ t: "value", v: pendingValue });
+          popStatus(`Opened "${s.name}"`, "ok");
+        }
+      }
+      if (m.c === "hist" && typeof m.i === "number" && editorState.currentId) {
+        const s = pineLibGet(editorState.currentId);
+        const v = s?.versions[m.i];
+        if (v && popConfirmDiscard()) {
+          pendingValue = v.src;
+          editorState.dirty = true;
+          popPost({ t: "value", v: pendingValue });
+          popStatus(`Loaded v${m.i + 1} (unsaved)`, "ok");
+        }
+      }
+      popMeta();
+    }
+  };
+}
+
+function popOpen(): void {
+  if (popWin && !popWin.closed) { popWin.focus(); return; }
+  const w = (lastCmdCtx?.host.ownerDocument.defaultView ?? window)
+    .open("/pine-editor.html", "opencharts.pine",
+      "width=980,height=720,menubar=no,toolbar=no,location=no,status=no");
+  if (w) popWin = w; // else popup blocked — nothing else to do
+}
+
 function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scriptId?: string): void {
-  if (!migrated) { migrated = true; try { pineLibMigrateLegacyHist(); } catch { /* first run */ } }
-  const want = { src: initialSrc, editingId, scriptId };
-  if (panelCtx && panelRoot) {
-    // Panel already mounted (visible or hidden): apply now — if hidden the
-    // shell's onOpen fires on toggle and only consumes pendingOpen, so we
-    // push the buffer directly instead of stashing.
-    applyOpenArgs(want);
-    if (want.src && edHandle) edHandle.setValue(want.src);
-    ctx.togglePanel?.(PANEL_ID, true);
-    refreshPanel?.();
-  } else {
-    pendingOpen = want;
-    ctx.togglePanel?.(PANEL_ID, true);
-  }
+  lastCmdCtx = ctx;
+  ctx.togglePanel?.(PANEL_ID, false);   // hide any stale side-dock mount
+  applyOpenArgs({ src: initialSrc, editingId, scriptId });
+  ensurePopChannel();
+  popOpen();
+  popPost({ t: "value", v: pendingValue });
+  popMeta();
 }
 
 function applyOpenArgs(want: { src: string; editingId?: string; scriptId?: string }): void {
@@ -801,6 +947,102 @@ function applyOpenArgs(want: { src: string; editingId?: string; scriptId?: strin
     handleId: want.editingId,
   };
   if (want.src) pendingValue = want.src;
+}
+
+// ── Floating window mode ── the panel's root lives inside a draggable,
+// resizable div on document.body; the shell dock is closed while floating.
+// Geometry persists in localStorage so the window reopens where it was left.
+let headbarEl: (() => HTMLElement | null) = () => null;  // set inside mountEditor
+let headbarSlot: (() => HTMLElement | null) = () => null;
+function saveFloatGeom(): void {
+  if (!floatWin) return;
+  const r = floatWin.getBoundingClientRect();
+  try { localStorage.setItem(FLOAT_POS_KEY, JSON.stringify({ l: r.left, t: r.top, w: r.width, h: r.height })); } catch { /* quota */ }
+}
+function applyFloatGeom(): void {
+  if (!floatWin) return;
+  let g: { l?: number; t?: number; w?: number; h?: number } | null = null;
+  try { g = JSON.parse(localStorage.getItem(FLOAT_POS_KEY) || "null"); } catch { /* corrupt */ }
+  const vw = window.innerWidth, vh = window.innerHeight;
+  floatWin.style.width = Math.min(Math.max(g?.w ?? 760, 480), vw - 16) + "px";
+  floatWin.style.height = Math.min(Math.max(g?.h ?? 560, 280), vh - 16) + "px";
+  floatWin.style.left = (g?.l !== undefined ? Math.max(0, Math.min(g.l, vw - 80)) : Math.round((vw - (g?.w ?? 760)) / 2)) + "px";
+  floatWin.style.top = (g?.t !== undefined ? Math.max(0, Math.min(g.t, vh - 40)) : Math.round((vh - (g?.h ?? 560)) / 4)) + "px";
+}
+function dockToFloat(): void {
+  if (!panelRoot || !panelCtx || floating) return;
+  undockStrip?.(); undockStrip = null; bottomDocked = false;
+  const doc = panelCtx.host.ownerDocument;
+  if (!floatWin) {
+    const win = doc.createElement("div");
+    win.className = "vela-pine-float";
+    const bar = doc.createElement("div");
+    bar.className = "vela-pine-float-titlebar";
+    const drag = doc.createElement("div");
+    drag.className = "vela-pine-float-drag";
+    const bodyEl = doc.createElement("div");
+    bodyEl.className = "vela-pine-float-body";
+    const pinBtn = doc.createElement("button");
+    pinBtn.type = "button";
+    pinBtn.className = "vela-pine-hbtn";
+    pinBtn.textContent = "⇤";
+    pinBtn.title = "Dock to side panel";
+    pinBtn.addEventListener("click", () => dockToSide());
+    const closeBtn = doc.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "vela-pine-hbtn";
+    closeBtn.textContent = "✕";
+    closeBtn.title = "Close";
+    closeBtn.addEventListener("click", () => { if (floatWin) floatWin.hidden = true; });
+    bar.append(drag, pinBtn, closeBtn);
+    win.append(bar, bodyEl);
+    doc.body.appendChild(win);
+    // Drag anywhere on the titlebar except on buttons — clamp inside viewport.
+    bar.addEventListener("pointerdown", (e) => {
+      if ((e.target as HTMLElement).closest("button")) return;
+      const r = win.getBoundingClientRect();
+      const dx = e.clientX - r.left, dy = e.clientY - r.top;
+      const move = (ev: PointerEvent) => {
+        const vw = doc.defaultView?.innerWidth ?? 1920;
+        const vh = doc.defaultView?.innerHeight ?? 1080;
+        win.style.left = Math.max(0, Math.min(ev.clientX - dx, vw - 80)) + "px";
+        win.style.top = Math.max(0, Math.min(ev.clientY - dy, vh - 40)) + "px";
+      };
+      const up = () => {
+        doc.removeEventListener("pointermove", move);
+        doc.removeEventListener("pointerup", up);
+        saveFloatGeom();
+      };
+      doc.addEventListener("pointermove", move);
+      doc.addEventListener("pointerup", up);
+      e.preventDefault();
+    });
+    const RO = (doc.defaultView ?? window).ResizeObserver;
+    if (RO) new RO(() => { if (floating) saveFloatGeom(); }).observe(win);
+    floatWin = win;
+  }
+  const bodyEl = floatWin.querySelector<HTMLElement>(".vela-pine-float-body");
+  const titlebar = floatWin.querySelector<HTMLElement>(".vela-pine-float-titlebar");
+  const drag = floatWin.querySelector<HTMLElement>(".vela-pine-float-drag");
+  if (bodyEl && titlebar && drag) {
+    bodyEl.appendChild(panelRoot);
+    const hb = headbarEl();
+    if (hb) drag.after(hb); // titlebar = [grip | headbar | pin | ✕]
+  }
+  applyFloatGeom();
+  floatWin.hidden = false;
+  floating = true;
+  panelCtx.togglePanel?.(PANEL_ID, false);
+}
+function dockToSide(): void {
+  if (!floating) return;
+  floating = false;
+  if (floatWin) floatWin.hidden = true;
+  const hb = headbarEl();
+  const home = headbarSlot();
+  if (hb && home) home.appendChild(hb);
+  if (panelRoot) panelBody?.appendChild(panelRoot);
+  panelCtx?.togglePanel?.(PANEL_ID, true);
 }
 
 function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHeader): void {
@@ -885,7 +1127,9 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
   const setStatus = (text: string, kind: "" | "ok" | "err" = "") => {
     statusMsg.textContent = text;
     statusMsg.dataset.kind = kind;
+    popChannel?.postMessage({ t: "status", v: text, kind });
   };
+
 
   // ── Header ── the shell owns the panel's row, title and ✕; our controls go
   // into header.slot. TV order: [name ▾] [↻] [Add to chart] [Save] [Publish] [⋯]
@@ -908,6 +1152,7 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
     const s = editorState.currentId ? pineLibGet(editorState.currentId) : undefined;
     nameLabel.textContent = s?.name ?? "Untitled script";
     dirtyDot.classList.toggle("on", editorState.dirty);
+    popChannel?.postMessage({ t: "name", name: s?.name ?? "Untitled script" });
   };
 
   const saveScript = () => {
@@ -1068,6 +1313,8 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
       item("Make a copy…", null, makeCopy),
       item("Rename…", null, renameScript),
       item("Version history…", null, openVersionHistory),
+      item("Open in separate window", null, () => { popOpen(); }),
+      item(floating ? "Dock editor to side panel" : "Float editor window", null, () => { floating ? dockToSide() : dockToFloat(); }),
       item(bottomDocked ? "Move script back to side panel" : "Move script to bottom", null, () => { dockToBottom(); }),
       sep(),
       item("Create new ▸", null, openCreateNew),
@@ -1205,6 +1452,7 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
   // moves it back into the panel body.
   const dockToBottom = () => {
     if (!panelRoot || !panelCtx) return;
+    if (floating) dockToSide();   // bottom-dock parks inside the shell, not the float
     if (bottomDocked) {
       undockStrip?.(); undockStrip = null; bottomDocked = false;
       panelBody?.appendChild(panelRoot);
@@ -1220,6 +1468,7 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
   };
 
   headbar.append(nameBtn, reloadBtn, addToChartBtn, saveBtn, publishBtn, moreBtn);
+
 
   // ── Buffer init: pendingOpen src (staged by applyOpenArgs) > collapsed
   // draft > current library entry > template ──
@@ -1243,6 +1492,7 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
     editorState.dirty = true;
     refreshName();
     lintOnChange();
+    if (popWin && !popWin.closed) popChannel?.postMessage({ t: "value", v: area.value });
   }
 
   // ── On-chart indicators: what this cell is currently running ──
@@ -1343,6 +1593,8 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
   // ── Assemble ── the shell owns the panel's header row and close button;
   // our controls live in `header.slot` (between title and ✕), the body gets
   // the editor host + on-chart list + statusbar.
+  headbarEl = () => headbar;
+  headbarSlot = () => header.slot as HTMLElement;
   header.slot.appendChild(headbar);
   root.append(edHost, onChartLabel, onChart, statusbar);
   body.appendChild(root);
@@ -1430,9 +1682,9 @@ const RAIL_CSS = `
 .vela-pine-rail button:hover{background:rgba(255,255,255,.08);color:var(--vela-fg,#d1d4dc)}
 .vela-pine-rail svg{width:16px;height:16px}
 `;
-// The editor is a contributed SIDE PANEL — a docked column beside the chart
-// (TV parity: right dock with collapse/close in the shell chrome). Registered
-// at import time; the shell hands mount() the body + a header slot.
+// The contributed SIDE PANEL registration stays — its dock column is only
+// reachable via "Dock editor to side panel" from the pop-out menu; the
+// default Pine entry opens the standalone window instead.
 registerSidePanel({
   id: PANEL_ID,
   title: "Pine Editor",
@@ -1447,6 +1699,9 @@ registerSidePanel({
       // panel's ctx is the mount-time cell; rebuild re-reads through it.
       onChart() { refreshPanel?.(); },
       onOpen() {
+        // Floating mode: re-show the window and re-hide the empty dock column
+        // the shell just opened.
+        if (floating) { if (floatWin) floatWin.hidden = false; panelCtx?.togglePanel?.(PANEL_ID, false); }
         // Consume args stashed while the panel was closed (rail/legend open)
         // and push the stashed source into the LIVE editor, not just state.
         if (pendingOpen && panelRoot) {
@@ -1460,7 +1715,10 @@ registerSidePanel({
         writeErrorUnsub?.(); writeErrorUnsub = null;
         for (const m of openMenus) m.remove(); openMenus.length = 0;
         undockStrip?.(); undockStrip = null; bottomDocked = false;
+        floatWin?.remove(); floatWin = null; floating = false;
+        headbarEl = () => null; headbarSlot = () => null;
         edHandle?.dispose(); edHandle = null;
+        popChannel?.close(); popChannel = null; popWin = null;
         panelCtx = null; panelBody = null; panelRoot = null; refreshPanel = null;
       },
     };

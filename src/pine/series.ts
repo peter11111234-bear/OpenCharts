@@ -21,6 +21,42 @@ export const seriesHooks: {
   touch: () => {},
 };
 
+// ── incremental-eval rewind support ─────────────────────────────────────────
+// A live session replays the forming bar on every tick from the last committed
+// checkpoint. Every BarSeries born while a session's registry is installed
+// joins that set; the incremental driver snapshots (incSnap) per committed bar
+// and rewinds (incRewind) before each re-eval. See docs plan
+// 2026-10-11-pine-incremental-live.md.
+
+/** Per-series registry the owning session rewinds over. Installed only while
+ *  that session evaluates — untracked runs never pay the Set.add. */
+let activeSeriesSet: Set<BarSeries> | null = null;
+export function setActiveSeriesSet(s: Set<BarSeries> | null): void {
+  activeSeriesSet = s;
+}
+
+/** Opaque checkpoint payload for one series — produced by incSnap, consumed
+ *  by incRewind on the SAME object. */
+export interface IncSnap {
+  lastBar: number;
+  firstBar: number;
+  head: number;
+  buf: Value[];
+  /** Subclass state (virtual fn/memo/lit, CowSeries inner/cow). */
+  x?: unknown;
+}
+
+/** LitSeries extra snap fields — the virtual-window flag. */
+export interface LitSnapX { virtual: boolean }
+
+/** LiftedSeries extra snap fields — lazy-kernel state. */
+export interface LiftedSnapX {
+  fn: ((k: number) => Value) | null;
+  len: number;
+  vLen: number;
+  shift: number;
+}
+
 /**
  * Bar-aware series slot — one history entry per bar, indexed by absolute
  * bar_index. This is the slot every named variable should get (context series
@@ -56,6 +92,53 @@ export class BarSeries extends Series {
   constructor(cap = 5000) {
     super(cap);
     this.capN = cap;
+    if (activeSeriesSet) activeSeriesSet.add(this);
+  }
+
+  /** Set when any written Value is a mutable container (array/map/udt/
+   *  matrix). The incremental driver deep-clones slot payloads only for
+   *  flagged series — scalar-only series rewind by truncation alone. */
+  hasContainers = false;
+
+  /** Checkpoint payload for the incremental driver. */
+  incSnap(): IncSnap {
+    return { lastBar: this.lastBar, firstBar: this.firstBar, head: this.head, buf: this.buf };
+  }
+
+  /** Rewind to a snap taken on this object; a null snap resets to
+   *  never-written (series born during the re-evaluated bar). Subclasses
+   *  layer their private state onto `snap.x`. */
+  incRewind(snap: IncSnap | null): void {
+    if (snap === null) {
+      this.buf.length = 0;
+      this.head = 0;
+      this.lastBar = -1;
+      this.firstBar = 0;
+      this.hasContainers = false;
+      return;
+    }
+    const drop = this.lastBar - snap.lastBar;
+    if (drop > 0) {
+      this.buf = snap.buf.slice(0, snap.buf.length - drop);
+    } else {
+      this.buf = snap.buf;
+      this.buf.length = snap.buf.length;
+    }
+    this.head = snap.head;
+    this.lastBar = snap.lastBar;
+    this.firstBar = snap.firstBar;
+  }
+
+  /** Absolute bar index recorded at buffer index `i` (head-adjusted). The
+   *  incremental driver needs it to clone container payloads per bar. */
+  incBarAt(i: number): number {
+    return this.lastBar - (this.buf.length - 1 - i);
+  }
+
+  /** Internal buffer view for the incremental driver's container snapshot —
+   *  index i records absolute bar incBarAt(i). Read-only use only. */
+  get incBuf(): Value[] {
+    return this.buf;
   }
 
   /** Bar index of the newest written slot (-1 when empty). */
@@ -85,6 +168,10 @@ export class BarSeries extends Series {
 
   /** Write (or same-bar overwrite) the value for absolute `bar`. */
   setAt(bar: number, v: Value): void {
+    if (!this.hasContainers) {
+      const k = v.kind;
+      if (k === 'array' || k === 'map' || k === 'matrix' || k === 'udt') this.hasContainers = true;
+    }
     if (bar === this.lastBar) {
       if (this.buf.length === this.head) this.buf.push(v);
       else this.buf[this.buf.length - 1] = v;
@@ -228,6 +315,18 @@ export class LitSeries extends BarSeries {
     if (this.virtual) { this.bump(bar); return; }
     super.ensureBar(bar);
   }
+
+  override incSnap(): IncSnap {
+    const s = super.incSnap();
+    s.x = { virtual: this.virtual };
+    return s;
+  }
+
+  override incRewind(snap: IncSnap | null): void {
+    super.incRewind(snap);
+    // null = born inside the re-evaluated bar → back to the fresh virtual state.
+    this.virtual = snap === null ? true : (snap.x as LitSnapX).virtual;
+  }
 }
 
 
@@ -309,6 +408,34 @@ export class LiftedSeries extends BarSeries {
     if (bar <= this.lastBar) return;
     this.shift += bar - this.lastBar;
     this.lastBar = bar;
+  }
+
+  override incSnap(): IncSnap {
+    const s = super.incSnap();
+    s.x = { fn: this.fn, len: this.len, vLen: this.vLen, shift: this.shift };
+    return s;
+  }
+
+  override incRewind(snap: IncSnap | null): void {
+    super.incRewind(snap);
+    if (snap === null) {
+      // Born inside the re-evaluated bar → inert; the object is unreachable
+      // after rewind anyway, so field values only need to be safe, not true.
+      this.fn = null;
+      this.len = 0;
+      this.vLen = 0;
+      this.shift = 0;
+      this.memo = [];
+      return;
+    }
+    const x = snap.x as LiftedSnapX;
+    this.fn = x.fn;
+    this.len = x.len;
+    this.vLen = x.vLen;
+    this.shift = x.shift;
+    // Drop the lazy memo — replayed values must come through the sources'
+    // rewound anchors, not entries cached during the discarded eval.
+    this.memo = [];
   }
 }
 

@@ -61,8 +61,28 @@ function tickPrice(t: TickEvent): number {
 }
 
 function tickEpochSec(t: TickEvent): number {
+  // Live tick date comes from the CONTRACT (e.g. MXFJ6 expiry), not the bar —
+  // only the wall-clock time is trustworthy. Anchor to today's Taipei date.
   const ms = Date.parse(`${t.date}T${t.time}+08:00`);
-  return Number.isFinite(ms) ? Math.floor(ms / 1000) : Math.floor(Date.now() / 1000);
+  if (Number.isFinite(ms)) {
+    const d = new Date(ms);
+    const now = new Date(Date.now() + 8 * 3600 * 1000);
+    // If the tick's date is more than a day off today, the date field is a
+    // contract/expiry date — rebuild with today's date + tick's wall time.
+    const dayMs = 86400 * 1000;
+    const tickDay = Math.floor((ms + 8 * 3600 * 1000) / dayMs);
+    const todayDay = Math.floor((Date.now() + 8 * 3600 * 1000) / dayMs);
+    if (Math.abs(tickDay - todayDay) <= 1) return Math.floor(ms / 1000);
+    const hh = `${d.getUTCHours()}`.padStart(2, "0");
+    const mm = `${d.getUTCMinutes()}`.padStart(2, "0");
+    const ss = `${d.getUTCSeconds()}`.padStart(2, "0");
+    const y = now.getUTCFullYear();
+    const mo = `${now.getUTCMonth() + 1}`.padStart(2, "0");
+    const dy = `${now.getUTCDate()}`.padStart(2, "0");
+    const fixed = Date.parse(`${y}-${mo}-${dy}T${hh}:${mm}:${ss}+08:00`);
+    if (Number.isFinite(fixed)) return Math.floor(fixed / 1000);
+  }
+  return Math.floor(Date.now() / 1000);
 }
 
 function isSane(symbol: string, price: number): boolean {

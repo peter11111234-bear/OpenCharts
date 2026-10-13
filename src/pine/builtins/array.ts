@@ -7,9 +7,15 @@ import { NA } from '../contracts';
 import type { BuiltinCtx, BuiltinFn, Value } from '../contracts';
 import { PineRuntimeError } from '../errors';
 import { registerBuiltin, registerConstant } from './registry';
-import { asNum, asStr, bindArgs, truthy } from './util';
+import { asNum, asStr, bindArgs, truthy, unwrapped } from './util';
 import { toDisplay } from './str';
 
+// Arrays hold SNAPSHOT values (TV semantics): `array.push(a, close)` stores the
+// current close, not a live series handle. Storing the raw `{kind:'series'}`
+// wrapper made every slot written from the same call site alias one live series
+// — all of them then read back the CURRENT bar's value, so a rolling buffer of
+// pivots read back duplicates (見高K tab_cb → ABC/harmonic lines vanished).
+const snap = (v: Value | undefined): Value => unwrapped(v) ?? NA;
 const VOID: Value = { kind: 'void' };
 const arrVal = (v: Value[]): Value => ({ kind: 'array', v });
 // Builtin args arrive as {kind:'series'} when the ident is series-bound (e.g.
@@ -85,26 +91,26 @@ const mut = (
     return a === null ? NA : f(a, bound);
   };
 
-registerBuiltin('array', 'push', mut(['id', 'val'], (a, b) => {
-  a.push(b.get('val') ?? NA);
+registerBuiltin('array', 'push', mut(['id', 'value'], (a, b) => {
+  a.push(snap(b.get('value')));
   return VOID;
-}), { idx: [1], names: ['val'] });
+}), { idx: [1], names: ['value'] });
 
-registerBuiltin('array', 'unshift', mut(['id', 'val'], (a, b) => {
-  a.unshift(b.get('val') ?? NA);
+registerBuiltin('array', 'unshift', mut(['id', 'value'], (a, b) => {
+  a.unshift(snap(b.get('value')));
   return VOID;
-}), { idx: [1], names: ['val'] });
+}), { idx: [1], names: ['value'] });
 
 registerBuiltin('array', 'pop', mut(['id'], (a) => (a.length === 0 ? NA : a.pop()!)));
 registerBuiltin('array', 'shift', mut(['id'], (a) => (a.length === 0 ? NA : a.shift()!)));
 
 registerBuiltin('array', 'set', mut(['id', 'index', 'value'], (a, b) => {
-  a[resolveIdx(b, 'index', a.length, a.length - 1)] = b.get('value') ?? NA;
+  a[resolveIdx(b, 'index', a.length, a.length - 1)] = snap(b.get('value'));
   return VOID;
 }), { idx: [2], names: ['value'] });
 
 registerBuiltin('array', 'insert', mut(['id', 'index', 'value'], (a, b) => {
-  a.splice(resolveIdx(b, 'index', a.length, a.length), 0, b.get('value') ?? NA);
+  a.splice(resolveIdx(b, 'index', a.length, a.length), 0, snap(b.get('value')));
   return VOID;
 }), { idx: [2], names: ['value'] });
 
@@ -114,7 +120,7 @@ registerBuiltin('array', 'remove', mut(['id', 'index'], (a, b) => {
 }));
 
 registerBuiltin('array', 'fill', mut(['id', 'value', 'index', 'length'], (a, b) => {
-  const v = b.get('value') ?? NA;
+  const v = snap(b.get('value'));
   const start = Math.max(0, idxOf(b, 'index', 0));
   const lenV = b.get('length');
   const len = lenV === undefined || lenV.kind === 'na' ? a.length - start : Math.trunc(asNum(lenV));
@@ -273,9 +279,9 @@ registerBuiltin('array', 'sort_indices', (_ctx, args, named) => {
 const binSearch =
   (edge: 'any' | 'left' | 'right'): BuiltinFn =>
   (_ctx, args, named) => {
-    const bound = bind(args, named, ['id', 'val']);
+    const bound = bind(args, named, ['id', 'value']);
     const a = asArr(bound.get('id'));
-    const v = bound.get('val');
+    const v = bound.get('value');
     if (a === null || v === undefined) return NA;
     // TV: returns index if found, else negative insertion hint.
     let lo = 0;
@@ -296,14 +302,21 @@ const binSearch =
     }
     return { kind: 'int', v: -(ins + 1) };
   };
-registerBuiltin('array', 'binary_search', binSearch('any'), { idx: [1], names: ['val'] });
-registerBuiltin('array', 'binary_search_leftmost', binSearch('left'), { idx: [1], names: ['val'] });
-registerBuiltin('array', 'binary_search_rightmost', binSearch('right'), { idx: [1], names: ['val'] });
+registerBuiltin('array', 'binary_search', binSearch('any'), { idx: [1], names: ['value'] });
+registerBuiltin('array', 'binary_search_leftmost', binSearch('left'), { idx: [1], names: ['value'] });
+registerBuiltin('array', 'binary_search_rightmost', binSearch('right'), { idx: [1], names: ['value'] });
 
 // ── Numeric stats ───────────────────────────────────────────────────────────
 
+// Elements stored via array.set/push from a series arg (e.g. `array.set(a, i,
+// ta.sma(close, n))`) keep their `{kind:'series'}` wrapper — evaluate them to
+// the current-bar scalar before the numeric filter, else max/min/sum/avg
+// silently see an empty list and return na (見高K ABC band bug).
 const numsOf = (a: Value[]): number[] =>
-  a.filter((e) => e.kind === 'int' || e.kind === 'float').map((e) => asNum(e));
+  a
+    .map((e) => (e.kind === 'series' ? e.v.cur() : e))
+    .filter((e) => e.kind === 'int' || e.kind === 'float')
+    .map((e) => asNum(e));
 
 const stat1 =
   (f: (xs: number[]) => number | null): BuiltinFn =>

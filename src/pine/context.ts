@@ -93,9 +93,15 @@ const f = (v: number): Value => ({ kind: 'float', v });
  * Series through bar i and return the shared BuiltinCtx (mutated in place —
  * do not retain across bars).
  */
+/**
+ * Forward-only cursor over chart bars. `seek(i)`/`next()` fill every context
+ * Series through bar i and return the shared BuiltinCtx (mutated in place —
+ * do not retain across bars). Live sessions grow the tape via setTape() and
+ * rewrite the forming bar via updateBar() — both keep barCount = tape length.
+ */
 export class BarCtx {
-  readonly bars: BarData[];
-  readonly barCount: number;
+  bars: BarData[];
+  barCount: number;
   readonly open = new BarSeries();
   readonly high = new BarSeries();
   readonly low = new BarSeries();
@@ -151,6 +157,7 @@ export class BarCtx {
       throw new Error(`Pine: bar ${bar} out of range (0..${this.barCount - 1})`);
     }
     if (bar < this.ctxBar) throw new Error(`Pine: BarCtx is forward-only (at ${this.ctxBar}, asked ${bar})`);
+    this.ctx.barCount = this.barCount;
     for (let i = this.ctxBar + 1; i <= bar; i++) this.pushBar(this.bars[i]!);
     this.ctx.barIndex = bar;
     this.ctxBar = bar;
@@ -162,7 +169,38 @@ export class BarCtx {
     return this.ctxBar + 1 >= this.barCount ? null : this.seek(this.ctxBar + 1);
   }
 
+  /** Live-session hook: point the tape at a grown array (same instance,
+   *  appended in place) and publish the new length to ctx. The caller must
+   *  only extend bars — truncation/rewrite of consumed history breaks the
+   *  context series and is rejected by the incremental driver beforehand. */
+  setTape(bars: BarData[]): void {
+    if (bars.length < this.ctxBar + 1) {
+      throw new Error(`Pine: tape shrunk below consumed bar ${this.ctxBar}`);
+    }
+    this.bars = bars;
+    this.barCount = bars.length;
+    this.ctx.barCount = this.barCount;
+  }
+
+  /** Rewrite the bar the cursor sits on (forming-bar tick data). Same-bar
+   *  setAt overwrite — history and later bars untouched. */
+  updateBar(b: BarData): void {
+    this.writeBar(this.ctxBar, b);
+  }
+
+  /** Incremental driver hook: logically move the cursor back after the
+   *  driver rewound the context series to `bar`. The next seek() then
+   *  re-pushes the skipped bars with their (possibly updated) tape data.
+   *  Never call without rewinding the series first — writes would
+   *  double-append. */
+  rewindCursor(bar: number): void {
+    this.ctxBar = bar;
+    this.ctx.barIndex = bar;
+  }
+
   private pushBar(b: BarData): void {
+    // .set() writes lastBar+1 — NOT ctxBar+1: ctxBar only updates after the
+    // seek loop, so a multi-bar seek must append by series position.
     this.open.set(f(b.open));
     this.high.set(f(b.high));
     this.low.set(f(b.low));
@@ -173,6 +211,19 @@ export class BarCtx {
     this.hlc3.set(f((b.high + b.low + b.close) / 3));
     this.ohlc4.set(f((b.open + b.high + b.low + b.close) / 4));
     this.hlcc4.set(f((b.high + b.low + b.close + b.close) / 4));
+  }
+
+  private writeBar(bar: number, b: BarData): void {
+    this.open.setAt(bar, f(b.open));
+    this.high.setAt(bar, f(b.high));
+    this.low.setAt(bar, f(b.low));
+    this.close.setAt(bar, f(b.close));
+    this.volume.setAt(bar, f(b.volume));
+    this.time.setAt(bar, { kind: 'int', v: b.openTime });
+    this.hl2.setAt(bar, f((b.high + b.low) / 2));
+    this.hlc3.setAt(bar, f((b.high + b.low + b.close) / 3));
+    this.ohlc4.setAt(bar, f((b.open + b.high + b.low + b.close) / 4));
+    this.hlcc4.setAt(bar, f((b.high + b.low + b.close + b.close) / 4));
   }
 }
 
@@ -200,4 +251,24 @@ export class MemoryDrawSink implements DrawSink {
     const i = this.objects.indexOf(obj);
     if (i >= 0) this.objects.splice(i, 1);
   }
+
+  // ── incremental-eval snapshot ─────────────────────────────────────────
+  // objectCount + nextId at the committed bar; props payloads are restored
+  // by the driver (it owns the deep clone for container values). Object
+  // IDENTITY is preserved across rewinds — script-held line/label handles
+  // must keep working.
+  incSnap(): DrawSnap {
+    return { nextId: this.nextId, objects: this.objects.slice() };
+  }
+  incRestore(snap: DrawSnap): void {
+    this.nextId = snap.nextId;
+    this.objects.length = 0;
+    for (const o of snap.objects) this.objects.push(o);
+  }
+}
+
+/** MemoryDrawSink checkpoint payload. */
+export interface DrawSnap {
+  nextId: number;
+  objects: DrawObj[];
 }

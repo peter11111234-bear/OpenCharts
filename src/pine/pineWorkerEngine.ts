@@ -13,9 +13,9 @@
 import { PineInterpreterEngine } from './engine';
 import { PineRunClient } from './pineWorkerClient';
 import type { BarData, RunResult } from './contracts';
-import type { RunOptions } from './interpreter';
+import type { ParsedInput, RunOptions, IncLive } from './interpreter';
 
-type SessionOpts = RunOptions & { sessionCtx?: unknown };
+type SessionOpts = RunOptions & { sessionCtx?: unknown; incKey?: string; incHolder?: { live: IncLive | null; active?: boolean } };
 
 export class PineWorkerEngine extends PineInterpreterEngine {
   private readonly clientFactory: () => PineRunClient;
@@ -29,20 +29,28 @@ export class PineWorkerEngine extends PineInterpreterEngine {
     return this.clientFactory();
   }
 
-  protected override runProgram(source: string, barData: BarData[], opts: SessionOpts): Promise<RunResult> {
+  protected override runProgram(parsed: ParsedInput, barData: BarData[], opts: SessionOpts): Promise<RunResult> {
     const client = opts.sessionCtx instanceof PineRunClient ? opts.sessionCtx : undefined;
-    if (!client || client.unavailable) return super.runProgram(source, barData, opts);
+    if (!client || client.unavailable) return super.runProgram(parsed, barData, opts);
     // fetchSeries crosses the boundary as an RPC (stays on this side);
-    // shouldAbort/sessionCtx are dropped — stop() terminates the session's
-    // worker via abortRun rather than polling a flag.
-    const { fetchSeries, shouldAbort: _shouldAbort, sessionCtx: _ctx, ...rest } = opts;
-    return client.run({ source, bars: barData, opts: { ...rest, fetchSeries } }).catch((e: unknown) => {
-      // Construction/transport failure flips client.unavailable → in-process
-      // retry keeps behavior. A 'disposed' rejection (stop raced the run) must
-      // NOT re-run the script the caller already cancelled.
-      if (client.unavailable) return super.runProgram(source, barData, opts);
-      throw e;
-    });
+    // shouldAbort/sessionCtx/incSession are dropped — stop() terminates the
+    // session's worker via abortRun; incHolder is the in-process holder
+    // (non-cloneable) — the worker keys its own sessions by incKey.
+    const { fetchSeries, shouldAbort: _shouldAbort, sessionCtx: _ctx, incHolder, ...rest } = opts;
+    return client.run({ parsed, bars: barData, opts: { ...rest, fetchSeries } })
+      .then((r) => {
+        // Mirror the worker's session liveness into the holder — the engine's
+        // heavy-tick exemption keys off it for the off-thread path.
+        if (incHolder) incHolder.active = client.incAlive;
+        return r;
+      })
+      .catch((e: unknown) => {
+        // Construction/transport failure flips client.unavailable → in-process
+        // retry keeps behavior. A 'disposed' rejection (stop raced the run) must
+        // NOT re-run the script the caller already cancelled.
+        if (client.unavailable) return super.runProgram(parsed, barData, opts);
+        throw e;
+      });
   }
 
   protected override abortRun(sessionCtx: unknown): void {

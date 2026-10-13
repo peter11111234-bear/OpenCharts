@@ -9,12 +9,58 @@
 import './builtins/index';
 import './mtf';
 
-import { runScript } from './interpreter';
+import { incRun, type IncLive, type ParsedInput } from './interpreter';
 import { parse } from './parser';
-import type { BarData } from './contracts';
-import type { FromWorker, ToWorker } from './pineWorkerProto';
-import { marshalError, sanitizeRunResult } from './pineMarshal';
+import type { BarData, RunResult, Value } from './contracts';
+import type { FromWorker, PlotDelta, ToWorker } from './pineWorkerProto';
+import { marshalError, sanitizeRunResult, sanitizeValue } from './pineMarshal';
 
+
+/** Last plots payload sent per run id — the incremental path reuses it to
+ *  ship only the changed tail instead of cloning ~5000 Value objects per
+ *  tick (structured-clone was ~9.5ms at 500 bars × 11 plots). Keyed by the
+ *  client's run id; entries live only for the current session's runs and
+ *  reset whenever a fresh full result goes out. */
+let lastPlots: Map<string, { index: number; len: number; tailV: Value; tailC: string | undefined; opts: unknown }> | null = null;
+
+/** Diff a RunResult's plots against `lastPlots`. Returns deltas when every
+ *  entry resolves to tail-only changes; null when the shape changed (new /
+ *  removed / re-ordered plots or different opts) — caller then sends the
+ *  full sanitized result. */
+function plotsDelta(plots: RunResult['plots']): PlotDelta[] | null {
+  if (!lastPlots) return null;
+  const out: PlotDelta[] = [];
+  for (const [key, p] of plots) {
+    const prev = lastPlots.get(key);
+    const len = p.values.length;
+    if (!prev || prev.index !== p.index || prev.opts !== p.opts) {
+      // New or re-shaped entry — ship it whole.
+      out.push({ key, from: 0, tail: { index: p.index, time: p.time.slice(), values: p.values.slice(), colors: p.colors.slice(), opts: p.opts } });
+      continue;
+    }
+    const shared = Math.min(prev.len, len);
+    const tailIdx = shared - 1;
+    const from = tailIdx >= 0 && (p.values[tailIdx] !== prev.tailV || p.colors[tailIdx] !== prev.tailC)
+      ? tailIdx
+      : shared;
+    if (from === len) {
+      // Nothing changed for this entry — still must record the current len
+      // so a later rollback diff stays correct.
+      prev.len = len;
+      continue;
+    }
+    out.push({ key, from, tail: { index: p.index, time: p.time.slice(from), values: p.values.slice(from), colors: p.colors.slice(from), opts: p.opts } });
+    prev.len = len;
+    prev.tailV = p.values[len - 1]!;
+    prev.tailC = p.colors[len - 1];
+  }
+  for (const key of lastPlots.keys()) if (!plots.has(key)) out.push({ key, from: 0, drop: true });
+  // Track membership for the next diff.
+  for (const [key, p] of plots) {
+    lastPlots.set(key, { index: p.index, len: p.values.length, tailV: p.values[p.values.length - 1] as Value, tailC: p.colors[p.colors.length - 1], opts: p.opts });
+  }
+  return out;
+}
 export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWorker) => void {
   // At most one run in flight — the engine's drain serializes runs per
   // session and each session owns its own worker — so a single fid sequence
@@ -33,6 +79,18 @@ export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWo
 
   const fail = (id: number, e: unknown) => {
     try { post({ t: 'fail', id, error: marshalError(e) }); } catch { /* nothing salvageable */ }
+  };
+  // Live-tick sessions: incKey → IncLive (committed checkpoint + forming-bar
+  // rollback). Bounded — a pooled worker can host a few sessions before the
+  // oldest evicts; evicted = next run just builds a fresh session.
+  const INC_CAP = 8;
+  const incSessions = new Map<string, IncLive | null>();
+  const incPut = (key: string, live: IncLive | null) => {
+    if (incSessions.size >= INC_CAP && !incSessions.has(key)) {
+      const oldest = incSessions.keys().next().value;
+      if (oldest !== undefined) incSessions.delete(oldest);
+    }
+    incSessions.set(key, live);
   };
 
   return (msg) => {
@@ -58,17 +116,48 @@ export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWo
       for (const p of pending.values()) p.rej(new Error('run settled'));
       pending.clear();
     };
+
     try {
-      runScript(parse(msg.source), msg.bars, {
+      const parsed: ParsedInput = msg.parsed ?? parse(msg.source ?? '');
+      const incKey = msg.opts.incKey;
+      const prior = incKey !== undefined ? incSessions.get(incKey) ?? null : null;
+      incRun(parsed, msg.bars, {
         symbol: msg.opts.symbol,
         timeframe: msg.opts.timeframe,
         inputValues: msg.opts.inputValues,
         syminfo: msg.opts.syminfo,
         fetchSeries: msg.opts.hasFetch ? rpcFetch : undefined,
+        incKey,
+        incSession: prior,
       }).then(
-        (r) => {
+        (out) => {
+          if (incKey !== undefined) incPut(incKey, out.live);
           try {
-            post({ t: 'done', id, result: sanitizeRunResult(r) });
+            // Delta path: an advancing session's plots only changed at the
+            // tail — diff BEFORE sanitize (sanitize re-wraps every Value,
+            // which would both cost O(N) per tick and defeat ref-equality).
+            const delta = out.live !== null ? plotsDelta(out.result.plots) : null;
+            lastPlots = null; // full-result runs reset diff state
+            if (delta !== null) {
+              // Sanitize only the delta tails + non-plot surfaces — the plots
+              // map ships EMPTY and the client patches its retained copy.
+              const seen = new Set<object>();
+              for (const d of delta) {
+                if (d.tail) d.tail.values = d.tail.values.map(v => sanitizeValue(v, seen));
+              }
+              const rest = sanitizeRunResult({ ...out.result, plots: new Map() });
+              post({ t: 'done', id, result: rest, plotDelta: delta, incAlive: out.live !== null });
+            } else {
+              const r = sanitizeRunResult(out.result);
+              // Full emit — seed the diff tracker so the next tick can delta.
+              if (out.live !== null) {
+                lastPlots = new Map();
+                for (const [k, p] of out.result.plots) {
+                  lastPlots.set(k, { index: p.index, len: p.values.length, tailV: p.values[p.values.length - 1] as Value, tailC: p.colors[p.colors.length - 1], opts: p.opts });
+                }
+              }
+              post({ t: 'done', id, result: r, incAlive: out.live !== null });
+            }
           } catch (e) {
             // sanitize/post throw must still close the protocol — an uncaught
             // rejection here would hang the client's pending run forever.

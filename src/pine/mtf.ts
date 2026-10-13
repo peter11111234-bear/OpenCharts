@@ -31,7 +31,7 @@
 import type { Arg, BarData, BuiltinCtx, Call, Node, Param, PineType, UdfDecl, Value } from './contracts';
 import { BREAK, CONTINUE, NA, ReturnSignal, Scope, Series } from './contracts';
 import { PineRuntimeError } from './errors';
-import { astChildren, callsiteKey, evalBlock, evalExpr, registerMtf } from './interpreter';
+import { astChildren, callsiteKey, evalBlock, evalExpr, registerMtf, type CtxStateSnap } from './interpreter';
 import { BarSeries, ForwardingSeries, histGetAt, seriesHooks } from './series';
 import { FOR_IN } from './parser';
 import { BUILTINS, CONSTANTS } from './builtins/registry';
@@ -183,6 +183,18 @@ interface SecuritySpec {
   chartHist?: Map<Node, Map<object, BarSeries>>;
   /** Latest chart bar each caller callsite emitted on (emit dedup guard). */
   lastChartBar?: Map<object, number>;
+  /** Post-checkpoint writes to maps/records that outlive the checkpoint —
+   *  restore deletes these keys to roll membership back. Cleared each
+   *  checkpoint; see mtfCheckpoint/mtfRestore. */
+  cw?: CwEntry[];
+}
+
+/** Rollback write-log entries: `{m,k}` deletes key k from map m on restore;
+ *  `{o,k}` deletes own-property k from record o (spec.series). */
+type CwEntry = { m: { delete(k: unknown): boolean }; k: unknown } | { o: Record<string, unknown>; k: string };
+
+function cwMap(spec: SecuritySpec, m: { delete(k: unknown): boolean }, k: unknown): void {
+  spec.cw?.push({ m, k });
 }
 
 interface MtfStore {
@@ -204,6 +216,19 @@ let store: MtfStore = newStore();
 export function resetMtf(): void {
   store = newStore();
 }
+
+// ── incremental checkpoint support ─────────────────────────────────────────
+// The interpreter owns cloneDeep/ctx.state walkers; bound at registration.
+
+let cloneH: (<T>(v: T, ids: Map<unknown, unknown>) => T) | null = null;
+let snapStateH: ((state: Map<unknown, unknown> | undefined, ids: Map<unknown, unknown>) => CtxStateSnap) | null = null;
+let restoreStateH: ((ck: CtxStateSnap, bar: number, ids: Map<unknown, unknown>) => void) | null = null;
+
+/** The store a session's prepareSecurity produced — sessions stash it so a
+ *  sibling run can't wipe spec state; incAdvance re-activates it per run. */
+function sessionStore(): unknown { return store; }
+
+function activateStore(s: unknown): void { store = s as MtfStore; }
 
 // ── AST walk ────────────────────────────────────────────────────────────────
 
@@ -599,6 +624,60 @@ export async function prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, allBars?:
     if (sym === DYNAMIC || tf === DYNAMIC) continue;
     spec.bars = store.fetched.get(`${sym}\n${tf}`) ?? [];
   }
+}
+
+/** Live-session refresh: re-fetch every spec's feed. Called from incAdvance
+ *  when the chart tape grew — higher-tf bars may have closed since the
+ *  session's first prefetch. Identical content keeps the spec's tf frame
+ *  (rollback surface untouched); changed content resets it so the next
+ *  eval rebuilds against the longer history. Dynamic specs pick the fresh
+ *  array up from store.fetched on their next call. */
+export async function refreshSecurity(ctx: BuiltinCtx, _frame?: Frame): Promise<void> {
+  const PREFETCH_TIMEOUT_MS = 30_000;
+  const chartTicker = ctx.syminfo?.tickerid?.kind === 'string' ? ctx.syminfo.tickerid.v : CHART_SYM;
+  const jobs = new Map<string, Promise<BarData[]>>();
+  const keys: string[] = [];
+  for (const spec of store.byNode.values()) {
+    const sym = resolvedSym(spec) === CHART_SYM ? chartTicker : resolvedSym(spec);
+    const tf = resolvedTf(spec);
+    if (sym === DYNAMIC || tf === DYNAMIC) continue;
+    const key = `${sym}\n${tf}`;
+    if (jobs.has(key)) continue;
+    keys.push(key);
+    const job = ctx.fetchSeries
+      ? Promise.resolve().then(() => ctx.fetchSeries!(sym, tf))
+      : Promise.resolve<BarData[]>([]);
+    jobs.set(key, Promise.race([
+      job,
+      (() => {
+        const { promise, reject } = Promise.withResolvers<BarData[]>();
+        setTimeout(() => reject(new Error(`fetchSeries timeout ${PREFETCH_TIMEOUT_MS}ms`)), PREFETCH_TIMEOUT_MS);
+        return promise;
+      })(),
+    ]).catch((e) => {
+      console.warn(`[pine] refresh ${sym} ${tf} failed:`, e instanceof Error ? e.message : e);
+      return store.fetched.get(key) ?? ([] as BarData[]); // stale beats empty
+    }));
+  }
+  const results = await Promise.all(keys.map(k => jobs.get(k)!));
+  const sameFeed = (a: BarData[] | null, b: BarData[]): boolean =>
+    a !== null && a.length === b.length &&
+    (a.length === 0 || (a[0]!.openTime === b[0]!.openTime && a[a.length - 1]!.closeTime === b[b.length - 1]!.closeTime));
+  keys.forEach((k, i) => {
+    const fresh = results[i]!;
+    const old = store.fetched.get(k);
+    if (old && sameFeed(old, fresh)) return; // content identical — keep identity
+    store.fetched.set(k, fresh);
+    for (const spec of store.byNode.values()) {
+      const sym = resolvedSym(spec) === CHART_SYM ? chartTicker : resolvedSym(spec);
+      const tf = resolvedTf(spec);
+      if (`${sym}\n${tf}` !== k) continue;
+      if (spec.bars !== fresh) {
+        spec.bars = fresh;
+        resetTfFrame(spec); // longer history → rebuild tf state lazily
+      }
+    }
+  });
 }
 
 /** Names of file-level globals referenced anywhere inside `node`. */
@@ -1636,6 +1715,7 @@ function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
     if (!(v.kind in MUTABLE_KINDS)) {
       let by = m.get(node);
       if (!by) { by = new Map(); m.set(node, by); }
+      cwMap(spec, by, j);
       by.set(j, v);
       return v;
     }
@@ -1652,9 +1732,11 @@ function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
   let byCaller = m?.get(caller);
   if (!byCaller) {
     byCaller = new Map();
-    if (!m) { m = new Map(); spec.nodeCache.set(node, m); }
+    if (!m) { m = new Map(); cwMap(spec, spec.nodeCache, node); spec.nodeCache.set(node, m); }
+    cwMap(spec, m, caller);
     m.set(caller, byCaller);
   }
+  cwMap(spec, byCaller, j);
   byCaller.set(j, v);
   return v;
 }
@@ -1859,9 +1941,9 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   const emit = (e: Node, v: Value): void => {
     const hist = (spec.chartHist ??= new Map());
     let by = hist.get(e);
-    if (!by) { by = new Map(); hist.set(e, by); }
+    if (!by) { by = new Map(); cwMap(spec, hist, e); hist.set(e, by); }
     let s = by.get(callerKey);
-    if (!s) { s = new BarSeries(); by.set(callerKey, s); }
+    if (!s) { s = new BarSeries(); cwMap(spec, by, callerKey); by.set(callerKey, s); }
     s.setAt(ctx.barIndex, v.kind === 'series' ? v.v.cur() : v);
   };
   const emitAll = (v: Value): void => {
@@ -1872,6 +1954,7 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
       const arr = v.kind === 'array' ? v.v : [];
       spec.exprs.forEach((e, i) => emit(e, arr[i] ?? NA));
     }
+    cwMap(spec, last, callerKey);
     last.set(callerKey, ctx.barIndex);
   };
 
@@ -1884,6 +1967,7 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
       emitAll(NA);
       return NA;                                // only first chart bar per tf bar emits
     }
+    cwMap(spec, emitted, callerKey);
     emitted.set(callerKey, j);
   }
 
@@ -1919,10 +2003,184 @@ function runConst(node: Node, frame: Frame): string | null {
   } catch { return null; }
 }
 
+// ── per-spec checkpoint / restore ───────────────────────────────────────────
+
+/** Snapshot of one SecuritySpec's rollback surface. Series inside
+ *  `series`/`chartHist` rewind via their own snaps; maps that gain entries
+ *  post-checkpoint roll back through spec.cw (the write-log). */
+interface SpecSnap {
+  loaded: number;
+  varUpto: number;
+  ltfEvaledThrough: number;
+  warmed: boolean | undefined;
+  varInited: Set<string>;
+  warned: Set<string>;
+  lastEmit: Map<object, number> | undefined;
+  lastChartBar: Map<object, number> | undefined;
+  agnosticCache: SecuritySpec['agnosticCache'];
+  nodeCache: SecuritySpec['nodeCache'];
+  durableCache: SecuritySpec['durableCache'];
+  chartHist: SecuritySpec['chartHist'];
+  ctx: SecuritySpec['ctx'];
+  scope: SecuritySpec['scope'];
+  pivot: SecuritySpec['pivot'];
+  varScope: SecuritySpec['varScope'];
+  callerScope: SecuritySpec['callerScope'];
+  callerKey: SecuritySpec['callerKey'];
+  series: SecuritySpec['series'];
+  bars: SecuritySpec['bars'];
+  scopeVars: Map<string, Series | Value>;
+  varScopeVars: Map<string, Series | Value>;
+  ctxState: CtxStateSnap | null;
+  ctxBar: number;
+  /** tfBar boundary for ctx.state memo pruning — post-rollback only bars
+   *  up to this are trusted. */
+  stateBound: number;
+  /** [series, snap] pairs across spec.series + chartHist leaves. */
+  snaps: [BarSeries, ReturnType<BarSeries['incSnap']>][];
+}
+
+function snapSpec(spec: SecuritySpec, ids: Map<unknown, unknown>): SpecSnap {
+  const snaps: SpecSnap['snaps'] = [];
+  for (const se of Object.values(spec.series)) if (se instanceof BarSeries) snaps.push([se, se.incSnap()]);
+  for (const by of spec.chartHist?.values() ?? []) {
+    for (const se of by.values()) if (se instanceof BarSeries) snaps.push([se, se.incSnap()]);
+  }
+  const scopeVars = new Map<string, Series | Value>();
+  if (spec.scope) for (const [n, v] of spec.scope.varsCopy()) scopeVars.set(n, cloneH!(v, ids));
+  const varScopeVars = new Map<string, Series | Value>();
+  if (spec.varScope) for (const [n, v] of spec.varScope.varsCopy()) varScopeVars.set(n, cloneH!(v, ids));
+  // lookahead_on / ltf specs may have evaluated a still-forming tf bar — its
+  // ctx.state memos at the tail aren't trustworthy, so bound pruning one bar
+  // earlier. lookahead_off only ever touches completed bars.
+  const tailRisk = spec.lookahead === 'on' || spec.isLtf;
+  const stateBound = tailRisk ? spec.loaded - 2 : spec.loaded - 1;
+  return {
+    loaded: spec.loaded,
+    varUpto: spec.varUpto,
+    ltfEvaledThrough: spec.ltfEvaledThrough,
+    warmed: spec.warmed,
+    varInited: new Set(spec.varInited),
+    warned: new Set(spec.warned),
+    lastEmit: spec.lastEmit ? new Map(spec.lastEmit) : undefined,
+    lastChartBar: spec.lastChartBar ? new Map(spec.lastChartBar) : undefined,
+    agnosticCache: spec.agnosticCache,
+    nodeCache: spec.nodeCache,
+    durableCache: spec.durableCache,
+    chartHist: spec.chartHist,
+    ctx: spec.ctx,
+    scope: spec.scope,
+    pivot: spec.pivot,
+    varScope: spec.varScope,
+    callerScope: spec.callerScope,
+    callerKey: spec.callerKey,
+    series: spec.series,
+    bars: spec.bars,
+    scopeVars,
+    varScopeVars,
+    ctxState: snapStateH ? snapStateH((spec.ctx as { state?: Map<unknown, unknown> } | null)?.state, ids) : null,
+    ctxBar: spec.ctx?.barIndex ?? 0,
+    stateBound,
+    snaps,
+  };
+}
+
+function restoreSpec(spec: SecuritySpec, ck: SpecSnap, ids: Map<unknown, unknown>): void {
+  // Post-checkpoint writes to long-lived maps — delete logged keys.
+  if (spec.cw) {
+    for (const e of spec.cw) {
+      if ('m' in e) e.m.delete(e.k);
+      else delete e.o[e.k];
+    }
+    spec.cw.length = 0;
+  }
+  spec.loaded = ck.loaded;
+  spec.varUpto = ck.varUpto;
+  spec.ltfEvaledThrough = ck.ltfEvaledThrough;
+  spec.warmed = ck.warmed;
+  spec.varInited = new Set(ck.varInited);
+  spec.warned = new Set(ck.warned);
+  spec.lastEmit = ck.lastEmit ? new Map(ck.lastEmit) : undefined;
+  spec.lastChartBar = ck.lastChartBar ? new Map(ck.lastChartBar) : undefined;
+  spec.agnosticCache = ck.agnosticCache;
+  spec.nodeCache = ck.nodeCache;
+  spec.durableCache = ck.durableCache;
+  spec.chartHist = ck.chartHist;
+  spec.ctx = ck.ctx;
+  spec.scope = ck.scope;
+  spec.pivot = ck.pivot;
+  spec.varScope = ck.varScope;
+  spec.callerScope = ck.callerScope;
+  spec.callerKey = ck.callerKey;
+  spec.series = ck.series;
+  spec.bars = ck.bars;
+  // Drop series entries added after the checkpoint, then rewind survivors.
+  for (const name of Object.keys(spec.series)) {
+    if (!ck.series[name]) delete spec.series[name];
+  }
+  const snapMap = new Map<BarSeries, ReturnType<BarSeries['incSnap']>>(ck.snaps);
+  for (const se of Object.values(spec.series)) {
+    if (se instanceof BarSeries) se.incRewind(snapMap.get(se) ?? null);
+  }
+  for (const by of spec.chartHist?.values() ?? []) {
+    for (const k of [...by.keys()]) {
+      const se = by.get(k);
+      if (se instanceof BarSeries) {
+        const snap = snapMap.get(se);
+        if (snap === undefined) by.delete(k); // born post-checkpoint
+        else se.incRewind(snap);
+      }
+    }
+  }
+  spec.scope?.varsRestore(new Map([...ck.scopeVars].map(([n, v]) => [n, cloneH!(v, ids)])));
+  spec.varScope?.varsRestore(new Map([...ck.varScopeVars].map(([n, v]) => [n, cloneH!(v, ids)])));
+  if (spec.ctx && ck.ctxState) {
+    spec.ctx.barIndex = ck.ctxBar;
+    restoreStateH?.(ck.ctxState, ck.stateBound, ids);
+  }
+  // lookahead_on / ltf: the tail tf bar may have been still-forming at the
+  // checkpoint — its eval state is untrusted. Drop eval caches entirely (they
+  // refill lazily) and step `loaded` back so advanceTo repushes the tail bar
+  // with its newest data.
+  if (spec.lookahead === 'on' || spec.isLtf) {
+    spec.nodeCache = new Map();
+    spec.durableCache = null;
+    spec.agnosticCache?.clear();
+    spec.loaded = Math.max(0, spec.loaded - 1);
+    spec.ltfEvaledThrough = Math.min(spec.ltfEvaledThrough, spec.loaded - 1);
+  }
+}
+
+interface MtfSnap { store: MtfStore; specs: [SecuritySpec, SpecSnap][]; }
+
+function mtfCheckpoint(): unknown {
+  const ids = new Map<unknown, unknown>();
+  const specs: [SecuritySpec, SpecSnap][] = [];
+  for (const spec of store.byNode.values()) {
+    spec.cw ??= [];
+    specs.push([spec, snapSpec(spec, ids)]);
+    spec.cw.length = 0; // baseline — post-checkpoint writes accumulate here
+  }
+  return { store, specs } satisfies MtfSnap;
+}
+
+function mtfRestore(snap: unknown): void {
+  const s = snap as MtfSnap;
+  store = s.store;
+  const ids = new Map<unknown, unknown>();
+  for (const [spec, ck] of s.specs) restoreSpec(spec, ck, ids);
+}
+
 
 // ── interpreter registration seam ───────────────────────────────────────────
 // interpreter.ts can't statically import this module (it keeps the dependency
 // direction acyclic), so we register ourselves. `builtins/request.ts` imports
 // mtf for this side effect; engine/tests should import builtins/index.
 
-registerMtf({ tryEvalSecurity, prepareSecurity, prefetchSecurity });
+registerMtf({
+  tryEvalSecurity, prepareSecurity, prefetchSecurity,
+  sessionStore, activate: activateStore, refresh: refreshSecurity,
+  checkpoint: () => mtfCheckpoint(),
+  restore: mtfRestore,
+  bindSnap: (c, sn, rs) => { cloneH = c; snapStateH = sn; restoreStateH = rs; },
+});

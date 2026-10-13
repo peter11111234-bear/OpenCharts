@@ -174,6 +174,18 @@ export class Scope {
   has(name: string): boolean {
     return this.vars.has(name) || (this.parent?.has(name) ?? false);
   }
+
+  // ── incremental-eval snapshot ─────────────────────────────────────────
+  // Top-level scope bindings roll back with the forming bar: the driver
+  // copies the map at checkpoint and restores it before each re-eval.
+  // Container Values still need the driver's deep clone — this is a
+  // shallow binding table, nothing more.
+  varsCopy(): Map<string, Series | Value> {
+    return new Map(this.vars);
+  }
+  varsRestore(copy: Map<string, Series | Value>): void {
+    this.vars = new Map(copy);
+  }
 }
 
 // ── Builtins ────────────────────────────────────────────────────────────────

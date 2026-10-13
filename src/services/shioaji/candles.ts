@@ -157,7 +157,12 @@ export async function getShioajiHistory(
   if (range && range.toMs > range.fromMs) {
     const fromSec = Math.floor(range.fromMs / 1000);
     const toSec = Math.floor(range.toMs / 1000);
-    return out.filter((b) => b.time >= fromSec && b.time <= toSec);
+    const win = out.filter((b) => b.time >= fromSec && b.time <= toSec);
+    // The window branch used to return EVERY bar in [from,to] — a Vela-supplied
+    // window (e.g. "since session open") then bypassed `want` entirely and the
+    // engine evaluated thousands of bars per first paint. Cap to `want` (tail =
+    // newest) exactly like the non-window branch.
+    return win.length > want ? win.slice(-want) : win;
   }
   return out.length > want ? out.slice(-want) : out;
 }

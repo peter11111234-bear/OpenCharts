@@ -26,6 +26,11 @@ function N(n: Node): number {
   if (i === undefined) { i = ++nextIdx; idxOf.set(n, i); }
   return i;
 }
+/** Hoisted R.call arg-descriptor array literals — emitted once per compile as
+ *  `const __ds=[...]` so callsites don't re-allocate [{k,x,i,f}] every bar.
+ *  Descriptors are read-only (jitMatArg/bindArgsJit only read fields); thunk
+ *  `f` closures capture the `R` param, live at function-body scope. */
+let dsDefs: string[] = [];
 
 function expr(n: Node): Emit {
   switch (n.type) {
@@ -81,7 +86,10 @@ function expr(n: Node): Emit {
       // args keep series for CowSeries; X.new takes raw evalExpr values).
       const args = n.args.map(a => arg(a));
       if (args.some(a => !a.ok)) return no;
-      return { ok: true, code: `R.call(${N(n)},[${args.map(a => a.ok ? a.code : '').join(',')}])` };
+      // Hoist the descriptor array into `__ds` — one allocation per compile,
+      // not per bar. The array and its entries are never mutated.
+      const k = dsDefs.push(`[${args.map(a => a.ok ? a.code : '').join(',')}]`) - 1;
+      return { ok: true, code: `R.call(${N(n)},__ds[${k}])` };
     }
     default: return no;
   }
@@ -217,16 +225,17 @@ export interface JitCompileResult {
 }
 
 export function jitCompile(body: Node[]): JitCompileResult {
-  nextIdx = 0;
+  nextIdx = 0; dsDefs = [];
   const table = collectAll(body);
-  const src = body.map((s, i) => {
+  let native = 0, fallback = 0;
+  const parts = body.map((s, i) => {
     const e = stmt(s, 0);
     const inner = e.ok ? e.code : `R.evalStmt(${N(s)});`;
+    e.ok ? native++ : fallback++;
     // topStmtIdx per stmt — slotFor's ensureList pruning reads it.
     return `run.topStmtIdx=${i};\ntry{\n${inner}\n}catch(e){R.stmtErr(e,${N(s)});}`;
   }).join('\n');
-  let native = 0, fallback = 0;
-  for (const s of body) (stmt(s, 0).ok ? native++ : fallback++);
+  const src = `const __ds=[${dsDefs.join(',')}];\n` + parts;
   return { src, nodeTable: table, native, fallback };
 }
 
@@ -235,20 +244,22 @@ export function jitCompile(body: Node[]): JitCompileResult {
  * evalBlock semantics. `run.topStmtIdx` stays -1 throughout (UDF decls always
  * register for ensureBar). Single-expr bodies emit a bare `return`. */
 export function jitCompileUdf(body: Node | Node[]): JitCompileResult {
-  nextIdx = 0;
+  nextIdx = 0; dsDefs = [];
   if (!Array.isArray(body)) {
     const table = collectAll([body]);
     const e = expr(body);
-    const src = e.ok ? `return ${e.code};` : `return R.evalStmt(${N(body)});`;
+    const src = `const __ds=[${dsDefs.join(',')}];\n` +
+      (e.ok ? `return ${e.code};` : `return R.evalStmt(${N(body)});`);
     return { src, nodeTable: table, native: e.ok ? 1 : 0, fallback: e.ok ? 0 : 1 };
   }
   const table = collectAll(body);
-  const src = `let __ret=R.VOID;\n` + body.map(s => {
+  let native = 0, fallback = 0;
+  const parts = body.map(s => {
     const e = stmt(s, 0, '__ret');
     const inner = e.ok ? e.code : `__ret=R.evalStmt(${N(s)});`;
+    e.ok ? native++ : fallback++;
     return `try{\n${inner}\n}catch(e){R.stmtErr(e,${N(s)});}`;
-  }).join('\n') + `\nreturn __ret;`;
-  let native = 0, fallback = 0;
-  for (const s of body) (stmt(s, 0, '__ret').ok ? native++ : fallback++);
+  }).join('\n');
+  const src = `const __ds=[${dsDefs.join(',')}];\nlet __ret=R.VOID;\n` + parts + `\nreturn __ret;`;
   return { src, nodeTable: table, native, fallback };
 }

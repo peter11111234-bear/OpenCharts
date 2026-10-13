@@ -36,12 +36,14 @@ import {
   type BuiltinFn,
   type Call,
   type ForStmt,
+  type DrawObj,
   type HistRef,
   type IndicatorDecl,
   type InputSchemaLite,
   type Member,
   type Node,
   type Param,
+  type PlotSink,
   type PlotOpts,
   type Reassign,
   type RunResult,
@@ -53,9 +55,9 @@ import {
 } from './contracts';
 import { PineRuntimeError, pineErr, wrapPineError } from './errors';
 import { FOR_IN } from './parser';
-import { BarSeries, ForwardingSeries, LitSeries, histGetAt, valueAt } from './series';
+import { BarSeries, ForwardingSeries, LitSeries, histGetAt, setActiveSeriesSet, valueAt, type IncSnap } from './series';
 import { Scope, blockFrame, seriesOf, type Frame } from './scope';
-import { BarCtx, MemoryDrawSink } from './context';
+import { BarCtx, MemoryDrawSink, type DrawSnap } from './context';
 import { BUILTINS, HIST_BUILTINS, getConstant, histSpecHas, kindBuiltin, registerConstant } from './builtins/registry';
 import { truthy, drainBindWarnings, type RtCtx } from './builtins/util';
 import { declDrawQuotas, INDICATOR_DECL_ORDER } from './builtins/draw';
@@ -84,10 +86,28 @@ export interface MtfHooks {
   tryEvalSecurity(node: Node, frame: Frame): Value | null;
   prepareSecurity(body: Node[], frame0?: unknown): void;
   prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, chartBars?: BarData[]): Promise<void>;
+  /** The store the last prepareSecurity created — buildSess stashes it on
+   *  the session so a sibling run's prepareSecurity can't wipe it. */
+  sessionStore?(): unknown;
+  /** Make this session's MTF store the active one before evaluation. */
+  activate?(store: unknown): void;
+  /** Checkpoint the ACTIVE store's per-spec tf state (snap carries the
+   *  store so restore works regardless of which store is active). */
+  checkpoint?(sess: PineSess): unknown;
+  restore?(snap: unknown): void;
+  /** Refetch every spec's feed for a live session (tape grew → higher-tf
+   *  bars may have closed). No-op for stores without specs. */
+  refresh?(ctx: BuiltinCtx, frame?: Frame): Promise<void>;
   /** mtf.ts binds evaluator adapters for its tf child frames. */
   bindEval?: (
     e: (n: Node, s: Scope, c: BuiltinCtx) => Value,
     b: (st: Node[], s: Scope, c: BuiltinCtx) => Value,
+  ) => void;
+  /** mtf.ts binds the checkpoint helpers (cloneDeep/ctx.state walkers). */
+  bindSnap?: (
+    c: <T>(v: T, ids: Map<unknown, unknown>) => T,
+    sn: (state: Map<unknown, unknown> | undefined, ids: Map<unknown, unknown>) => CtxStateSnap,
+    rs: (ck: CtxStateSnap, bar: number, ids: Map<unknown, unknown>) => void,
   ) => void;
 }
 
@@ -99,6 +119,7 @@ export function registerMtf(h: MtfHooks): void {
     (n, s, c) => evalExpr(n, { scope: s, ctx: c }),
     (st, s, c) => evalBlock(st, { scope: s, ctx: c }),
   );
+  h.bindSnap?.(cloneDeep, snapCtxState, restoreCtxState);
 }
 
 // ── per-run state ─────────────────────────────────────────────────────────────
@@ -157,7 +178,7 @@ interface RunState {
   /** callsite key → param name → persistent CowSeries (UDF-local series carry bar history). */
   paramCows: Map<object, Map<string, CowSeries>>;
   /** UDF body Node[] → compiled JitState (lazy; undefined until first use). */
-  udfJit: WeakMap<Node[], JitState>;
+  udfJit: WeakMap<Node[], JitState | null>;
  /** Call node → selfType → resolved UdtMethodDef (null = none). Registry
   *  resets per runScript, so the cache lives on RunState, not module level. */
  udtMethodCache: WeakMap<Node, Map<string, UdtMethodDef | null>>;
@@ -292,6 +313,18 @@ class CowSeries extends ForwardingSeries {
   override set(v: Value): void {
     if (this.cow) this.cow.set(v);
     else this.writable(0).set(v);
+  }
+
+  /** Incremental driver: snapshot the materialized copy (or its absence). */
+  incCowGet(): { cow: BarSeries; snap: IncSnap } | null {
+    return this.cow ? { cow: this.cow, snap: this.cow.incSnap() } : null;
+  }
+  /** Restore the materialized copy: null un-materializes; else re-link the
+   *  snap's cow (rebind may have spawned a twin CowSeries since). */
+  incCowSet(v: { cow: BarSeries; snap: IncSnap } | null): void {
+    if (v === null) { this.cow = null; return; }
+    v.cow.incRewind(v.snap);
+    this.cow = v.cow;
   }
   override get(n: number): Value {
     return (this.cow ?? this.inner).get(n);
@@ -2062,18 +2095,23 @@ function jitEnabled(): boolean {
   return false;
 }
 
-/** UDF-body JIT — default ON. R12 re-measured on the REAL K4.55 workload
- * (all 195 builtins; earlier benches ran a builtins-less bundle so both the
- * R11 "jit loses" verdict and R12b's −38% were artifacts): jitUdf
- * 9.94–10.98ms/bar vs interp 12.8–14.5 (~20–25% win), K4.55 plot output
- * bit-identical, UDF-heavy micro-bench ~60% win, full suite green.
- * Opt out via `__pineNoJitUdf=true` / PINE_JIT_UDF=0. `__pineJit` implies it.
- * Compile failures silently fall back to the interpreted body. */
+/** UDF-body JIT — default OFF since 2026-10-11. R12's −38% was measured
+ *  before R13/R14 reworked the interpreted path (siteCtx hoist, paramFlags,
+ *  histSpecHas); re-measured on both real scripts the JIT is now a net loss
+ *  everywhere: MACD雙周期V7 5.75→4.47 ms/bar off, K4.55 4.12→3.14 off, even a
+ *  10-stmt hot UDF loses (79 vs 67ms). The call preamble + scope swap cost
+ *  more than the emit saves. Opt back in via `__pineJitUdf=true` /
+ *  PINE_JIT_UDF=1; `__pineNoJitUdf` / PINE_JIT_UDF=0 also forces off.
+ *  Compile failures silently fall back to the interpreted body. */
 function udfJitEnabled(): boolean {
   const g = globalThis as Record<string, unknown>;
+  // NoJit wins over Jit when both flags exist — a stale off-flag must not
+  // be overridden by an experiment opt-in left set on globalThis.
   if (g.__pineNoJitUdf === true) return false;
   if (typeof process !== 'undefined' && process.env?.PINE_JIT_UDF === '0') return false;
-  return true;
+  if (g.__pineJitUdf === true) return true;
+  if (typeof process !== 'undefined' && process.env?.PINE_JIT_UDF === '1') return true;
+  return false;
 }
 
 /** Compile-or-fetch the per-UDF-body JitState. Cached on run.udfJit keyed by
@@ -2083,7 +2121,19 @@ function udfJitState(body: Node[], run: RunState, ctx: BuiltinCtx): JitState | n
   let js = run.udfJit.get(body);
   if (js !== undefined) return js;
   try {
-    const { src, nodeTable } = jitCompileUdf(body);
+    const { src, nodeTable, native, fallback } = jitCompileUdf(body);
+    // Two gates, both measured on MACD雙周期V7 (15 UDF bodies, all <6 stmts):
+    //   size — UDF-JIT nets −20% on small bodies (call preamble + scope swap
+    //          never amortize, even at 100% native emit). Threshold 8 stmts
+    //          keeps K4.55's large-body −38% win.
+    //   coverage — a large body mostly falling back to R.evalStmt pays the
+    //          preamble on top of the interp work it still does.
+    // Cache null so the gate runs once per body, not per call.
+    if (body.length < 8 || native < fallback) {
+      run.udfJit.set(body, null);
+      __pineJitStats.udfGated++;
+      return null;
+    }
     const fn = new Function('R', 'run', 'nodes', `"use strict";\n${src}`) as JitState['fn'];
     js = { fn, nodes: nodeTable, cur: null as unknown as Frame, scopeStack: [], save: [], udfR: undefined };
     js.udfR = jitRuntime(js, run, ctx);
@@ -2104,7 +2154,7 @@ function udfJitState(body: Node[], run: RunState, ctx: BuiltinCtx): JitState | n
  * litFastPath), `e` deferred expr thunk, `x` nodeTable idx for callHist keys. */
 type JitArg = { k: 'i' | 'l' | 'e'; x: number; i?: string; n?: string; f?: () => Value };
 
-export const __pineJitStats = { runs: 0, native: 0, fallback: 0, compileMs: 0, udfRuns: 0, udfCompiled: 0 };
+export const __pineJitStats = { runs: 0, native: 0, fallback: 0, compileMs: 0, udfRuns: 0, udfCompiled: 0, udfGated: 0 };
 
 interface JitState {
   fn: (R: unknown, run: RunState, nodes: Node[]) => Value;
@@ -2490,6 +2540,13 @@ export interface RunOptions {
   syminfo?: Record<string, Value>;
   /** Called at each macrotask yield during the bar loop; truthy = caller superseded this run, bail out. */
   shouldAbort?: () => boolean;
+  /** Content-derived incremental-session key — the caller (worker or engine
+   *  holder) persists the IncLive under it; identical key + extended tape
+   *  resumes at the committed checkpoint instead of a full re-run. */
+  incKey?: string;
+  /** Previously returned live session for this key — in-process callers
+   *  carry it; the worker keys its own map. */
+  incSession?: IncLive | null;
 }
 
 export type ParsedInput =
@@ -2541,34 +2598,72 @@ export function runScript(
   return p;
 }
 
-async function runScriptInner(
+/** A resumable script execution — everything a live tick session must keep
+ *  alive between runs: ctx, top scope, run state, compiled bodies, and the
+ *  series registry used by the incremental driver for rollback. */
+interface PineSess {
+  decl: IndicatorDecl | StrategyDecl | null;
+  body: Node[];
+  barCtx: BarCtx;
+  ctx: RtCtx;
+  drawSink: MemoryDrawSink;
+  run: RunState;
+  scope: Scope;
+  frame0: Frame;
+  compiledBody: CompiledStmt[] | null;
+  jit: JitState | null;
+  jitR: JitRt | null;
+  /** Per-plot-sink assembled-array cache — append-only across incremental
+   *  ticks (see PlotEmitCache). Undefined for one-shot sessions. */
+  emitCache?: Map<PlotSink, PlotEmitCache>;
+  /** Every BarSeries born while this session evaluates — the incremental
+   *  driver snapshots and rewinds them. */
+  seriesSet: Set<BarSeries>;
+  /** This session's MTF store (request.* scripts) — re-activated per run so
+   *  sibling runs can't wipe its spec state. */
+  mtf?: unknown;
+}
+
+/** jitRuntime's public surface — named once so PineSess doesn't re-derive it. */
+type JitRt = ReturnType<typeof jitRuntime>;
+
+const emptyResult = (body: Node[], decl: IndicatorDecl | StrategyDecl | null): RunResult => ({
+  plots: new Map(),
+  drawings: [],
+  fills: [],
+  bgcolors: new Map(),
+  barcolors: new Map(),
+  alerts: [],
+  alertconditions: [],
+  warnings: [],
+  inputs: collectInputs(body),
+  props: declProps(decl),
+  title: declTitle(decl) ?? '',
+  shorttitle: declShortTitle(decl),
+  overlay: declOverlay(decl),
+});
+
+/** Build a session: ctx/scope/dispatch tables + MTF prefetch. Shared by
+ *  runScriptInner (one-shot) and the incremental driver (resume). */
+async function buildSess(
   parsed: ParsedInput,
   bars: BarData[],
-  opts: RunOptions = {},
-): Promise<RunResult> {
+  opts: RunOptions,
+  /** Incremental sessions pass a set so every BarSeries born inside (ctx
+   *  series + evaluation-time) registers for rollback. Null = one-shot. */
+  seriesSet: Set<BarSeries> | null = null,
+): Promise<PineSess | null> {
   const decl = Array.isArray(parsed) ? null : (parsed.decl ?? null);
   const body = Array.isArray(parsed) ? parsed : parsed.body;
+  // Register ctx-series births (BarCtx ctor) into the incremental set too —
+  // rewind rewrites them wholesale, but membership keeps parity checks cheap.
+  if (seriesSet) setActiveSeriesSet(seriesSet);
 
   // UDT registries are module globals — clear types/methods/scope from any
   // previous run before this script's decls re-register.
   UDT_REGISTRY.reset();
 
-  const empty = (): RunResult => ({
-    plots: new Map(),
-    drawings: [],
-    fills: [],
-    bgcolors: new Map(),
-    barcolors: new Map(),
-    alerts: [],
-    alertconditions: [],
-    warnings: [],
-    inputs: collectInputs(body),
-    props: declProps(decl),
-    title: declTitle(decl) ?? '',
-    shorttitle: declShortTitle(decl),
-    overlay: declOverlay(decl),
-  });
-  if (bars.length === 0) return empty();
+  if (bars.length === 0) return null;
 
   const ctxRef: { current: BuiltinCtx | null } = { current: null };
   const barCtx = new BarCtx(bars, {
@@ -2614,6 +2709,11 @@ async function runScriptInner(
   // commission, process_orders_on_close, default_qty…). indicator() decl
   // fields are read directly via declProps/declTitle/etc.
   if (decl?.type === 'strategy') strategyDecl(ctx, decl);
+  // indicator(...) decl is likewise stripped from `body`, so its draw quotas
+  // (max_lines_count / max_labels_count / max_boxes_count) must be read here —
+  // otherwise every drawing kind falls back to DEFAULT_QUOTA=50 and scripts
+  // declaring 500 lose most of their lines/labels/boxes (見高K zigzag case).
+  else if (decl?.type === 'indicator') declDrawQuotas(ctx, decl.args, INDICATOR_DECL_ORDER);
 
   // Bind context series + globals into the top scope.
   const bound: Record<string, Series> = {
@@ -2651,10 +2751,11 @@ async function runScriptInner(
     await mtf.prefetchSecurity(ctx, frame0, bars);
     (globalThis as Record<string, unknown>).__pineStage = 'barloop';
   }
-  // A stopped run pays full prefetch otherwise — check before the bar loop.
-  if (opts.shouldAbort?.()) return empty();
+  // Stash the store on the session — incremental resumes re-activate it
+  // before each tick so sibling runs can't wipe spec state.
+  const mtfStore = mtf?.sessionStore?.();
 
-  // ── bar loop ──
+  // ── bar-loop dispatch tables ──
   // Static early-exit scan: the first top-level stmt that may skip the rest
   // of the body (bare or if/switch-arm break/continue/return) caps pruning —
   // decls at or after it aren't provably written every bar, so their slots
@@ -2663,8 +2764,6 @@ async function runScriptInner(
   for (let i = 0; i < body.length; i++) {
     if (stmtMayExitTop(body[i]!, false, false)) { run.pruneCutoff = i; break; }
   }
-  let barErr: PineRuntimeError | null = null;
-  let sliceStart = nowMs();
   // Slice-D: compile the top-level body once per run. Fallback stmts keep
   // evalExpr; topStmtIdx bookkeeping is identical either way.
   const compiledBody: CompiledStmt[] | null =
@@ -2674,7 +2773,7 @@ async function runScriptInner(
   // compiled fn. Falls back to the compiled/interpreted path on any setup
   // failure (transpile throw, new Function CSP, malformed node table).
   let jit: JitState | null = null;
-  let jitR: ReturnType<typeof jitRuntime> | null = null;
+  let jitR: JitRt | null = null;
   if (jitEnabled()) {
     try {
       const t = nowMs();
@@ -2695,61 +2794,71 @@ async function runScriptInner(
       jitR = null;
     }
   }
-  for (let bar = 0; bar < bars.length; bar++) {
-    if (bar > 0) barCtx.seek(bar);
+  return { decl, body, barCtx, ctx, drawSink, run, scope, frame0, compiledBody, jit, jitR, seriesSet: seriesSet ?? new Set(), mtf: mtfStore };
+}
+
+/** Evaluate one bar. 'ok' = continue; 'ret' = top-level return, stop the
+ *  script; other = wrapped runtime error. */
+function evalOneBar(s: PineSess, bar: number): 'ok' | 'ret' | PineRuntimeError {
+  const { run, ctx } = s;
+  if (ctx.barIndex !== bar) s.barCtx.seek(bar);
+  try {
+    // Decl slots created while topLevelBody is set are written every bar —
+    // their ensureBar is a no-op, so slotFor keeps them out of ensureList
+    // (topStmtIdx < pruneCutoff only; see the scan in buildSess).
+    run.topLevelBody = true;
     try {
-      // Decl slots created while topLevelBody is set are written every bar —
-      // their ensureBar is a no-op, so slotFor keeps them out of ensureList
-      // (topStmtIdx < pruneCutoff only; see the scan above).
-      run.topLevelBody = true;
-      try {
-        if (jit && jitR) {
-          jit.fn(jitR, run, jit.nodes);
-        } else if (compiledBody) {
-          for (let i = 0; i < body.length; i++) {
-            run.topStmtIdx = i;
-            const c = compiledBody[i]!;
-            if (c.kind === 'fallback') evalExpr(c.node, frame0);
-            else if (c.kind === 'twoPhase')
-              (c.isFresh(run) ? c.fresh : c.later)(frame0, run);
-            else c.fn(frame0, run);
-          }
-        } else {
-          for (let i = 0; i < body.length; i++) {
-            run.topStmtIdx = i;
-            evalExpr(body[i]!, frame0);
-          }
+      if (s.jit && s.jitR) {
+        s.jit.fn(s.jitR, run, s.jit.nodes);
+      } else if (s.compiledBody) {
+        for (let i = 0; i < s.body.length; i++) {
+          run.topStmtIdx = i;
+          const c = s.compiledBody[i]!;
+          if (c.kind === 'fallback') evalExpr(c.node, s.frame0);
+          else if (c.kind === 'twoPhase')
+            (c.isFresh(run) ? c.fresh : c.later)(s.frame0, run);
+          else c.fn(s.frame0, run);
         }
-      } finally {
-        run.topStmtIdx = -1;
-        run.topLevelBody = false;
-      }
-    } catch (e) {
-      if (e === BREAK || e === CONTINUE) {
-        warn(run, ctx, 'break/continue outside loop');
-      } else if (e instanceof ReturnSignal) {
-        break; // top-level return stops the script
       } else {
-        barErr = wrapPineError(e, undefined);
-        break;
+        for (let i = 0; i < s.body.length; i++) {
+          run.topStmtIdx = i;
+          evalExpr(s.body[i]!, s.frame0);
+        }
       }
+    } finally {
+      run.topStmtIdx = -1;
+      run.topLevelBody = false;
     }
-    // Densify every slot to `bar` (carry-forward for skipped statements).
-    for (let i = 0; i < run.ensureList.length; i++) run.ensureList[i]!.ensureBar(bar);
-    // Yield to the event loop when one bar batch has hogged >16ms so input,
-    // paint, and pending fetch callbacks can run. Fast bars (most scripts)
-    // amortize this to a near-zero-cost time check.
-    if (nowMs() - sliceStart > 16) {
-      await yieldTask();
-      sliceStart = nowMs();
-      if (opts.shouldAbort?.()) return empty();
+  } catch (e) {
+    if (e === BREAK || e === CONTINUE) {
+      warn(run, ctx, 'break/continue outside loop');
+    } else if (e instanceof ReturnSignal) {
+      return 'ret'; // top-level return stops the script
+    } else {
+      return wrapPineError(e, undefined);
     }
   }
-  (globalThis as Record<string, unknown>).__pineStage = 'assemble';
-  if (opts.shouldAbort?.()) return empty();
-  if (barErr) throw barErr;
+  // Densify every slot to `bar` (carry-forward for skipped statements).
+  for (let i = 0; i < run.ensureList.length; i++) run.ensureList[i]!.ensureBar(bar);
+  return 'ok';
+}
 
-  // ── assemble RunResult ──
+/** Per-sink emit cache entry — the assembled arrays append only; a rollback
+ *  (buf shorter than emitted) truncates in place, and a live-forming-bar
+ *  tail entry is always rewritten. Arrays are shared across emissions by
+ *  design: consumers (model builder / sanitize) copy, and incremental
+ *  sessions save the O(bars) per-tick rebuild. */
+interface PlotEmitCache {
+  emitted: number;
+  time: number[];
+  values: Value[];
+  colors: (string | undefined)[];
+}
+
+/** Assemble RunResult from the session's accumulated state. */
+function assembleRunResult(s: PineSess): RunResult {
+  const { ctx, drawSink, body, decl, barCtx } = s;
+  const bars = barCtx.bars;
   const plots: RunResult['plots'] = new Map();
   // Extrapolate off-range times by average bar duration, never bare indexes.
   const barDur = bars.length > 1
@@ -2758,6 +2867,7 @@ async function runScriptInner(
   const lastTime = bars[bars.length - 1]!.openTime;
   const timeAt = (bi: number): number =>
     bars[bi]?.openTime ?? lastTime + (bi - bars.length + 1) * barDur;
+  const emitCache = s.emitCache;
   ctx.plots.forEach((sink, idx) => {
     const raw = 'buf' in sink ? sink.buf : undefined;
     const buf = Array.isArray(raw)
@@ -2770,15 +2880,43 @@ async function runScriptInner(
     let k = 1;
     while (plots.has(key)) key = `${title}#${++k}`;
     const offset = Math.floor(buf[buf.length - 1]!.opts.offset ?? 0);
+    const opts = buf[buf.length - 1]!.opts;
+    let cache = emitCache?.get(sink);
+    if (cache) {
+      // Forming-bar rollback shrinks buf — truncate emitted arrays to match,
+      // then the append loop re-pushes the tail (incl. any changed entries).
+      if (cache.emitted > buf.length) {
+        cache.time.length = cache.values.length = cache.colors.length = buf.length;
+        cache.emitted = buf.length;
+      } else if (cache.emitted > 0) {
+        // The tail entry may have been re-pushed with newer tick data —
+        // pop it and let the append loop re-emit.
+        cache.time.pop(); cache.values.pop(); cache.colors.pop();
+        cache.emitted--;
+      }
+      for (let i = cache.emitted; i < buf.length; i++) {
+        const p = buf[i]!;
+        cache.time.push(timeAt((p.barIndex ?? i) + offset));
+        cache.values.push(p.value);
+        cache.colors.push(p.opts.color);
+      }
+      cache.emitted = buf.length;
+      plots.set(key, { index: idx, time: cache.time, values: cache.values, opts, colors: cache.colors });
+      return;
+    }
     // Entry barIndex is recorded at push time — sparse sinks (plot inside
     // if/for) map each value to its own bar, not buf position.
-    plots.set(key, {
+    const entry = {
       index: idx,
       time: buf.map((p, i) => timeAt((p.barIndex ?? i) + offset)),
       values: buf.map(p => p.value),
-      opts: buf[buf.length - 1]!.opts,
+      opts,
       colors: buf.map(p => p.opts.color),
-    });
+    };
+    plots.set(key, entry);
+    if (emitCache) {
+      emitCache.set(sink, { emitted: buf.length, time: entry.time, values: entry.values, colors: entry.colors });
+    }
   });
 
   return {
@@ -2797,6 +2935,585 @@ async function runScriptInner(
     shorttitle: declShortTitle(decl),
     overlay: declOverlay(decl),
   };
+}
+
+async function runScriptInner(
+  parsed: ParsedInput,
+  bars: BarData[],
+  opts: RunOptions = {},
+): Promise<RunResult> {
+  const decl = Array.isArray(parsed) ? null : (parsed.decl ?? null);
+  const body = Array.isArray(parsed) ? parsed : parsed.body;
+  const empty = (): RunResult => emptyResult(body, decl);
+  if (bars.length === 0) return empty();
+
+  const s = await buildSess(parsed, bars, opts);
+  if (!s) return empty();
+  // A stopped run pays full prefetch otherwise — check before the bar loop.
+  if (opts.shouldAbort?.()) return empty();
+
+  let barErr: PineRuntimeError | null = null;
+  let sliceStart = nowMs();
+  for (let bar = 0; bar < bars.length; bar++) {
+    const r = evalOneBar(s, bar);
+    if (r === 'ret') break;
+    if (r !== 'ok') { barErr = r; break; }
+    // Yield to the event loop when one bar batch has hogged >16ms so input,
+    // paint, and pending fetch callbacks can run. Fast bars (most scripts)
+    // amortize this to a near-zero-cost time check.
+    if (nowMs() - sliceStart > 16) {
+      await yieldTask();
+      sliceStart = nowMs();
+      if (opts.shouldAbort?.()) return empty();
+    }
+  }
+  (globalThis as Record<string, unknown>).__pineStage = 'assemble';
+  if (opts.shouldAbort?.()) return empty();
+  if (barErr) throw barErr;
+
+  return assembleRunResult(s);
+}
+
+// ── incremental execution (live-tick resume) ─────────────────────────────────
+// TV-equivalent semantics: closed bars commit once; the forming bar is
+// re-evaluated per tick after rolling back to the committed checkpoint. See
+// docs/superpowers/plans/2026-10-11-pine-incremental-live.md.
+//
+// Eligibility: indicator decls without request.* — MTF specs own bar-aligned
+// eval state that the rollback model doesn't cover yet, and strategy order
+// execution is event-driven, not per-bar deterministic.
+
+/** Checkpoint payload — one snapshot per committed bar boundary. */
+interface IncCkpt {
+  /** Last committed bar. */
+  bar: number;
+  scopeVars: Map<string, Series | Value>;
+  seriesSnaps: Map<BarSeries, IncSnap>;
+  /** series → buf-index → cloned container Value (hasContainers only). */
+  containers: Map<BarSeries, Map<number, Value>>;
+  declSlots: Map<object, BarSeries>;
+  declCows: Map<object, CowSeries>;
+  declAliased: Set<object>;
+  trackedSlots: Set<BarSeries>;
+  ensureLen: number;
+  callHist: Map<Node, BarSeries>;
+  misc: Map<string, BarSeries>;
+  tupleKeys: Map<Node, Map<string, object>>;
+  paramCows: Map<object, Map<string, CowSeries>>;
+  /** ctx.state leaf entries needing rollback:
+   *   vs — VS objects (last + memo > bar pruned, snap/restore if present)
+   *   nummaps — Map<number,*> leaves (entries > bar deleted)
+   *   plains — plain objects (fields overwritten by stored clone)
+   *   maps — structural maps (membership restored to stored key list) */
+  stateVs: { e: { last: number; memo?: Map<number, number | undefined>; snap?(): unknown; restore?(s: unknown): void }; snap: unknown; last: number }[];
+  stateNumMaps: Map<number, unknown>[];
+  statePlains: { obj: Record<string, unknown>; fields: Record<string, unknown> }[];
+  stateMaps: { map: Map<unknown, unknown>; keys: unknown[] }[];
+  drawSnap: DrawSnap;
+  drawProps: Map<DrawObj, Record<string, unknown>>;
+  sinkLen: number;
+  sbufLens: number[];
+  alertstate: Map<string, number>;
+  fills: unknown[];
+  fillSites: Map<string, number>;
+  bgcolors: Map<number, Map<string, string>>;
+  barcolors: Map<number, Map<string, string>>;
+  liveArrays: unknown[][];
+  /** CowSeries → materialized inner state: null = still aliasing; else the
+   *  owned BarSeries + its snap. */
+  cowSnaps: Map<CowSeries, { cow: BarSeries; snap: IncSnap } | null>;
+  /** MTF store checkpoint — opaque to the interpreter; mtf.ts owns the
+   *  shape. Present only when the session's script uses request.*. */
+  mtfSnap?: unknown;
+  /** Accumulator lengths — the forming bar re-appends; restore truncates. */
+  alertsLen: number;
+  warningsLen: number;
+  alertcondLen: number;
+  inSchemaLen: number;
+  /** Counters/sets the forming bar may mutate. */
+  plotSeq: number;
+  declQuotas: RtCtx['declQuotas'];
+  warnKeys: RtCtx['warnKeys'];
+}
+
+/** Live incremental session. `committed` = last bar whose state is trusted;
+ *  bars after it are tentatively evaluated and rolled back per tick. */
+export interface IncLive {
+  s: PineSess;
+  ckpt: IncCkpt;
+  committed: number;
+  /** Session key — advance only reuses the session when the caller's key
+   *  still matches (inputs/syminfo changes land on a different key). */
+  key?: string;
+  /** Set by evalOneBar 'ret' or error — session can't produce another
+   *  trustworthy model; the next run falls back to a fresh full eval. */
+  dead: boolean;
+}
+
+/** Opaque ctx.state snapshot — shared by the chart ctx and mtf.tf child
+ *  ctxs (mtf.ts consumes via registerMtf's bindSnap). */
+export interface CtxStateSnap {
+  vs: { e: { last: number; memo?: Map<number, number | undefined>; snap?(): unknown; restore?(s: unknown): void }; snap: unknown; last: number }[];
+  nummaps: Map<number, unknown>[];
+  plains: { obj: Record<string, unknown>; fields: Record<string, unknown> }[];
+  maps: { map: Map<unknown, unknown>; keys: unknown[] }[];
+}
+
+/** Snapshot a BuiltinCtx.state tree: classify leaves so bar-indexed memos
+ *  prune, structural maps keep membership, VS objects snap/restore. `ids`
+ *  shared with the caller's cloneDeep pass preserves cross-references. */
+export function snapCtxState(state: Map<unknown, unknown> | undefined, ids: Map<unknown, unknown>): CtxStateSnap {
+  const out: CtxStateSnap = { vs: [], nummaps: [], plains: [], maps: [] };
+  const walk = (m: Map<unknown, unknown>) => {
+    for (const v of m.values()) {
+      if (v instanceof Map) {
+        // Bar-memo leaves (number → scalar/undefined) get key-pruned on
+        // restore; STRUCTURAL maps — kparts layers like ['stv','sma',site,3]
+        // whose number keys index call args, not bars — must keep their
+        // entries so the VS objects inside stay reachable.
+        let isBarMemo = true;
+        for (const [k, val] of v) {
+          if (typeof k !== 'number' || (val !== undefined && val !== null && typeof val === 'object')) {
+            isBarMemo = false;
+            break;
+          }
+        }
+        if (isBarMemo && v.size > 0) {
+          out.nummaps.push(v as Map<number, unknown>);
+        } else {
+          out.maps.push({ map: v, keys: [...v.keys()] });
+          walk(v);
+        }
+        continue;
+      }
+      if (v !== null && typeof v === 'object') {
+        if (typeof (v as { get?: unknown }).get === 'function' && 'last' in (v as object)) {
+          const e = v as CtxStateSnap['vs'][number]['e'];
+          out.vs.push({ e, snap: e.snap?.(), last: e.last });
+          continue;
+        }
+        const proto = Object.getPrototypeOf(v);
+        if (proto === Object.prototype || proto === null) {
+          out.plains.push({ obj: v as Record<string, unknown>, fields: cloneDeep(v, ids) as Record<string, unknown> });
+        }
+        // class instances (VS handled above): pass through untouched —
+        // rollback imprecision, flagged by the caller if it matters.
+      }
+    }
+  };
+  if (state) walk(state);
+  return out;
+}
+
+/** Restore a ctx.state snapshot against `bar` (the committed index). */
+export function restoreCtxState(ck: CtxStateSnap, bar: number, ids: Map<unknown, unknown>): void {
+  for (const e of ck.vs) {
+    e.e.last = e.last;
+    if (e.e.memo) for (const k of [...e.e.memo.keys()]) if (k > bar) e.e.memo.delete(k);
+    if (e.snap !== undefined && e.e.restore) e.e.restore(e.snap);
+  }
+  for (const m of ck.nummaps) for (const k of [...m.keys()]) if (k > bar) m.delete(k);
+  for (const p of ck.plains) {
+    for (const k of Object.keys(p.obj)) delete p.obj[k];
+    Object.assign(p.obj, cloneDeep(p.fields, ids));
+  }
+  for (const sm of ck.maps) {
+    const want = new Set(sm.keys);
+    for (const k of [...sm.map.keys()]) if (!want.has(k)) sm.map.delete(k);
+  }
+}
+
+/** Identity-preserving deep clone for checkpoint state. Containers (arrays,
+ *  maps, plain objects, udt fields, Value wrappers) are cloned; references
+ *  (Series, functions, DrawObj handles) pass through — they rewind via their
+ *  own channels (seriesSnaps, drawProps). */
+function cloneDeep<T>(v: T, ids: Map<unknown, unknown>): T {
+  if (v === null || typeof v !== 'object') return v;
+  const hit = ids.get(v);
+  if (hit !== undefined) return hit as T;
+  if (Array.isArray(v)) {
+    const out: unknown[] = new Array(v.length);
+    ids.set(v, out);
+    for (let i = 0; i < v.length; i++) out[i] = cloneDeep(v[i], ids);
+    return out as T;
+  }
+  if (v instanceof Map) {
+    const out = new Map<unknown, unknown>();
+    ids.set(v, out);
+    for (const [k, val] of v) out.set(k, cloneDeep(val, ids));
+    return out as T;
+  }
+  if (v instanceof Set) {
+    const out = new Set<unknown>();
+    ids.set(v, out);
+    for (const x of v) out.add(cloneDeep(x, ids));
+    return out as T;
+  }
+  if (v instanceof Series || v instanceof Function) return v;
+  const o = v as Record<string, unknown>;
+  // DrawObj handles keep identity — the sink's props snapshot restores them.
+  if ('id' in o && 'kind' in o && 'props' in o) return v;
+  // Value wrappers: clone payload fields by kind.
+  if (typeof o.kind === 'string') {
+    const kind = o.kind;
+    if (kind === 'array') { const c = { kind: 'array', v: cloneDeep(o.v, ids) }; ids.set(v, c); return c as T; }
+    if (kind === 'map') { const c = { kind: 'map', v: cloneDeep(o.v, ids) }; ids.set(v, c); return c as T; }
+    if (kind === 'matrix') { const c = { kind: 'matrix', v: cloneDeep(o.v, ids) }; ids.set(v, c); return c as T; }
+    if (kind === 'udt') {
+      const src = o.v as { typeName: string; fields: Map<string, Value> };
+      const c = { kind: 'udt', v: { typeName: src.typeName, fields: cloneDeep(src.fields, ids) } };
+      ids.set(v, c);
+      return c as T;
+    }
+    return v; // scalar / series / function / drawing Value — immutable or ref
+  }
+  const proto = Object.getPrototypeOf(v);
+  if (proto === Object.prototype || proto === null) {
+    const out: Record<string, unknown> = {};
+    ids.set(v, out);
+    for (const k of Object.keys(o)) out[k] = cloneDeep(o[k], ids);
+    return out as T;
+  }
+  // Class instance not recognized — pass through (rollback imprecision, see
+  // statePlains note). VS handled by the state walk before reaching here.
+  return v;
+}
+
+function checkpoint(s: PineSess, bar: number): IncCkpt {
+  const { run, ctx } = s;
+  const ids = new Map<unknown, unknown>();
+  const seriesSnaps = new Map<BarSeries, IncSnap>();
+  const containers = new Map<BarSeries, Map<number, Value>>();
+  for (const se of s.seriesSet) {
+    seriesSnaps.set(se, se.incSnap());
+    if (se.hasContainers) {
+      const m = new Map<number, Value>();
+      const buf = se.incBuf;
+      for (let i = 0; i < buf.length; i++) {
+        const v = buf[i];
+        if (!v || typeof v !== 'object') continue;
+        const k = v.kind;
+        if (k === 'array' || k === 'map' || k === 'matrix' || k === 'udt') {
+          m.set(se.incBarAt(i), cloneDeep(v, ids));
+        }
+      }
+      if (m.size > 0) containers.set(se, m);
+    }
+  }
+  const scopeVars = new Map<string, Series | Value>();
+  for (const [n, v] of s.scope.varsCopy()) scopeVars.set(n, cloneDeep(v, ids));
+  // ctx.state leaf classification — see IncCkpt doc.
+  const { vs: stateVs, nummaps: stateNumMaps, plains: statePlains, maps: stateMaps } =
+    snapCtxState(ctx.state, ids);
+  const drawSnap = s.drawSink.incSnap();
+  const drawProps = new Map<DrawObj, Record<string, unknown>>();
+  for (const o of s.drawSink.objects) drawProps.set(o, cloneDeep(o.props, ids));
+  const sbufLens: number[] = [];
+  for (const sink of ctx.plots) {
+    const b = (sink as { buf?: unknown[] }).buf;
+    sbufLens.push(Array.isArray(b) ? b.length : -1);
+  }
+  const deep2 = (x: unknown) => cloneDeep(x, ids);
+  return {
+    bar,
+    scopeVars,
+    seriesSnaps,
+    containers,
+    declSlots: new Map(run.declSlots),
+    declCows: new Map(run.declCows),
+    declAliased: new Set(run.declAliased),
+    trackedSlots: new Set(run.trackedSlots),
+    ensureLen: run.ensureList.length,
+    callHist: new Map(run.callHist),
+    misc: new Map(run.misc),
+    tupleKeys: new Map([...run.tupleKeys].map(([k, v]) => [k, new Map(v)])),
+    paramCows: new Map([...run.paramCows].map(([k, v]) => [k, new Map(v)])),
+    stateVs, stateNumMaps, statePlains, stateMaps,
+    drawSnap, drawProps,
+    sinkLen: ctx.plots.length,
+    sbufLens,
+    alertstate: new Map(ctx.alertstate),
+    fills: (ctx.fills ?? []).map(f => deep2(f)),
+    fillSites: new Map(ctx.fillSites),
+    bgcolors: new Map([...(ctx.bgcolors ?? new Map())].map(([k, v]) => [k, new Map(v)])),
+    barcolors: new Map([...(ctx.barcolors ?? new Map())].map(([k, v]) => [k, new Map(v)])),
+    liveArrays: [ctx.liveLines, ctx.liveLabels, ctx.liveBoxes, ctx.liveTables, ctx.livePolylines, ctx.liveLinefills]
+      .map(a => (a ?? []).slice()),
+    cowSnaps: (() => {
+      const m = new Map<CowSeries, { cow: BarSeries; snap: IncSnap } | null>();
+      for (const c of run.declCows.values()) m.set(c, c.incCowGet());
+      for (const byParam of run.paramCows.values())
+        for (const c of byParam.values()) if (!m.has(c)) m.set(c, c.incCowGet());
+      return m;
+    })(),
+    alertsLen: ctx.alerts.length,
+    warningsLen: ctx.warnings.length,
+    alertcondLen: (ctx.alertconditions ?? []).length,
+    inSchemaLen: (ctx.inputSchemas ?? []).length,
+    plotSeq: ctx.plotSeq ?? 0,
+    declQuotas: ctx.declQuotas ? { ...ctx.declQuotas } : undefined,
+    warnKeys: ctx.warnKeys ? new Set(ctx.warnKeys) : undefined,
+    mtfSnap: mtf?.checkpoint?.(s),
+  };
+}
+
+/** Restore one checkpoint — every mutable surface rolls back to committed. */
+function restoreCkpt(s: PineSess, ck: IncCkpt): void {
+  const { run, ctx } = s;
+  const ids = new Map<unknown, unknown>();
+  // Series: rewind to snap; series born during the forming bar → unseen (null).
+  for (const se of s.seriesSet) se.incRewind(ck.seriesSnaps.get(se) ?? null);
+  // Container slot payloads — the fresh clones re-share identity within this
+  // restore pass (two names bound to the same array see the same clone).
+  for (const [se, slots] of ck.containers) {
+    for (const [bar, v] of slots) se.setAt(bar, cloneDeep(v, ids));
+  }
+  // Top scope: membership + fresh clones.
+  const vars = new Map<string, Series | Value>();
+  for (const [n, v] of ck.scopeVars) vars.set(n, cloneDeep(v, ids));
+  s.scope.varsRestore(vars);
+  // RunState map membership (+ reference values — refs are stable by design).
+  const restoreMap = <K, V>(live: Map<K, V>, saved: Map<K, V>) => {
+    for (const k of [...live.keys()]) if (!saved.has(k)) live.delete(k);
+    for (const [k, v] of saved) live.set(k, v);
+  };
+  restoreMap(run.declSlots, ck.declSlots);
+  restoreMap(run.declCows, ck.declCows);
+  run.declAliased.clear();
+  for (const x of ck.declAliased) run.declAliased.add(x);
+  run.trackedSlots.clear();
+  for (const x of ck.trackedSlots) run.trackedSlots.add(x);
+  run.ensureList.length = ck.ensureLen;
+  restoreMap(run.callHist, ck.callHist);
+  restoreMap(run.misc, ck.misc);
+  for (const k of [...run.tupleKeys.keys()]) if (!ck.tupleKeys.has(k)) run.tupleKeys.delete(k);
+  for (const [k, saved] of ck.tupleKeys) {
+    const live = run.tupleKeys.get(k) ?? new Map<string, object>();
+    restoreMap(live, saved);
+    run.tupleKeys.set(k, live);
+  }
+  for (const k of [...run.paramCows.keys()]) if (!ck.paramCows.has(k)) run.paramCows.delete(k);
+  for (const [k, saved] of ck.paramCows) {
+    const live = run.paramCows.get(k) ?? new Map<string, CowSeries>();
+    restoreMap(live, saved);
+    run.paramCows.set(k, live);
+  }
+  // ctx.state
+  restoreCtxState({ vs: ck.stateVs, nummaps: ck.stateNumMaps, plains: ck.statePlains, maps: ck.stateMaps }, ck.bar, ids);
+  // MTF per-spec tf state (request.* scripts only).
+  if (ck.mtfSnap !== undefined) mtf?.restore?.(ck.mtfSnap);
+  // Drawings: object list + props payloads (identity preserved).
+  s.drawSink.incRestore(ck.drawSnap);
+  for (const o of s.drawSink.objects) {
+    const p = ck.drawProps.get(o);
+    if (p) o.props = cloneDeep(p, ids);
+  }
+  // Plot sinks: membership + per-sink buffer length.
+  ctx.plots.length = ck.sinkLen;
+  for (let i = 0; i < ctx.plots.length && i < ck.sbufLens.length; i++) {
+    const b = (ctx.plots[i] as { buf?: unknown[] }).buf;
+    const n = ck.sbufLens[i]!;
+    if (Array.isArray(b) && n >= 0) b.length = n;
+  }
+  // Scalars/collections on ctx — reference/clone restore.
+  restoreMap(ctx.alertstate ?? (ctx.alertstate = new Map()), ck.alertstate);
+  const fills = ctx.fills ?? (ctx.fills = []);
+  fills.length = 0;
+  for (const f of ck.fills) fills.push(cloneDeep(f, ids) as NonNullable<typeof ctx.fills>[number]);
+  restoreMap(ctx.fillSites ?? (ctx.fillSites = new Map()), ck.fillSites);
+  const restoreLayer = (live: Map<number, Map<string, string>> | undefined, saved: Map<number, Map<string, string>>) => {
+    if (!live) return;
+    for (const k of [...live.keys()]) if (!saved.has(k)) live.delete(k);
+    for (const [k, v] of saved) live.set(k, new Map(v));
+  };
+  restoreLayer(ctx.bgcolors, ck.bgcolors);
+  restoreLayer(ctx.barcolors, ck.barcolors);
+  const liveLists = [ctx.liveLines, ctx.liveLabels, ctx.liveBoxes, ctx.liveTables, ctx.livePolylines, ctx.liveLinefills];
+  for (let i = 0; i < liveLists.length; i++) {
+    const a = liveLists[i];
+    if (!a) continue;
+    a.length = 0;
+    for (const o of ck.liveArrays[i]!) (a as unknown[]).push(o);
+  }
+  // CowSeries materialized copies — before drawing/layer rewinds is fine;
+  // order vs seriesSet doesn't matter (cow inners aren't in the set).
+  for (const [c, snap] of ck.cowSnaps) c.incCowSet(snap);
+  // Accumulators: truncate anything the forming bar appended.
+  ctx.alerts.length = ck.alertsLen;
+  ctx.warnings.length = ck.warningsLen;
+  if (ctx.alertconditions) ctx.alertconditions.length = ck.alertcondLen;
+  if (ctx.inputSchemas) ctx.inputSchemas.length = ck.inSchemaLen;
+  if (ctx.plotSeq !== undefined) ctx.plotSeq = ck.plotSeq;
+  if (ck.declQuotas) ctx.declQuotas = { ...ck.declQuotas };
+  if (ck.warnKeys) ctx.warnKeys = new Set(ck.warnKeys);
+  // JIT residual: mid-eval stacks are always empty at bar boundaries;
+  // re-anchoring is belt-and-suspenders for an aborted forming eval.
+  if (s.jit) {
+    s.jit.scopeStack.length = 1;
+    s.jit.scopeStack[0] = s.scope;
+    s.jit.cur = s.frame0;
+    s.jit.save.length = 0;
+  }
+  // Transient ctx fields — evaluation always leaves them clean at bar end.
+  ctx.callsite = undefined;
+  ctx.scopeDepth = 0;
+  run.topLevelBody = false;
+  run.topStmtIdx = -1;
+  run.siteStack.length = 0;
+  run.siteCtx.length = 0;
+}
+
+/** Does the script qualify for incremental resume? Strategy order execution
+ *  is event-driven — it falls back to a fresh run per tick. request.* state
+ *  lives in the per-session MTF store, checkpointed like everything else. */
+function incEligible(parsed: ParsedInput): boolean {
+  if (!Array.isArray(parsed)) return parsed.decl?.type !== 'strategy';
+  return true;
+}
+
+/** First incremental run: build, evaluate every bar, checkpoint after each
+ *  CLOSED bar — the forming (last) bar's state is discarded per tick, so the
+ *  checkpoint must be taken at its predecessor, before it evaluates.
+ *  Returns null session for empty tapes/ineligible scripts (caller falls
+ *  back to plain runScript). */
+export async function incRunStart(
+  parsed: ParsedInput,
+  bars: BarData[],
+  opts: RunOptions = {},
+): Promise<{ live: IncLive | null; result: RunResult }> {
+  const decl = Array.isArray(parsed) ? null : (parsed.decl ?? null);
+  const body = Array.isArray(parsed) ? parsed : parsed.body;
+  const empty = (): RunResult => emptyResult(body, decl);
+  if (bars.length === 0 || !incEligible(parsed)) return { live: null, result: await runScriptInner(parsed, bars, opts) };
+
+  const s = await buildSess(parsed, bars, opts, new Set());
+  if (s) s.emitCache = new Map(); // incremental sessions keep assembled plot arrays
+  if (!s) return { live: null, result: empty() };
+  if (opts.shouldAbort?.()) return { live: null, result: empty() };
+
+  // committed = last CLOSED bar; a one-bar tape has no closed bar yet —
+  // its checkpoint is the empty pre-bar state.
+  const live: IncLive = { s, ckpt: checkpoint(s, -1), committed: -1, key: opts.incKey, dead: false };
+  try {
+    let barErr: PineRuntimeError | null = null;
+    let sliceStart = nowMs();
+    const lastClosed = bars.length - 2; // bars[len-1] is the forming bar
+    for (let bar = 0; bar < bars.length; bar++) {
+      const r = evalOneBar(s, bar);
+      if (r === 'ret') break;
+      if (r !== 'ok') { barErr = r; break; }
+      if (bar <= lastClosed) live.committed = bar;
+      // Single checkpoint at the committed boundary — per-bar checkpoints
+      // were O(N^2) snapshots on first load (60s+ on 500-bar scripts).
+      if (bar === lastClosed) live.ckpt = checkpoint(s, bar);
+      if (nowMs() - sliceStart > 16) {
+        await yieldTask();
+        sliceStart = nowMs();
+        if (opts.shouldAbort?.()) return { live: null, result: empty() };
+      }
+    }
+    if (barErr) throw barErr;
+  } finally {
+    setActiveSeriesSet(null);
+  }
+  (globalThis as Record<string, unknown>).__pineStage = 'assemble';
+  if (opts.shouldAbort?.()) return { live: null, result: empty() };
+  return { live, result: assembleRunResult(s) };
+}
+
+const barsEq = (a: BarData | undefined, b: BarData | undefined): boolean =>
+  a === b || (!!a && !!b && a.openTime === b.openTime && a.open === b.open &&
+    a.high === b.high && a.low === b.low && a.close === b.close &&
+    a.volume === b.volume && a.closeTime === b.closeTime);
+
+/** Advance a live session to a changed tape. 'fallback' = caller must do a
+ *  fresh run (prefix changed, session dead, or tape shrank). Otherwise:
+ *  evaluate newly closed bars (checkpoint each), then rollback + re-eval the
+ *  forming bar. */
+export async function incAdvance(
+  live: IncLive,
+  bars: BarData[],
+): Promise<'fallback' | RunResult> {
+  const s = live.s;
+  if (live.dead || bars.length === 0) return 'fallback';
+  const old = s.barCtx.bars;
+  const oldLen = old.length; // `old` aliases s.barCtx.bars — the in-place grow below would mask the length delta
+  // Tape shrink realigns absolute indexes — index-keyed checkpoints can't
+  // map back; restart. Same-length extension-free tapes still fall through
+  // to the forming-bar rollback below.
+  if (bars.length < old.length) return 'fallback';
+  // First index where the tapes differ — a changed earlier bar invalidates
+  // committed state (bars are append-only in live mode; anything else means
+  // history rewrite, e.g. data reload).
+  let firstDiff = old.length;
+  for (let i = 0; i < old.length; i++) {
+    if (!barsEq(old[i], bars[i])) { firstDiff = i; break; }
+  }
+  if (firstDiff <= live.committed) return 'fallback';
+  // Grow/rewrite the shared tape in place.
+  for (let i = 0; i < bars.length; i++) s.barCtx.bars[i] = bars[i]!;
+  s.barCtx.bars.length = bars.length;
+  s.barCtx.setTape(s.barCtx.bars);
+  const last = bars.length - 1;
+  // Restore this session's MTF store as the active one — a sibling run may
+  // have prepared security against its own store meanwhile.
+  if (s.mtf !== undefined) mtf?.activate?.(s.mtf);
+  setActiveSeriesSet(s.seriesSet);
+  try {
+    // Discard last tick's tentative forming-bar eval FIRST — committed bars
+    // must evaluate on clean checkpoint state, not on top of stale writes.
+    // rewindCursor moves the cursor back with the series so the upcoming
+    // seeks re-push the bars (no double-write: the series state was rolled
+    // back to the same point).
+    restoreCkpt(s, live.ckpt);
+    s.barCtx.rewindCursor(live.ckpt.bar);
+    // Tape grew → higher-tf feeds may carry freshly closed bars. Refresh
+    // AFTER the checkpoint restore (restore rewrote spec.bars to its snap);
+    // refresh's resetTfFrame drops tf frames only when content changed.
+    if (bars.length > oldLen && s.mtf !== undefined && mtf?.refresh) {
+      await mtf.refresh(s.ctx, s.frame0);
+    }
+    // Commit newly closed bars: evaluate (committed+1 .. last-1); the old
+    // forming bar sits in this range and lands its final tick's data.
+    for (let b = live.committed + 1; b < last; b++) {
+      const r = evalOneBar(s, b);
+      if (r === 'ret' || r !== 'ok') { live.dead = true; return 'fallback'; }
+      live.committed = b;
+      live.ckpt = checkpoint(s, b);
+    }
+    // Re-evaluate the forming bar with its newest data (state = post-eval
+    // of the newest closed bar — the commit loop already cleaned it).
+    const r = evalOneBar(s, last);
+    if (r === 'ret' || r !== 'ok') { live.dead = true; return 'fallback'; }
+  } finally {
+    setActiveSeriesSet(null);
+  }
+  return assembleRunResult(s);
+}
+
+/** Session-aware runScript: advance an existing IncLive when the key matches
+ *  and the tape extends; build a new one when it doesn't. Returns the session
+ *  to persist for the next call (null = keep using plain runScript). */
+export async function incRun(
+  parsed: ParsedInput,
+  bars: BarData[],
+  opts: RunOptions = {},
+): Promise<{ live: IncLive | null; result: RunResult }> {
+  const p = runScriptTail.then(async () => {
+    const prior = opts.incSession ?? null;
+    // Key mismatch = the run's inputs/syminfo/source changed since this
+    // session was built — resuming it would emit stale-input results.
+    if (prior && prior.key === opts.incKey && incEligible(parsed)) {
+      const r = await incAdvance(prior, bars);
+      if (r !== 'fallback') return { live: prior, result: r };
+    }
+    if (!incEligible(parsed)) {
+      return { live: null, result: await runScriptInner(parsed, bars, opts) };
+    }
+    return incRunStart(parsed, bars, opts);
+  });
+  runScriptTail = p.then(() => {}, () => {});
+  return p;
 }
 
 // ── script declaration (indicator/strategy) ───────────────────────────────────

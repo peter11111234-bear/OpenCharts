@@ -81,13 +81,18 @@ const seriesAt = (v: Value, i: number): Value =>
 // ── math.* ──────────────────────────────────────────────────────────────────
 
 describe('math.*', () => {
-  it('abs/max/min scalar + na-skip', () => {
+  // TV propagates na through math.max/min: math.max(2, na) is na, not 2.
+  // (Was pinned as "na-skip" — that behaviour diverged from TradingView and
+  // changed real script output, e.g. 高量1.46's math.max(ta.stdev(...), mintick)
+  // on the warm-up bars where ta.stdev is na.)
+  it('abs/max/min scalar + na propagation', () => {
     expect(call('math.abs', [floatV(-3)])).toEqual(floatV(3));
     expect(call('math.abs', [intV(-3)])).toEqual(intV(3));
     expect(call('math.abs', [NA])).toEqual(NA);
     expect(call('math.max', [intV(2), intV(7), intV(4)])).toEqual(intV(7));
-    expect(call('math.max', [intV(2), NA])).toEqual(intV(2));
+    expect(call('math.max', [intV(2), NA])).toEqual(NA);
     expect(call('math.min', [intV(2), intV(7)])).toEqual(intV(2));
+    expect(call('math.min', [intV(2), NA])).toEqual(NA);
     expect(call('math.min', [NA, NA])).toEqual(NA);
   });
 

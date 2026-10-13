@@ -256,3 +256,138 @@
  skip 11628 vs noskip 11586 (noise; ~5µs/bar theory vs 12ms base). Virtual-
  call cost is too small to matter at 1358 calls/bar. (b) trim() inline
  guard — same class, ~0.3% ceiling. Both reverted.
+- 2026-10-11 R15 — RESIDUAL PROFILE + REAL PLAN v1 (post-R14):
+  * P3 verify (JEV daily_cap 降級主 LLM): scout claims VERIFIED vs source —
+    computeAt mtf.ts:1663 sole eval site, cache-before-dispatch 1619-1634;
+    callUdfValue interpreter.ts:1517-1534 already jitUdf (gap closed since R12c).
+    Gate-fail cross-caller (node,j) memo REJECTED as semantically unsafe —
+    transient-cache miss is REQUIRED (UDF param bindings differ per invocation).
+  * Fresh profiles flip the target: K4.55 mtfStats.evals=0 (NO security) —
+    1.57M evalNodes, top ident/str/call; udfRuns 258k. MTF memo lever = zero
+    help for K4.55. TRIS390: evals 50k, str 168k (56%), tf callHist 227.9/bar.
+  * Plan: docs/superpowers/plans/2026-10-11-pine-residual-perf-v1.md —
+    S1 R.call arg fast-arms + top-level jit A/B (main), S2 str attribution,
+    S3 tf-domain callHist→histSpecHas, S4 (investigate-only) caller-binding
+    content fingerprint. Targets <9ms K4.55 / <14ms TRIS390.
+- 2026-10-11 R16 — INCREMENTAL LIVE-TICK EXECUTION (landed):
+  * Problem: every tick → full runScript (500 bars); ~150ms/refresh heavy →
+    UI hang reports. Root cause was NOT per-bar cost — no incremental path.
+  * Landed: TV-style committed/rollback. closed bars eval once; forming bar
+    re-evals per tick from the previous checkpoint. interpreter.ts split
+    runScriptInner → buildSess/evalOneBar/assembleRunResult + incRun/
+    incRunStart/incAdvance/checkpoint/restoreCkpt; pineWorker incSessions
+    (incKey, cap 8); client keeps session workers out of the pool;
+    engine incHolder + heavy-tick exemption; double-parse fixed via
+    msg.parsed.
+  * Four real bugs caught by parity test: committed must exclude the
+    forming bar; structural number-keyed ctx.state maps vs bar-memos;
+    restore must rewind BarCtx cursor (seek skip ate ctx series pushes);
+    incRun must key-match before reusing a session (input update stuck).
+  * Perf smoke (500 bars, 10 ta.* + UDF): full 152ms → tick p50 2.7ms /
+    append 3.8ms. v1 excludes strategy + request.* (auto full-run).
+  * Verify: src/pine/__tests__/inc-parity.test.ts (5 tick scenarios vs
+    full rerun, value-level diff); suite 769+5 green; tsc clean on touched
+    files. Plan doc: docs/superpowers/plans/2026-10-11-pine-incremental-live.md.
+
+- 2026-10-12 R17 - DRAW-QUOTA BUG (indicator decl stripped from body):
+  * Symptom: 見高K on Vela/TV diverged hard — only ~42 zigzag lines vs TV's
+    many; every drawing kind capped at exactly 50.
+  * Root cause: parse() returns { decl, body }; indicator(...) lives in
+    `decl`, not `body`. buildSess called strategyDecl() for strategy decls but
+    NEVER declDrawQuotas() for indicator decls, so max_lines_count/
+    max_labels_count/max_boxes_count were ignored and created() fell back to
+    DEFAULT_QUOTA=50 (draw.ts:92).
+  * Fix: interpreter.ts buildSess — `else if (decl?.type === 'indicator')
+    declDrawQuotas(ctx, decl.args, INDICATOR_DECL_ORDER)`.
+  * Measured (MXF 5m 2906 bars, 見高K4.55): drawings 151 → 937
+    (white zigzag lines 42 → 241; labels 50 → 87; boxes 50 → 350).
+  * Also: feed.ts tickEpochSec hardened against a contract/expiry date in the
+    live tick's `date` field (anchor wall time to today when >1 day off).
+
+- 2026-10-12 R18 - PINE INTERPRETER TV-ALIGNMENT BUGS (3 fixes):
+  * Context: 見高K4.55 rendered far fewer lines on Vela than TV (same script,
+    same symbol). Root causes were all in OUR from-scratch interpreter
+    (src/pine/**), not in Vela (renderer) or TV.
+  * FIX 1 (draw quotas): parse() returns { decl, body }; indicator(...) lives
+    in `decl`, so buildSess's body loop never reached `case 'indicator'` and
+    declDrawQuotas was never called → every drawing kind fell back to
+    DEFAULT_QUOTA=50 (draw.ts:92) even when the script declared 500.
+    buildSess now calls declDrawQuotas for indicator decls (interpreter.ts).
+    Measured (MXF 5m, 見高K4.55): drawings 151 -> 937; white zigzag 42 -> 241.
+  * FIX 2 (array stats): array.max/min/sum/avg/range/median filtered elements
+    by kind BEFORE unwrapping {kind:'series'} → series-sourced elements were
+    dropped, so array.max returned na. numsOf now unwraps first (array.ts).
+  * FIX 3 (array store semantics — the big one): push/set/insert/unshift/fill
+    stored the raw {kind:'series'} wrapper. Every slot written from one call
+    site then aliased ONE live series, so a rolling buffer read back the same
+    current value in every slot. TV arrays hold SNAPSHOT values. Added snap()
+    (unwraps series to cur()) at all array store sites (array.ts).
+    Symptom: 見高K tab_cb (ZigZag pivot ring buffer) returned duplicate
+    pivots → tab_rate stuck at 0/1 → ABC lines never drawn; same for the
+    harmonic ZigZag buffers. After fix: rInBand 0 -> 149; ABC lines
+    10 lime + 10 red (xloc.bar_time) now emitted.
+  * Verified: line census on 見高K (MXF 5m 2909 bars) — 404 lines
+    (241 white zigzag, 20 ABC bar_time, 50+50 divergence, harmonic
+    teal/olive/fuchsia/lime), 147 labels (A/B/C x10). Goldens regenerated
+    (UPDATE_GOLDEN=1) since drawing counts legitimately changed.
+  * NOT a Vela issue: Vela supports xloc.bar_time / colors / widths; it
+    renders whatever the engine emits.
+
+- 2026-10-12 R19 - FIRST-PAINT COST (perf, measured):
+  * Profile (node --cpu-prof, 見高K4.55 on real MXF 5m): 83% of busy time is
+    evalOneBar; NO single function >5% after that. Cost is ~16 ms/bar and
+    scales linearly (200 bars 3.3s, 400 6.5s, 800 12.9s → 2000 ~32s,
+    2900 ~46s). The felt "3 indicators take minutes" was mostly bar COUNT,
+    not a hot loop.
+  * Bug A: velaProvider floored the bar limit at 2000 (Math.max(limit,2000))
+    while chasing a phantom "missing drawings" cause → every first paint
+    evaluated 2000+ bars. Removed; honor Vela's requested window.
+  * Bug B: getShioajiHistory's windowed branch returned EVERY bar in
+    [from,to] and ignored `want` — a Vela-supplied window ("since session
+    open") bypassed the limit entirely. Now capped to `want` (tail).
+  * Bug C (cached results): new src/pine/modelCache.ts — IndexedDB cache of
+    the built IndicatorModel keyed by (modelId=source hash, symbol, tf,
+    inputs, bar count, last bar openTime). Served ONLY for the first run of
+    a session (page restore); tick/update runs always recompute. Any edit,
+    tf/symbol change, input change or new bar misses the cache.
+  * NOT done: micro-opts in the interpreter hot path (runOf property cache,
+    udfJitEnabled memo, UDF arg-wrap reduction) — each ~1-3%, deliberately
+    skipped (ponytail: YAGNI until measured need).
+
+- 2026-10-13 R20 - MZigZag - HP "legend shows, zero output" (silent na):
+  * Symptom: MZigZag - HP (high452/HP) renders nothing in Vela while 見高K4.55
+    does. Interpreter + engine both "succeed" with warns [].
+  * Root cause (single, named arg): `array.unshift(a, value=v)` /
+    `array.push(a, value=v)` bound NOTHING. The builtins' internal param slot
+    was named 'val'; TV's reference name is `value`. bindArgs only matches
+    `order` names (+ the one series→source alias), so the named arg landed as
+    an unknown name, 'val' stayed undefined, and `snap(undefined) -> na` was
+    pushed. The three pivot buffers therefore grew to the right length with
+    ALL-na values → every ratio in detect_harmonic_pattern came out na →
+    wm_pattern never true → no lines, no labels. Silent: nothing throws,
+    nothing warns.
+  * Fix: builtins/array.ts push/unshift/binary_search(_leftmost/_rightmost)
+    param slot 'val' -> 'value' (+ HistSpec names). Class audit: the other 28
+    array.* registrations already used TV names, so the mismatch was confined
+    to these 5.
+  * Measured (real MXF 500 bars, node): MZ drawings {table:1} (+0 lines) ->
+    {table:1, line:101, label:26}. Oscillating synthetic 400 bars: 30 lines /
+    14 labels. Instrumented run showed pivots buffer size 71 but px/pa/pb/pc/pd
+    all na before the fix, real prices + ratios (xab 1.14, abc 1.45, bcd 1.08,
+    xad 1.28) after.
+  * The other 4 primitives the handoff listed as suspects were verified ALREADY
+    correct (unseriesTruth/truthy coerce numbers in if/and/or/not/ternary;
+    bare expression statements in a UDF body do execute) — pinned by tests so a
+    future coercion change cannot regress them.
+  * Tests: new src/pine/__tests__/mzigzag_semantics.test.ts (5 cases: numeric→
+    bool in `if`; numeric in and/or/not/ternary; named `value=` on push/unshift;
+    bare UDF statements; e2e MZigZag emits lines+labels).
+  * Vela verified (not just node): dev server had died the way dev-up.ps1 cannot
+    see — esbuild child gone, `/` still 200, every transform 500, page mounts
+    empty with no console error. Recovered by Stop-Process on the :5173 owner +
+    scripts/dev-up.ps1. Then `window.__vela.chart.runIndicator(mzSrc)` on 2330 5m
+    -> ok, 2.0s, and the canvas shows the harmonic lines + Double Top /
+    Butterfly Double Top / ABCD labels.
+  * Residual (not fixed, out of scope): a named arg that matches no slot still
+    binds nothing silently — no warn. Same failure class could hide behind any
+    other builtin whose internal name drifts from TV's.

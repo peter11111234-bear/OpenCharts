@@ -98,6 +98,13 @@ const arr = (...vs: Value[]): Value => ({ kind: 'array', v: vs });
 interface VS {
   get(b: number): number | undefined;
   last: number; // highest bar attempted/computed (-1 none)
+  /** Per-bar memo exposed for the incremental driver's checkpoint/rewind —
+   *  present on every factory that memoizes (vstate/vseries/ema/winAgg). */
+  memo?: Map<number, number | undefined>;
+  /** Extra closure state beyond {last,memo} — winAgg's deque/accumulators.
+   *  Absent → the driver rewinds {last,memo} generically. */
+  snap?(): unknown;
+  restore?(s: unknown): void;
 }
 
 const SERIES_IDS = new WeakMap<Series, number>();
@@ -172,8 +179,9 @@ function vsOf(ctx: BuiltinCtx, v: Value | undefined, sig: string): VS {
 function vseries(ctx: BuiltinCtx, key: Key, fn: (b: number) => number | undefined): VS {
   return stateFor<VS>(ctx, ['dvs', ...kparts(key)], () => {
     const memo = new Map<number, number | undefined>();
-    return {
+    const self: VS = {
       last: -1,
+      memo,
       get(b: number): number | undefined {
         if (b > this.last) this.last = b;
         if (memo.has(b)) return memo.get(b);
@@ -182,6 +190,7 @@ function vseries(ctx: BuiltinCtx, key: Key, fn: (b: number) => number | undefine
         return v;
       },
     };
+    return self;
   });
 }
 
@@ -192,6 +201,7 @@ function vstate(ctx: BuiltinCtx, key: Key, step: (b: number) => number | undefin
     const memo = new Map<number, number | undefined>();
     const self: VS = {
       last: -1,
+      memo,
       get(b: number): number | undefined {
         if (b <= self.last) return memo.get(b);
         for (let i = self.last + 1; i <= b; i++) memo.set(i, step(i));
@@ -302,6 +312,11 @@ const vsId = (v: VS): number => {
   if (id === undefined) { id = nextVsId++; VS_IDS.set(v, id); }
   return id;
 };
+/** Serialized winAgg payload — every closure variable the slide mutates. */
+interface WinAggSnap {
+  dqJ: number[]; dqV: number[]; qh: number; bad: number; wnum: number;
+  ax: number; ac: number; sx: number; sc: number;
+}
 
 /** Incremental window aggregate. Forward bars slide the [b-L+1, b] window in
  *  O(1) amortized; na/out-of-history bars tracked by a bad counter (enter++ /
@@ -375,6 +390,23 @@ function winAgg(ctx: BuiltinCtx, kind: WinKind, vs: VS, L: number): VS {
     };
     const self: VS = {
       last: -1,
+      memo,
+      // Sliding-window closure state must rewind with the forming bar —
+      // dq/acc/wnum/bad mutate per bar and memo pruning alone can't rebuild
+      // them. snap/restore serialize the whole aggregate payload.
+      snap() {
+        return {
+          dqJ: dqJ.slice(), dqV: dqV.slice(), qh, bad, wnum,
+          ax: acc.x, ac: acc.c, sx: accSq.x, sc: accSq.c,
+        };
+      },
+      restore(s: unknown) {
+        const x = s as WinAggSnap;
+        dqJ.length = 0; dqJ.push(...x.dqJ);
+        dqV.length = 0; dqV.push(...x.dqV);
+        qh = x.qh; bad = x.bad; wnum = x.wnum;
+        acc.x = x.ax; acc.c = x.ac; accSq.x = x.sx; accSq.c = x.sc;
+      },
       get(b: number): number | undefined {
         if (b <= self.last) {
           if (memo.has(b)) return memo.get(b);
@@ -432,6 +464,7 @@ function emaVs(ctx: BuiltinCtx, src: VS, len: number, tag: Key): VS {
     const memo = new Map<number, number | undefined>();
     const self: VS = {
       last: -1,
+      memo,
       get(b: number): number | undefined {
         if (b > self.last) self.last = b;
         if (memo.has(b)) return memo.get(b);
