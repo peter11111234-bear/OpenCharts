@@ -22,6 +22,10 @@ logs/
 # third-party bundles downloaded by scratch/_extract_tv_stdlib.mjs
 scratch/tv-bundle/
 
+# Pine v6 reference knowledge base (github.com/mrojas-mx/pine-script-v6-kb),
+# cloned for the stdlib-alignment slices
+scratch/pine-v6-kb/
+
 # throwaway agent reports / QA artifacts (probe .mjs stay tracked)
 scratch/report-*.md
 scratch/qa-round*-*.md

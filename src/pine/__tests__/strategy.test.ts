@@ -950,3 +950,164 @@ plot(strategy.position_size)`, bars);
   });
 });
 
+
+// ── 2026-10-13: TV stdlib alignment — the strategy.* metric surface ────────
+// docs/tv-pine-stdlib.json pins the names; these pin the numbers. Percent
+// bases follow the reference: whole-range metrics ÷ initial capital, per-trade
+// metrics ÷ the trade's size (entry price × quantity).
+
+describe('strategy metrics', () => {
+  const strV = (v: Value): string => (v.kind === 'string' ? v.v : `#${v.kind}`);
+
+  const declCfg = (ctx: BuiltinCtx, args: [string, Node][]): void =>
+    strategyDecl(ctx, { type: 'strategy', args: args.map(([name, value]) => ({ name, value })) });
+
+  const L = { kind: 'string', v: 'L' } as const;
+  const S = { kind: 'string', v: 'S' } as const;
+  const LONG = { kind: 'string', v: 'strategy.long' } as const;
+  const SHORT = { kind: 'string', v: 'strategy.short' } as const;
+
+  // bars: open=close=10+i, high=12+i, low=9+i.
+  //   L entry bar0 → fills bar1 @11; exit bar2 → fills bar3 @13  (+2)
+  //   S entry bar4 → fills bar5 @15; exit bar6 → fills bar7 @17  (−2)
+  const twoTrades = (exitShort = true, before?: (ctx: BuiltinCtx) => void) => {
+    const { ctx, barCtx } = mkRtCtx(mkBars(8, 10));
+    before?.(ctx);
+    callStrategy('entry', [L, LONG], { comment: { kind: 'string', v: 'long entry' } }, ctx);
+    barCtx.seek(2);
+    callStrategy('exit', [{ kind: 'string', v: 'XL' }, L], { comment: { kind: 'string', v: 'tp' } }, ctx);
+    barCtx.seek(4);
+    callStrategy('entry', [S, SHORT], {}, ctx);
+    barCtx.seek(6);
+    if (exitShort) callStrategy('exit', [{ kind: 'string', v: 'XS' }, S], {}, ctx);
+    barCtx.seek(7);
+    return { ctx, barCtx };
+  };
+
+  it('exposes per-trade identity, counts and averages', () => {
+    const { ctx } = twoTrades();
+    expect(strV(callTrades('closedtrades.entry_id', ctx, 0))).toBe('L');
+    expect(strV(callTrades('closedtrades.exit_id', ctx, 0))).toBe('XL');
+    expect(strV(callTrades('closedtrades.entry_comment', ctx, 0))).toBe('long entry');
+    expect(strV(callTrades('closedtrades.exit_comment', ctx, 0))).toBe('tp');
+    expect(callTrades('closedtrades.entry_id', ctx, 2).kind).toBe('na');
+    expect(callTrades('closedtrades.exit_id', ctx, -1).kind).toBe('na');
+
+    expect(numV(getConstant('strategy.wintrades', ctx))).toBe(1);
+    expect(numV(getConstant('strategy.losstrades', ctx))).toBe(1);
+    expect(numV(getConstant('strategy.eventrades', ctx))).toBe(0);
+    expect(numV(getConstant('strategy.closedtrades.first_index', ctx))).toBe(0);
+
+    expect(numV(getConstant('strategy.avg_trade', ctx))).toBeCloseTo(0);
+    expect(numV(getConstant('strategy.avg_trade_percent', ctx)))
+      .toBeCloseTo((2 / 11 * 100 + -2 / 15 * 100) / 2);
+    expect(numV(getConstant('strategy.avg_winning_trade', ctx))).toBeCloseTo(2);
+    expect(numV(getConstant('strategy.avg_losing_trade', ctx))).toBeCloseTo(-2);
+    expect(numV(getConstant('strategy.avg_winning_trade_percent', ctx))).toBeCloseTo(2 / 11 * 100);
+    expect(numV(getConstant('strategy.avg_losing_trade_percent', ctx))).toBeCloseTo(-2 / 15 * 100);
+
+    // profit_percent = profit ÷ (entry price × quantity) — the trade's size.
+    expect(numV(callTrades('closedtrades.profit_percent', ctx, 0))).toBeCloseTo(2 / 11 * 100);
+    expect(numV(callTrades('closedtrades.profit_percent', ctx, 1))).toBeCloseTo(-2 / 15 * 100);
+
+    // Whole-range ratios use the initial capital (default 100000).
+    expect(numV(getConstant('strategy.grossprofit_percent', ctx))).toBeCloseTo(0.002);
+    expect(numV(getConstant('strategy.grossloss_percent', ctx))).toBeCloseTo(0.002);
+    expect(numV(getConstant('strategy.netprofit_percent', ctx))).toBeCloseTo(0);
+  });
+
+  it('derives trade excursions from the bar range and the trade size', () => {
+    const { ctx } = twoTrades();
+    // long: highs 13..15 vs entry 11 → runup 4; lows 10..12 → drawdown 1
+    expect(numV(callTrades('closedtrades.max_runup', ctx, 0))).toBeCloseTo(4);
+    expect(numV(callTrades('closedtrades.max_drawdown', ctx, 0))).toBeCloseTo(1);
+    expect(numV(callTrades('closedtrades.max_runup_percent', ctx, 0))).toBeCloseTo(4 / 11 * 100);
+    expect(numV(callTrades('closedtrades.max_drawdown_percent', ctx, 0))).toBeCloseTo(1 / 11 * 100);
+    // short: lows 14..16 vs entry 15 → runup 1; highs 17..19 → drawdown 4
+    expect(numV(callTrades('closedtrades.max_runup', ctx, 1))).toBeCloseTo(1);
+    expect(numV(callTrades('closedtrades.max_drawdown', ctx, 1))).toBeCloseTo(4);
+  });
+
+  it('reports whole-range equity run-up/drawdown from the equity curve', () => {
+    // equity: 100000, 100000, 100001, 100002, 100002, 100002, 100001, 100000
+    const { ctx } = twoTrades();
+    expect(numV(getConstant('strategy.max_drawdown', ctx))).toBeCloseTo(2);
+    expect(numV(getConstant('strategy.max_runup', ctx))).toBeCloseTo(2);
+    expect(numV(getConstant('strategy.max_drawdown_percent', ctx))).toBeCloseTo(0.002);
+    expect(numV(getConstant('strategy.max_runup_percent', ctx))).toBeCloseTo(0.002);
+  });
+
+  it('tracks position entry name and max contracts held', () => {
+    const flat = twoTrades();
+    expect(flat.ctx && getConstant('strategy.position_entry_name', flat.ctx).kind).toBe('na');
+    expect(numV(getConstant('strategy.max_contracts_held_all', flat.ctx))).toBe(1);
+    expect(numV(getConstant('strategy.max_contracts_held_long', flat.ctx))).toBe(1);
+    expect(numV(getConstant('strategy.max_contracts_held_short', flat.ctx))).toBe(1);
+
+    // Short still open at the last bar → named after the entry that opened it.
+    const open = twoTrades(false);
+    expect(strV(getConstant('strategy.position_entry_name', open.ctx))).toBe('S');
+  });
+
+  it('marks open trades to the current close and reports capital held', () => {
+    const { ctx } = twoTrades(false);
+    // short 1 @15 marked at close(7)=17 → −2, ÷ size 15 → −13.33%
+    expect(numV(callTrades('opentrades.profit', ctx, 0))).toBeCloseTo(-2);
+    expect(numV(callTrades('opentrades.profit_percent', ctx, 0))).toBeCloseTo(-2 / 15 * 100);
+    expect(strV(callTrades('opentrades.entry_id', ctx, 0))).toBe('S');
+    expect(numV(callTrades('opentrades.max_runup', ctx, 0))).toBeCloseTo(1);
+    expect(numV(callTrades('opentrades.max_drawdown', ctx, 0))).toBeCloseTo(4);
+    // Default margin is 100% → the whole market value is held.
+    expect(numV(getConstant('strategy.opentrades.capital_held', ctx))).toBeCloseTo(17);
+
+    // 50% margin → half the position's market value.
+    const half = twoTrades(false, (c) => declCfg(c, [['margin_short', numN(50)], ['margin_long', numN(50)]]));
+    expect(numV(getConstant('strategy.opentrades.capital_held', half.ctx))).toBeCloseTo(8.5);
+  });
+
+  it('solves the margin liquidation price from the margin-call condition', () => {
+    const mk = (decl: [string, Node][], dir: Value) => {
+      const { ctx, barCtx } = mkRtCtx(mkBars(4, 10));
+      declCfg(ctx, [['initial_capital', numN(5)], ...decl]);
+      callStrategy('entry', [{ kind: 'string', v: 'E' }, dir], {}, ctx);
+      barCtx.seek(1);
+      return ctx;
+    };
+    // Long 1 @11, equity 5, 25% margin → p where equity (5 + p − 11) = p × 0.25.
+    const long = mk([['margin_long', numN(25)]], LONG);
+    const p = numV(getConstant('strategy.margin_liquidation_price', long));
+    expect(p).toBeCloseTo(8);
+    expect(5 + 1 * (p - 11)).toBeCloseTo(p * 1 * 0.25);
+    // Short 1 @11 → equity (5 + 11 − p) = p × 0.25.
+    const short = mk([['margin_short', numN(25)]], SHORT);
+    const ps = numV(getConstant('strategy.margin_liquidation_price', short));
+    expect(ps).toBeCloseTo(12.8);
+    expect(5 + (11 - ps)).toBeCloseTo(ps * 0.25);
+    // 100% margin long → the price is unattainable.
+    expect(getConstant('strategy.margin_liquidation_price', mk([['margin_long', numN(100)]], LONG)).kind).toBe('na');
+    // No margin parameter declared → na, per the reference.
+    expect(getConstant('strategy.margin_liquidation_price', mk([], LONG)).kind).toBe('na');
+  });
+
+  it('resolves account currency, initial capital and default entry qty', () => {
+    const { ctx } = mkRtCtx(mkBars(1));
+    expect(numV(getConstant('strategy.initial_capital', ctx))).toBe(100000);
+    // currency.NONE (the default) means "the chart symbol's currency".
+    expect(strV(getConstant('strategy.account_currency', ctx))).toBe('USD');
+    expect(numV(callStrategy('default_entry_qty', [{ kind: 'int', v: 11 }], {}, ctx))).toBe(1);
+
+    declCfg(ctx, [['currency', strN('currency.TWD')]]);
+    expect(strV(getConstant('strategy.account_currency', ctx))).toBe('TWD');
+    // No FX source: a cross-currency conversion reports once and passes through.
+    expect(numV(callStrategy('convert_to_account', [{ kind: 'int', v: 10 }], {}, ctx))).toBe(10);
+    expect(ctx.warnings.some((w) => w.includes('no exchange rate'))).toBe(true);
+    expect(numV(callStrategy('convert_to_symbol', [{ kind: 'int', v: 10 }], {}, ctx))).toBe(10);
+
+    declCfg(ctx, [
+      ['default_qty_type', strN('strategy.percent_of_equity')],
+      ['default_qty_value', numN(50)],
+      ['initial_capital', numN(10000)],
+    ]);
+    expect(numV(callStrategy('default_entry_qty', [{ kind: 'int', v: 10 }], {}, ctx))).toBeCloseTo(500);
+  });
+});

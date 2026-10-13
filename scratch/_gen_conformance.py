@@ -383,8 +383,8 @@ payload = {
     "compat_doc": "https://pynecore.org/docs/overview/compatibility/",
     "core_concepts": "https://pynecore.org/docs/overview/core-concepts/"
   },
-  "ours_measured": {"builtins": 412, "constants": 189, "ta_functions": 61,
-                    "strategy_builtins": 21, "line": 26, "label": 31, "box": 43,
+  "ours_measured": {"builtins": 449, "constants": 193, "ta_functions": 61,
+                    "strategy_builtins": 47, "line": 26, "label": 31, "box": 43,
                     "table": 29, "polyline": 3, "linefill": 9},
   "counts": {},
   "items": ITEMS,

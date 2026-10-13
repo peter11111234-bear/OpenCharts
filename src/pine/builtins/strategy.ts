@@ -44,6 +44,9 @@ export interface StratCfg {
    *  / short positions. 0 disables every position-size limit. Default 100. */
   margin_long: number;
   margin_short: number;
+  /** `margin_long` or `margin_short` was passed to strategy() — the reference
+   *  makes strategy.margin_liquidation_price na without it. */
+  marginDeclared?: boolean;
 }
 
 export interface StratOrder {
@@ -136,6 +139,14 @@ export interface TradeLeg {
   bar: number;
   time: number;
   price: number;
+  /** Entry order id — strategy.opentrades.entry_id. */
+  id: string;
+  /** Entry order comment — strategy.opentrades.entry_comment. */
+  comment: string;
+  /** Order that last closed this leg — strategy.closedtrades.exit_id. */
+  exitId: string;
+  /** Its comment — strategy.closedtrades.exit_comment. */
+  exitComment: string;
   /** Signed side (+1 long / -1 short). */
   dir: number;
   /** Remaining open contracts. */
@@ -162,6 +173,14 @@ export interface ClosedTrade {
   entryPrice: number;
   dir: number;
   openedQty: number;
+  /** Entry order id — strategy.closedtrades.entry_id. */
+  id: string;
+  /** Entry order comment — strategy.closedtrades.entry_comment. */
+  comment: string;
+  /** Order that closed the leg — strategy.closedtrades.exit_id. */
+  exitId: string;
+  /** Its comment — strategy.closedtrades.exit_comment. */
+  exitComment: string;
   exitBar: number;
   exitTime: number;
   exitPrice: number;
@@ -184,6 +203,12 @@ interface Sim {
   openLegs: TradeLeg[];
   /** Fully-closed entry legs, chronological — strategy.closedtrades.* rows. */
   closed: ClosedTrade[];
+  /** Entry id that opened the current position — strategy.position_entry_name. */
+  positionEntryName: string;
+  /** Largest |position| over the replay — strategy.max_contracts_held_*. */
+  maxContractsAll: number;
+  maxContractsLong: number;
+  maxContractsShort: number;
 }
 
 const ORDERS_KEY = 'strategy|orders';
@@ -257,6 +282,7 @@ const timeAt = (ctx: BuiltinCtx, bar: number, upto: number) => numAt(ctx.time, b
 const emptySim = (): Sim => ({
   qty: 0, avgEntry: 0, realizedPnl: 0, closedTrades: 0, openTrades: 0,
   execs: [], curTrade: 0, openLegs: [], closed: [],
+  positionEntryName: '', maxContractsAll: 0, maxContractsLong: 0, maxContractsShort: 0,
 });
 
 // ── replay ──────────────────────────────────────────────────────────────────
@@ -724,7 +750,11 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     const match = traded * dir; // signed contracts traded
     if (match === 0) return;
     // New round-trip: entry at flat position OR an entry that flips the side.
-    if (isEntry && (sim.qty === 0 || Math.sign(sim.qty) !== dir)) sim.curTrade++;
+    if (isEntry && (sim.qty === 0 || Math.sign(sim.qty) !== dir)) {
+      sim.curTrade++;
+      // The order that initially opened the position names it until flat.
+      sim.positionEntryName = o.id;
+    }
     sim.execs.push({
       bar, price, dir,
       kind: isEntry ? 'entry' : 'exit',
@@ -762,6 +792,8 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
         leg.exitBar = bar;
         leg.exitTime = timeAt(ctx, bar, uptoBar);
         leg.exitComm += comm * (q / closing);
+        leg.exitId = o.id;
+        leg.exitComment = o.comment ?? '';
         leg.qty -= q;
         left -= q;
         if (leg.qty <= 1e-12) {
@@ -769,6 +801,8 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
           sim.closed.push({
             entryBar: leg.bar, entryTime: leg.time, entryPrice: leg.price,
             dir: leg.dir, openedQty: leg.openedQty,
+            id: leg.id, comment: leg.comment,
+            exitId: leg.exitId, exitComment: leg.exitComment,
             exitBar: leg.exitBar, exitTime: leg.exitTime,
             exitPrice: leg.exitNotional / leg.exitQty,
             profit: leg.pnl - leg.entryComm - leg.exitComm,
@@ -781,6 +815,7 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     if (opening > 1e-12) {
       sim.openLegs.push({
         bar, time: timeAt(ctx, bar, uptoBar), price, dir: Math.sign(match),
+        id: o.id, comment: o.comment ?? '', exitId: '', exitComment: '',
         qty: opening, openedQty: opening, pnl: 0,
         entryComm: closing > 0 ? 0 : comm,
         exitComm: 0, exitQty: 0, exitNotional: 0, exitBar: -1, exitTime: NaN,
@@ -808,6 +843,12 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     let legQty = 0, legNotional = 0;
     for (const l of sim.openLegs) { legQty += l.qty; legNotional += l.qty * l.price; }
     sim.avgEntry = legQty > 1e-12 ? legNotional / legQty : 0;
+    // Position size only changes at fills, so the per-fill max is exact for
+    // the whole range (strategy.max_contracts_held_*).
+    const held = Math.abs(sim.qty);
+    if (held > sim.maxContractsAll) sim.maxContractsAll = held;
+    if (sim.qty > sim.maxContractsLong) sim.maxContractsLong = sim.qty;
+    if (-sim.qty > sim.maxContractsShort) sim.maxContractsShort = -sim.qty;
     // OCA: a fill in an oca group retires (cancel) or shrinks (reduce) its
     // pending siblings. cancelledAt = bar-1 forbids same-bar sibling fills —
     // the group is one-cancels-others, not first-touched-wins-later.
@@ -1186,6 +1227,98 @@ function regOpen(name: string, pick: (t: TradeLeg) => number): void {
   });
 }
 
+/** Identity fields shared by open and closed trade rows. */
+interface TradeIds { id: string; comment: string; exitId: string; exitComment: string }
+
+/** String-valued per-trade accessor (entry_id / entry_comment / …). */
+function regStr(ns: string, name: string, pick: (t: TradeIds) => string): void {
+  registerBuiltin(ns, name, (c, args) => {
+    if (!c) return NA;
+    const sim = simAt(c, c.barIndex);
+    const rows: readonly TradeIds[] = ns === 'strategy.closedtrades' ? sim.closed : sim.openLegs;
+    const i = curNum(args[0] ?? NA);
+    const t = i !== undefined && i >= 0 && i < rows.length ? rows[Math.trunc(i)]! : undefined;
+    return t === undefined ? NA : { kind: 'string', v: pick(t) };
+  });
+}
+
+// ── trade excursions (MFE / MAE) ────────────────────────────────────────────
+// TV defines a trade's run-up/drawdown as the largest favorable / adverse
+// price move while it was open, in account currency; the percent variants
+// divide by the trade's size (entry price × quantity) — the guide calls it
+// "a percentage of the trade's size". Scanning the bar range is memoized by
+// row content so the documented "loop over every trade on every bar" pattern
+// costs one scan per closed trade instead of one per bar.
+
+interface ExcCache { byKey: Map<string, { runup: number; drawdown: number }> }
+const EXC_KEY = 'strategy|excCache';
+
+function excursionOf(
+  ctx: BuiltinCtx, key: string, dir: number, entryPrice: number, qty: number,
+  fromBar: number, toBar: number,
+): { runup: number; drawdown: number } {
+  const st = stateOf(ctx);
+  let cache = st?.get(EXC_KEY) as ExcCache | undefined;
+  if (st && !cache) { cache = { byKey: new Map() }; st.set(EXC_KEY, cache); }
+  const hit = cache?.byKey.get(key);
+  if (hit) return hit;
+  let runup = 0, drawdown = 0;
+  const upto = ctx.barIndex;
+  for (let b = Math.max(0, fromBar); b <= toBar; b++) {
+    const hi = highAt(ctx, b, upto), lo = lowAt(ctx, b, upto);
+    if (!Number.isFinite(hi) || !Number.isFinite(lo)) continue;
+    const up = (dir > 0 ? hi - entryPrice : entryPrice - lo) * qty;
+    const dn = (dir > 0 ? entryPrice - lo : hi - entryPrice) * qty;
+    if (up > runup) runup = up;
+    if (dn > drawdown) drawdown = dn;
+  }
+  const res = { runup, drawdown };
+  cache?.byKey.set(key, res);
+  return res;
+}
+
+/** Excursion accessor for one trade row; `to` is the exit bar (closed) or the
+ *  current bar (open). Percent variants use the trade's size as denominator. */
+function regExc(ns: string, name: string, which: 'runup' | 'drawdown', percent: boolean): void {
+  registerBuiltin(ns, name, (c, args) => {
+    if (!c) return NA;
+    const sim = simAt(c, c.barIndex);
+    const i = curNum(args[0] ?? NA);
+    if (i === undefined || i < 0) return NA;
+    const k = Math.trunc(i);
+    // A closed row spans entry→exit; an open one spans entry→the current bar
+    // (a TradeLeg also carries exitBar = -1, so the namespace decides).
+    let dir: number, entryPrice: number, size: number, entryBar: number, endBar: number;
+    if (ns === 'strategy.closedtrades') {
+      const t = sim.closed[k];
+      if (t === undefined) return NA;
+      ({ dir, entryPrice, size } = { dir: t.dir, entryPrice: t.entryPrice, size: t.openedQty });
+      entryBar = t.entryBar;
+      endBar = t.exitBar;
+    } else {
+      const t = sim.openLegs[k];
+      if (t === undefined) return NA;
+      ({ dir, entryPrice, size } = { dir: t.dir, entryPrice: t.price, size: t.openedQty });
+      entryBar = t.bar;
+      endBar = c.barIndex;
+    }
+    if (endBar < entryBar) return NA;
+    const key = `${ns}|${which}|${dir}|${entryPrice}|${size}|${entryBar}|${endBar}`;
+    const ex = excursionOf(c, key, dir, entryPrice, size, entryBar, endBar);
+    const v = which === 'runup' ? ex.runup : ex.drawdown;
+    if (!percent) return numVal(v);
+    const denom = entryPrice * size;
+    return denom > 0 ? numVal(v / denom * 100) : NA;
+  });
+}
+
+/** Unrealized P&L of one open leg (its partial exits + remaining contracts). */
+function openLegProfit(ctx: BuiltinCtx, leg: TradeLeg): number {
+  const close = closeAt(ctx, ctx.barIndex, ctx.barIndex);
+  const open = Number.isFinite(close) ? leg.qty * leg.dir * (close - leg.price) : 0;
+  return leg.pnl - leg.entryComm - leg.exitComm + open;
+}
+
 regClosed('entry_bar_index', t => t.entryBar);
 regClosed('entry_price', t => t.entryPrice);
 regClosed('entry_time', t => t.entryTime);
@@ -1201,6 +1334,60 @@ regOpen('entry_price', t => t.price);
 regOpen('entry_time', t => t.time);
 regOpen('size', t => t.qty * t.dir);
 regOpen('commission', t => t.entryComm + t.exitComm);
+
+/** strategy.opentrades.profit() — marked to the current bar's close. */
+registerBuiltin('strategy.opentrades', 'profit', (c, args) => {
+  if (!c) return NA;
+  const rows = simAt(c, c.barIndex).openLegs;
+  const i = curNum(args[0] ?? NA);
+  const t = i !== undefined && i >= 0 && i < rows.length ? rows[Math.trunc(i)]! : undefined;
+  return t === undefined ? NA : numVal(openLegProfit(c, t));
+});
+
+regStr('strategy.closedtrades', 'entry_id', t => t.id);
+regStr('strategy.closedtrades', 'exit_id', t => t.exitId);
+regStr('strategy.closedtrades', 'entry_comment', t => t.comment);
+regStr('strategy.closedtrades', 'exit_comment', t => t.exitComment);
+regStr('strategy.opentrades', 'entry_id', t => t.id);
+regStr('strategy.opentrades', 'entry_comment', t => t.comment);
+
+regExc('strategy.closedtrades', 'max_runup', 'runup', false);
+regExc('strategy.closedtrades', 'max_drawdown', 'drawdown', false);
+regExc('strategy.closedtrades', 'max_runup_percent', 'runup', true);
+regExc('strategy.closedtrades', 'max_drawdown_percent', 'drawdown', true);
+regExc('strategy.opentrades', 'max_runup', 'runup', false);
+regExc('strategy.opentrades', 'max_drawdown', 'drawdown', false);
+regExc('strategy.opentrades', 'max_runup_percent', 'runup', true);
+regExc('strategy.opentrades', 'max_drawdown_percent', 'drawdown', true);
+
+/** P&L as a percentage of the trade's size (entry price × quantity). */
+function regProfitPercent(ns: string, name: string, open: boolean): void {
+  registerBuiltin(ns, name, (c, args) => {
+    if (!c) return NA;
+    const sim = simAt(c, c.barIndex);
+    const i = curNum(args[0] ?? NA);
+    if (i === undefined || i < 0) return NA;
+    const k = Math.trunc(i);
+    let entryPrice: number, size: number, profit: number;
+    if (open) {
+      const leg = sim.openLegs[k];
+      if (leg === undefined) return NA;
+      entryPrice = leg.price;
+      size = leg.openedQty;
+      profit = openLegProfit(c, leg);
+    } else {
+      const t = sim.closed[k];
+      if (t === undefined) return NA;
+      entryPrice = t.entryPrice;
+      size = t.openedQty;
+      profit = t.profit;
+    }
+    const denom = entryPrice * size;
+    return denom > 0 ? numVal(profit / denom * 100) : NA;
+  });
+}
+regProfitPercent('strategy.closedtrades', 'profit_percent', false);
+regProfitPercent('strategy.opentrades', 'profit_percent', true);
 
 registerLazyConstant('strategy', 'grossprofit', (c) => {
   const ctx = c as BuiltinCtx | undefined;
@@ -1218,6 +1405,247 @@ registerLazyConstant('strategy', 'netprofit', (c) => {
   const ctx = c as BuiltinCtx | undefined;
   if (!ctx) return NA;
   return { kind: 'float', v: simAt(ctx, ctx.barIndex).closed.reduce((s, t) => s + t.profit, 0) };
+});
+
+// ── trade statistics + performance ratios ───────────────────────────────────
+// Percent bases follow the reference: the whole-range metrics (gross/net/max
+// run-up/max drawdown) are "a percentage of the initial capital"; the per-trade
+// ones are "a percentage of the trade's size"; openprofit_percent is documented
+// as openPL / realizedEquity × 100.
+
+const closedOf = (ctx: BuiltinCtx): ClosedTrade[] => simAt(ctx, ctx.barIndex).closed;
+
+/** Whole-range metric as a percentage of the initial capital. */
+export function pctOfCapital(ctx: BuiltinCtx, v: number): Value {
+  const cap = cfgOf(ctx).initial_capital;
+  return cap > 0 ? numVal(v / cap * 100) : NA;
+}
+
+const closedSum = (ctx: BuiltinCtx, keep: (t: ClosedTrade) => boolean): number =>
+  closedOf(ctx).reduce((s, t) => keep(t) ? s + t.profit : s, 0);
+
+registerLazyConstant('strategy', 'grossprofit_percent', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? pctOfCapital(ctx, closedSum(ctx, t => t.profit > 0)) : NA;
+});
+
+registerLazyConstant('strategy', 'grossloss_percent', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? pctOfCapital(ctx, Math.abs(closedSum(ctx, t => t.profit < 0))) : NA;
+});
+
+registerLazyConstant('strategy', 'netprofit_percent', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? pctOfCapital(ctx, closedSum(ctx, () => true)) : NA;
+});
+
+/** strategy.openprofit_percent — openPL / realizedEquity × 100, where the
+ *  realized equity is the initial capital plus every closed trade's P&L. */
+registerLazyConstant('strategy', 'openprofit_percent', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  if (!ctx) return NA;
+  const sim = simAt(ctx, ctx.barIndex);
+  if (sim.qty === 0) return numVal(0);
+  const close = closeAt(ctx, ctx.barIndex, ctx.barIndex);
+  if (!Number.isFinite(close)) return NA;
+  const realizedEquity = cfgOf(ctx).initial_capital + sim.realizedPnl;
+  if (realizedEquity === 0) return NA;
+  return numVal(sim.qty * (close - sim.avgEntry) / realizedEquity * 100);
+});
+
+registerLazyConstant('strategy', 'wintrades', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? numVal(closedOf(ctx).filter(t => t.profit > 0).length) : NA;
+});
+
+registerLazyConstant('strategy', 'losstrades', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? numVal(closedOf(ctx).filter(t => t.profit < 0).length) : NA;
+});
+
+registerLazyConstant('strategy', 'eventrades', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? numVal(closedOf(ctx).filter(t => t.profit === 0).length) : NA;
+});
+
+/** Mean of `pick` over the closed trades `keep` accepts; na with no such row. */
+function meanOver(ctx: BuiltinCtx, keep: (t: ClosedTrade) => boolean, pick: (t: ClosedTrade) => number): Value {
+  const rows = closedOf(ctx).filter(keep);
+  if (rows.length === 0) return NA;
+  return numVal(rows.reduce((s, t) => s + pick(t), 0) / rows.length);
+}
+
+/** Per-trade P&L as a percentage of the trade's size (entry price × qty). */
+const tradePct = (t: ClosedTrade): number =>
+  t.entryPrice * t.openedQty > 0 ? t.profit / (t.entryPrice * t.openedQty) * 100 : NaN;
+
+registerLazyConstant('strategy', 'avg_trade', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? meanOver(ctx, () => true, t => t.profit) : NA;
+});
+
+registerLazyConstant('strategy', 'avg_trade_percent', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? meanOver(ctx, () => true, tradePct) : NA;
+});
+
+registerLazyConstant('strategy', 'avg_winning_trade', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? meanOver(ctx, t => t.profit > 0, t => t.profit) : NA;
+});
+
+registerLazyConstant('strategy', 'avg_winning_trade_percent', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? meanOver(ctx, t => t.profit > 0, tradePct) : NA;
+});
+
+registerLazyConstant('strategy', 'avg_losing_trade', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? meanOver(ctx, t => t.profit < 0, t => t.profit) : NA;
+});
+
+registerLazyConstant('strategy', 'avg_losing_trade_percent', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? meanOver(ctx, t => t.profit < 0, tradePct) : NA;
+});
+
+// ── position / account state ────────────────────────────────────────────────
+
+registerLazyConstant('strategy', 'initial_capital', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? numVal(cfgOf(ctx).initial_capital) : NA;
+});
+
+/** strategy.account_currency — the currency code the run books P&L in. The
+ *  strategy() default (currency.NONE) means "the chart symbol's currency". */
+function accountCurrencyOf(ctx: BuiltinCtx): string {
+  const c = cfgOf(ctx).currency;
+  if (c === '' || c === 'NONE' || c === 'currency.NONE') {
+    const v = ctx.syminfo?.currency;
+    const u = v !== undefined && v.kind === 'series' ? v.v.cur() : v;
+    return u !== undefined ? asStr(u) : 'NONE';
+  }
+  return c.startsWith('currency.') ? c.slice('currency.'.length) : c;
+}
+
+registerLazyConstant('strategy', 'account_currency', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? { kind: 'string', v: accountCurrencyOf(ctx) } : NA;
+});
+
+registerLazyConstant('strategy', 'position_entry_name', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  if (!ctx) return NA;
+  const sim = simAt(ctx, ctx.barIndex);
+  return sim.qty !== 0 ? { kind: 'string', v: sim.positionEntryName } : NA;
+});
+
+registerLazyConstant('strategy', 'max_contracts_held_all', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? numVal(simAt(ctx, ctx.barIndex).maxContractsAll) : NA;
+});
+
+registerLazyConstant('strategy', 'max_contracts_held_long', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? numVal(simAt(ctx, ctx.barIndex).maxContractsLong) : NA;
+});
+
+registerLazyConstant('strategy', 'max_contracts_held_short', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  return ctx ? numVal(simAt(ctx, ctx.barIndex).maxContractsShort) : NA;
+});
+
+/** strategy.closedtrades.first_index — the List of Trades is never trimmed by
+ *  this engine, so the oldest listed trade is always number 0. */
+registerLazyConstant('strategy.closedtrades', 'first_index', () => numVal(0));
+
+/** strategy.opentrades.capital_held — the account money the open legs tie up:
+ *  each leg's current market value times its side's margin ratio. na when the
+ *  run uses no margin at all (both ratios zero). */
+registerLazyConstant('strategy', 'opentrades.capital_held', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  if (!ctx) return NA;
+  const cfg = cfgOf(ctx);
+  if (cfg.margin_long === 0 && cfg.margin_short === 0) return NA;
+  const sim = simAt(ctx, ctx.barIndex);
+  if (sim.openLegs.length === 0) return numVal(0);
+  const close = closeAt(ctx, ctx.barIndex, ctx.barIndex);
+  const price = Number.isFinite(close) ? close : 0;
+  const pv = pointValueOf(ctx);
+  let held = 0;
+  for (const leg of sim.openLegs) {
+    const ratio = (leg.dir > 0 ? cfg.margin_long : cfg.margin_short) / 100;
+    held += leg.qty * price * pv * ratio;
+  }
+  return numVal(held);
+});
+
+/** strategy.margin_liquidation_price — the price where the Broker Emulator's
+ *  margin call fires. Solving available funds = equity − margin = 0 for the
+ *  price gives (dir·Q·PV·entry − E0) / (Q·PV·(dir − ratio)), with E0 the
+ *  equity excluding the open position's P&L. A zero denominator (100% margin
+ *  long) means the price is unattainable. na when flat, when no margin
+ *  parameter was declared, or when the ratio is zero (no limit). */
+registerLazyConstant('strategy', 'margin_liquidation_price', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  if (!ctx) return NA;
+  const cfg = cfgOf(ctx);
+  if (!cfg.marginDeclared) return NA;
+  const sim = simAt(ctx, ctx.barIndex);
+  if (sim.qty === 0) return NA;
+  const dir = Math.sign(sim.qty);
+  const ratio = (dir > 0 ? cfg.margin_long : cfg.margin_short) / 100;
+  if (!(ratio > 0)) return NA;
+  const size = Math.abs(sim.qty) * pointValueOf(ctx);
+  const denom = size * (dir - ratio);
+  if (denom === 0) return NA;
+  const e0 = cfg.initial_capital + sim.realizedPnl;
+  return numVal((dir * size * sim.avgEntry - e0) / denom);
+});
+
+// ── currency conversion + default sizing ────────────────────────────────────
+
+/** strategy.convert_to_account / convert_to_symbol — both need a daily FX
+ *  rate this engine has no source for. Same-currency runs are the identity;
+ *  a cross-currency run is reported once and returns the input unchanged
+ *  rather than inventing a rate. */
+function convertCurrency(ctx: BuiltinCtx, args: readonly Value[], dir: 'account' | 'symbol'): Value {
+  const n = curNum(args[0] ?? NA);
+  if (n === undefined || !Number.isFinite(n)) return NA;
+  const sym = ctx.syminfo?.currency;
+  const symCur = sym !== undefined ? asStr(sym.kind === 'series' ? sym.v.cur() : sym) : '';
+  const acct = accountCurrencyOf(ctx);
+  if (symCur !== acct) {
+    warnOnce(ctx, 'strategy|fx',
+      `strategy.convert_to_${dir}(): no exchange rate for ${symCur} → ${acct}; the value is returned unchanged`);
+  }
+  return numVal(n);
+}
+registerBuiltin('strategy', 'convert_to_account', (c, args) => c ? convertCurrency(c, args, 'account') : NA);
+registerBuiltin('strategy', 'convert_to_symbol', (c, args) => c ? convertCurrency(c, args, 'symbol') : NA);
+
+/** strategy.default_entry_qty(fill_price) — the quantity an entry would size
+ *  to at that price under the strategy's default_qty_* settings. Ignores any
+ *  open position, exactly like the reference. */
+registerBuiltin('strategy', 'default_entry_qty', (c, args) => {
+  if (!c) return NA;
+  const price = curNum(args[0] ?? NA);
+  if (price === undefined || !(price > 0)) return NA;
+  const cfg = cfgOf(c);
+  const sim = simAt(c, c.barIndex);
+  const close = closeAt(c, c.barIndex, c.barIndex);
+  const open = sim.qty !== 0 && Number.isFinite(close) ? sim.qty * (close - sim.avgEntry) : 0;
+  const equity = cfg.initial_capital + sim.realizedPnl + open;
+  switch (cfg.default_qty_type) {
+    case 'strategy.percent_of_equity':
+    case 'percent_of_equity':
+      return numVal(equity * cfg.default_qty_value / (100 * price));
+    case 'strategy.cash':
+    case 'cash':
+      return numVal(cfg.default_qty_value / price);
+    default:
+      return numVal(cfg.default_qty_value);
+  }
 });
 
 // ── enum / currency constants ───────────────────────────────────────────────
@@ -1328,6 +1756,7 @@ export function strategyDecl(ctx: BuiltinCtx, node: StrategyDecl): void {
     slippage: num('slippage', DEFAULT_CFG.slippage),
     margin_long: num('margin_long', DEFAULT_CFG.margin_long),
     margin_short: num('margin_short', DEFAULT_CFG.margin_short),
+    marginDeclared: bound.has('margin_long') || bound.has('margin_short'),
   };
   st.set(CFG_KEY, cfg);
   // Declared-but-unimplemented parameters are reported once per run instead of

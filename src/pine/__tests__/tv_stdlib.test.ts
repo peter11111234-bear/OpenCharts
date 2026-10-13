@@ -27,7 +27,7 @@ const tvNames = new Set(tv.functions.map((f) => f.qualified ?? f.name));
  *  resolve in the registry. `indicator()` / `strategy()` are declaration
  *  statements handled by the interpreter, not registry entries, so they are
  *  deliberately absent from this list. */
-const IMPLEMENTED_PREFIXES = ['log.', 'strategy.risk.', 'session.', 'str.'];
+const IMPLEMENTED_PREFIXES = ['log.', 'strategy.', 'session.', 'str.'];
 const IMPLEMENTED_EXACT = [
   'strategy.entry', 'strategy.exit', 'strategy.close',
   'strategy.close_all', 'strategy.order', 'strategy.cancel', 'strategy.cancel_all',

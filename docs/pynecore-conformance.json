@@ -10,10 +10,10 @@
     "core_concepts": "https://pynecore.org/docs/overview/core-concepts/"
   },
   "ours_measured": {
-    "builtins": 412,
-    "constants": 189,
+    "builtins": 449,
+    "constants": 193,
     "ta_functions": 61,
-    "strategy_builtins": 21,
+    "strategy_builtins": 47,
     "line": 26,
     "label": 31,
     "box": 43,

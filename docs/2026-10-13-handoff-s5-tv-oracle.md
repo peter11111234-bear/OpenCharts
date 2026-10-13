@@ -108,7 +108,7 @@ npx vitest run src/pine/__tests__/tv_stdlib.test.ts
 | namespace | 缺 | 備註 |
 |---|---|---|
 | `matrix.*` | 48 | 純工作量；`Value` kind 與 flat 解構已鋪好路 |
-| `strategy.*` | 45 | v5/v6 成員：`account_currency`、`avg_*_trade*`、`closedtrades.entry_id/exit_id/entry_comment/…`、`max_runup`、`wintrades/losstrades/eventrades`… |
+| `strategy.*` | **0** | 2026-10-13 追加完成（見第 6 節）：96/96 全註冊 |
 | `currency.*` | 43 | 常數，機械工作（本引擎只有 13 個） |
 | `ta.*` | 13 | `alma`、`barssince`、`rising/falling`、`pivot_point_levels`、`range`、`rci`… |
 | `chart.*` | 10 | `bg_color`、`is_*`（圖表類型）、`left/right_visible_bar_time` |
@@ -121,7 +121,7 @@ npx vitest run src/pine/__tests__/tv_stdlib.test.ts
 
 ### 4.3 建議順序
 
-1. `strategy.*` 的 45 個成員 —— 直接影響回測數字與 UI 欄位（跟剛做完的 S5 同一條線）。
+1. ~~`strategy.*` 的 45 個成員~~ —— 已完成（第 6 節）。
 2. `ta.*` 的 13 個 —— 有真實腳本在用（`barssince`、`rising/falling` 最常見）。
 3. `currency.*` 43 個常數 —— 半天、機械。
 4. `matrix.*` 48 個 —— 沒腳本在用，計畫文件的 P2 原則是「等真有腳本要用再做」。
@@ -136,3 +136,40 @@ npx vitest run src/pine/__tests__/tv_stdlib.test.ts
 - `scratch/tv-bundle/`（已 gitignore）
 
 三個 commit 之後工作區乾淨（`git status` 只剩上面這些未追蹤檔）。
+
+---
+
+## 6. 2026-10-13 追加：`strategy.*` 96/96 全註冊（S6）
+
+`docs/tv-pine-stdlib.json` 的 45 個缺口一次補完；`tv_stdlib.test.ts` 的
+`IMPLEMENTED_PREFIXES` 由 `'strategy.risk.'` 升級為 `'strategy.'`，整個 namespace 現在是
+契約（887 名稱中 530 → 575 已註冊）。
+
+**語意來源**：`scratch/pine-v6-kb/`（github.com/mrojas-mx/pine-script-v6-kb，TV v6 參考文件的
+機器可查版，已加 .gitignore）。百分比基準照官方：整體區間指標 ÷ initial_capital，單筆指標
+÷ 該筆的 size（entry price × quantity），`openprofit_percent` 是 openPL / realizedEquity。
+
+**新增資料**：`TradeLeg`/`ClosedTrade` 各加 `id`/`comment`/`exitId`/`exitComment`；
+`Sim` 加 `positionEntryName` + `maxContractsAll/Long/Short`（部位只在成交時變，逐筆追蹤即精確，
+不碰 riskWalk 的跳過最佳化）。`StratCfg` 加 `marginDeclared`。
+
+**MFE/MAE 走 lazy 掃描 + 內容鍵快取**（`excursionOf`，key 用 entry/exit bar + 價格 + 數量）：
+不進 replay 熱路徑，且官方範例「每 bar 迴圈所有 trade」只會各掃一次。**注意**：
+`TradeLeg.exitBar` 初始值就是 -1，用 `'exitBar' in t` 判斷 closed/open 會誤判 ——
+已改成用 namespace 判斷（這個 bug 被新測試抓到）。
+
+**`margin_liquidation_price`** 由追繳條件 `equity − margin = 0` 解出：
+`(dir·Q·PV·entry − E0) / (Q·PV·(dir − ratio))`，E0 = initial_capital + realizedPnl。
+分母為 0（100% 保證金 long）＝ 不可達 → na；未宣告 margin 參數 → na（照官方）。
+
+**已知取捨**（不是半成品）：
+1. `convert_to_account` / `convert_to_symbol` 沒有 FX 資料源 → 同幣別為恆等，跨幣別
+   warnOnce 一次後原值返回（不編造匯率）。
+2. `opentrades.capital_held` 用當前 close 的市值 × 該方向的 margin ratio（與 `marginCall`
+   的 MVS 同一個價），na 條件是兩邊 margin 都是 0。
+3. `closedtrades.first_index` 恆為 0（本引擎不裁切 List of Trades）。
+
+**驗證**：`npx vitest run src/pine` → 48 檔 / 833 passed / 1 skipped；新增 7 個測試在
+`strategy.test.ts` 的 `strategy metrics` 區塊（含 margin_liquidation_price 與追繳條件的一致性斷言）。
+`docs/pynecore-conformance.{json,html}` 的 `ours_measured` 已同步（builtins 412→449、
+constants 189→193、strategy_builtins 21→47）。
