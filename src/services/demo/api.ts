@@ -156,11 +156,11 @@ export const demoApi = {
   getFills: () => Promise.resolve({ data: engine.getFills(), total: engine.getFills().length, page: 1, pageSize: 50, totalPages: 1 }),
   getClosedPositions: () =>
     Promise.resolve({ data: engine.getClosedPositions(), total: engine.getClosedPositions().length, page: 1, pageSize: 50, totalPages: 1 }),
-  getClosedPositionsSummary: () => Promise.resolve({ realizedPnl: 0, trades: 0, wins: 0, losses: 0 }),
-  getFillQuality: () => Promise.resolve([]),
+  getClosedPositionsSummary: () => Promise.resolve({ pnl: 0, commission: 0, swap: 0, tradeCount: 0 }),
+  getFillQuality: () => Promise.resolve({ avgScore: null, count: 0, entries: [] }),
 
   // ── Trade journal (localStorage-free demo: empty) ──
-  getJournalEntries: () => Promise.resolve([]),
+  getJournalEntries: () => Promise.resolve({ entries: [], total: 0 }),
   createJournalEntry: () => Promise.resolve(null),
   updateJournalEntry: () => Promise.resolve(null),
   deleteJournalEntry: () => Promise.resolve({ success: true }),
@@ -171,7 +171,7 @@ export const demoApi = {
 
   // ── Feature gating / misc (terminal reads these on mount) ──
   getFeatureFlags: () => Promise.resolve({}),
-  isAiTraderEnabled: () => Promise.resolve(false),
+  isAiTraderEnabled: () => Promise.resolve({ enabled: false }),
   getAnnouncements: () => Promise.resolve([]),
   getAnnouncementsUnreadCount: () => Promise.resolve(0),
   replayGetSession: () => Promise.resolve(null),
