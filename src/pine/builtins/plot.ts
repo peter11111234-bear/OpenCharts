@@ -12,7 +12,7 @@
 // is a plot id, the documented convention for fill(plotA, plotB, …) args.
 
 import type { BuiltinCtx, PlotOpts, PlotSink, Value } from '../contracts';
-import { NA, VFALSE } from '../contracts';
+import { NA, VFALSE, VTRUE } from '../contracts';
 import { registerBuiltin, registerConstant } from './registry';
 import {
   RtCtx, bindArgs, truthy, asNum, asStr, strArg, boolArg,
@@ -43,7 +43,7 @@ enumSet('position', [
   'middle_left', 'middle_center', 'middle_right',
   'bottom_left', 'bottom_center', 'bottom_right',
 ]);
-enumSet('display', ['all', 'none', 'data_window', 'pane', 'price_scale', 'status_line']);
+enumSet('display', ['all', 'none', 'data_window', 'pane', 'price_scale', 'status_line', 'pine_screener']);
 enumSet('xloc', ['bar_index', 'bar_time']);
 enumSet('yloc', ['price', 'abovebar', 'belowbar']);
 enumSet('extend', ['none', 'left', 'right', 'both']);
@@ -52,10 +52,20 @@ enumSet('alert', [
   'freq_once_per_bar', 'freq_once_per_bar_close', 'freq_all',
 ]);
 
-// plot.style_* display constants
+// plot.style_* / plot.linestyle_* display constants
 enumSet('plot', ['style_line', 'style_linebr', 'style_stepline', 'style_steplinebr',
   'style_circles', 'style_cross', 'style_area', 'style_areabr', 'style_columns',
-  'style_histogram']);
+  'style_histogram', 'linestyle_solid', 'linestyle_dashed', 'linestyle_dotted',
+  'style_stepline_diamond']);
+
+enumSet('scale', ['right', 'left', 'none']);
+
+// Chart-type facts for this app: standard candles only, no renko/kagi/pnf/
+// linebreak/range/heikinashi rendering.
+registerConstant('chart', 'is_standard', VTRUE);
+for (const n of ['is_heikinashi', 'is_renko', 'is_linebreak', 'is_kagi', 'is_pnf', 'is_range']) {
+  registerConstant('chart', n, { kind: 'bool', v: false });
+}
 
 // ── Sink routing ────────────────────────────────────────────────────────────
 

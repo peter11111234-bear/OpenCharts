@@ -64,8 +64,9 @@ describe('strategy constants', () => {
   });
 
   it('registers currency.* constants', () => {
+    // TV's currency.X IS the bare code string "X", not a dotted name.
     for (const c of ['USD', 'TWD', 'EUR', 'JPY', 'GBP', 'AUD', 'CAD', 'CHF', 'CNY', 'HKD', 'NONE', 'BTC', 'ETH']) {
-      expect(getConstant(`currency.${c}`), `currency.${c}`).toEqual({ kind: 'string', v: `currency.${c}` });
+      expect(getConstant(`currency.${c}`), `currency.${c}`).toEqual({ kind: 'string', v: c });
     }
   });
 
@@ -159,7 +160,8 @@ describe('strategyDecl', () => {
     strategyDecl(ctx, node);
     const cfg = ctx.state.get('strategy|cfg') as StratCfg;
     expect(cfg.default_qty_type).toBe('strategy.percent_of_equity');
-    expect(cfg.currency).toBe('currency.TWD');
+    // currency.* is the one enum whose value is the bare code (TV: currency.TWD === "TWD").
+    expect(cfg.currency).toBe('TWD');
   });
 
   it('warns once about declared-but-unimplemented parameters', () => {
@@ -957,7 +959,7 @@ plot(strategy.position_size)`, bars);
 // metrics ÷ the trade's size (entry price × quantity).
 
 describe('strategy metrics', () => {
-  const strV = (v: Value): string => (v.kind === 'string' ? v.v : `#${v.kind}`);
+  const strV = (v: Value | undefined): string => (v && v.kind === 'string' ? v.v : `#${v?.kind}`);
 
   const declCfg = (ctx: BuiltinCtx, args: [string, Node][]): void =>
     strategyDecl(ctx, { type: 'strategy', args: args.map(([name, value]) => ({ name, value })) });
@@ -1039,7 +1041,7 @@ describe('strategy metrics', () => {
 
   it('tracks position entry name and max contracts held', () => {
     const flat = twoTrades();
-    expect(flat.ctx && getConstant('strategy.position_entry_name', flat.ctx).kind).toBe('na');
+    expect(getConstant('strategy.position_entry_name', flat.ctx)?.kind).toBe('na');
     expect(numV(getConstant('strategy.max_contracts_held_all', flat.ctx))).toBe(1);
     expect(numV(getConstant('strategy.max_contracts_held_long', flat.ctx))).toBe(1);
     expect(numV(getConstant('strategy.max_contracts_held_short', flat.ctx))).toBe(1);
@@ -1084,9 +1086,9 @@ describe('strategy metrics', () => {
     expect(ps).toBeCloseTo(12.8);
     expect(5 + (11 - ps)).toBeCloseTo(ps * 0.25);
     // 100% margin long → the price is unattainable.
-    expect(getConstant('strategy.margin_liquidation_price', mk([['margin_long', numN(100)]], LONG)).kind).toBe('na');
+    expect(getConstant('strategy.margin_liquidation_price', mk([['margin_long', numN(100)]], LONG))?.kind).toBe('na');
     // No margin parameter declared → na, per the reference.
-    expect(getConstant('strategy.margin_liquidation_price', mk([], LONG)).kind).toBe('na');
+    expect(getConstant('strategy.margin_liquidation_price', mk([], LONG))?.kind).toBe('na');
   });
 
   it('resolves account currency, initial capital and default entry qty', () => {

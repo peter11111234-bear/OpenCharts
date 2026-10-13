@@ -1517,7 +1517,9 @@ registerLazyConstant('strategy', 'initial_capital', (c) => {
 });
 
 /** strategy.account_currency — the currency code the run books P&L in. The
- *  strategy() default (currency.NONE) means "the chart symbol's currency". */
+ *  strategy() default (currency.NONE, the bare string 'NONE') means "the chart
+ *  symbol's currency". Legacy dotted values ('currency.TWD') are still accepted
+ *  because the strategy() `currency=` argument may carry one. */
 function accountCurrencyOf(ctx: BuiltinCtx): string {
   const c = cfgOf(ctx).currency;
   if (c === '' || c === 'NONE' || c === 'currency.NONE') {
@@ -1661,7 +1663,18 @@ enumSet('strategy.oca', ['none', 'cancel', 'reduce']);
 // Plan's `strategy.order.*` constants are the OCA family in Pine v5; register
 // both spellings so either reference resolves.
 enumSet('strategy.order', ['none', 'cancel', 'reduce']);
-enumSet('currency', ['USD', 'TWD', 'EUR', 'JPY', 'GBP', 'AUD', 'CAD', 'CHF', 'CNY', 'HKD', 'NONE', 'BTC', 'ETH']);
+// currency.* — TV's `currency.USD` IS the string "USD" (unlike the dotted-name
+// enums above), so these carry the bare code as their value. `currency.NONE`
+// means "use the chart symbol's currency" (see accountCurrencyOf).
+const CURRENCY_CODES = [
+  'NONE', 'USD', 'EUR', 'AUD', 'GBP', 'NZD', 'CAD', 'CHF', 'HKD', 'JPY', 'NOK',
+  'SEK', 'SGD', 'TRY', 'ZAR', 'RUB', 'BTC', 'ETH', 'MYR', 'KRW', 'USDT', 'INR',
+  'PLN', 'PKR', 'EGP', 'AED', 'COP', 'MXN', 'CLP', 'BRL', 'ARS', 'PEN', 'IDR',
+  'SAR', 'BDT', 'BHD', 'CNY', 'CZK', 'DKK', 'HUF', 'ILS', 'ISK', 'KES', 'KWD',
+  'LKR', 'MAD', 'NGN', 'PHP', 'QAR', 'RON', 'RSD', 'THB', 'TND', 'TWD', 'VES',
+  'VND',
+];
+for (const c of CURRENCY_CODES) registerConstant('currency', c, { kind: 'string', v: c });
 
 // ── strategy(...) declaration ───────────────────────────────────────────────
 

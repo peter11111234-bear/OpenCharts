@@ -215,3 +215,144 @@ constants 189→193、strategy_builtins 21→47）。
 **本引擎沒有靜默失敗這一類**：未註冊的 `ns.member` 一律 `unknown constant`、
 未註冊的裸名／namespace 根一律 `identifier 'x' not found`，都是每 run 一次的警告。
 寫探測器時，斷言「沒有輸出」比斷言「有錯誤」更容易誤判 —— 要用實際產生的值／訊息全文。
+
+---
+
+## 8. 2026-10-13 追加：backlog 238 → 150（S7：ta.* 13 ＋ 常數 75）
+
+第 7 節把 312 拆成「40 誤報 / 34 語法 / 238 真缺口」之後，這一輪收掉其中 88 個：
+
+| 批次 | 數量 | 內容 |
+|---|---|---|
+| `ta.*` 真函式 | 13 | `accdist` `alma` `barssince` `falling` `iii` `max` `min` `percentrank` `pivot_point_levels` `range` `rci` `rising` `wvad` |
+| 常數／列舉 | 75 | `currency` 43、`dayofweek` 7、`chart.is_*` 7、`plot` 4、`scale` 3、`adjustment` 3、`backadjustment` 3、`settlement_as_close` 3、`display.pine_screener` 1、`input.enum` 1 |
+
+報告現在印：`TV names: 887 | registered: 663 | absent from registry: 224 | alignment backlog: 150`。
+
+### 8.1 `ta.*` 的實作要點（`src/pine/builtins/ta.ts`）
+
+- **13 個全部有現成參考**：`src/pine/pinets{Stateless,StatefulA,StatefulB}.ts` 是 pinets 的逐字移植
+  （只掛在測試 shim 上，`pinetsAll` 沒有生產 import）。公式照它抄，**不要**直接把 shim 接進生產
+  （那是另一套 PtSeries/PineTsCtx 執行環境）。
+- **`ta.accdist` / `ta.iii` / `ta.wvad` 是變數不是函式**（`plot(ta.iii)` 合法、`ta.iii()` 不合法）
+  → 註冊成 `registerLazyConstant` + `FnSeries`，比照既有的 `ta.tr` / `ta.obv` / `ta.wad`。
+- `ta.iii` / `ta.wvad` 是**逐 bar**（官方文件「the same on pine」的鏡射就是逐 bar 公式），
+  只有 `ta.accdist` 累加；`range === 0` 貢獻 0。
+- `ta.max` / `ta.min` 是**全歷史**的 running 極值（v6 語意），不是 rolling。
+- `ta.range` 的窗口是「最近 length 個**非 na** 值」；`ta.percentrank` 的 na 比較為 false 但不改變分母。
+- `ta.barssince` 用遞推（cond → 0；否則 prev+1；prev 是 na 就維持 na）——**不要**寫成每 bar 往回掃，
+  條件永不成立時會退化成 O(n²)。
+- **陷阱**：`reg(name, fn, false)` 會讓 `evalArg` 不再把純量引數包成 per-callsite BarSeries
+  （`interpreter.ts:1303` `noHist`），需要讀歷史的引數（例如 barssince 的 condition）**必須**用預設
+  `hist = true`。
+- **測試陷阱**：`x = ta.iii` 這種「先把 series 常數綁到變數」的寫法會讓 plot 拿到未解開的 series
+  Value（畫出來是空的）；`plot(ta.iii, "x")` 直接寫才對。布林值不能直接 plot，用 `? 1 : 0`。
+
+### 8.2 常數的兩個判斷
+
+- **`currency.*` 的值改成裸碼**（`currency.TWD === 'TWD'`）：TV 就是這樣，原本的 13 個存的是
+  `'currency.TWD'`。`accountCurrencyOf` 已改成讀裸碼（保留 legacy 前綴剝除），`strategy.test.ts` 的斷言同步更新。
+- **`chart.bg_color` / `chart.left_visible_bar_time` / `chart.right_visible_bar_time` 刻意不註冊**：
+  本引擎沒有圖表顏色與可見區間來源，補成 na 只會蓋掉現在有用的 `unknown constant` 警告。
+  這 3 個（＋`syminfo` 27 欄位＋資料源類）是第 7 節「D 批：有資料源才做」的同一條線。
+
+### 8.3 剩下的 150，按價值
+
+| 批次 | 數量 | 建議 |
+|---|---|---|
+| `matrix.*` | 48 | 沒腳本在用，最後做 |
+| `syminfo` 缺欄位 | 27 | 有基本面資料源才做 |
+| `map.*` | 10 | Pine v6 的 UDT 風格腳本會用，值得做 |
+| `footprint` / `ticker` / `volume_row` / `earnings` / `dividends` / `request` / `splits` | 45 | 需要 tick／基本面資料源 → 註冊成 stub + warn |
+| `(global)` `ask`/`bid`/`timenow`/`time_tradingday`/`weekofyear`/`last_bar_time` | 6 | 有資料源才做 |
+| `timeframe` / `array.copy` / `label.copy` / `box.copy` / `line.copy` / `chart.*` 3 | 12 | 小刀，順手做 |
+
+### 8.4 驗證
+
+`npx vitest run src/pine` → 全綠（見 commit message）；新增 `ta_gap.test.ts`（11 個，含
+`ta.pivot_point_levels` 的 level 數值與非法 type 拋錯）與 `stdlib_constants.test.ts`（7 個，
+釘實際值：`dayofweek` 整數、`currency` 裸碼、`chart.is_standard` 布林、每個新列舉集合的值）。
+
+---
+
+## 9. 交接清單（2026-10-13 收工）
+
+### 9.1 本輪已落地（4 個 commit）
+
+| commit | 內容 | 驗證 |
+|---|---|---|
+| `8de652c` | `strategy.*` 45 個缺口全補（96/96） | `src/pine` 全綠 833 |
+| `3f7a95f` | 對齊報告改量 backlog（312 → 238），`resolvesFromCtx` 匯出 + 釘住 | `src/pine` 全綠 834 |
+| （本節同批） | `ta.*` 13 個真函式 + 常數 75 個（backlog 238 → 150） | `src/pine` 全綠 852 |
+| （本節同批） | `pynecore-conformance` 計數與 4 個 namespace 條目同步（full 34→36、missing 5→4） | 產生器重跑 |
+
+### 9.2 未完成 — 依「有沒有人真的受影響」排序
+
+#### A. TV 標準庫還缺 150（`tv_stdlib.test.ts` 會印最新數字）
+
+| 批次 | 數量 | 建議 | 為什麼 |
+|---|---|---|---|
+| `matrix.*` | 48 | **最後做** | 本 repo 真實腳本 0 使用（grep 驗過），補了只讓數字好看 |
+| `syminfo` 缺欄位 | 27 | 有基本面資料源才做 | 補成 na 會蓋掉現在有用的 `unknown constant` 警告 |
+| `map.*` | 10 | 值得做 | Pine v6 的 UDT 風格腳本會用；`Value` kind `map` 已存在 |
+| `footprint` 9 / `ticker` 9 / `volume_row` 8 / `earnings` 7 / `dividends` 5 / `request` 5 / `splits` 2 | 45 | 註冊成 **stub + warn** | 需要 tick／基本面資料源；照 `request.ts:38-42` 既有模式，警告比假 na 誠實 |
+| `(global)` `ask` `bid` `timenow` `time_tradingday` `weekofyear` `last_bar_time` | 6 | 有資料源才做 | 同上 |
+| `timeframe` 4 / `array.copy` `array.new_linefill` `array.new_table` / `label.copy` `label.style_text_outline` / `box.copy` / `line.copy` / `chart.*` 3 | 12 | 小刀，順手做 | `chart.bg_color`、`chart.left/right_visible_bar_time` 刻意不做（無來源） |
+
+#### B. 引擎正確性／相容性（**不是本輪造成的**，先前就列著）
+
+1. **PyneCore「A 級」四項 —— 一項都沒做**（本輪核對過現況）：
+   - **編譯期語言規則檢查**：只有 CE10188，而且是 **runtime warn-and-skip**（`builtins/util.ts:74-85`）；
+     PyneCore 的另外三個（OuterWrite / ExportCapture / SecurityDrawings）**完全沒有**
+     （`grep -i outerwrite\|exportcapture\|securitydrawing` = 0 命中）。TV 在存檔前拒絕的腳本，
+     在這裡會跑完並給出不同數字 —— **靜默分歧**。建議做 parse 後的 AST pass。
+     ⚠️ 動手前先確認一件事：我們的 parser 允許在 UDF 內寫全域變數，TV 拒絕（OuterWrite）。
+   - **ScriptRequirements 靜態偵測**：`engine.ts:225` 的 `capabilities` 是固定值
+     `{streaming:false, visibleRange:false, inputs:true}`，不是掃 AST 得出的腳本需求。
+     與上一項共用同一次 AST 走訪，建議一起做。
+   - **保留識別字命名空間 + 守衛測試**：JIT 產 `__ret`（`jit.ts:258-263`），
+     `__pine*` 有 8 個名字散在 `interpreter.ts`／`engine.ts`，**沒有任何守衛測試**
+     （`compile.test.ts`／`qa_yield` 裡的 `__pine` 是測試鉤子）。可觸發的靜默錯誤：
+     UDF body 是 `let __ret=R.VOID; <使用者程式碼>; return __ret;` → 使用者寫 `__ret = 5` 會覆寫回傳值。
+   - **合成節點帶 loc**：`loc` 在 AST 是**選填**（`contracts.ts:100 loc?:`），所以 tsc 不會擋；
+     parser 產的節點都有 loc，**interpreter 根本不合成節點**，真正缺的是
+     **`mtf.ts:322 / 377 / 1993`** 三處。MTF 去糖後的程式碼出錯會退化成無行號。
+
+2. **S5 留下的已知限制**（本檔第 3 節，全部是刻意的取捨，不是半成品）：追繳平倉不截斷成整數合約、
+   risk 規則以事件密度近似逐 bar、進場保證金不足是 warn 而非 error、`session.ispremarket/postmarket`
+   恆 false、跨年 D/W `bars_back` 未實作。
+
+3. **`log.*` 沒有輸出面板**：資料在 `RunResult.logs`，本 app 沒有 logs pane。
+
+4. **新補的 `ta.*` / `strategy.*` 指標沒有 TV 數值 oracle**：oracle 只保證**名字**對齊，
+   數值是我照官方文件與 pinets 逐字移植推的，**沒有**跟 TV 端逐位比對過。
+   要提升信心只能靠人工在 TV 上跑同一個腳本對數字。
+
+#### C. 技術債
+
+- **`tsc` 基線 275 errors**（`queries.ts` 126、`parser.ts` 58、`parser.test.ts` 23、
+  `round2_verify.test.ts` 8、`store.tsx` 7、`useReplayChartData.ts` 5…）。
+  計畫檔：`docs/superpowers/plans/2026-10-13-typescript-debt-remediation.md`（本輪一併進版控）。
+  本輪動到的檔案 0 錯誤。
+- **pinets 移植層 5346 行只被測試 import**（`pinetsAll` 沒有生產 import）→ 同時是
+  「ta 的參考實作庫」與「沒進生產的孤兒」。要決定：提升為生產 / 刪除 / 保留當測試夾具。
+  **`ta.*` 13 個的公式是照它抄的**，刪之前先確認第 8.1 節已把語意記下來。
+
+#### D. 工作區未追蹤
+
+- `scratch/vela_*.png` ×6（Vela 截圖，先前 session 留下；要保留當證據就 commit，不要就刪）
+
+### 9.3 環境陷阱（本檔第 0 節 ＋ 本輪新增）
+
+- **新增**：`reg(name, fn, false)` 會讓 `evalArg` 不再把純量引數包成 per-callsite BarSeries
+  （`interpreter.ts:1303` 的 `noHist`）→ 需要讀歷史的引數必須用預設 `hist = true`。
+- **新增**：`x = ta.iii`（先把 series 常數綁到變數）會讓 plot 拿到未解開的 series Value；
+  直接 `plot(ta.iii, "x")` 才對。布林值不能直接 plot，用 `? 1 : 0`。
+- **新增**：寫探測器時，斷言「沒有輸出」比斷言「有錯誤」更容易誤判 —— 要用實際產生的值／訊息全文
+  （第 7 節那個被推翻的「靜默 na」結論就是 `/not found/` 漏掉 `unknown constant` 造成的）。
+
+### 9.4 建議的下一刀
+
+1. **`map.*` 10 個**（Pine v6 腳本會用、`Value` kind 已存在、可獨立驗證）。
+2. **PyneCore A 級第 3 項（保留名守衛）**：最便宜、修的是可觸發的靜默錯誤。
+3. **A 級第 1+2 項合併**（同一次 AST 走訪）：使用者貼腳本時立刻報錯，是「對齊 TV」最直接的可見收益。

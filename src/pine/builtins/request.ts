@@ -12,7 +12,19 @@
 import type { Value } from '../contracts';
 import { NA } from '../contracts';
 import '../mtf'; // side effect: registers security hooks with the interpreter
-import { registerBuiltin } from './registry';
+import { registerBuiltin, registerConstant } from './registry';
+
+// ── request.security enum constants ─────────────────────────────────────────
+// Value = full dotted name (the repo's constant convention); request.security's
+// adjustment/backadjustment/settlement_as_close parameters take these.
+
+function enumSet(ns: string, names: readonly string[]): void {
+  for (const n of names) registerConstant(ns, n, { kind: 'string', v: `${ns}.${n}` });
+}
+
+enumSet('adjustment', ['none', 'splits', 'dividends']);
+enumSet('backadjustment', ['inherit', 'on', 'off']);
+enumSet('settlement_as_close', ['inherit', 'on', 'off']);
 
 let warnedSecurity = false;
 

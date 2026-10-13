@@ -12,9 +12,10 @@
 import type { BuiltinCtx, Value } from '../contracts';
 import { NA, Series } from '../contracts';
 import { registerBuiltin, registerLazyConstant } from './registry';
-import { bindArgs, boolArg, curNum, numArg, truthy, unwrapped } from './util';
+import { bindArgs, boolArg, curNum, numArg, truthy, unwrapped, asStr } from './util';
 import type { RtCtx } from './util';
 import { isTfBoundary } from './time';
+import { PineRuntimeError } from '../errors';
 
 // ── numeric helpers ──────────────────────────────────────────────────────────
 
@@ -1659,3 +1660,350 @@ for (const name of ['wad', 'pvt', 'nvi', 'pvi'] as const) {
     return { kind: 'series', v: new FnSeries(ctx, (off) => fl(acc.get(ctx.barIndex - off))) };
   });
 }
+
+// ── TV stdlib alignment: the ta.* names this engine did not answer ───────────
+// ta.accdist / ta.alma / ta.barssince / ta.falling / ta.iii / ta.max / ta.min /
+// ta.percentrank / ta.pivot_point_levels / ta.range / ta.rci / ta.rising /
+// ta.wvad. Semantics follow the official v6 reference; each formula matches the
+// verbatim port in the pinets tier (src/pine/pinets*.ts), which mirrors TV.
+//
+// ta.accdist / ta.iii / ta.wvad are *variables* in TV (`plot(ta.iii)`), so they
+// register as lazy constants over FnSeries like ta.tr / ta.obv above.
+
+const at = (ctx: BuiltinCtx, s: Series, b: number): number | undefined => num(s.get(ctx.barIndex - b));
+
+/** Per-bar condition read — a bool series unwraps per bar, a scalar is constant. */
+function condAt(ctx: BuiltinCtx, v: Value | undefined, b: number): boolean {
+  if (v === undefined) return false;
+  return v.kind === 'series' ? truthy(v.v.get(ctx.barIndex - b)) : truthy(v);
+}
+
+/** State-key tail for a (callsite, source) pair — two callsites over one series
+ *  keep separate accumulators, exactly like the other stateful ta.* builtins. */
+function srcKey(ctx: BuiltinCtx, v: Value | undefined): string {
+  const rt = ctx as RtCtx;
+  const id = v !== undefined && v.kind === 'series' ? `s${seriesId(v.v)}` : `c${num(v)}`;
+  return `${rt.callsite ?? 'g'}|${id}`;
+}
+
+// ── ta.iii / ta.wvad — per-bar, NOT cumulative ──────────────────────────────
+// The reference's own "the same on pine" mirror is the bare per-bar formula,
+// so that is what these evaluate. A zero range contributes 0; any na input is na.
+
+registerLazyConstant('ta', 'iii', (c) => {
+  if (c === undefined) return NA;
+  const ctx = c as BuiltinCtx;
+  return { kind: 'series', v: new FnSeries(ctx, (off) => {
+    const cl = num(ctx.close.get(off)), h = num(ctx.high.get(off));
+    const l = num(ctx.low.get(off)), v = num(ctx.volume.get(off));
+    if (cl === undefined || h === undefined || l === undefined || v === undefined) return NA;
+    const range = h - l;
+    return fl(range === 0 ? 0 : ((2 * cl - h - l) / range) * v);
+  })};
+});
+
+registerLazyConstant('ta', 'wvad', (c) => {
+  if (c === undefined) return NA;
+  const ctx = c as BuiltinCtx;
+  return { kind: 'series', v: new FnSeries(ctx, (off) => {
+    const cl = num(ctx.close.get(off)), op = num(ctx.open.get(off));
+    const h = num(ctx.high.get(off)), l = num(ctx.low.get(off)), v = num(ctx.volume.get(off));
+    if (cl === undefined || op === undefined || h === undefined || l === undefined || v === undefined) return NA;
+    const range = h - l;
+    return fl(range === 0 ? 0 : ((cl - op) / range) * v);
+  })};
+});
+
+// ── ta.accdist — cumulative accumulation/distribution ───────────────────────
+
+function accdistVs(ctx: BuiltinCtx, key: Key): VS {
+  const acc = vstate(ctx, key, (bb) => {
+    const prev = acc.get(bb - 1) ?? 0;
+    const cl = at(ctx, ctx.close, bb), h = at(ctx, ctx.high, bb);
+    const l = at(ctx, ctx.low, bb), v = at(ctx, ctx.volume, bb);
+    // An na bar holds the running sum instead of restarting it.
+    if (cl === undefined || h === undefined || l === undefined || v === undefined) return prev;
+    const range = h - l;
+    return prev + (range === 0 ? 0 : ((cl - l) - (h - cl)) / range * v);
+  });
+  return acc;
+}
+
+registerLazyConstant('ta', 'accdist', (c) => {
+  if (c === undefined) return NA;
+  const ctx = c as BuiltinCtx;
+  const acc = accdistVs(ctx, ['ta.accdist', 'bare']);
+  return { kind: 'series', v: new FnSeries(ctx, (off) => fl(acc.get(ctx.barIndex - off))) };
+});
+
+// ── ta.max / ta.min — running extreme over the whole chart so far ────────────
+
+function runningVs(ctx: BuiltinCtx, key: Key, src: VS, pick: 'max' | 'min'): VS {
+  const run = vstate(ctx, key, (bb) => {
+    const prev = run.get(bb - 1);
+    const v = src.get(bb);
+    if (v === undefined) return prev; // na bar holds the running extreme
+    if (prev === undefined) return v;
+    return pick === 'max' ? Math.max(prev, v) : Math.min(prev, v);
+  });
+  return run;
+}
+
+for (const pick of ['max', 'min'] as const) {
+  reg(pick, (ctx, args, named) => {
+    const b = bindArgs(args, named, ['source'] as const);
+    const src = srcOf(ctx, b);
+    if (!src) return NA;
+    return fl(runningVs(ctx, [pick, srcKey(ctx, b.get('source'))], src, pick).get(ctx.barIndex));
+  });
+}
+
+// ── ta.alma — Arnaud Legoux moving average ──────────────────────────────────
+// Weights w[i] = exp(-(i - m)² / (2s²)), i = 0..length-1 over the oldest→newest
+// window, m = offset·(length-1) (floored when `floor`), s = length/sigma.
+// A non-full or na-containing window is na (the reference: na inputs produce na).
+
+reg('alma', (ctx, args, named) => {
+  const b = bindArgs(args, named, ['series', 'length', 'offset', 'sigma', 'floor'] as const);
+  const src = srcOf(ctx, b, 'series');
+  const L = lenOf(b);
+  const offset = constNum(ctx, b.get('offset'));
+  const sigma = constNum(ctx, b.get('sigma'));
+  if (!src || L === undefined || offset === undefined || sigma === undefined) return NA;
+  const floorArg = b.get('floor');
+  const floored = floorArg === undefined ? false : truthy(floorArg);
+  const s = L / sigma;
+  if (s === 0) return NA;
+  const m = floored ? Math.floor(offset * (L - 1)) : offset * (L - 1);
+  let sum = 0, wsum = 0;
+  for (let i = 0; i < L; i++) {
+    const v = src.get(ctx.barIndex - (L - 1 - i)); // weight i ↔ (L-1-i) bars back
+    if (v === undefined) return NA;
+    const w = Math.exp(-((i - m) * (i - m)) / (2 * s * s));
+    sum += v * w;
+    wsum += w;
+  }
+  return wsum === 0 ? NA : fl(sum / wsum);
+});
+
+// ── ta.barssince — bars since the condition was last true (na if never) ─────
+
+reg('barssince', (ctx, args, named) => {
+  const b = bindArgs(args, named, ['condition'] as const);
+  const cond = b.get('condition');
+  if (cond === undefined) return NA;
+  const rt = ctx as RtCtx;
+  const site = rt.callsite ?? 'g';
+  const vs = vstate(ctx, ['barssince', site], (bb) => {
+    if (condAt(ctx, cond, bb)) return 0;
+    const prev = vs.get(bb - 1);
+    return prev === undefined ? undefined : prev + 1;
+  });
+  const v = vs.get(ctx.barIndex);
+  return v === undefined ? NA : { kind: 'int', v };
+});
+
+// ── ta.rising / ta.falling — consecutive strict moves ──────────────────────
+// A pair touching an na value neither extends nor breaks the run (reference:
+// "na values are ignored"), so those steps are skipped, not counted as a break.
+
+function consecutiveMoves(src: VS, bb: number, L: number, up: boolean): boolean {
+  let count = 0;
+  for (let j = 0; j < bb && count < L; j++) {
+    const a = src.get(bb - j), prev = src.get(bb - j - 1);
+    if (a === undefined || prev === undefined) continue;
+    if (!(up ? a > prev : a < prev)) break;
+    count++;
+  }
+  return count >= L;
+}
+
+for (const up of [true, false] as const) {
+  reg(up ? 'rising' : 'falling', (ctx, args, named) => {
+    const b = bindArgs(args, named, ['source', 'length'] as const);
+    const src = srcOf(ctx, b);
+    const L = lenOf(b);
+    if (!src || L === undefined) return NA;
+    return fbool(consecutiveMoves(src, ctx.barIndex, L, up));
+  });
+}
+
+// ── ta.range — max − min over the last `length` NON-na values ───────────────
+// na slots are skipped rather than shrinking the window; an na current bar is na.
+
+reg('range', (ctx, args, named) => {
+  const b = bindArgs(args, named, ['source', 'length'] as const);
+  const src = srcOf(ctx, b);
+  const L = lenOf(b);
+  if (!src || L === undefined) return NA;
+  const bar = ctx.barIndex;
+  if (src.get(bar) === undefined) return NA;
+  let max = -Infinity, min = Infinity, seen = 0;
+  for (let k = 0; seen < L; k++) {
+    if (bar - k < 0) return NA; // ran out of history before filling the window
+    const v = src.get(bar - k);
+    if (v === undefined) continue;
+    if (v > max) max = v;
+    if (v < min) min = v;
+    seen++;
+  }
+  return fl(max - min);
+});
+
+// ── ta.percentrank — share of the previous `length` values ≤ the current one ─
+// na compares false and is not counted, but the divisor stays `length`; before
+// `length` bars of history the result is na.
+
+reg('percentrank', (ctx, args, named) => {
+  const b = bindArgs(args, named, ['source', 'length'] as const);
+  const src = srcOf(ctx, b);
+  const L = lenOf(b);
+  if (!src || L === undefined) return NA;
+  const bar = ctx.barIndex;
+  if (bar < L) return NA;
+  const cur = src.get(bar);
+  if (cur === undefined) return fl(0);
+  let count = 0;
+  for (let i = 1; i <= L; i++) {
+    const v = src.get(bar - i);
+    if (v !== undefined && v <= cur) count++;
+  }
+  return fl((count / L) * 100);
+});
+
+// ── ta.rci — Rank Correlation Index (Spearman ρ × 100, −100..100) ───────────
+// Ranks are average-ranked over ties; the time series is 1..length oldest→newest.
+
+reg('rci', (ctx, args, named) => {
+  const b = bindArgs(args, named, ['source', 'length'] as const);
+  const src = srcOf(ctx, b);
+  const L = lenOf(b);
+  if (!src || L === undefined || L < 2) return NA;
+  const bar = ctx.barIndex;
+  if (bar < L) return NA;
+  const w: number[] = [];
+  for (let k = 0; k < L; k++) {
+    const v = src.get(bar - k);
+    if (v === undefined) return NA;
+    w.push(v);
+  }
+  w.reverse(); // oldest → newest
+  const order = w.map((_, i) => i).sort((x, y) => w[x]! - w[y]!);
+  const ranks = new Array<number>(L);
+  for (let i = 0; i < L;) {
+    let j = i;
+    while (j + 1 < L && w[order[j + 1]!] === w[order[i]!]) j++;
+    const rank = (i + j) / 2 + 1;
+    for (let k = i; k <= j; k++) ranks[order[k]!] = rank;
+    i = j + 1;
+  }
+  const mean = (L + 1) / 2;
+  let cov = 0, varX = 0, varY = 0;
+  for (let i = 0; i < L; i++) {
+    const dx = i + 1 - mean, dy = ranks[i]! - mean;
+    cov += dx * dy;
+    varX += dx * dx;
+    varY += dy * dy;
+  }
+  if (varY === 0 || varX === 0) return NA; // a flat series has no rank spread
+  return fl((cov / Math.sqrt(varX * varY)) * 100);
+});
+
+// ── ta.pivot_point_levels — 11 levels of the period that just closed ────────
+// The anchor bar fixes the levels that the following period shows; without an
+// anchor the levels stay na. `developing` recomputes from the live period.
+
+interface PivotPeriod { open: number; high: number; low: number; close: number }
+interface PivotSnap { period: PivotPeriod | null; levels: number[] | null }
+
+const PIVOT_TYPES = ['Traditional', 'Fibonacci', 'Woodie', 'Classic', 'DM', 'Camarilla'];
+
+/** The 11 levels [P, R1, S1, R2, S2, R3, S3, R4, S4, R5, S5]; types that do not
+ *  define a level leave it NaN. `open` is the period open (Woodie uses the open
+ *  of the NEW period, which its caller passes in). */
+function pivotLevels(type: string, p: PivotPeriod, open: number): number[] {
+  const { high: h, low: l, close: c } = p;
+  const range = h - l;
+  const pivot = (h + l + c) / 3;
+  switch (type) {
+    case 'Traditional':
+      return [pivot, pivot * 2 - l, pivot * 2 - h, pivot + range, pivot - range,
+        pivot * 2 + (h - 2 * l), pivot * 2 - (2 * h - l),
+        pivot * 3 + (h - 3 * l), pivot * 3 - (3 * h - l),
+        pivot * 4 + (h - 4 * l), pivot * 4 - (4 * h - l)];
+    case 'Fibonacci':
+      return [pivot, pivot + 0.382 * range, pivot - 0.382 * range,
+        pivot + 0.618 * range, pivot - 0.618 * range, pivot + range, pivot - range,
+        NaN, NaN, NaN, NaN];
+    case 'Woodie': {
+      const wp = (h + l + 2 * open) / 4;
+      const r3 = h + 2 * (wp - l);
+      const s3 = l - 2 * (h - wp);
+      return [wp, 2 * wp - l, 2 * wp - h, wp + range, wp - range, r3, s3, r3 + range, s3 - range, NaN, NaN];
+    }
+    case 'Classic':
+      return [pivot, 2 * pivot - l, 2 * pivot - h, pivot + range, pivot - range,
+        pivot + 2 * range, pivot - 2 * range, pivot + 3 * range, pivot - 3 * range, NaN, NaN];
+    case 'DM': {
+      const x = c < open ? h + 2 * l + c : c > open ? 2 * h + l + c : h + l + 2 * c;
+      return [x / 4, x / 2 - l, x / 2 - h, NaN, NaN, NaN, NaN, NaN, NaN, NaN, NaN];
+    }
+    case 'Camarilla': {
+      const r5 = (h / l) * c;
+      return [pivot, c + (range * 1.1) / 12, c - (range * 1.1) / 12,
+        c + (range * 1.1) / 6, c - (range * 1.1) / 6,
+        c + (range * 1.1) / 4, c - (range * 1.1) / 4,
+        c + (range * 1.1) / 2, c - (range * 1.1) / 2, r5, c - (r5 - c)];
+    }
+    default:
+      return new Array<number>(11).fill(NaN);
+  }
+}
+
+reg('pivot_point_levels', (ctx, args, named) => {
+  const b = bindArgs(args, named, ['type', 'anchor', 'developing'] as const);
+  const tv = b.get('type');
+  const type = tv === undefined ? '' : asStr(tv.kind === 'series' ? tv.v.cur() : tv);
+  if (!PIVOT_TYPES.includes(type)) {
+    throw new PineRuntimeError(
+      `ta.pivot_point_levels: invalid argument '${type}' for 'type' — possible values: ${PIVOT_TYPES.join(', ')}`);
+  }
+  const developing = b.get('developing') === undefined ? false : truthy(b.get('developing') as Value);
+  if (developing && type === 'Woodie') {
+    throw new PineRuntimeError('ta.pivot_point_levels: `developing` cannot be true when `type` is "Woodie"');
+  }
+  const rt = ctx as RtCtx;
+  const st = stateFor<{ last: number; memo: Map<number, number[]>; prev: PivotSnap; cur: PivotSnap }>(
+    ctx, ['piv', rt.callsite ?? 'g', type, developing ? 1 : 0],
+    () => ({ last: -1, memo: new Map(), prev: { period: null, levels: null }, cur: { period: null, levels: null } }),
+  );
+  const bar = ctx.barIndex;
+  for (let i = st.last + 1; i <= bar; i++) {
+    if (st.last >= 0) st.prev = st.cur; // the previous bar's tentative state commits
+    const open = at(ctx, ctx.open, i), high = at(ctx, ctx.high, i);
+    const low = at(ctx, ctx.low, i), close = at(ctx, ctx.close, i);
+    const anchor = condAt(ctx, b.get('anchor'), i);
+    let period = st.prev.period;
+    let levels = st.prev.levels;
+    if (open === undefined || high === undefined || low === undefined || close === undefined) {
+      st.cur = st.prev; // an na bar cannot extend or reset the period
+    } else if (anchor || period === null) {
+      // The period that just ended fixes the levels shown from here on; Woodie
+      // reads the open of the NEW period (this bar).
+      if (anchor && period !== null) levels = pivotLevels(type, period, type === 'Woodie' ? open : period.open);
+      period = { open, high, low, close };
+      st.cur = { period, levels };
+    } else {
+      period = {
+        open: period.open, high: Math.max(period.high, high),
+        low: Math.min(period.low, low), close,
+      };
+      st.cur = { period, levels };
+    }
+    st.last = i;
+    st.memo.set(i, developing
+      ? pivotLevels(type, st.cur.period!, st.cur.period!.open)
+      : (st.cur.levels ?? new Array<number>(11).fill(NaN)));
+  }
+  return arr(...(st.memo.get(bar) ?? new Array<number>(11).fill(NaN)).map((n) => fl(n)));
+});

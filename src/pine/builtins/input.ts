@@ -145,9 +145,10 @@ function scalarInput(
   kind: 'int' | 'float' | 'bool' | 'string' | 'color',
   schemaType: string,
   dflt: Value,
+  order: readonly string[] = INPUT_ORDER,
 ): (ctx: RtCtx, args: Value[], named: Record<string, Value>) => Value {
   return (ctx, args, named) => {
-    const bound = bindArgs(args, named, INPUT_ORDER);
+    const bound = bindArgs(args, named, order);
     const raw = rawDefval(unwrapped(bound.get('defval') ?? dflt));
     const { value } = recordAndOverride(ctx, bound, schemaType, raw, (dv, ov) => {
       const o = ov;
@@ -174,6 +175,14 @@ registerBuiltin('input', 'session', scalarInput('string', 'session', { kind: 'st
 registerBuiltin('input', 'symbol', scalarInput('string', 'symbol', { kind: 'string', v: '' }));
 registerBuiltin('input', 'text_area', scalarInput('string', 'text_area', { kind: 'string', v: '' }));
 registerBuiltin('input', 'price', scalarInput('float', 'price', { kind: 'float', v: 0 }));
+// input.enum(defval, title, options, …) → the selected option string. Pine's
+// enum signature puts `options` third (input.int's minval/maxval/step slots do
+// not exist here), so it binds its own positional order; the schema/override
+// machinery below is the shared one.
+const ENUM_ORDER = [
+  'defval', 'title', 'options', 'tooltip', 'inline', 'group', 'confirm', 'display', 'active',
+] as const;
+registerBuiltin('input', 'enum', scalarInput('string', 'enum', { kind: 'string', v: '' }, ENUM_ORDER));
 
 // input.time(defval, title, ...) → int timestamp
 registerBuiltin('input', 'time', (ctx, args, named) => {

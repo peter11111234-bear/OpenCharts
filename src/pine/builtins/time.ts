@@ -8,7 +8,7 @@
 import type { BuiltinCtx, Value } from '../contracts';
 import { NA, Series } from '../contracts';
 import { bindArgs, numArg, warnOnce } from './util';
-import { registerBuiltin, registerLazyConstant } from './registry';
+import { registerBuiltin, registerConstant, registerLazyConstant } from './registry';
 import { tfNext, tfToMs } from '../mtf';
 import { part, tzOf, tzOffsetMs, zonedMs } from '../tz';
 
@@ -96,6 +96,16 @@ const CAL_FIELDS = [
 
 for (const [n, f] of CAL_FIELDS)
   registerBuiltin('', n, calFn(f as Intl.DateTimeFormatPartTypes));
+
+// dayofweek.* constants — TV numbering Sunday = 1 … Saturday = 7. The
+// `dayofweek(time)` builtin above reads Intl `weekday`, which uses the same
+// 1=Sunday base, so the constants and the function agree.
+for (const [n, v] of [
+  ['sunday', 1], ['monday', 2], ['tuesday', 3], ['wednesday', 4],
+  ['thursday', 5], ['friday', 6], ['saturday', 7],
+] as const) {
+  registerConstant('dayofweek', n, { kind: 'int', v });
+}
 
 // Bare calendar vars (`hour == 15`) resolve as series vars in TV. The call form
 // `hour(t)` is unaffected — evalCallDispatch consults BUILTINS before constants;

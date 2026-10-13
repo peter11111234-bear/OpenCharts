@@ -79,10 +79,13 @@ describe('TV stdlib name alignment', () => {
 
   it('resolvesFromCtx agrees with the interpreter', async () => {
     // One name per path, plus the negative cases that must stay gaps.
+    // (currency.* and ta.barssince used to be negative cases; every TV v6
+    // currency code and the 13 ta gaps are now registered, so chart.bg_color
+    // and matrix.add_col carry the absent-constant/absent-function cases.)
     const cases: [string, boolean][] = [
       ['close', true], ['bar_index', true], ['hlc3', true],
       ['syminfo.currency', true], ['timeframe.multiplier', true], ['barstate.islast', true],
-      ['syminfo.country', false], ['currency.AED', false], ['ta.barssince', false],
+      ['syminfo.country', false], ['chart.bg_color', false], ['matrix.add_col', false],
     ];
     for (const [name, expected] of cases) {
       expect(resolvesFromCtx(probeCtx, name), `resolvesFromCtx(${name})`).toBe(expected);
