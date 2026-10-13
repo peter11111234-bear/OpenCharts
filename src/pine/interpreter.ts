@@ -54,6 +54,7 @@ import {
   type WhileStmt,
 } from './contracts';
 import { PineRuntimeError, pineErr, wrapPineError } from './errors';
+import { debugFlag, markStage } from './debugFlags';
 import { FOR_IN } from './parser';
 import { BarSeries, ForwardingSeries, LitSeries, histGetAt, setActiveSeriesSet, valueAt, type IncSnap } from './series';
 import { Scope, blockFrame, seriesOf, type Frame } from './scope';
@@ -680,7 +681,7 @@ function evalNode(node: Node, frame: Frame): Value {
   const { scope, ctx } = frame;
   const run = runOf(ctx);
   const bar = ctx.barIndex;
-  if ((globalThis as Record<string, unknown>).__pineEvalCount) {
+  if (debugFlag('evalCount')) {
     __evalNodeCounts.set(node.type, (__evalNodeCounts.get(node.type) ?? 0) + 1);
   }
 
@@ -1868,11 +1869,8 @@ export const __compiledKinds = new Map<string, 'direct' | 'twoPhase' | 'fallback
 /** Compiled path enabled unless explicitly opted out (env or global).
  *  Evaluated once per runScriptInner — a mid-run flip never interleaves paths. */
 function compiledEnabled(): boolean {
-  const g = globalThis as Record<string, unknown>;
-  if (g.__pineInterp === true) return false;
-  if (typeof process !== 'undefined' && process.env?.PINE_INTERP === '1') return false;
   // Compiled path is the default; opt out via `__pineInterp`/`PINE_INTERP=1`.
-  return true;
+  return !debugFlag('interp');
 }
 
 /** Wraps a raw per-kind body so it carries evalExpr's error contract. */
@@ -2136,10 +2134,7 @@ function compileStmt(stmt: Node): CompiledStmt {
  * real cost centre (series/UDF machinery, not node dispatch) is un-JITted.
  * `__pineInterp` still forces the fully-interpreted path. */
 function jitEnabled(): boolean {
-  const g = globalThis as Record<string, unknown>;
-  if (g.__pineJit === true) return true;
-  if (typeof process !== 'undefined' && process.env?.PINE_JIT === '1') return true;
-  return false;
+  return debugFlag('jit');
 }
 
 /** UDF-body JIT — default OFF since 2026-10-11. R12's −38% was measured
@@ -2151,14 +2146,10 @@ function jitEnabled(): boolean {
  *  PINE_JIT_UDF=1; `__pineNoJitUdf` / PINE_JIT_UDF=0 also forces off.
  *  Compile failures silently fall back to the interpreted body. */
 function udfJitEnabled(): boolean {
-  const g = globalThis as Record<string, unknown>;
   // NoJit wins over Jit when both flags exist — a stale off-flag must not
   // be overridden by an experiment opt-in left set on globalThis.
-  if (g.__pineNoJitUdf === true) return false;
-  if (typeof process !== 'undefined' && process.env?.PINE_JIT_UDF === '0') return false;
-  if (g.__pineJitUdf === true) return true;
-  if (typeof process !== 'undefined' && process.env?.PINE_JIT_UDF === '1') return true;
-  return false;
+  if (debugFlag('noJitUdf')) return false;
+  return debugFlag('jitUdf');
 }
 
 /** Compile-or-fetch the per-UDF-body JitState. Cached on run.udfJit keyed by
@@ -2188,7 +2179,7 @@ function udfJitState(body: Node[], run: RunState, ctx: BuiltinCtx): JitState | n
     __pineJitStats.udfCompiled++;
     return js;
   } catch (e) {
-    if (!(globalThis as Record<string, unknown>).__pineJitQuiet)
+    if (!debugFlag('jitQuiet'))
       console.error('[udf-jit] compile failed:', e instanceof Error ? e.message : e);
     return null; // compile failure → interpreted path keeps semantics
   }
@@ -2798,9 +2789,9 @@ async function buildSess(
   // MTF pre-pass: collect security specs; resolve unique (sym,tf) fetches.
   if (mtf) {
     mtf.prepareSecurity(body, frame0);
-    (globalThis as Record<string, unknown>).__pineStage = 'prefetch';
+    markStage('prefetch');
     await mtf.prefetchSecurity(ctx, frame0, bars);
-    (globalThis as Record<string, unknown>).__pineStage = 'barloop';
+    markStage('barloop');
   }
   // Stash the store on the session — incremental resumes re-activate it
   // before each tick so sibling runs can't wipe spec state.
@@ -3019,7 +3010,7 @@ async function runScriptInner(
       if (opts.shouldAbort?.()) return empty();
     }
   }
-  (globalThis as Record<string, unknown>).__pineStage = 'assemble';
+  markStage('assemble');
   if (opts.shouldAbort?.()) return empty();
   if (barErr) throw barErr;
 
@@ -3468,7 +3459,7 @@ export async function incRunStart(
   } finally {
     setActiveSeriesSet(null);
   }
-  (globalThis as Record<string, unknown>).__pineStage = 'assemble';
+  markStage('assemble');
   if (opts.shouldAbort?.()) return { live: null, result: empty() };
   return { live, result: assembleRunResult(s) };
 }

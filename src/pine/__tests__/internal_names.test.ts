@@ -8,8 +8,6 @@
 // (`f() => __ret = 5` must not overwrite the UDF's return value).
 
 import { describe, expect, it } from 'vitest';
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { parse } from '../parser';
 import '../builtins/index';
 import { __pineJitStats, runScript } from '../interpreter';
@@ -17,24 +15,14 @@ import type { Node } from '../contracts';
 import { INTERNAL_NAMES, INTERNAL_PREFIX } from '../internalNames';
 import { jitCompile, jitCompileUdf } from '../jit';
 import { mkBars } from './golden';
+import { engineCode, engineSources } from './sourceScan';
 
-/** Every engine source file, minus the registry itself and the tests. */
-function engineSources(dir: string): string[] {
-  const out: string[] = [];
-  for (const e of readdirSync(dir, { withFileTypes: true })) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) {
-      if (e.name !== '__tests__') out.push(...engineSources(p));
-    } else if (e.name.endsWith('.ts') && e.name !== 'internalNames.ts') {
-      out.push(p);
-    }
-  }
-  return out;
-}
-
-/** Names that cross a scope boundary: codegen literals, property names
- *  (globalThis switches), and named exports (instrumentation). */
+/** Names that cross a scope boundary. The token pattern is the point: a name
+ *  emitted INSIDE a generated template (`` `const __ds=[…]` ``) is not at the
+ *  start of the literal, so quote-anchored patterns alone would miss it.
+ *  Comments are removed by the scanner, so prose cannot register a phantom. */
 const PATTERNS = [
+  /\b(__[A-Za-z0-9_]+)/g,
   /['"`](__[A-Za-z0-9_]+)/g,
   /\.(__[A-Za-z0-9_]+)/g,
   /export\s*\{\s*(__[A-Za-z0-9_]+)/g,
@@ -43,8 +31,7 @@ const PATTERNS = [
 
 describe('engine-internal identifiers', () => {
   const seen = new Set<string>();
-  for (const file of engineSources('src/pine')) {
-    const src = readFileSync(file, 'utf8');
+  for (const [, src] of engineCode('src/pine')) {
     for (const p of PATTERNS) for (const m of src.matchAll(p)) seen.add(m[1]!);
   }
 

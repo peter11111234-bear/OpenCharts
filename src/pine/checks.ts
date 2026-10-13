@@ -22,13 +22,23 @@
 //     non-constant main() state; drawing constructors in request expressions
 //     are rejected; plot/plotshape/fill/bgcolor and other declarations outside
 //     the unconditional main() body raise a source-located error.
+//   - Pine type qualifiers (const ⊂ input ⊂ simple ⊂ series): every input.*
+//     `defval` except input.source's is `const` in TV, so a series default is a
+//     compile error there and a wrong recorded default here. qualifiers.ts does
+//     the inference; the request.security `timeframe` is deliberately NOT gated
+//     — this engine resolves a dynamic sym/tf on purpose (mtf.ts's DYNAMIC
+//     path), so rejecting it would delete a working feature.
 //
 // Fused phases are the point. `PINE_AST_SEQUENTIAL=1` (alias
 // `PYNE_AST_SEQUENTIAL=1`, PyneCore's spelling) runs each rule as its own pass;
 // checks_equivalence.test.ts asserts both modes emit identical diagnostics over
-// the whole corpus.
+// the whole corpus. Both spellings live in debugFlags.ts — the single door for
+// every diagnostic switch.
 
 import type { ArrowFunc, Call, FuncDecl, Member, MethodDecl, Node, Reassign } from './contracts';
+import { childNodes } from './astWalk';
+import { debugFlag } from './debugFlags';
+import { CONST_INPUTS, defvalArg, provenSeries } from './qualifiers';
 import { ParseError } from './parser';
 import type { ParsedInput } from './interpreter';
 
@@ -102,6 +112,8 @@ interface Ctx {
   globals: Set<string>;
   /** Global names holding non-constant state (var/varip/reassigned). */
   mutable: Set<string>;
+  /** Global name → the expression that initialised it (for qualifier lookups). */
+  globalValues: Map<string, Node>;
   diags: CheckDiag[];
   req: ScriptRequirements;
 }
@@ -182,6 +194,23 @@ const RULES: readonly Rule[] = [
     },
   },
   {
+    id: 'input-const',
+    call: (node, name, _f, ctx) => {
+      // TV documents every input.* `defval` (except input.source's) as `const`;
+      // a series default is a compile error there and a wrong recorded default
+      // here. `provenSeries` only fires on a demonstrable per-bar value, so a
+      // script that runs today cannot be rejected by guesswork.
+      if (!CONST_INPUTS.has(name)) return;
+      const defval = defvalArg(node.args);
+      if (defval === undefined) return;
+      const globalValues = ctx.globalValues;
+      if (provenSeries(defval, (n) => globalValues.get(n), ctx.mutable)) {
+        diag(ctx, node, 'input-const',
+          `Cannot call '${name}' with a series 'defval' — TV requires a const default`);
+      }
+    },
+  },
+  {
     id: 'requirements',
     call: (_node, name, _f, ctx) => {
       const req = ctx.req;
@@ -202,35 +231,6 @@ const RULES: readonly Rule[] = [
 ];
 
 // ── name scans (hoisting pre-pass + export-capture) ─────────────────────────
-
-const isNode = (v: unknown): v is Node =>
-  v !== null && typeof v === 'object' && 'type' in v && typeof v.type === 'string';
-
-/** Every AST node reachable from `v`, unwrapping `{name, value}` arg wrappers
- *  and `{test, body}` blocks. Strings/numbers (names, flags, locations) drop. */
-function collectNodes(v: unknown, out: Node[]): void {
-  if (Array.isArray(v)) {
-    for (const item of v) collectNodes(item, out);
-    return;
-  }
-  if (isNode(v)) {
-    out.push(v);
-    return;
-  }
-  if (v !== null && typeof v === 'object') {
-    for (const inner of Object.values(v)) collectNodes(inner, out);
-  }
-}
-
-/** Direct child nodes of any node. */
-function childNodes(n: Node): Node[] {
-  const out: Node[] = [];
-  for (const [key, v] of Object.entries(n)) {
-    if (key === 'loc' || key === 'export' || key === 'params') continue;
-    collectNodes(v, out);
-  }
-  return out;
-}
 
 /** Collect declared + referenced names in a subtree. Descends into functions —
  *  an inner UDF's capture is the outer function's capture too. */
@@ -261,7 +261,10 @@ function scanNames(node: Node | Node[], used: Set<string>, declared: Set<string>
 function collectGlobals(body: readonly Node[], ctx: Ctx): void {
   for (const s of body) {
     switch (s.type) {
-      case 'assign': case 'let': case 'const': ctx.globals.add(s.name); break;
+      case 'assign': case 'let': case 'const':
+        ctx.globals.add(s.name);
+        ctx.globalValues.set(s.name, s.value);
+        break;
       case 'var':
         ctx.globals.add(s.name);
         ctx.mutable.add(s.name);
@@ -392,6 +395,7 @@ export function checkScript(parsed: ParsedInput, sequential?: boolean): CheckRes
   const ctx: Ctx = {
     globals: new Set(),
     mutable: new Set(),
+    globalValues: new Map(),
     diags: [],
     req: {
       security: false, externalData: false, orders: false, drawings: false,
@@ -401,8 +405,7 @@ export function checkScript(parsed: ParsedInput, sequential?: boolean): CheckRes
   collectGlobals(body, ctx);
   markReassigned(body, false, ctx);
 
-  const seq = sequential ?? (typeof process !== 'undefined' &&
-    (process.env?.PINE_AST_SEQUENTIAL === '1' || process.env?.PYNE_AST_SEQUENTIAL === '1'));
+  const seq = sequential ?? debugFlag('astSequential');
   const passes = seq ? RULES.map((r) => [r]) : [RULES];
   for (const rules of passes) {
     const w: Walk = { rules, ctx };

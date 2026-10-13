@@ -1134,6 +1134,7 @@ function ensureTfFrame(spec: SecuritySpec, frame: { scope: Scope; ctx: BuiltinCt
     drawings: [],
     warnings: parent.warnings,
     alerts: parent.alerts,
+    logs: parent.logs,                              // log.* inside security() belongs to the requesting script
     // syminfo.* inside security() refers to the REQUESTED symbol per TV
     // semantics — build it from resolved tf sym (F5). Carry parent's
     // provider overrides EXCEPT identity fields — context.ts:85 merges

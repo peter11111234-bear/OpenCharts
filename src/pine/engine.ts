@@ -18,6 +18,7 @@ import type {
 import type { BarData, DrawObj, PlotOpts, RunResult, Value } from './contracts';
 import { parse } from './parser';
 import { assertScript, type ScriptRequirements } from './checks';
+import { recordRunTiming } from './debugFlags';
 import { collectInputs, incRun, type IncLive, type ParsedInput, type RunOptions } from './interpreter';
 import { tfFloor, tfNext } from './mtf';
 import { modelCacheGet, modelCachePut } from './modelCache';
@@ -334,7 +335,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
             // Snapshot inputs at run start — a mid-run update() must not let the
             // stale emit advertise input values the curves weren't computed with.
             const runInputs = { ...inputs };
-            const __t0 = performance.now();
+            const runStartedAt = performance.now();
             // runProgram is the worker seam: PineWorkerEngine overrides it to
             // ship the run off-thread; shouldAbort stays meaningful only on the
             // in-process path (worker abort rides the client protocol).
@@ -379,10 +380,9 @@ export class PineInterpreterEngine implements ScriptingEngine {
             // Dev-only run timing: window.__pineRunLog collects {bars, ms} per
             // run so browser QA can split prefetch vs eval cost without a
             // profiler. Zero cost when nobody reads it.
-            lastRunMs = performance.now() - __t0;
+            lastRunMs = performance.now() - runStartedAt;
             try {
-              const w = globalThis as unknown as { __pineRunLog?: Array<{ bars: number; ms: number }> };
-              (w.__pineRunLog ??= []).push({ bars: barData.length, ms: Math.round(lastRunMs) });
+              recordRunTiming(barData.length, Math.round(lastRunMs));
             } catch { /* headless */ }
             if (stopped || myRun !== runId) continue;
             const model = buildModel(token.modelId, req, result, barTimes, runInputs);
