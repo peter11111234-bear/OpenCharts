@@ -9,7 +9,7 @@ import type { BuiltinCtx, Value } from '../contracts';
 import { NA, Series } from '../contracts';
 import { bindArgs, numArg, warnOnce } from './util';
 import { registerBuiltin, registerConstant, registerLazyConstant } from './registry';
-import { tfNext, tfToMs } from '../mtf';
+import { tfNext, tfString, tfToMs } from '../mtf';
 import { part, tzOf, tzOffsetMs, zonedMs } from '../tz';
 
 const unser = (v: Value | undefined): number | undefined => {
@@ -306,5 +306,30 @@ registerLazyConstant('timeframe', 'in_seconds', (c) => {
   const s = tfSeconds(ctx.timeframe.period);
   return s === null ? NA : { kind: 'int', v: s };
 });
+
+// timeframe.change(tf) — TV: "Returns true on the first bar of a new
+// timeframe, false otherwise." This is exactly the period-boundary test the
+// session.*/mtf machinery already uses (incl. first bar = true).
+registerBuiltin('timeframe', 'change', (c, args, named) => {
+  const bound = bindArgs(args, named, ['timeframe'] as const);
+  const tf = unserStr(bound.get('timeframe')) ?? c.timeframe.period;
+  return { kind: 'bool', v: isTfBoundary(c, tf, c.barIndex) };
+});
+
+// timeframe.main_period — the *script's* timeframe in TV's `<quantity><unit>`
+// spelling ("30" minutes, "240" hours-as-minutes, "10S", "1D", "2W", "3M").
+// Reads mainPeriod, not period: TV documents that this value does not change
+// inside a request.*() expression argument, and mtf.ts carries it through.
+// Declared `simple string`, so it is never na.
+registerLazyConstant('timeframe', 'main_period', (c) => {
+  const ctx = c as BuiltinCtx | undefined;
+  if (!ctx) return { kind: 'string', v: '' };
+  return { kind: 'string', v: tfString(ctx.timeframe.mainPeriod ?? ctx.timeframe.period) };
+});
+
+// timeframe.isticks — TV: "true if current resolution is a ticks resolution,
+// false otherwise". No code path gives ctx.timeframe a tick kind, so a script
+// running here is never on ticks.
+registerLazyConstant('timeframe', 'isticks', () => ({ kind: 'bool', v: false }));
 
 

@@ -494,9 +494,9 @@ no-ReturnType-contracts 規則）。
    `.github/workflows`、也沒有 husky／pre-commit，所以「防回歸」要自己選：掛 pre-commit
    （每次 commit ~40–80s）或等有 CI 再掛。`docs/superpowers/plans/2026-10-13-typescript-debt-remediation.md`
    的 Phase 3 講的就是這件事（該計畫的 Phase 2 現在 100% 完成）。
-2. **§9.2.A 剩下的 95**（本輪補掉 45 顆，見 §10.7）：`matrix.*` 48（本 repo 真實腳本 0 使用，
-   最後做）、`syminfo` 27 欄位（等基本面資料源）、`(global)` 6、小刀 12（`timeframe` 4／
-   `array.*` 3／`label.*` 2／`box.copy`／`line.copy`／`chart.*` 3）。
+2. **§9.2.A 剩下的 85**（45 顆資料源 stub ＋ 小刀 10 顆已補，見 §10.7／§10.8）：`matrix.*` 48
+   （本 repo 真實腳本 0 使用，最後做）、`syminfo` 27 欄位（等基本面資料源）、`(global)` 6、
+   `timeframe.from_seconds`、`chart.bg_color`／`left_visible_bar_time`／`right_visible_bar_time`。
 3. **常數摺疊**（正確形狀見 §10.3）與**broker port**（設計見 §10.3），等對應前提成熟。
 4. `scratch/vela_*.png` ×6 仍未追蹤（§9.2.D）。
 
@@ -534,3 +534,34 @@ alignment backlog 由 **140 → 95**（`absent from registry` 214 → 169）。
 `unknown constant`，每個名字恰一則警告；`earnings.actual` 是 `na` 不是 0；`footprint.poc`／
 `ticker.renko` 回 `na` 且警告具名）、`tv_stdlib.test.ts` 3 顆、`npx tsc --noEmit` **0**、
 pine 全套綠。
+
+---
+
+### 10.8 2026-10-13 追加：小刀批次 10/14（backlog 95 → 85）
+
+先更正一個數量：§9.2.A 的「小刀」列寫 **12**，但它自己列出的名字是 **14**
+（`timeframe` 4／`array.*` 3／`label.*` 2／`box.copy`／`line.copy`／`chart.*` 3）。
+`docs/2026-10-13-remaining-work.md` B 表那個「未歸類 2」就是這個算術差：
+95 − 48 − 27 − 6 = **14**，不是 12。本輪做掉其中 10 個 → **backlog 85**。
+
+**做了 —— 語意逐條取自 `scratch/pine-v6-kb/dist/bundles/*.md`（不是猜的）**
+
+| 名字 | 實作 |
+|---|---|
+| `timeframe.change(tf)` | 複用既有的 `isTfBoundary(ctx, tf, bar)`（time.ts 導出，session／mtf 已在用）。TV：「Returns true on the first bar of a new timeframe」 |
+| `timeframe.main_period` | 新增 `ctx.timeframe.mainPeriod`（表頭 tf）；`mtf.ts` 把 parent 的值帶進 request.* 的 child ctx（TV 明講這個值**不隨** request.* 變）；輸出過 `tfString()` 正規化：`"30"` 分／`"240"` 時／`"10S"`／`"1D"`／`"2W"`／`"3M"` |
+| `timeframe.isticks` | 恆 `false`（沒有任何路徑把 ctx.timeframe 標成 tick 解析度） |
+| `array.copy(id)` | 淺拷貝容器（`a.slice()`）—— TV：「creates a copy of an existing array」 |
+| `array.new_linefill`／`array.new_table` | 併進既有 `new_*` 迴圈（同一個 `newArray`；linefill/table 型別本來就有） |
+| `label.copy`／`box.copy`／`line.copy` | `created(ctx, kind, {...src.props})` → 新的 live 物件（吃該 kind 的配額），props 不共享 |
+| `label.style_text_outline` | 併進 label 的 `enumSet`（dotted-string 慣例） |
+
+**沒做（4）**
+- `timeframe.from_seconds`：TV 的規則需要「合法 timeframe 集合」（例：2–5 秒 → `"5S"` 而**不是** `"3S"`）；
+  KB 只有函式頁、沒有 tf 字串規格頁 → 照猜會生出**靜默錯誤的字串**，等規格到手再做。
+- `chart.bg_color`／`chart.left_visible_bar_time`／`chart.right_visible_bar_time`：§9.2 已決定不做
+  （沒有圖表主題色／可見區間來源）。
+
+驗證：`stdlib_small_batch.test.ts` 8 顆（`tfString` 對 TV 文件例子、main_period／isticks／change 三態、
+`array.copy` 獨立性照 TV 範例、new_linefill／new_table 大小、三個 copy 的 live 物件數與 props 不連動、
+style_text_outline 常數）、`tv_stdlib.test.ts` 印 **85**、`npx tsc --noEmit` **0**、pine 全套綠。

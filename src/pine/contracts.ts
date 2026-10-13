@@ -207,7 +207,12 @@ export interface BuiltinCtx {
   logs: ScriptLog[];
   /** Symbol info (syminfo.*). */
   syminfo: Record<string, Value>;
-  timeframe: { period: string; multiplier: number; isseconds: boolean; isminutes: boolean; isdaily: boolean; isweekly: boolean; ismonthly: boolean; isintraday: boolean };
+  timeframe: { period: string; multiplier: number; isseconds: boolean; isminutes: boolean; isdaily: boolean; isweekly: boolean; ismonthly: boolean; isintraday: boolean;
+    /** The *script's* timeframe (chart or indicator() declaration). Unlike
+     *  `period`, TV keeps this fixed inside a `request.*()` expression argument
+     *  — see timeframe.main_period. mtf.ts carries the parent's value through;
+     *  when absent (hand-built ctxs, non-MTF runs) `period` already IS it. */
+    mainPeriod?: string };
   /** UDF call — evaluate user function with args at current bar. */
   callUdf: (fn: UdfDecl, args: Value[]) => Value;
 }

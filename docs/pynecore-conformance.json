@@ -10,13 +10,13 @@
     "core_concepts": "https://pynecore.org/docs/overview/core-concepts/"
   },
   "ours_measured": {
-    "builtins": 460,
-    "constants": 267,
+    "builtins": 509,
+    "constants": 268,
     "ta_functions": 71,
     "strategy_builtins": 47,
-    "line": 26,
-    "label": 31,
-    "box": 43,
+    "line": 27,
+    "label": 32,
+    "box": 44,
     "table": 29,
     "polyline": 3,
     "linefill": 9
@@ -334,9 +334,9 @@
       "item": "array.*",
       "pynecore": "full — 57 函式",
       "status": "partial",
-      "evidence": "src/pine/builtins/array.ts（實測 54 個）",
-      "note": "new/new_*/push/pop/set/insert/remove/fill/sort/binary_search/percentile/covariance… 齊。",
-      "gap": "需與 Pine v6 逐項核對（PyneCore 57 vs 實測 54）。"
+      "evidence": "src/pine/builtins/array.ts（實測 57 個）",
+      "note": "new/new_*/push/pop/set/insert/remove/fill/sort/binary_search/percentile/covariance… 齊。2026-10-13 補 array.copy / new_linefill / new_table（54 → 57）。",
+      "gap": "數量與 PyneCore 對上（57 = 57）；逐項語意仍需 TV oracle 抽查。"
     },
     {
       "id": "ns-session",
@@ -354,9 +354,9 @@
       "item": "timeframe.*",
       "pynecore": "full — 19 函式",
       "status": "partial",
-      "evidence": "src/pine/builtins/time.ts:294 in_seconds · interpreter.ts:935 timeframeFields（9 欄位）",
-      "note": "只有 in_seconds 一個函式；period/multiplier/isintraday/… 以 UDT 欄位提供。",
-      "gap": "timeframe.from_seconds / change / isdwm 之外的多數轉換函式缺。"
+      "evidence": "src/pine/builtins/time.ts（in_seconds / change）· mtf.ts tfString · context.ts timeframe record（10 欄位）",
+      "note": "in_seconds / change 兩個函式；period/multiplier/isintraday/main_period/isticks… 以 UDT 欄位提供。2026-10-13 補 timeframe.change / main_period / isticks：main_period 過 tfString 正規化（「30」分／「240」時／「10S」／「1D」／「2W」／「3M」）且明講不隨 request.* 變，isticks 恆 false。",
+      "gap": "timeframe.from_seconds 缺 —— TV 的規則是「沒有合法 timeframe 就取次高合法者」（2–5 秒 → 「5S」而非「3S」），合法集合的規格頁不在手邊；照猜會生出靜默錯誤的字串。其餘轉換函式（isdwm 之外）同樣缺。"
     },
     {
       "id": "ns-syminfo",

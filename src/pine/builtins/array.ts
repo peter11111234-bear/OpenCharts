@@ -72,12 +72,20 @@ const newArray = (ctx: BuiltinCtx, args: Value[], named: Record<string, Value>) 
   return arrVal(new Array<Value>(size).fill(init === undefined ? NA : init));
 };
 registerBuiltin('array', 'new', newArray, { idx: [1], names: ['initial_value'] });
-for (const name of ['new_bool', 'new_color', 'new_float', 'new_int', 'new_line', 'new_label', 'new_box', 'new_string', 'new_type']) {
+for (const name of ['new_bool', 'new_color', 'new_float', 'new_int', 'new_line', 'new_label', 'new_box', 'new_linefill', 'new_table', 'new_string', 'new_type']) {
   registerBuiltin('array', name, newArray, { idx: [1], names: ['initial_value'] });
 }
 
 // Every arg is an element — stash keeps live-series semantics.
 registerBuiltin('array', 'from', (_ctx, args) => arrVal(args.slice()), true);
+
+// array.copy(id) — TV: "creates a copy of an existing array". Shallow: element
+// Values are shared, so a nested array/map/drawing stays aliased to the same
+// object (the copy is an independent *container*).
+registerBuiltin('array', 'copy', (_ctx, args, named) => {
+  const a = asArr(bind(args, named, ['id']).get('id'));
+  return a === null ? NA : arrVal(a.slice());
+});
 
 // ── Mutation ────────────────────────────────────────────────────────────────
 

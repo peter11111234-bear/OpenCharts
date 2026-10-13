@@ -34,6 +34,9 @@ export function parseTimeframe(period: string): TimeframeInfo {
   const ismonthly = unit === 'month';
   return {
     period,
+    // The chart/declaration timeframe: timeframe.main_period reads this, and
+    // mtf.ts propagates it so a request.*() expression keeps reporting it.
+    mainPeriod: period,
     multiplier,
     isseconds,
     isminutes,

@@ -33,7 +33,7 @@ enumSet('label', [
   'style_label_down', 'style_label_left', 'style_label_right',
   'style_label_lower_left', 'style_label_lower_right',
   'style_label_upper_left', 'style_label_upper_right', 'style_label_center',
-  'style_label_outline',
+  'style_label_outline', 'style_text_outline',
 ]);
 enumSet('text', [
   'align_left', 'align_center', 'align_right',
@@ -330,6 +330,13 @@ registerBuiltin('line', 'delete', (c, args) => {
   return { kind: 'void' };
 });
 
+// TV clones the drawing: the result is a NEW live object (it counts against the
+// kind's quota) carrying the source's current properties.
+registerBuiltin('line', 'copy', (c, args) => {
+  const obj = asObj(args[0]);
+  return obj ? { kind: 'line', v: created(c as RtCtx, 'line', { ...obj.props }) } : NA;
+});
+
 // ── label ───────────────────────────────────────────────────────────────────
 
 registerBuiltin('label', 'new', (c, args, named) => {
@@ -390,6 +397,12 @@ registerBuiltin('label', 'delete', (c, args) => {
     if (i >= 0) live.splice(i, 1);
   }
   return { kind: 'void' };
+});
+
+// New live label carrying the source's properties (see line.copy).
+registerBuiltin('label', 'copy', (c, args) => {
+  const obj = asObj(args[0]);
+  return obj ? { kind: 'label', v: created(c as RtCtx, 'label', { ...obj.props }) } : NA;
 });
 
 // ── box ─────────────────────────────────────────────────────────────────────
@@ -469,6 +482,12 @@ registerBuiltin('box', 'delete', (c, args) => {
     if (i >= 0) live.splice(i, 1);
   }
   return { kind: 'void' };
+});
+
+// New live box carrying the source's properties (see line.copy).
+registerBuiltin('box', 'copy', (c, args) => {
+  const obj = asObj(args[0]);
+  return obj ? { kind: 'box', v: created(c as RtCtx, 'box', { ...obj.props }) } : NA;
 });
 
 // ── table ───────────────────────────────────────────────────────────────────

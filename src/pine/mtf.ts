@@ -71,6 +71,23 @@ function tfParts(tf: string): { n: number; unit: string } {
   return { n, unit: unit === '' ? 'MIN' : unit };
 }
 
+/** TV's timeframe-string spelling: `<quantity><unit>` with the unit omitted for
+ *  minutes, hours folded into minutes, and T/S/D/W/M for the rest
+ *  ("30" = 30 minutes, "240" = 4 hours, "10S", "1D", "2W", "3M").
+ *  `timeframe.period` and `timeframe.main_period` are documented in this form. */
+export function tfString(tf: string): string {
+  const { n, unit } = tfParts(tf);
+  switch (unit) {
+    case 'S': return `${n}S`;
+    case 'T': return `${n}T`;
+    case 'H': return String(n * 60);
+    case 'D': return `${n}D`;
+    case 'W': return `${n}W`;
+    case 'M': return `${n}M`;
+    default: return String(n);
+  }
+}
+
 const DAY = 86_400_000;
 
 /** Floor a UTC timestamp to the start of its tf bar (UTC-anchored). */
@@ -1149,6 +1166,9 @@ function ensureTfFrame(spec: SecuritySpec, frame: { scope: Scope; ctx: BuiltinCt
       isweekly: unit === 'W',
       ismonthly: unit === 'M',
       isintraday: !calendar,
+      // timeframe.main_period must keep reporting the *script's* timeframe
+      // inside this expression (TV documents it as not following request.*).
+      mainPeriod: parent.timeframe.mainPeriod,
     },
     callUdf: (fn, args) => invokeUdf(spec, fn, args),
   };
