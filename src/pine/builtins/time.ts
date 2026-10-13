@@ -24,6 +24,13 @@ const unserStr = (v: Value | undefined): string | undefined => {
   return x.kind === 'string' ? x.v : undefined;
 };
 
+/** Milliseconds in a day, and in a TV month. TV's timeframe arithmetic uses
+ *  2628003 s for a month — "When the timeframe is "1M" or more, calculations
+ *  use 2628003 as the number of seconds in one month, which represents 30.4167
+ *  (365/12) days" (scratch/pine-v6-kb/dist/bundles/timeframe.md:170-172). */
+const DAY_MS = 86_400_000;
+const MONTH_SECONDS = 2_628_003;
+
 // ── timezone helpers ─────────────────────────────────────────────────────────
 // The implementation lives in ../tz — a leaf module, so the strategy replay
 // can reach it without entering the interpreter → strategy → mtf → interpreter
@@ -113,11 +120,11 @@ for (const [n, v] of [
 // extend Series (get(n) = n bars ago) computed on demand from ctx.time.
 
 class CalSeries extends Series {
-  constructor(private ctx: BuiltinCtx, private field: Intl.DateTimeFormatPartTypes) { super(); }
+  constructor(private ctx: BuiltinCtx, private compute: (ms: number, tz: string) => number) { super(); }
   private at(off: number): Value {
     const t = this.ctx.time.get(off);
     if (t.kind !== 'int' && t.kind !== 'float') return NA;
-    return { kind: 'int', v: part(t.v, tzOf(this.ctx), this.field) };
+    return { kind: 'int', v: this.compute(t.v, tzOf(this.ctx)) };
   }
   override get(n: number): Value { return n >= 0 && Number.isFinite(n) ? this.at(Math.floor(n)) : NA; }
   override cur(): Value { return this.at(0); }
@@ -126,14 +133,45 @@ class CalSeries extends Series {
 
 for (const [n, f] of CAL_FIELDS)
   registerLazyConstant('', n, (c) =>
-    c === undefined ? NA : { kind: 'series', v: new CalSeries(c as BuiltinCtx, f as Intl.DateTimeFormatPartTypes) });
+    c === undefined ? NA
+      : { kind: 'series', v: new CalSeries(c as BuiltinCtx, (ms, tz) => part(ms, tz, f as Intl.DateTimeFormatPartTypes)) });
+
+// weekofyear — "The week number of the year, in the exchange time zone,
+// calculated from the bar's opening UNIX timestamp" (variables.md:1107-1108,
+// type "series int"); the call form adds "Calculates the week number of the
+// year, in a specified time zone, from a UNIX timestamp"
+// (functions/weekofyear.md:29-30). The numbering is ISO 8601: weeks run Monday
+// to Sunday and belong to the year their Thursday falls in, so week 1 always
+// holds January 4 — 2024-12-30 is week 1 of 2025 and 2022-01-01 is week 52 of
+// 2021. The time zone comes from the bar (or the arg), matching the other
+// calendar fields (Java calendar semantics, like TV's).
+function isoWeek(ms: number, tz: string): number {
+  const y = part(ms, tz, 'year'), mo = part(ms, tz, 'month'), d = part(ms, tz, 'day');
+  const day = Date.UTC(y, mo - 1, d);
+  const mondayDow = (new Date(day).getUTCDay() + 6) % 7;   // Monday = 0 … Sunday = 6
+  const thursday = day + (3 - mondayDow) * DAY_MS;         // Thursday of this ISO week
+  const isoYear = new Date(thursday).getUTCFullYear();
+  const jan4 = Date.UTC(isoYear, 0, 4);                    // week 1 always holds Jan 4
+  const week1Mon = jan4 - ((new Date(jan4).getUTCDay() + 6) % 7) * DAY_MS;
+  return Math.round((thursday - week1Mon) / (7 * DAY_MS)) + 1;
+}
+
+// weekofyear(time, timezone) — `time` is a UNIX ms timestamp, `timezone`
+// defaults to syminfo.timezone (functions/weekofyear.md:35-41).
+registerBuiltin('', 'weekofyear', (ctx, args, named) => {
+  const bound = bindArgs(args, named, ['time', 'timezone'] as const);
+  const ms = unser(bound.get('time')) ?? unser(ctx.time.get(0));
+  if (ms === undefined) return NA;
+  return { kind: 'int', v: isoWeek(ms, unserStr(bound.get('timezone')) ?? tzOf(ctx)) };
+});
+// Bare `weekofyear` is the series variable.
+registerLazyConstant('', 'weekofyear', (c) =>
+  c === undefined ? NA : { kind: 'series', v: new CalSeries(c as BuiltinCtx, isoWeek) });
 
 // ── time / time_close / timestamp ────────────────────────────────────────────
 // A Pine `session` argument is "HHMM-HHMM" or "HH:MM-HH:MM". The venue windows
 // this app knows live in session.ts; time()/time_close() need only the raw spec
 // plus the bar's timezone.
-
-const DAY_MS = 86_400_000;
 
 /** `"0900-1330"` / `"09:00-13:30"` → minutes since local midnight. */
 function parseSessionSpec(spec: string): { startMin: number; endMin: number } | null {
@@ -275,7 +313,12 @@ registerBuiltin('', 'timestamp', (_c, args, named) => {
 });
 
 // timeframe.in_seconds — intraday via tfToMs; calendar units (D/W/M) get fixed
-// day counts (1d=86400s, 1w=604800s, 1m=2592000s) since tfToMs returns null.
+// day/second counts (1d=86400s, 1w=604800s, 1m=2628003s) since tfToMs returns
+// null. The month length is the one the reference requires (MONTH_SECONDS
+// above), so below the 12M ceiling the round trip
+// `in_seconds(timeframe.from_seconds(x))` does not shrink x. Above
+// 12 × 2628003 = 31,536,036 s, from_seconds clamps to "12M" and the round trip
+// does shrink — TV has no larger timeframe to offer either.
 const tfSeconds = (tf: string): number | null => {
   const ms = tfToMs(tf);
   if (ms !== null) return Math.floor(ms / 1000);
@@ -286,7 +329,7 @@ const tfSeconds = (tf: string): number | null => {
   switch ((m[2] ?? '').toUpperCase()) {
     case 'D': return n * 86_400;
     case 'W': return n * 604_800;
-    case 'M': return n * 2_592_000;
+    case 'M': return n * MONTH_SECONDS;
     default: return null;
   }
 };
@@ -306,6 +349,46 @@ registerLazyConstant('timeframe', 'in_seconds', (c) => {
   const s = tfSeconds(ctx.timeframe.period);
   return s === null ? NA : { kind: 'int', v: s };
 });
+
+// timeframe.from_seconds(seconds) — "Converts a number of seconds into a valid
+// timeframe string" (timeframe.md:88-89); `seconds` is `simple int`
+// (timeframe.md:94) and the result `simple string` (timeframe.md:104).
+// The valid timeframe set it rounds against comes from the manual's "Timeframe
+// string specifications" (guide/concepts/timeframes.md:57-65): seconds
+// 1/5/10/15/30/45, minutes 1..1440, days 1..365, weeks 1..52, months 1..12 —
+// except that the seconds ladder stops at 30, so 31..59 s round to "1"
+// (measured on TV by LuxAlgo/PineTS src/timeframe.ts — 45 s → "1", 59 s → "1").
+// Rules encoded (timeframe.md:109-118):
+//   • no exact timeframe → "the next higher valid timeframe … one second or
+//     less will return "1S", 2-5 seconds will return "5S", and 604,799 seconds
+//     (one second less than 7 days) will return "7D"";
+//   • exact for two or more → "the one with the larger base unit will be used.
+//     Thus 604,800 seconds (7 days) returns "1W", not "7D"";
+//   • "All values above 31,622,400 (366 days) return "12M"".
+const SEC_LADDER = [1, 5, 10, 15, 30] as const;
+function fromSeconds(seconds: number): string {
+  const s = Math.trunc(seconds);
+  if (s >= 365 * 86_400) return '12M';          // 365 days and up
+  if (s <= 30) return `${SEC_LADDER.find((x) => s <= x) ?? 30}S`;  // ≤1 s → 1S, 2-5 s → 5S, …
+  if (s < 86_400) return String(Math.ceil(s / 60));   // minutes 1..1440
+  if (s % 604_800 === 0) return `${s / 604_800}W`;    // an exact week beats the 7-day day count
+  if (s % MONTH_SECONDS === 0) return `${s / MONTH_SECONDS}M`;
+  return `${Math.ceil(s / 86_400)}D`;                 // otherwise round up to whole days
+}
+
+registerBuiltin('timeframe', 'from_seconds', (_c, args, named) => {
+  const bound = bindArgs(args, named, ['seconds'] as const);
+  const s = unser(bound.get('seconds'));
+  if (s === undefined) return NA;
+  return { kind: 'string', v: tfString(fromSeconds(s)) };
+});
+
+// timenow — "Current time in UNIX format. It is the number of milliseconds that
+// have elapsed since 00:00:00 UTC, 1 January 1970" (variables.md:1026-1028).
+// It reads the host clock, so any script that reads it makes the run
+// NON-DETERMINISTIC: golden/replay comparisons must not use it (TV likewise
+// documents it as a repainting variable).
+registerLazyConstant('', 'timenow', () => ({ kind: 'int', v: Date.now() }));
 
 // timeframe.change(tf) — TV: "Returns true on the first bar of a new
 // timeframe, false otherwise." This is exactly the period-boundary test the

@@ -1805,6 +1805,25 @@ function evalNode(node: Node, spec: SecuritySpec, _j: number, scope?: Scope): Va
 
 // ── public per-bar entry ────────────────────────────────────────────────────
 
+/** TV's parameter lists for the two entry points (docs/tv-pine-stdlib.json):
+ *    request.security(symbol, timeframe, expression, gaps, lookahead,
+ *                     ignore_invalid_symbol, currency, calc_bars_count)
+ *    request.security_lower_tf(symbol, timeframe, expression,
+ *                     ignore_invalid_symbol, currency, ignore_invalid_timeframe,
+ *                     calc_bars_count)
+ *  The first `read` entries are the ones this engine consumes; TV's remaining
+ *  names are reported as declared-but-not-implemented, and a name TV does not
+ *  have at all is reported as unknown. Module-level: no per-call allocation. */
+const SECURITY_PARAMS: Record<'security' | 'security_lower_tf', { all: readonly string[]; read: number }> = {
+  security: {
+    all: ['symbol', 'timeframe', 'expression', 'gaps', 'lookahead', 'ignore_invalid_symbol', 'currency', 'calc_bars_count'],
+    read: 5,
+  },
+  security_lower_tf: {
+    all: ['symbol', 'timeframe', 'expression', 'ignore_invalid_symbol', 'currency', 'ignore_invalid_timeframe', 'calc_bars_count'],
+    read: 3,
+  },
+};
 
 /**
  * Interpreter hook: call inside evalExpr's Call case BEFORE evaluating args.
@@ -1816,6 +1835,19 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   const spec = store.byNode.get(node);
   if (!spec) return NA; // not scanned (e.g. built dynamically) — graceful na
   const ctx = frame.ctx;
+
+  // Dropping a named argument silently is the worst case: a script asking for
+  // currency-converted data would keep raw data with no message. Name the
+  // parameter TV declares, or the name itself when TV has no such parameter.
+  const params = SECURITY_PARAMS[spec.isLtf ? 'security_lower_tf' : 'security'];
+  for (const a of node.args) {
+    if (a.name === undefined) continue;
+    const i = params.all.indexOf(a.name);
+    if (i >= 0 && i < params.read) continue;
+    warnOnce(spec, ctx, i >= 0
+      ? `request.${spec.isLtf ? 'security_lower_tf' : 'security'}(): '${a.name}' declared but not implemented — the request ignores it`
+      : `unknown named argument '${a.name}=' — ignored; this function takes (${params.all.join(', ')})`);
+  }
 
   // Resolve dynamic sym/tf lazily — must hit an already-fetched key because
   // fetchSeries is async and we're in a sync per-bar context.

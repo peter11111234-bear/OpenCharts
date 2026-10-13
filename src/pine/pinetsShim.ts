@@ -15,7 +15,7 @@
 
 import { NA, type BuiltinCtx, type BuiltinFn, type Value } from './contracts';
 import { BUILTINS, registerBuiltin } from './builtins/registry';
-import { bindArgs, type RtCtx } from './builtins/util';
+import { bindArgs, drainBindWarnings, type RtCtx } from './builtins/util';
 import { Series as PineSeries } from './contracts';
 
 // ── Value → raw JS scalar (pinets works on bare numbers/booleans/strings) ────
@@ -555,6 +555,11 @@ const toValue = (v: unknown): Value => {
 function wrapPorted(name: string, factory: PtFactory, order: readonly string[]): BuiltinFn {
   return (ctx, args, named) => {
     const bound = bindArgs(args, named, order);
+    // bindArgs queues its unknown/duplicate-named-arg warning on the
+    // module-global bind queue, which the interpreter drains inside
+    // callBuiltin. This wrapper is invoked directly, so drain into this run's
+    // ctx here — otherwise the message surfaces on an unrelated later run.
+    for (const w of drainBindWarnings()) if (!ctx.warnings.includes(w)) ctx.warnings.push(w);
     const rawArgs = order.map((k) => {
       const v = bound.get(k);
       return v === undefined ? undefined : adaptSeries(v, ctx);

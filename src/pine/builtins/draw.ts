@@ -122,13 +122,23 @@ function declNum(n: Node | undefined): number | undefined {
   return undefined;
 }
 
-/** Pine v5 indicator() signature order (positional binding). */
+/** Pine **v6** indicator() signature order (positional binding) — name set and
+ *  order come from docs/tv-pine-stdlib.json:
+ *    indicator(title, shorttitle, overlay, format, precision, scale,
+ *              max_bars_back, timeframe, timeframe_gaps, explicit_plot_zorder,
+ *              max_lines_count, max_labels_count, max_boxes_count,
+ *              calc_bars_count, max_polylines_count, dynamic_requests,
+ *              behind_chart)
+ *  v5-only names (linktoseries, max_tables_count, calc_chart_luminosity_order,
+ *  max_circles_count, backtest_fill_limits_assumption) are dropped: TV v6
+ *  rejects them, so binding them into a slot would be a silent divergence.
+ *  `dynamic_requests` needs no warning — this engine always allows dynamic
+ *  requests (see handoff §9.2.F) — and `behind_chart` is layer metadata. */
 export const INDICATOR_DECL_ORDER = [
   'title', 'shorttitle', 'overlay', 'format', 'precision', 'scale',
-  'max_bars_back', 'backtest_fill_limits_assumption',
-  'linktoseries', 'max_lines_count', 'max_labels_count', 'max_boxes_count',
-  'max_tables_count', 'max_polylines_count', 'calc_chart_luminosity_order',
-  'explicit_plot_zorder', 'max_circles_count',
+  'max_bars_back', 'timeframe', 'timeframe_gaps', 'explicit_plot_zorder',
+  'max_lines_count', 'max_labels_count', 'max_boxes_count', 'calc_bars_count',
+  'max_polylines_count', 'dynamic_requests', 'behind_chart',
 ] as const;
 
 /** `indicator()` parameters that carry behaviour this interpreter does not
@@ -136,7 +146,7 @@ export const INDICATOR_DECL_ORDER = [
  *  ARE consumed by declDrawQuotas and display metadata is harmless, so only the
  *  ones that would change results or drawing capacity are listed. */
 export const INDICATOR_UNSUPPORTED_PARAMS = [
-  'max_bars_back', 'backtest_fill_limits_assumption', 'max_circles_count',
+  'max_bars_back', 'timeframe', 'timeframe_gaps', 'calc_bars_count',
 ] as const;
 
 /** Report the declared-but-unimplemented `indicator()` parameters once per run. */
@@ -229,20 +239,29 @@ const PROP_TABLES: Record<string, Record<string, PropType>> = {
 // override depends on registration order — keep table entries as-is.
 
 for (const [kind, table] of Object.entries(PROP_TABLES)) {
+  // TV's first parameter is `id` for line/label/box/linefill/polyline and
+  // `table_id` for table (KB: line.set_color(id, color), table.set_bgcolor(table_id, …)).
+  // Declare the reference name so `id=` / `table_id=` bind; the undocumented
+  // `line_id=` / `table=` spellings now report an unknown named argument, which
+  // is what TV does with them. Order is built once per registration, not per call.
+  const idName = kind === 'table' ? 'table_id' : 'id';
+  const idOrder: readonly string[] = [idName];
   for (const [prop, t] of Object.entries(table)) {
+    const order: readonly string[] = [idName, prop];
     registerBuiltin(kind, `set_${prop}`, (c, args, named) => {
-      const bound = bindArgs(args, named, [kind, prop] as const);
-      // TV names the object arg `id` (line/label/box) or `table_id` — accept
-      // all spellings so named calls don't silently no-op.
-      const obj = asObj(bound.get(kind) ?? bound.get('id') ?? bound.get(`${kind}_id`));
+      const bound = bindArgs(args, named, order);
+      const obj = asObj(bound.get(idName));
       if (obj) {
         const p = { [prop]: coerceIn(bound.get(prop), t) };
         drawSink(c as RtCtx).update(obj, p);
       }
       return { kind: 'void' };
     });
-    registerBuiltin(kind, `get_${prop}`, (_c, args) => {
-      const obj = asObj(args[0]);
+    // TV exposes set_* only; the generated getters are a harmless superset, but
+    // they must bind the same reference name — `line.get_color(id = l)` used to
+    // read args[0] (undefined) and return na without a message.
+    registerBuiltin(kind, `get_${prop}`, (_c, args, named) => {
+      const obj = asObj(bindArgs(args, named, idOrder).get(idName));
       return obj ? coerceOut(obj.props[prop], t) : NA;
     });
   }

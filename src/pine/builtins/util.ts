@@ -92,7 +92,30 @@ export function bindDeclArgs(args: Arg[] | undefined, order: readonly string[]):
   const bound = new Map<string, Node>();
   let pi = 0;
   for (const a of args ?? []) {
-    if (a.name !== undefined) { bound.set(a.name, a.value); continue; }
+    if (a.name !== undefined) {
+      // TV rejects an unknown parameter name in indicator()/strategy() at
+      // compile time; this layer has the reference order, so name it. Declarations
+      // are bound before any run ctx exists, so the warning rides the same bind
+      // queue bindArgs uses — drained by flushBindWarnings at the decl site
+      // (callBuiltin only drains for its own builtin calls). A decl is bound
+      // twice (declDrawQuotas + warnUnsupportedIndicatorParams, or strategyDecl
+      // + declDrawQuotas), so a message is queued twice and the ctx.warnings
+      // dedup on flush collapses it to one.
+      if (!order.includes(a.name)) {
+        bindWarnQ.push(
+          `unknown named argument '${a.name}=' — ignored; this declaration takes (${order.join(', ')})`);
+        continue;
+      }
+      if (bound.has(a.name)) {
+        // Keep the FIRST binding, matching bindCallArgs (bindArgs warns
+        // "overwritten" for the builtin path — TV errors on both).
+        bindWarnQ.push(
+          `duplicate named argument '${a.name}=' — ignored (this declaration parameter is already bound)`);
+        continue;
+      }
+      bound.set(a.name, a.value);
+      continue;
+    }
     while (pi < order.length && bound.has(order[pi]!)) pi++;
     if (pi < order.length) bound.set(order[pi++]!, a.value);
   }

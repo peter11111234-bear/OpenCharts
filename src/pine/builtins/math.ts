@@ -6,7 +6,7 @@ import { NA } from '../contracts';
 import type { BuiltinCtx, BuiltinFn, Value } from '../contracts';
 import { BarSeries, LiftedSeries, freezeReader } from '../series';
 import { registerBuiltin, registerConstant } from './registry';
-import { asNum, bindArgs, numVal } from './util';
+import { asNum, bindArgs, numVal, warnOnce } from './util';
 
 // ── Series lifting ──────────────────────────────────────────────────────────
 // Returns a number or null (= na result for that bar). `kind` decides whether
@@ -57,9 +57,43 @@ function freezeArgs(vs: Value[]): ((i: number) => Value)[] | null {
 type NumKernel = (xs: [number | null, ...(number | null)[]]) => number | null;
 type OutKind = 'int' | 'float' | 'auto';
 
-export function liftNums(f: NumKernel, kind: OutKind = 'float'): BuiltinFn {
+/** TV's variadic numeric signatures (math.max/min/avg) declare
+ *  `number0, number1, ...` — there is no single bindable parameter name. The
+ *  label is carried verbatim so it shows up in the warning text, and any
+ *  `number<k>` a caller writes is accepted (TV declares the whole ladder, so
+ *  rejecting `number2=` would be a new divergence of our own). */
+const VARIADIC_NUMS: readonly string[] = ['number0', 'number1', '...'];
+const VARIADIC_NUM_NAME = /^number\d+$/;
+
+/** Named-arg values in call order, minus every name `params` doesn't declare.
+ *  An unknown name used to be appended as if it were positional —
+ *  `math.round(1.5, bogus=1)` silently read `bogus` as `precision` (2 → 1.5)
+ *  with no message. Declared names keep their call order, so a valid call binds
+ *  exactly as it did before. */
+function namedValues(
+  ctx: BuiltinCtx,
+  named: Record<string, Value>,
+  params: readonly string[],
+): Value[] {
+  const variadic = params.includes('...');
+  const out: Value[] = [];
+  for (const [k, v] of Object.entries(named)) {
+    if (!params.includes(k) && !(variadic && VARIADIC_NUM_NAME.test(k))) {
+      warnOnce(ctx, `namedarg|${params.join(',')}|${k}`,
+        `unknown named argument '${k}=' — ignored; this function takes (${params.join(', ')})`);
+      continue;
+    }
+    out.push(v);
+  }
+  return out;
+}
+
+/** `params` is TV's reference parameter list for this builtin (see
+ *  docs/tv-pine-stdlib.json) — named args outside it are dropped with a warning
+ *  instead of being appended as positionals. */
+export function liftNums(f: NumKernel, params: readonly string[], kind: OutKind = 'float'): BuiltinFn {
   return (ctx: BuiltinCtx, args: Value[], named: Record<string, Value>) => {
-    const vs = args.concat(Object.values(named));
+    const vs = args.concat(namedValues(ctx, named, params));
     const asN = (u: Value): number | null => (u.kind === 'int' || u.kind === 'float' ? u.v : null);
     // 'auto' → int only when every input is int-typed right now; decided once
     // per call so deferred entries agree with an eager build.
@@ -96,7 +130,7 @@ const nulls = (xs: (number | null)[]): xs is number[] => !xs.includes(null);
 
 // ── Simple numeric kernels ──────────────────────────────────────────────────
 
-registerBuiltin('math', 'abs', liftNums((xs) => (xs[0] === null ? null : Math.abs(xs[0])), 'auto'));
+registerBuiltin('math', 'abs', liftNums((xs) => (xs[0] === null ? null : Math.abs(xs[0])), ['number'], 'auto'));
 
 // TV propagates na: math.max(10, na) → na (not 10). Same for min.
 registerBuiltin(
@@ -107,7 +141,7 @@ registerBuiltin(
     let best = xs[0]!;
     for (const x of xs) if (x > best) best = x;
     return best;
-  }, 'auto'),
+  }, VARIADIC_NUMS, 'auto'),
 );
 
 registerBuiltin(
@@ -118,33 +152,33 @@ registerBuiltin(
     let best = xs[0]!;
     for (const x of xs) if (x < best) best = x;
     return best;
-  }, 'auto'),
+  }, VARIADIC_NUMS, 'auto'),
 );
 
-registerBuiltin('math', 'sign', liftNums((xs) => (xs[0] === null ? null : Math.sign(xs[0])), 'int'));
+registerBuiltin('math', 'sign', liftNums((xs) => (xs[0] === null ? null : Math.sign(xs[0])), ['number'], 'int'));
 
 registerBuiltin(
   'math',
   'pow',
-  liftNums((xs) => (nulls(xs) ? Math.pow(xs[0]!, xs[1]!) : null)),
+  liftNums((xs) => (nulls(xs) ? Math.pow(xs[0]!, xs[1]!) : null), ['base', 'exponent']),
 );
 registerBuiltin(
   'math',
   'sqrt',
-  liftNums((xs) => (xs[0] === null ? null : Math.sqrt(xs[0]))),
+  liftNums((xs) => (xs[0] === null ? null : Math.sqrt(xs[0])), ['number']),
 );
-registerBuiltin('math', 'log', liftNums((xs) => (xs[0] === null ? null : Math.log(xs[0]))));
-registerBuiltin('math', 'log10', liftNums((xs) => (xs[0] === null ? null : Math.log10(xs[0]))));
-registerBuiltin('math', 'exp', liftNums((xs) => (xs[0] === null ? null : Math.exp(xs[0]))));
-registerBuiltin('math', 'floor', liftNums((xs) => (xs[0] === null ? null : Math.floor(xs[0])), 'auto'));
-registerBuiltin('math', 'ceil', liftNums((xs) => (xs[0] === null ? null : Math.ceil(xs[0])), 'auto'));
+registerBuiltin('math', 'log', liftNums((xs) => (xs[0] === null ? null : Math.log(xs[0])), ['number']));
+registerBuiltin('math', 'log10', liftNums((xs) => (xs[0] === null ? null : Math.log10(xs[0])), ['number']));
+registerBuiltin('math', 'exp', liftNums((xs) => (xs[0] === null ? null : Math.exp(xs[0])), ['number']));
+registerBuiltin('math', 'floor', liftNums((xs) => (xs[0] === null ? null : Math.floor(xs[0])), ['number'], 'auto'));
+registerBuiltin('math', 'ceil', liftNums((xs) => (xs[0] === null ? null : Math.ceil(xs[0])), ['number'], 'auto'));
 
-registerBuiltin('math', 'acos', liftNums((xs) => (xs[0] === null ? null : Math.acos(xs[0]))));
-registerBuiltin('math', 'asin', liftNums((xs) => (xs[0] === null ? null : Math.asin(xs[0]))));
-registerBuiltin('math', 'atan', liftNums((xs) => (xs[0] === null ? null : Math.atan(xs[0]))));
-registerBuiltin('math', 'cos', liftNums((xs) => (xs[0] === null ? null : Math.cos(xs[0]))));
-registerBuiltin('math', 'sin', liftNums((xs) => (xs[0] === null ? null : Math.sin(xs[0]))));
-registerBuiltin('math', 'tan', liftNums((xs) => (xs[0] === null ? null : Math.tan(xs[0]))));
+registerBuiltin('math', 'acos', liftNums((xs) => (xs[0] === null ? null : Math.acos(xs[0])), ['angle']));
+registerBuiltin('math', 'asin', liftNums((xs) => (xs[0] === null ? null : Math.asin(xs[0])), ['angle']));
+registerBuiltin('math', 'atan', liftNums((xs) => (xs[0] === null ? null : Math.atan(xs[0])), ['angle']));
+registerBuiltin('math', 'cos', liftNums((xs) => (xs[0] === null ? null : Math.cos(xs[0])), ['angle']));
+registerBuiltin('math', 'sin', liftNums((xs) => (xs[0] === null ? null : Math.sin(xs[0])), ['angle']));
+registerBuiltin('math', 'tan', liftNums((xs) => (xs[0] === null ? null : Math.tan(xs[0])), ['angle']));
 
 // TV rounds halves away from zero (math.round(-1.5) → -2).
 function roundHalf(v: number, precision: number): number {
@@ -162,7 +196,7 @@ registerBuiltin('math', 'round', (ctx, args, named) => {
     if (v === null) return null;
     const p = xs[1] ?? null;
     return p === null ? roundHalf(v, 0) : roundHalf(v, Math.trunc(p));
-  });
+  }, ['number', 'precision']);
   const r = f(ctx, args, named);
   const hasP =
     (args[1] !== undefined && args[1].kind !== 'na') ||
@@ -197,7 +231,7 @@ registerBuiltin(
   liftNums((xs) => {
     const vals = xs.filter((x): x is number => x !== null);
     return vals.length === 0 ? null : vals.reduce((a, b) => a + b, 0) / vals.length;
-  }),
+  }, VARIADIC_NUMS),
 );
 
 // math.sum(source, length) — rolling window sum; na if the window is short or
@@ -294,8 +328,8 @@ registerBuiltin('math', 'random', (ctx, args, named) => {
   return { kind: 'float', v: loN + u * (hiN - loN) };
 });
 
-registerBuiltin('math', 'todegrees', liftNums((xs) => (xs[0] === null ? null : (xs[0] * 180) / Math.PI)));
-registerBuiltin('math', 'toradians', liftNums((xs) => (xs[0] === null ? null : (xs[0] * Math.PI) / 180)));
+registerBuiltin('math', 'todegrees', liftNums((xs) => (xs[0] === null ? null : (xs[0] * 180) / Math.PI), ['radians']));
+registerBuiltin('math', 'toradians', liftNums((xs) => (xs[0] === null ? null : (xs[0] * Math.PI) / 180), ['degrees']));
 
 // ── Constants ───────────────────────────────────────────────────────────────
 // Registered both as constants (bare member expr) and callables (math.pi() —

@@ -2,6 +2,11 @@
 
 日期：2026-10-13 ｜ 專案：`C:\Users\bear9\OpenCharts`（Pine Script v6 直譯器在 `src/pine/`）
 
+> ⚠️ **本檔已過期（同日稍晚）**：只涵蓋 S1–S4。後續工作已 commit 到 `bf82d48`（HEAD）。
+> 權威狀態看 `docs/2026-10-13-handoff-s5-tv-oracle.md` 與 `docs/2026-10-13-remaining-work.md`。
+> 本檔失效處：§3「什麼都沒 commit」（已 commit `261d6e5`）、§5.3 的 partial 三項（S5 已做）、
+> §6 的 A 級四項（已 commit `28b2c2d`）。§0 的環境陷阱仍然有效。
+
 ---
 
 ## 0. 接手前必讀（環境陷阱，每個都會浪費你半小時）

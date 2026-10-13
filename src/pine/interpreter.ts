@@ -889,9 +889,14 @@ function evalNode(node: Node, frame: Frame): Value {
     case 'indicator':
       declDrawQuotas(ctx, node.args, INDICATOR_DECL_ORDER);
       warnUnsupportedIndicatorParams(ctx, node.args);
+      // A declaration binds its args through bindDeclArgs, whose warnings ride
+      // the same module-global queue as builtins — drain them here or they
+      // leak onto the next script's ctx.
+      flushBindWarnings(ctx);
       return { kind: 'void' };
     case 'strategy':
       strategyDecl(ctx, node);
+      flushBindWarnings(ctx);
       return { kind: 'void' };
   }
 }
@@ -1381,9 +1386,23 @@ function callBuiltin(
     // that a ctx is reachable; dedup so a per-bar builtin warns once. Must run
     // in `finally` — on a thrown builtin the queue is module-global, so an
     // undrained warning would leak onto the NEXT call's ctx.
-    for (const w of drainBindWarnings()) {
-      if (!ctx.warnings.includes(w)) ctx.warnings.push(w);
-    }
+    flushBindWarnings(ctx);
+  }
+}
+
+/** Move queued bind-time warnings (module-global queue) onto `ctx`, deduped.
+ *  Dedup through a Set built once per flush: `ctx.warnings` grows with every
+ *  distinct unknown named argument, so a linear `includes` per queued message
+ *  made a call with thousands of distinct names quadratic in wall time. The
+ *  early return keeps the common (empty-queue) path allocation-free. */
+function flushBindWarnings(ctx: BuiltinCtx): void {
+  const queued = drainBindWarnings();
+  if (queued.length === 0) return;
+  const seen = new Set(ctx.warnings);
+  for (const w of queued) {
+    if (seen.has(w)) continue;
+    seen.add(w);
+    ctx.warnings.push(w);
   }
 }
 
@@ -2544,7 +2563,22 @@ function bindArgsJit(state: JitState, run: RunState, ctx: BuiltinCtx,
     const d = ds[i]!;
     if (a.name !== undefined) {
       const p = params.findIndex(pp => pp.name === a.name);
-      if (p >= 0 && !filled.has(p)) { out[p] = jitMatArg(state, run, ctx, d, false, noHist(params[p]!)); filled.add(p); return; }
+      if (p >= 0) {
+        if (filled.has(p)) {
+          warn(run, ctx,
+            `duplicate named argument '${a.name}=' — ignored (this parameter is already bound)`);
+        } else {
+          out[p] = jitMatArg(state, run, ctx, d, false, noHist(params[p]!));
+          filled.add(p);
+        }
+        return;
+      }
+      // An unknown name used to fall through to `positionals` and bind to the
+      // next free slot, so `f(bogus=3)` silently wrote 3 into parameter 0. Name
+      // it and drop it — bindCallArgs does the same on the interpreted path.
+      warn(run, ctx,
+        `unknown named argument '${a.name}=' — ignored; this function takes (${params.map(pp => pp.name).join(', ')})`);
+      return;
     }
     positionals.push({ a, d });
   });
@@ -2768,6 +2802,12 @@ async function buildSess(
     declDrawQuotas(ctx, decl.args, INDICATOR_DECL_ORDER);
     warnUnsupportedIndicatorParams(ctx, decl.args);
   }
+  // Both decl paths above bind through bindDeclArgs, which queues its warnings
+  // on the module-global bind queue (a decl is bound before any run ctx exists).
+  // Drain them into THIS run's ctx here: the evalNode 'indicator'/'strategy'
+  // cases only fire for a nested decl, so a top-level decl's warning would
+  // otherwise be lost for its own run and leak onto the next script's ctx.
+  flushBindWarnings(ctx);
 
   // Bind context series + globals into the top scope.
   const bound: Record<string, Series> = {

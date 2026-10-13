@@ -14,6 +14,9 @@
 | §8 | `ta.*` 13 ＋ 常數 75（backlog 238 → 150） | `962df6d` |
 | §9 | **交接清單：未完成事項**（先讀這節） | `962df6d` |
 | §10 | 追加：`map.*`、A 四項、B 三項、TS 技術債(275→0)、45 顆資料源 stub(backlog 140→95) ＋**對 §9.2 三處前提的更正** | `a66631b`＋`6e5c6d4` |
+| §10.7–§10.8 | 45 顆資料源 stub(140→95)、小刀批次 10/14(95→85) | `bf82d48`＋`a76318e` |
+| §10.9 | 未知具名引數驗證 v2：2 個綁定點 → **6 個**（JIT binder／`math.*`／宣告／`request.*`）＋ draw setter/getter 的 `id=` 回歸修正；P8 review 後再修 3 處假警告 | `c9344b2` ＋ S10（本輪） |
+| §10.10 | `timeframe.from_seconds`／`weekofyear`／`timenow`／`in_seconds` 月長修正（backlog 85→82） | S10（本輪） |
 
 ---
 
@@ -349,9 +352,11 @@ constants 189→193、strategy_builtins 21→47）。
   「ta 的參考實作庫」與「沒進生產的孤兒」。要決定：提升為生產 / 刪除 / 保留當測試夾具。
   **`ta.*` 13 個的公式是照它抄的**，刪之前先確認第 8.1 節已把語意記下來。
 
-#### D. 工作區未追蹤
+#### D. 工作區未追蹤 — **已清空（2026-10-13 第二輪）**
 
-- `scratch/vela_*.png` ×6（Vela 截圖，先前 session 留下；要保留當證據就 commit，不要就刪）
+- ~~`scratch/vela_*.png` ×6~~ → **已刪**（使用者指示；`git status` 現在沒有未追蹤檔）。
+  要重建同型截圖：`npm run dev` 之後開 `/vela`，而且**必須用 headed 視窗**拍 ——
+  隱藏視窗只會拍到全黑（DOM 有內容、`canvas` 也建好了，但 rAF 不跑、畫面停在第 0 幀）。
 
 ### 9.3 環境陷阱（本檔第 0 節 ＋ 本輪新增）
 
@@ -494,11 +499,14 @@ no-ReturnType-contracts 規則）。
    `.github/workflows`、也沒有 husky／pre-commit，所以「防回歸」要自己選：掛 pre-commit
    （每次 commit ~40–80s）或等有 CI 再掛。`docs/superpowers/plans/2026-10-13-typescript-debt-remediation.md`
    的 Phase 3 講的就是這件事（該計畫的 Phase 2 現在 100% 完成）。
-2. **§9.2.A 剩下的 85**（45 顆資料源 stub ＋ 小刀 10 顆已補，見 §10.7／§10.8）：`matrix.*` 48
-   （本 repo 真實腳本 0 使用，最後做）、`syminfo` 27 欄位（等基本面資料源）、`(global)` 6、
-   `timeframe.from_seconds`、`chart.bg_color`／`left_visible_bar_time`／`right_visible_bar_time`。
+2. **§9.2.A 剩下的 82**（45 顆資料源 stub ＋ 小刀 10 顆 ＋ 本輪的 `timeframe.from_seconds`／
+   `weekofyear`／`timenow`，見 §10.7／§10.8／§10.10）：`matrix.*` 48（本 repo 真實腳本 0 使用，
+   最後做）、`syminfo` 27 欄位（等基本面資料源）、`(global)` **4**（`ask`／`bid`／`time_tradingday`／
+   `last_bar_time`，等資料源）、`chart.bg_color`／`left_visible_bar_time`／`right_visible_bar_time`
+   （刻意不做，理由見 §9.2.F）。
 3. **常數摺疊**（正確形狀見 §10.3）與**broker port**（設計見 §10.3），等對應前提成熟。
-4. `scratch/vela_*.png` ×6 仍未追蹤（§9.2.D）。
+4. `scratch/vela_*.png` ×6 **已刪**（§9.2.D）；同一輪也停掉卡在 `5173` 的孤兒 dev server
+   （esbuild 子行程已死，見 §10.11），新的 dev server 跑 `127.0.0.1:5174`。
 
 ---
 
@@ -565,3 +573,126 @@ pine 全套綠。
 驗證：`stdlib_small_batch.test.ts` 8 顆（`tfString` 對 TV 文件例子、main_period／isticks／change 三態、
 `array.copy` 獨立性照 TV 範例、new_linefill／new_table 大小、三個 copy 的 live 物件數與 props 不連動、
 style_text_outline 常數）、`tv_stdlib.test.ts` 印 **85**、`npx tsc --noEmit` **0**、pine 全套綠。
+
+---
+
+### 10.9 2026-10-13 追加：未知具名引數驗證 v2（2 條路徑 → 5 條）
+
+計畫正文：`docs/superpowers/plans/2026-10-13-named-arg-validation.md`。v1（`bindArgs`／`bindCallArgs`）
+已隨 `c9344b2` 落地；本節是 v2 —— 三軸唯讀探索（3 個 `task` 代理）找出**同型**的另外四條（表格 #1–#4），
+全部實測重現。含 v1 在內，會產生這類警告的綁定點共 **6 個**：
+`bindArgs`、`bindCallArgs`、`bindArgsJit`、`bindDeclArgs`、`liftNums` 的 `namedValues`、
+`request.*` 的 `tryEvalSecurity`。
+
+| # | 路徑 | 原本行為 | 級別 |
+|---|---|---|---|
+| 1 | `bindArgsJit`（`src/pine/interpreter.ts`） | 未知名仍被推成位置引數 → 綁到參數 0；重複名靜默忽略。**v1 自己的測試在 `PINE_JIT=1 PINE_JIT_UDF=1` 下 2 failed / 4 passed**（JIT 預設關，是 documented opt-in，所以是潛伏但走在支援路徑上） | **blocker** |
+| 2 | `liftNums`（`src/pine/builtins/math.ts`） | `args.concat(Object.values(named))` → 未知名變成**下一個位置引數**：`math.round(1.5, bogus=1)` 把 `bogus` 當 `precision`（**值錯**，比丟掉更糟） | risk |
+| 3 | `bindDeclArgs`（`src/pine/builtins/util.ts`） | `bound.set(a.name, …)` 進一個沒人讀的 key，零訊息（`indicator(bogus=1)`） | risk |
+| 4 | `pickArg`（`src/pine/mtf.ts`） | 只認固定名單；`adjustment=`／`backadjustment=`／`currency=` 是 TV **真有**的參數卻被靜默丟掉 | risk（語意分歧） |
+| 5 | UDT `T.new`（`src/pine/udt.ts`） | 未知名直接 throw | 不是缺口（TV 也錯，且不靜默）→ 只記錄 |
+
+**修法（#1–#4）**：同一個形狀 —— 解析名字 → 跳過 → 每 run 警告一次。bind 期一律走 `bindWarnQ`，
+**誰產生、誰排空**：builtin 呼叫由 `callBuiltin` 的 finally 排空；宣告期沒有 ctx，所以在
+`runScriptCore` 綁完 top-level decl 之後呼叫 `flushBindWarnings(ctx)`（`evalNode` 的
+`indicator`／`strategy` 分支各留一行給 nested decl）。**這裡踩過一次**：v2 第一版只把 flush
+裝在 `evalNode` 那兩個分支，而 top-level 宣告由 parser 抽成 `decl`、根本不走那條路
+（P8 正確性 review 抓到）→ 症狀是「自己那一輪看不到、警告留給下一個腳本」。
+
+- `request.*` 分兩類回報：**TV 有、本引擎沒做**（`ignore_invalid_symbol`／`currency`／
+  `calc_bars_count`／`ignore_invalid_timeframe` → `request.security(): 'x' declared but not implemented`）
+  vs **TV v6 根本沒有的名字**（`unknown named argument`）。參數表逐字對 `docs/tv-pine-stdlib.json`
+  （security 8 個、security_lower_tf 7 個）。**v2 第一版這裡兩個方向都寫錯**：把
+  `adjustment`／`backadjustment`／`settlement_as_close` 當成 request.* 的參數（其實是
+  `ticker.new`／`ticker.modify` 的），又漏了上面四個真參數 —— 等於製造新的假警告
+  （P8 兩個 review 角度同時抓到，已修）。
+- **順手修掉一個回歸**：`draw.ts` 生成的 setter 把物件槽宣告成**內部名**（drawing kind），
+  所以 TV 文件上的 `id=` 被丟掉並開警告（`line.set_color(id = l, …)`）。現在槽名用 TV 的參考名
+  （`table` 用 `table_id`，其餘 `id`），順序在**註冊期**建一次、不在每次呼叫重算；
+  未文件的 `line_id=`／`table=` 現在如 TV 一樣報未知名。生成的 **getter** 一併改成吃
+  `id=`／`table_id=`（它原本連 `named` 都不收 → `line.get_color(id = l)` 靜默回 `na`）。
+- **v2 還產生第三種假警告**：`INDICATOR_DECL_ORDER` 是 **v5** 的表（`linktoseries`／`max_tables_count`／
+  `calc_chart_luminosity_order`／`max_circles_count`／`backtest_fill_limits_assumption`），
+  缺 v6 的 `timeframe`／`timeframe_gaps`／`calc_bars_count`／`dynamic_requests`／`behind_chart`
+  → `indicator("t", timeframe = "240")` 會被報成 unknown。已整表換成 oracle 的 v6 順序
+  （v5 專屬名留著會靜默綁錯槽，所以直接移除），並把 `timeframe`／`timeframe_gaps`／
+  `calc_bars_count` 放進「declared but not implemented」。
+
+**刻意分歧（維持 v1）**：TV 在**編譯期**拒絕未知具名引數；本引擎沒有 parse 期簽章表，
+硬報錯會讓今天能跑的腳本直接壞掉 → 執行期警告一次後繼續。
+
+**沒進本輪**（先記錄，未計數）：`grep` 顯示 `draw.ts` 單檔就有 23 個註冊完全不看 `named`
+（多數是 `get_*`／`delete` 存取器）→ 具名呼叫會靜默 no-op。這是**先前就存在**、與本守衛無關的另一類。
+
+---
+
+### 10.10 2026-10-13 追加：timeframe／calendar 收尾（backlog 85 → 82）
+
+三個名字 ＋ 一個數值修正，語意逐條取自 `scratch/pine-v6-kb/dist/bundles/`：
+
+| 名字 | 實作 | 來源 |
+|---|---|---|
+| `timeframe.from_seconds(seconds)` | 秒階梯 **1/5/10/15/30**（`≤1 s → 1S`、`2–5 s → 5S`…）；31–59 s 落到分鐘級（45 s → `"1"`）；≥ 86400 s 無條件進位到整天；恰好整週／整月時取**較大單位**（604800 s → `1W` 而非 `7D`）；≥ 365 天（31,536,000 s）一律 `12M`。**兩處邊界與 KB 文字不一致，目前以實測表為準、尚未定案**：KB 寫「above 31,622,400 (366 days) return "12M"」，但 12M 本身是 12 × 2,628,003 = 31,536,036 s（與 365 天差 36 秒）；KB 的合法秒階層含 45，實測表卻說 45 s → `"1"`。 | `timeframe.md:88-118` ＋ `guide/concepts/timeframes.md:57-65`；邊界值逐條比對 LuxAlgo/PineTS 的 TV 實測表（**未自行在 TV 覆核**，列在 `remaining-work` D6） |
+| `weekofyear`（變數＋`weekofyear(time, timezone)`） | ISO 8601：週一起算、屬於「星期四所在的那一年」（2024-12-30 是 2025 第 1 週、2022-01-01 是 2021 第 52 週）；`timezone` 預設 `syminfo.timezone` | `variables.md:1107-1108`、`functions/weekofyear.md:29-41` |
+| `timenow` | `Date.now()`。**非決定性**：任何讀它的腳本都不能進 golden／replay 比對（TV 也把它歸在 repainting 變數） | `variables.md:1026-1028` |
+| `timeframe.in_seconds` | 月長 2592000 → **2628003**（1 個月 = 30.4167 天 = 365/12） | `timeframe.md:170-172` |
+
+驗證：`timeframe_calendar.test.ts` **12 顆**（`from_seconds` 的每個邊界（含 604799 s → `7D`、
+604800 s → `1W`、366 天 → `12M`）、`in_seconds` 與 `from_seconds` 來回不縮水、
+ISO 週跨年兩例、`timenow` 落在合理時窗）、`tv_stdlib.test.ts` 印 **82**
+（`TV names: 887 | registered: 731 | absent: 156 | alignment backlog: 82`）、`npx tsc --noEmit` **0**。
+
+---
+
+### 10.11 2026-10-13 追加：本輪環境陷阱 ＋ P7 收斂 ＋ P8 review
+
+#### 環境陷阱（第二輪新增，全部實際踩到）
+
+1. **長跑的 vite dev server，它的 esbuild 子行程會死**。症狀：頁面出現
+   `[plugin:vite:esbuild] The service is no longer running` 的 overlay，之後每個 module 請求都
+   `net::ERR_ABORTED`，body 只剩 144 bytes，看起來像「套件沒裝好」。**`node_modules` 沒壞**
+   （`@luxalgo/vela/dist/workspace.js`、`monaco-editor/.../editor.worker.js` 都在）——
+   重啟 dev server 就好，不要 `npm i`。
+2. **隱藏視窗的截圖會全黑**：`/vela` 的 DOM 與 7 張 1609×864 的 canvas 都在，`innerText` 也讀得到
+   工具列，但截圖只有最早畫的那幾幀（差分視窗不跑 rAF）。要拍畫面用 headed（本輪的驗收截圖如此拍）。
+3. **`taskkill` 會被本機 jev-gate 擋**（`jev-gate L0: provably dangerous command`）；
+   harness 的 `proc://<id>/kill` 對**已脫離**的孤兒行程只清記錄、不殺行程
+   （實測：記錄變 `Stopped`，`netstat` 顯示同一個 PID 仍在 LISTEN）。
+   實務做法：**換埠**起新的（本輪 dev server 改跑 `127.0.0.1:5174`；`5173` 的孤兒留給人砍）。
+4. `PINE_JIT=1 PINE_JIT_UDF=1` 只涵蓋 named-args 那 3 檔的驗證範圍（不是整套 suite）。
+
+#### P7 收斂（驗收逐條，2026-10-13）
+
+| 驗收 | 結果 |
+|---|---|
+| `npx vitest run src/pine` 全綠 | **62 檔 / 947 passed / 1 skipped**（含 P8 修正後重跑） |
+| `PINE_JIT=1 PINE_JIT_UDF=1` 下的 named-args | **3 檔 / 20 passed**（修前 baseline：2 failed / 4 passed） |
+| `npx tsc --noEmit` | **0**（本輪動到的檔案） |
+| 新發現歸零 | 四條路徑各有測試；第 5 條（UDT `T.new`）本來就不靜默 |
+| golden | **警告會進 golden**（`golden.ts` 的 `snapshot()` 一起比對 `warnings`）→ 新增／改動警告字串要 `UPDATE_GOLDEN=1` 重生成並在 review 看 diff；本輪因為沒有腳本使用新警告的名字，golden 未變 |
+| `tv_stdlib.test.ts` | 印 **82** |
+| `e2e.test.ts` 的永久 gate | 8 支真實使用者腳本零 `unknown named argument`，**唯一例外是白名單**：`高量1.46` 對 `box.new` 傳了 TV 沒有的 `tooltip=`（使用者腳本自身的 bug，`e2e.test.ts:37-39` 具名放行） |
+
+附帶驗證（與本 diff 無關，但同一輪做掉）：dev server 換埠重啟後 `/vela` 真的開得起來 ——
+`MODULE-LOADED`／`WS-CREATED :: cells=1`、7 張 chart canvas、無 error overlay、
+2330 TSE 5m K 線 ＋ 成交量 ＋ EMA 20 正常繪製（headed 截圖）。
+
+#### P8 三視角 review 的發現與處置
+
+3 個 `task` 代理全部回來了（正確性 13m43s／可維護性 17m42s／安全 30m33s）。**三個角度都獨立抓到問題，
+而且都落在此輪自己新寫的程式碼上** —— 同一個守衛若把合法 TV 參數報成 unknown，它就變成新的噪音來源：
+
+| # | 發現（級別） | 處置 |
+|---|---|---|
+| 1 | `request.*` 參數表兩個方向都錯：漏了 TV 真有的 4 個參數、又把 `ticker.*` 的 3 個當成 request 的（Important，**本輪引入**） | 已修：`SECURITY_PARAMS` 逐字對 oracle（security 8／ltf 7 個），真參數走 `declared but not implemented`，不在表上的走 `unknown` |
+| 2 | 宣告期警告的 flush 裝錯位置：top-level `indicator()`／`strategy()` 走 `runScriptCore`，`evalNode` 那兩個分支不會執行 → 自己那輪看不到、漏給下一輪（Important，**本輪引入**） | 已修：在 `runScriptCore` 綁完 decl 後排空；測試「含未知名的宣告、body 零 builtin」＋「下一支腳本 warnings 為空」把洩漏釘住 |
+| 3 | `INDICATOR_DECL_ORDER` 是 v5 的表 → 合法 v6 參數（`timeframe` 等 5 個）被報 unknown（Important，**本輪引入**） | 已修：整表換成 oracle 的 v6 順序；v5 專屬名移除（TV v6 也拒絕）；3 個行為參數進 unsupported |
+| 4 | 手寫 drawing builtin 完全不看 `named`（`line.delete(id = l)` 靜默 no-op）（Important，**既有**） | 本輪只修了產生的 `get_<prop>`；其餘 44 個（draw 27／core 8／strategy 9）需要逐函式簽章＝獨立切片，見 `remaining-work` D5 |
+| 5 | 文件寫「警告不進 golden」與事實相反（Important，本輪引入） | 已全數改正（本節上表、PROGRESS S10、plan） |
+| 6 | 新的 drawing-setter 測試可以空過（兩邊都 no-op 也會相等）（Important，本輪引入） | 已修：加 `toHaveLength(1)` 並把 `color` 期望值寫死 `#FF0000` |
+| 7 | `math.*` variadic 的 `number<k>` 名（TV 的 `number0, number1, ...` 是無上限的）會被當成未知名丟掉（自查發現，本輪引入） | 已修：`/^number\d+$/` 在白名單內，只有真正不存在的名字才警告 |
+| 8 | Minor：`in_seconds` 註解宣稱「永不縮水」在 12M 上限之上為假；`from_seconds` 永不產出 `45S`；duplicate 語意各 binder 不一致；`pinetsShim` 的 bind 警告沒人排空；訊息樣板 6 份重複 | 註解與文件已改精確；`pinetsShim` 已補排空；樣板重複與 duplicate 語意**刻意保留**（計畫 v2 明拒新抽象；差異已寫在 `util.ts` 註解），`45S` 等邊界爭議列入 `remaining-work` D6 |
+| 9 | 安全視角（跑 30 分鐘才回）：模組全域 `bindWarnQ` 在 top-level decl 沒排空 → 腳本 A 的警告落到腳本 B（**與 #2 同一個根因**；它獨立重現，並確認現行修訂已關閉：5 個情境 own=1、下一支 run=0） | 已由 #2 的修正關閉；它要求的回歸測試＝本輪新增的「宣告警告不跨 run」案例 |
+| 10 | 安全視角：`flushBindWarnings` 用 `ctx.warnings.includes` 去重 → 上萬個相異未知名時呈 O(n²)（實測 16,000 個名字 ≈ 53 秒 CPU） | 已修：改為每次 flush 建一次 `Set`，空佇列時直接返回（`callBuiltin` 與宣告路徑共用同一支） |
+| 11 | 安全視角（Minor，**pre-existing**）：`tz.ts` 的 Intl 快取無上限 × 腳本可控的 `timezone=` 字串（≈0.5 KB/相異字串、跨 run 不回收）；`timenow` 讓 model cache 回放過期的時鐘值 | 記錄未修，列進 `remaining-work` D8／D9（根因都不在本輪 diff；`tz.ts` 屬另一條線） |
+| 12 | 安全視角：`set_*` 移除 `line=`／`label=`／`box=`／`table=` 拼法（HEAD 可用）→ 變成警告＋no-op | 刻意的 TV 對齊（TV 文件上的名字是 `id=`／`table_id=`）；全 repo grep 沒有任何呼叫端，位置參數不受影響 |

@@ -483,3 +483,42 @@
 * 驗證：`src/pine` **59 檔 / 921 passed / 1 skipped**；`npx tsc --noEmit` **0**；
   golden 不需重生成（警告不進 golden，成功案例的值不變）。
 
+---
+
+## 2026-10-13（S10）未知具名引數 v2（2 → 5 條路徑）＋ timeframe/calendar 收尾
+
+* **v1 只修 2 條路徑，v2 補齊同型的另外 3 條**（計畫：`docs/superpowers/plans/2026-10-13-named-arg-validation.md`）。
+  三軸唯讀探索找出並實測重現：
+
+  | # | 路徑 | 原本行為 | 級別 |
+  |---|---|---|---|
+  | 1 | `bindArgsJit`（`interpreter.ts`） | 未知名被推成位置引數 → 綁到參數 0；重複名靜默忽略。`PINE_JIT=1 PINE_JIT_UDF=1` 下 v1 的測試 2 failed / 4 passed（JIT 是 opt-in 路徑） | blocker |
+  | 2 | `liftNums`（`math.ts`） | `args.concat(Object.values(named))` → `math.round(1.5, bogus=1)` 把 `bogus` 當 precision，**值錯**（比丟掉更糟） | risk |
+  | 3 | `bindDeclArgs`（`util.ts`） | 未知名進沒人讀的 key，零訊息（`indicator(bogus=1)`） | risk |
+  | 4 | `pickArg`（`mtf.ts`） | `request.*` 的 `adjustment`／`backadjustment`／`currency`——TV 真有的參數——被靜默丟掉 | risk |
+  | 5 | UDT `T.new`（`udt.ts`） | 未知名直接 throw | 不是缺口（TV 也錯，且不靜默） |
+
+  1–4 的修法同一個形狀：解析名字 → 跳過 → 每 run 警告一次。`request.*` 另外把
+  「TV 有這個參數、我們沒實作」與「TV 也沒有這個名字」分成兩種訊息。
+* **順手修掉一個回歸**：`draw.ts` 生成的 setter 把物件槽宣告成**內部名**（drawing kind），
+  TV 文件上的 `id=` 因此被丟掉並開警告（`line.set_color(id=l, …)`）；
+  現在槽名用 TV 的參考名（`table` 用 `table_id`，其餘 `id`），順序在註冊期建一次、
+  不在每次呼叫重算。未文件的 `line_id=`／`table=` 現在如 TV 一樣報未知名。
+* **timeframe／calendar 收尾**（backlog **85 → 82**）：`timeframe.from_seconds`（秒階梯 1/5/10/15/30；
+  ≥365 天 → `12M`；恰好整週／整月時優先較大單位）、`weekofyear`（ISO 8601，`timezone` 預設
+  `syminfo.timezone`）、`timenow`（`Date.now()`，**非決定性** → golden 不得使用）、
+  `timeframe.in_seconds` 的月長 2592000 → **2628003**（TV 文件：1 個月 = 30.4167 天 = 365/12）。
+  語意逐條取自 `scratch/pine-v6-kb/dist/bundles/`。
+* 驗證：`src/pine` **62 檔 / 947 passed / 1 skipped**；`PINE_JIT=1 PINE_JIT_UDF=1` 下的 named-args
+  3 檔 **20 passed**（修前 baseline：2 failed / 4 passed）；`npx tsc --noEmit` **0**；
+  `tv_stdlib.test.ts` 印 **82**（887 名稱 / 731 已註冊 / 156 缺）。
+* **警告會進 golden**：`golden.ts` 的 `snapshot()` 把 `warnings` 一起比對，所以新增／改動任何警告字串
+  都要 `UPDATE_GOLDEN=1` 重生成，並在 review 時看 `.golden.json` 的 diff（`c9344b2` 就重生成過
+  `scripts/golden/高量1.46.golden.json`，唯一差異是 `tooltip=` 那條警告）。先前的文件寫「警告不進 golden」是錯的。
+* P8 三視角 review（正確性／可維護性各 1 個 `task` 代理）的發現與處置見 handoff §10.11；
+  本輪因此又多修：`request.security` 參數表（假 unknown ＋ 錯分類）、宣告期警告的 flush 位置、
+  v6 `indicator()` 參數表（假 unknown）、產生的 drawing getter 不吃 `id=`。
+* 已知限制：JIT 變體只跑 named-args 那 3 檔（不是整套）；`draw.ts`／`core.ts`／`strategy.ts` 另有
+  實測 27／8／9 個手寫註冊完全不看 `named`（多數 `get_*`／`delete`／`set_xloc`）→ 具名呼叫會靜默 no-op，
+  屬先前就存在的另一類，盤點與切片見 `docs/2026-10-13-remaining-work.md` D5。
+

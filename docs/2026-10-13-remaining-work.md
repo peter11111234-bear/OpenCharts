@@ -1,9 +1,11 @@
-# 未完成事項總表（2026-10-13 收工）
+# 未完成事項總表（2026-10-13 第三輪收工）
 
-**狀態基準**：HEAD = `bf82d48`（45 顆資料源 stub，backlog 140 → 95）。
-工作區只剩 `scratch/vela_*.png` ×6 未追蹤，**沒有未 commit 的程式改動**。
+**狀態基準**：`c9344b2`（已提交的 v1 named-arg 守衛 ＋ e2e gate ＋ golden 重生成）**＋ 目前 worktree**
+（v2 的五條路徑、`indicator()` v6 參數表、timeframe/calendar 收尾、P8 review 修正；見 handoff §10.9–§10.11）。
+Review 範圍就是這個聯集 —— 只看 HEAD 會漏掉 e2e gate 與 golden，只看 worktree 會漏掉 v1。
+工作區：`scratch/vela_*.png` ×6 已刪。
 
-來源：`docs/2026-10-13-handoff-s5-tv-oracle.md`（§9.2／§10.6／§10.7，權威）＋
+來源：`docs/2026-10-13-handoff-s5-tv-oracle.md`（§9.2／§10.6／§10.7–§10.11，權威）＋
 `docs/pynecore-conformance.json`（full 36／partial 14／missing 4／divergent 2）＋ 實測複核。
 
 > 另一份 `docs/2026-10-13-fix-four-pain-points-handoff.md`（S1–S4）**已過期**：
@@ -18,7 +20,7 @@
    `Failed to load url .../src/__tests__/setup.ts` —— 假錯誤，檔案存在。
 2. **`src/pine/` 有兩份複本**（`OpenCharts/src/pine/` 與 `MYOPENCHART/pine-interpreter/`）。**只改前者**。
 3. **`reg(name, fn, false)` 是地雷**：第三個參數 `false` 會讓 `evalArg` 不再把純量引數包成 per-callsite
-   BarSeries（`interpreter.ts:1303` 的 `noHist`）。**需要讀歷史的引數必須用預設 `hist = true`**，否則會拿到錯的值。
+   BarSeries（`interpreter.ts` 的 `noHist`）。**需要讀歷史的引數必須用預設 `hist = true`**，否則會拿到錯的值。
 4. **`strategy.ts` 卡在 import 循環**（`interpreter → builtins/strategy → mtf → interpreter`）。
    要從 `strategy.ts` 用時間工具，**只能走 `../tz`**（葉模組），不要 import `../mtf` 或 `./time`。
 5. **`git` 是 Windows 原生**：用 `C:/Users/...`，不要 `/c/...`。
@@ -28,36 +30,36 @@
 8. **寫探測器時，斷言「沒有輸出」比斷言「有錯誤」更容易誤判** —— 要用實際產生的值／訊息**全文**比對。
    （教訓：先前用 `/not found/` 篩警告，漏掉 `unknown constant`，得出錯的「124 個靜默 na」結論。）
 9. **同一檔案不可併發 edit**：若同時開多個 agent，**先切檔**；共用根因（例如 `api.ts` 這種）要指定**單一 owner**。
+10. **vite dev server 長跑會壞**：esbuild 子行程死掉 → overlay
+    `[plugin:vite:esbuild] The service is no longer running` ＋ 所有 module `net::ERR_ABORTED`。
+    **`node_modules` 沒壞，重啟 dev server 就好**（不要 `npm i`）。另外：
+    `taskkill` 會被本機 jev-gate 擋，harness 的 `proc://<id>/kill` 殺不掉已脫離的孤兒行程 → **換埠**起新的。
 
 ---
 
 ## A. 有計畫、未實作 —— 最該先做
 
-| # | 項目 | 證據 | 成本 |
-|---|---|---|---|
-| A1 | **未知具名引數的驗證**（`bindArgs` 警告未知名 ＋ `bindCallArgs` 不要再把它推成位置引數） | 計畫已寫好：`docs/superpowers/plans/2026-10-13-named-arg-validation.md`；實測 grep `unknown named argument`／`udfarg` = **0 命中**，`src/pine/__tests__/named_arg*` **不存在** | ~25 行 ＋ 5 個測試 |
-| A2 | 6 張 Vela 截圖的去留（commit 當證據 or 刪） | `scratch/vela_{2330,err20,fatlines,harmonic,noharmonic,zoom}_window.png` 未追蹤 | 1 分鐘 |
-
-**A1 為什麼值得**：R20 的 MZigZag「零輸出」根因就是它（`value=` 綁不進 `'val'` 槽，靜默全 na）。
-R20 只修了那 5 個 `array.*` 的槽名；**通用防護沒做** —— 下一個參數名漂移還會靜默出錯。
-已知的兩條靜默路徑：`util.ts:171`（builtins，未知名落進沒人讀的 key）、
-`interpreter.ts:1458`（UDF，未知名被推成位置引數，`f(bogus=3)` 靜默覆寫參數 0）。
-計畫的 S2 已做過 dry run：8 支真實腳本裡預期**沒有**其他違規者（只有既有的 `series→source` 別名）。
+| # | 項目 | 現況 |
+|---|---|---|
+| A1 | **未知具名引數的驗證** | **已完成（6 個綁定點）**。v1（`c9344b2`）：`bindArgs` ＋ `bindCallArgs` 走「指名 ＋ 忽略 ＋ 每 run 警告一次」＋ `duplicate named argument`，外加 `e2e.test.ts` 的永久 gate。v2（本輪，handoff §10.9）：補齊同型的另外四條 —— `bindArgsJit`（JIT binder，v1 的測試在 `PINE_JIT=1 PINE_JIT_UDF=1` 下 2 failed）、`liftNums`（`math.*` 未知名變成下一個位置引數 → **值錯**）、`bindDeclArgs`（宣告期靜默）、`tryEvalSecurity`（`request.*` 的真參數被靜默丟棄）。P8 review 後再修掉三處**這一輪自己製造的假警告**（`request.*` 參數表兩個方向都錯、宣告期 flush 位置、`indicator()` 的 v5→v6 參數表）＋ 產生的 drawing getter 不吃 `id=`。**剩下的同型項見 D5** |
+| A2 | Vela 截圖去留 | **已結案**：6 張全刪（使用者指示）。要重建同型截圖記得用 **headed** 視窗（隱藏視窗只拍到全黑） |
 
 ---
 
-## B. TV 標準庫還缺 85（`tv_stdlib.test.ts` 會印最新數字）
+## B. TV 標準庫還缺 82（`tv_stdlib.test.ts` 會印最新數字）
 
-現況（2026-10-13 第二輪後）：`TV names: 887 | registered: 728 | absent: 159 | alignment backlog: 85`
-（先前的 `140 → 95` 是 45 顆資料源 stub；`95 → 85` 是「小刀」批次 10 顆，見 handoff §10.8）
+現況（本輪後）：`TV names: 887 | registered: 731 | absent: 156 | alignment backlog: 82`
+（140 → 95 是 45 顆資料源 stub；95 → 85 是小刀批次 10 顆；**85 → 82** 是本輪的
+`timeframe.from_seconds`／`weekofyear`／`timenow`，見 handoff §10.10）
 
 | 批次 | 量 | 建議 | 理由 |
 |---|---|---|---|
 | `matrix.*` | 48 | **最後做** | 本 repo 真實腳本 0 使用（已 grep 驗證） |
 | `syminfo` 缺欄位 | 27 | 等資料源 | 補成 na 會**蓋掉**現在有用的 `unknown constant` 警告 |
-| `(global)` `ask` `bid` `timenow` `time_tradingday` `weekofyear` `last_bar_time` | 6 | 等資料源 | 同上 |
-| 小刀 | 14 | 順手做（10 已做，見下） | `timeframe` 4／`array.*` 3／`label.*` 2／`box.copy`／`line.copy`／`chart.*` 3 |
-| （未歸類） | ~~2~~ | **已釐清：不是未歸類** | 上面合計 93 與 95 差 2，是因為「小刀」列實際列了 14 個名字、數量欄卻寫 12。修好後：48+27+6+14 = 95 ✓ |
+| `(global)` `ask` `bid` `time_tradingday` `last_bar_time` | 4 | 等資料源 | 同上（`timenow`／`weekofyear` 本輪已補） |
+| `chart.bg_color`／`left_visible_bar_time`／`right_visible_bar_time` | 3 | **刻意不做** | 無圖表主題色／可見區間來源，補 na 只會蓋掉警告（§9.2.F） |
+
+合計：48 + 27 + 4 + 3 = **82** ✓
 
 ## C. PyneCore 對照表 —— missing 4 ／ partial 14
 
@@ -74,6 +76,30 @@ R20 只修了那 5 個 `array.*` 的槽名；**通用防護沒做** —— 下�
 3. **S5 留下的五條刻意限制**（見 S5 handoff §3）：追繳平倉不截斷成整數合約、risk 規則以事件密度近似逐 bar、
    進場保證金不足時 warn 而非 error、`session.ispremarket/ispostmarket` 恆 false、跨年 D/W `bars_back` 未實作。
 4. **`matrix.*` 只有 stub 級覆蓋**（同 B 首批）。
+5. **【新】手寫 drawing builtin 完全不看 `named`**（多數 `get_*`／`delete`／`copy`／`set_xloc`／
+   `get_price` 存取器）→ 對它們用具名呼叫（TV 文件化的 `line.delete(id = l)`、`line.get_price(id = l, x)`）
+   會靜默 no-op，連警告都沒有。與本輪的「未知名」守衛無關（那些名字**是**合法的），是先前就存在的另一類。
+   **實測盤點（2026-10-13 P8 review 複核）**：`draw.ts` **27** 個、`core.ts` **8** 個、`strategy.ts` **9** 個
+   （先前文件寫「單檔 23」是低估）。本輪已先修掉其中 generated `get_<prop>`（現在吃 `id=`／`table_id=`）；
+   其餘 44 個需要逐函式的 TV 簽章（oracle `docs/tv-pine-stdlib.json` 每個都有）＝一個獨立切片。
+   `grep -nE "registerBuiltin\(.*\((c|_c|ctx), *args\)" src/pine/builtins/*.ts` 可重建清單。
+6. **【新】`from_seconds` 邊界值的權威未定**：實作用「≥ 365 天（31,536,000 s）→ `12M`」，
+   引用的是 LuxAlgo/PineTS 在 TV 上的實測表；但 KB 原文寫「above 31,622,400 (366 days) return "12M"」，
+   而 12M 本身是 12 × 2,628,003 = 31,536,036 s（與 365 天差 36 秒）。同一個衝突還包括
+   「45 秒該回 `45S`（KB 的合法秒階層含 45）還是 `1`（PineTS 實測）」。
+   定案需要人工在 TV 上跑 `timeframe.from_seconds` 逐值對照，在那之前以實測表為準。
+7. **【新】`duplicate named argument` 的語意各 binder 不一致**：builtins 走 `bindArgs` 是 last-wins
+   （訊息 `collides with … overwritten`），UDF／JIT／宣告都是 first-wins。TV 兩者都是編譯錯誤，
+   所以不是致命問題，但同一構造在兩條路徑結果不同（`util.ts` 的註解已明寫）。
+8. **【新】`tz.ts` 的 Intl 快取沒有上限，而時間函式的 `timezone=` 是腳本可控字串**（安全 review 實測）：
+   `plot(weekofyear(time, timezone = str.tostring(bar_index)))` 每根 bar 一個新字串 → `partCache`／
+   `partsMemo` 各多一筆且不回收（約 0.5 KB/相異字串；1M bar 約 500 MB，跨 run 累積）。
+   根因 **pre-existing**（`hour(time, timezone=…)` 走同一條路），本輪只是多開一個入口（`weekofyear`）。
+   修法屬 `tz.ts` 擁有者：上限化 `partCache`／外層 `partsMemo`（內層已有 4096 上限）。
+9. **【新】`timenow` 讓 model cache 的不變式失效**（安全 review）：`engine.ts` 的 `cacheKey` 不含時鐘成分，
+   讀過 `timenow` 的腳本若命中 IndexedDB 快取，會看到**上次執行**的時鐘值；同一根 bar 內兩次讀也會不同。
+   golden／replay 只要用到 `timenow` 就會 flake（本輪的測試只斷言值落在 before/after 之間）。
+   TV 也有這個變數，所以不是「不該有」；要解就得把 `timenow` 標成不可快取／不可決定性依賴。
 
 ## E. 技術債
 
@@ -81,7 +107,7 @@ R20 只修了那 5 個 `array.*` 的槽名；**通用防護沒做** —— 下�
 |---|---|
 | **TypeScript 防回歸** | `tsc` 已歸零，但 **repo 沒有 CI、沒有 husky/pre-commit** → 沒有人擋它再紅。計畫：`docs/superpowers/plans/2026-10-13-typescript-debt-remediation.md` Phase 3 |
 | **pinets 移植層 5346 行是孤兒** | 只被測試 import（`pinetsAll` 沒有生產 import）。要決定：提升為生產／刪除／保留當測試夾具。**刪之前先確認 §8.1 的語意筆記夠用** |
-| **常數摺疊未做** | 正確形狀已定（S5 handoff §10.3）：要用 evaluator 對 literal-only 初始式求值一次，**不能**另寫一套常數算術 |
+| **常數摺疊未做** | 正確形狀已定（handoff §10.3）：要用 evaluator 對 literal-only 初始式求值一次，**不能**另寫一套常數算術 |
 | **broker port 未做** | 設計已定（~40 行 `BrokerPort` ＋ paper/sim 實作），但 `src/services/shioaji/api.ts` 目前**零 import** → 現在做會有零個使用者。等實盤路徑接上 |
 
 ## F. 明確決定「不做」（列出來避免重複討論）
@@ -89,13 +115,14 @@ R20 只修了那 5 個 `array.*` 的槽名；**通用防護沒做** —— 下�
 - **`request.security` 的 tf 不做編譯期檢查** —— `mtf.ts` 的 DYNAMIC 路徑是**刻意支援**的功能，擋掉等於刪掉一個能跑的功能（TV 會拒絕）。
 - **`chart.bg_color`／`chart.left/right_visible_bar_time` 不註冊** —— 無圖表顏色／可見區間來源，補 na 只會蓋掉有用的警告。
 - **`syminfo` 那 27 個欄位不補 na** —— 同上，維持警告比回 na 誠實。
+- **未知具名引數不改成編譯期報錯** —— TV 在編譯期拒絕；本引擎沒有 parse 期簽章表，硬報錯會讓今天能跑的腳本壞掉。維持「執行期警告一次後繼續」（handoff §10.9）。
 
 ---
 
 ## 建議順序
 
-1. **A1**（named-arg validation）—— 最便宜，修的是**可觸發的靜默錯誤**，且計畫與 dry run 都做完了。
-2. **A2**（PNG 去留）＋ **E 的 TypeScript 防回歸**（10 分鐘的事，但決定這輪 275→0 會不會再爛掉）。
-3. **C 的 `strategy.calc_on_order_fills` 與 `varip`** —— 對照表裡「會影響數字」的那一類。
-4. **B 的小刀批次**（14 顆，已做 10；剩 `timeframe.from_seconds` ＋ 刻意不做的 `chart.*` 3）。
-5. 其餘等資料源或真實需求（B 的 `matrix.*`／`syminfo`、E 的 broker port）。
+1. **D5（`draw.ts` 的 named-blind handler 盤點）** —— 與本輪同一個「靜默 no-op」家族，`grep` 就有清單，最便宜。
+2. **C 的 `strategy.calc_on_order_fills` 與 `varip`** —— 對照表裡「會影響數字」的那一類。
+3. **E 的 TypeScript 防回歸**（10 分鐘的事，但決定 275 → 0 會不會再爛掉）。
+4. **D1（新 `ta.*` 的 TV 數值 oracle）** —— 要人工在 TV 對數字，成本最高但價值也最高。
+5. 其餘等資料源或真實需求（B 的 `matrix.*`／`syminfo`、E 的 broker port、D6）。
