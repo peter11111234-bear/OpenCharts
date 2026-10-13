@@ -2666,6 +2666,7 @@
   "alerts": [],
   "alertconditions": [],
   "warnings": [
-    "indicator(): 'max_bars_back' declared but not implemented — the run ignores it"
+    "indicator(): 'max_bars_back' declared but not implemented — the run ignores it",
+    "unknown named argument 'tooltip=' — ignored; this function takes (left, top, right, bottom, xloc, extend, border_color, border_width, border_style, bgcolor, text, text_size, text_color, text_halign, text_valign, text_wrap, text_font_family, force_overlay)"
   ]
 }

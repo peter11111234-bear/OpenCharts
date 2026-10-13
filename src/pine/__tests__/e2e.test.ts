@@ -27,6 +27,17 @@ const check = (r: RunResult, opts: {
     console.log('WARN STORM:', warns.slice(0, 20));
   }
   expect(warns.length).toBeLessThanOrEqual(maxWarns);
+  // Named-argument validation gate. A *new* unknown named argument means a slot
+  // name drifted from TV's reference (the R20 class: `value=` vs an internal
+  // `'val'`) or a genuine alias is missing, so it must fail here.
+  // Known exception: 高量1.46:193 passes `tooltip=` to box.new, and TV's v6
+  // reference defines no tooltip for boxes at all (scratch/pine-v6-kb/dist/
+  // bundles/box.md mentions it 0 times; docs/tv-pine-stdlib.json lists no box
+  // tooltip) — that is the script's own bug, not an engine gap.
+  const knownScriptBugs = ['tooltip='];
+  const unknownArgs = r.warnings.filter(w => w.startsWith('unknown named argument')
+    && !knownScriptBugs.some(k => w.startsWith(`unknown named argument '${k}'`)));
+  expect(unknownArgs).toEqual([]);
   if (opts.minPlots) expect(r.plots.size).toBeGreaterThanOrEqual(opts.minPlots);
   if (opts.minDrawings) expect(r.drawings.length).toBeGreaterThanOrEqual(opts.minDrawings);
 };

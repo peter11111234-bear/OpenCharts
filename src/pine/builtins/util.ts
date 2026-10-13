@@ -188,6 +188,16 @@ export function bindArgs(
   }
   for (const [k, v] of Object.entries(named)) {
     const canon = !order.includes(k) && k === 'series' && order.includes('source') ? 'source' : k;
+    if (!order.includes(canon)) {
+      // TV rejects an unknown named argument at compile time ("Unknown
+      // argument"); this layer sees no signature table, so the name is surfaced
+      // here instead. Letting it through bound nothing and left the slot
+      // undefined — MZigZag's `array.unshift(a, value=v)` hit an internal slot
+      // named 'val', so every pivot came out na with no message.
+      bindWarnQ.push(
+        `unknown named argument '${k}=' — ignored; this function takes (${order.join(', ')})`);
+      continue;
+    }
     if (out.has(canon)) bindWarnQ.push(
       `named arg '${k}' collides with '${canon}' — the earlier binding is overwritten`);
     out.set(canon, v);

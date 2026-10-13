@@ -456,3 +456,30 @@
     重生成（全綠）。
   * 已知限制：bundle 的 chunk hash 隨 TV 部署變動（`--auto` 會重新定位）；
     oracle 只有表面（名稱/參數/型別），不含散文與執行期語意。
+
+---
+
+## 2026-10-13（S9）未知具名引數驗證 ＋ 小刀批次 10/14
+
+* **未知具名引數不再靜默**（計畫 `docs/superpowers/plans/2026-10-13-named-arg-validation.md`）。
+  兩條路徑原本都會安靜吞掉打錯的名字：
+  * `bindArgs`（`src/pine/builtins/util.ts`）把未知名塞進 Map 裡一個沒人讀的 key，
+    槽位留 `undefined` → `NA`／預設值。R20 的 MZigZag 全 na 就是這個：
+    `array.unshift(a, value=v)` 的內部槽當時叫 `'val'`，綁不進去且零訊息。
+  * `bindCallArgs`（`src/pine/interpreter.ts`）更糟：未知名被推成**位置引數**，
+    綁到下一個空槽，所以 `f(bogus=3)` 會把 3 寫進參數 0。
+  現在兩條路徑都只做一件事：**指名 + 忽略 + 每 run 警告一次**
+  （`unknown named argument 'bogus=' — ignored; this function takes (id, value)`），
+  另補 `duplicate named argument`（同一參數名綁兩次，TV 也是錯；保留第一次的綁定）。
+  別名檢查維持只有既有的 `series → source`（不加通用 alias 表，等真的有需要）。
+* **刻意分歧（記錄在案，不假裝 parity）**：TV 在**編譯期**就拒絕未知具名引數；
+  本引擎沒有 parse 期的簽章表，而硬報錯會讓今天能跑的腳本直接壞掉
+  → 我們選擇**執行期警告一次後繼續**。
+* 測試：`src/pine/__tests__/named_args.test.ts` 6 條（builtin 未知名、`ta.*` 未知名、
+  R20 的 `value=` 真的綁得進去、`series→source` 別名無誤報、UDF 未知名不寫入參數、
+  UDF 重複名保留第一次）；`e2e.test.ts` 的 `check()` 追加**永久 gate**：
+  8 支真實使用者腳本不得出現任何 `unknown named argument`（＝槽名漂移的 canary，
+  之前只看 `maxWarns ≤ 3`，被 1–2 則新警告滲透也看不出來）。
+* 驗證：`src/pine` **59 檔 / 921 passed / 1 skipped**；`npx tsc --noEmit` **0**；
+  golden 不需重生成（警告不進 golden，成功案例的值不變）。
+

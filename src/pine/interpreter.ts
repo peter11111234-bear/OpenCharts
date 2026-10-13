@@ -1506,11 +1506,23 @@ function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame,
   for (const a of callArgs) {
     if (a.name !== undefined) {
       const i = params.findIndex(p => p.name === a.name);
-      if (i >= 0 && !filled.has(i)) {
-        out[i] = evalArg(a, frame, false, noHist(params[i]!));
-        filled.add(i);
+      if (i >= 0) {
+        if (filled.has(i)) {
+          warn(runOf(frame.ctx), frame.ctx,
+            `duplicate named argument '${a.name}=' — ignored (this parameter is already bound)`);
+        } else {
+          out[i] = evalArg(a, frame, false, noHist(params[i]!));
+          filled.add(i);
+        }
         continue;
       }
+      // An unknown name used to fall through to `positionals` and bind to the
+      // next free slot, so `f(bogus=3)` silently wrote 3 into parameter 0. TV
+      // rejects the call at compile time ("Unknown argument"); we have no
+      // signature table at parse time, so name it and drop it.
+      warn(runOf(frame.ctx), frame.ctx,
+        `unknown named argument '${a.name}=' — ignored; this function takes (${params.map(pp => pp.name).join(', ')})`);
+      continue;
     }
     positionals.push(a);
   }
