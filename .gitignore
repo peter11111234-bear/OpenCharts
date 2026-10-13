@@ -19,6 +19,9 @@ scripts/golden/*.actual.json
 # runtime artifacts
 logs/
 
+# third-party bundles downloaded by scratch/_extract_tv_stdlib.mjs
+scratch/tv-bundle/
+
 # throwaway agent reports / QA artifacts (probe .mjs stay tracked)
 scratch/report-*.md
 scratch/qa-round*-*.md

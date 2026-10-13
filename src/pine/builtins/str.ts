@@ -40,7 +40,7 @@ export function toDisplay(v: Value): string {
 }
 
 /** Unwrap a series to its current-bar value. */
-const cur = (v: Value): Value => (v.kind === 'series' ? v.v.cur() : v);
+export const cur = (v: Value): Value => (v.kind === 'series' ? v.v.cur() : v);
 
 // ── Numeric format patterns ─────────────────────────────────────────────────
 
@@ -171,16 +171,14 @@ registerBuiltin('str', 'tonumber', (_ctx, args, named) => {
 
 // ── str.format ──────────────────────────────────────────────────────────────
 
-registerBuiltin('str', 'format', (ctx, args, named) => {
-  const tpl = args[0];
-  if (!tpl || tpl.kind === 'na') return NA;
-  const template = asStr(tpl);
-  const positional = args.slice(1).map(cur);
-  const lookup = (key: string): Value | undefined => {
-    if (/^\d+$/.test(key)) return positional[Number(key)];
-    return named[key];
-  };
-  const out = template.replace(/\{([^{}]+)\}/g, (_m, body: string) => {
+/** Placeholder expansion shared by `str.format()` and `log.*()` — the TV
+ *  remarks for `log.*` point at `str.format()`, so both use one grammar:
+ *  `{key}`, `{key,spec}` and `{key,date,pattern}` over positional (0-based) or
+ *  named arguments. A missing or `na` value renders as `NaN`. */
+export function pineFormat(ctx: BuiltinCtx, template: string, positional: Value[], named: Record<string, Value>): string {
+  const lookup = (key: string): Value | undefined =>
+    /^\d+$/.test(key) ? positional[Number(key)] : named[key];
+  return template.replace(/\{([^{}]+)\}/g, (_m, body: string) => {
     const parts = body.split(',');
     const v = lookup(parts[0]!.trim());
     if (v === undefined || v.kind === 'na') return 'NaN';
@@ -197,7 +195,12 @@ registerBuiltin('str', 'format', (ctx, args, named) => {
     }
     return toDisplay(v);
   });
-  return strVal(out);
+}
+
+registerBuiltin('str', 'format', (ctx, args, named) => {
+  const tpl = args[0];
+  if (!tpl || tpl.kind === 'na') return NA;
+  return strVal(pineFormat(ctx, asStr(tpl), args.slice(1).map(cur), named));
 });
 
 registerBuiltin('str', 'format_time', (ctx, args, named) => {

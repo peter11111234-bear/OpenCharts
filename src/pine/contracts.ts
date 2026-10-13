@@ -203,6 +203,8 @@ export interface BuiltinCtx {
   drawings: DrawSink[];
   warnings: string[];
   alerts: { id: string; msg: string }[];
+  /** `log.*()` output — one entry per call, in call order. */
+  logs: ScriptLog[];
   /** Symbol info (syminfo.*). */
   syminfo: Record<string, Value>;
   timeframe: { period: string; multiplier: number; isseconds: boolean; isminutes: boolean; isdaily: boolean; isweekly: boolean; ismonthly: boolean; isintraday: boolean };
@@ -211,6 +213,15 @@ export interface BuiltinCtx {
 }
 
 export interface BarData { openTime: number; open: number; high: number; low: number; close: number; volume: number; closeTime?: number }
+
+/** One line of script output written by `log.info/warning/error()` — what
+ *  TradingView shows in its "Pine logs" pane. */
+export interface ScriptLog {
+  level: 'info' | 'warning' | 'error';
+  /** Bar the call executed on. */
+  bar: number;
+  msg: string;
+}
 
 export interface PlotSink {
   /** Per-bar value to emit; engine buffers then aligns to bar time. */
@@ -258,6 +269,8 @@ export interface RunResult {
   /** Strategy order executions — buildModel maps to IndicatorModel.trades. */
   execs?: { bar: number; price: number; dir: number; kind: 'entry' | 'exit'; label?: string; qty: number; tradeId: number }[];
   alerts: { id: string; msg: string }[];
+  /** `log.*()` output, in call order. */
+  logs: ScriptLog[];
   /** Registered `alertcondition(...)` templates — Pine defines these at global
    *  scope for the Create-Alert dialog; the condition is evaluated later by the
    *  alert engine, so an entry is recorded once per title regardless of the

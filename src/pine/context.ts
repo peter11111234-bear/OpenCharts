@@ -140,6 +140,7 @@ export class BarCtx {
       drawings: opts.drawings ?? [],
       warnings: [],
       alerts: [],
+      logs: [],
       syminfo: this.syminfo,
       timeframe: this.timeframe,
       callUdf:

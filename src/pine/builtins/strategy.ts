@@ -1275,8 +1275,9 @@ export const STRATEGY_DECL_ORDER = [
   'process_orders_on_close', 'close_entries_rule',
   'margin_long', 'margin_short',
   'explicit_plot_zorder', 'max_lines_count', 'max_labels_count',
-  'max_boxes_count', 'max_tables_count', 'max_polylines_count',
-  'risk_free_rate', 'use_bar_magnifier',
+  'max_boxes_count', 'calc_bars_count', 'risk_free_rate', 'use_bar_magnifier',
+  'fill_orders_on_standard_ohlc', 'max_polylines_count', 'dynamic_requests',
+  'behind_chart', 'calc_on_every_history_tick',
 ] as const;
 
 /** `strategy()` parameters that carry behaviour this engine does not implement.
@@ -1288,6 +1289,8 @@ export const STRATEGY_UNSUPPORTED_PARAMS = [
   'calc_on_order_fills', 'calc_on_every_tick', 'max_bars_back',
   'backtest_fill_limits_assumption', 'close_entries_rule',
   'risk_free_rate', 'use_bar_magnifier',
+  'calc_bars_count', 'fill_orders_on_standard_ohlc', 'dynamic_requests',
+  'calc_on_every_history_tick',
 ] as const;
 
 export function strategyDecl(ctx: BuiltinCtx, node: StrategyDecl): void {

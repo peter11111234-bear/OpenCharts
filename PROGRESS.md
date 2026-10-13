@@ -425,3 +425,34 @@
   * 已知限制：追繳平倉不截斷成整數合約（本引擎全程用分數部位，TV 會截）；
     risk 規則以事件密度近似逐 bar 評估；進場保證金不足時直接不成交並
     warnOnce（TV 是拒絕並報錯），因此宣告 margin 的腳本可能少幾筆進場。
+
+- 2026-10-13 R22 - TV 標準庫 oracle（REA）＋ log.* ＋ strategy() 宣告序修正:
+  * **新對照來源**：`docs/tv-pine-stdlib.json` —— 從官方 Pine v6 reference
+    bundle 抽出 1408 條 / 887 個唯一名稱的標準庫表面（name / qualified /
+    thisType / syntax / args[name + allowedTypeIDs + required] /
+    returnedTypes）。這是第一個「TV 自己出的」對照，不再靠 PyneCore 或人工
+    讀網頁。產生器 `scratch/_extract_tv_stdlib.mjs`（`--auto` 自行定位 chunk：
+    頁面 → runtime chunk 的 chunk-id→hash map → 依大小探測）。
+  * **REA 用法**：Chrome `--remote-debugging-port=9222` ＋ REA
+    `list_browser_targets` 可用；`analyze_web_bundle` 在 50+ chunk 的頁面會
+    撞 30s MCP 上限，實務走「REA 列目標 → 資源清單 → 單檔下載 → 本地抽取」。
+  * **新測試** `src/pine/__tests__/tv_stdlib.test.ts`：本引擎「聲稱支援」的
+    namespace（log. / strategy.risk. / session. / str. ＋ 具名清單）逐一對
+    oracle 名稱斷言存在，並印出剩餘缺口 —— 目前 887 個名稱中 530 已註冊、
+    357 缺（最大塊：matrix 48、strategy 45、currency 43、ta 13、chart 10、
+    map 10；syminfo/timeframe/barstate 走 ctx-record 屬誤報）。
+  * **log.\***（`src/pine/builtins/log.ts`）：log.info/warning/error，兩個
+    overload（message ／ formatString + arg0…），placeholder 走 str.format
+    同一套語法（TV 的 log.* remarks 明指 str.format）；格式化抽成 str.ts 的
+    `pineFormat()` 共用。輸出收在 `ctx.logs` → `RunResult.logs`
+    （level / bar / msg）。UI 未接（本 app 沒有 logs pane）。
+  * **strategy() 宣告序修正**：`STRATEGY_DECL_ORDER` 原本第 26 格是
+    `max_tables_count`（strategy() 沒有這個參數），且缺 `calc_bars_count` /
+    `fill_orders_on_standard_ohlc` / `dynamic_requests` / `behind_chart` /
+    `calc_on_every_history_tick` → 第 25 格之後的位置參數全部錯位。已對齊 TV
+    的 34 格；新增的四個行為參數一併進 `STRATEGY_UNSUPPORTED_PARAMS`。
+  * 測試：`log.test.ts` 6 條、`tv_stdlib.test.ts` 2 條。
+  * 驗證：src/pine **48 檔 / 826 passed / 1 skipped**（196s）；golden 不需
+    重生成（全綠）。
+  * 已知限制：bundle 的 chunk hash 隨 TV 部署變動（`--auto` 會重新定位）；
+    oracle 只有表面（名稱/參數/型別），不含散文與執行期語意。
