@@ -21,6 +21,7 @@ import { NA, VTRUE, type BuiltinCtx, type Node, type StrategyDecl, type Value } 
 import { getConstant, registerBuiltin, registerConstant, registerLazyConstant } from './registry';
 import { asStr, bindArgs, curNum, numVal, truthy, warnOnce, bindDeclArgs, type RtCtx } from './util';
 import { declDrawQuotas } from './draw';
+import { part, tzOf } from '../tz';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -35,13 +36,21 @@ export interface StratCfg {
   process_orders_on_close: boolean;
   currency: string;
   pyramiding: number;
+  /** Ticks added to (buys) / subtracted from (sells) the fill price of market
+   *  and stop orders. Limit fills are never slipped (Pine: "the fill price of
+   *  market/stop orders"). Default 0. */
+  slippage: number;
+  /** Percentage of the purchase price that must be covered by equity for long
+   *  / short positions. 0 disables every position-size limit. Default 100. */
+  margin_long: number;
+  margin_short: number;
 }
 
 export interface StratOrder {
   /** Bar the call executed on. */
   bar: number;
   seq: number;
-  kind: 'entry' | 'exit' | 'close' | 'order' | 'cancel';
+  kind: 'entry' | 'exit' | 'close' | 'order' | 'cancel' | 'risk';
   id: string;
   /** Entry id to close (exit/cancel/cancel_all). */
   fromEntry: string;
@@ -83,6 +92,30 @@ export interface StratOrder {
   comment?: string;
   /** Duplicate-id / OCA-reduce modifications applied during replay. */
   mod?: { qty: number; qtySet?: boolean; eqPct: number; eqPctSet?: boolean; limit?: number; stop?: number };
+  /** `kind === 'risk'` payload — one strategy.risk.* call. */
+  risk?: RiskRuleSpec;
+}
+
+/** One `strategy.risk.*` call, recorded in the ledger so the replay stays a
+ *  pure function of (orders, bars, cfg) — a rule installed on bar 5 must not
+ *  affect a replay that stops on bar 3. */
+export interface RiskRuleSpec {
+  rule: 'allow_entry_in' | 'max_drawdown' | 'max_intraday_loss'
+      | 'max_cons_loss_days' | 'max_intraday_filled_orders' | 'max_position_size';
+  /** Enum string for allow_entry_in, a number for the rest. */
+  value: string | number;
+  /** `type` arg was strategy.percent_of_equity (not strategy.cash). */
+  percent: boolean;
+}
+
+/** Risk rules active at a point of the replay. */
+interface ActiveRules {
+  allowEntryIn: string;
+  maxDrawdown?: { value: number; percent: boolean };
+  maxIntradayLoss?: { value: number; percent: boolean };
+  maxConsLossDays?: number;
+  maxIntradayFilledOrders?: number;
+  maxPositionSize?: number;
 }
 
 /** One order fill — a StrategyTrade anchor for the IndicatorModel. */
@@ -183,6 +216,9 @@ const DEFAULT_CFG: StratCfg = {
   process_orders_on_close: false,
   currency: 'NONE',
   pyramiding: 0,
+  slippage: 0,
+  margin_long: 100,
+  margin_short: 100,
 };
 
 export function cfgOf(ctx: BuiltinCtx | undefined): StratCfg {
@@ -192,6 +228,13 @@ export function cfgOf(ctx: BuiltinCtx | undefined): StratCfg {
 /** syminfo.mintick for tick-denominated params (profit/loss/trail_*); 1 = fallback. */
 function mintickOf(ctx: BuiltinCtx): number {
   const v = ctx.syminfo?.mintick;
+  const u = v !== undefined && v.kind === 'series' ? v.v.cur() : v;
+  return u !== undefined && (u.kind === 'int' || u.kind === 'float') && u.v > 0 ? u.v : 1;
+}
+
+/** syminfo.pointvalue — money moved by a whole-number price move (futures ≠ 1). */
+function pointValueOf(ctx: BuiltinCtx): number {
+  const v = ctx.syminfo?.pointvalue;
   const u = v !== undefined && v.kind === 'series' ? v.v.cur() : v;
   return u !== undefined && (u.kind === 'int' || u.kind === 'float') && u.v > 0 ? u.v : 1;
 }
@@ -236,6 +279,19 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
   const pending: StratOrder[] = [];
   let i = 0;
 
+  // ── strategy.risk.* state (see riskWalk) ──
+  const rules: ActiveRules = { allowEntryIn: 'strategy.direction.all' };
+  let riskBar = -1;        // last bar the rule engine has observed
+  let haltBar = -1;        // permanent halt began on this bar (-1 = trading)
+  let sessionHaltDay = -1; // day key an intraday halt began in
+  let day = -1;            // day key of the bar being evaluated
+  let dayStartEquity = cfg.initial_capital;
+  let dayPeak = cfg.initial_capital;
+  let peakEquity = cfg.initial_capital;
+  let consLoss = 0;
+  const fillsByDay = new Map<number, number>();
+  const pointValue = pointValueOf(ctx);
+
   /** Touch-check every pending order through `limit`, filling on touch. */
   const advancePending = (limit: number): void => {
     const lim = Math.min(limit, uptoBar);
@@ -243,7 +299,15 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
       const o = pending[k]!;
       for (let b = o.seen + 1; b <= lim; b++) {
         if (o.cancelledAt !== undefined && b > o.cancelledAt) break;
-        if (fillCandidate(o, b)) { applyFill(o, b, o.fillPrice!, o.fillQty!); o.seen = b; break; }
+        if (fillCandidate(o, b)) {
+          applyFill(o, b, o.fillPrice!, o.fillQty!);
+          if (rules.maxIntradayFilledOrders !== undefined) {
+            const k = dayKeyOf(b);
+            fillsByDay.set(k, (fillsByDay.get(k) ?? 0) + 1);
+          }
+          o.seen = b;
+          break;
+        }
         o.seen = b;
       }
       if (o.fillPrice !== undefined || (o.cancelledAt !== undefined && o.seen >= o.cancelledAt)) {
@@ -262,7 +326,7 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     if (o.kind === 'cancel') return false;
     const sameBar = o.immediate || (cfg.process_orders_on_close && o.bar === b);
     const r = sameBar ? o.bar : o.bar + 1;
-    const dir = fillDir(o);
+    const dir = effDir(o);
     const lo = lowAt(ctx, b, uptoBar);
     const hi = highAt(ctx, b, uptoBar);
     const op = openAt(ctx, b, uptoBar);
@@ -289,8 +353,8 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
         if (armed && Number.isFinite(lo) && (side > 0 ? lo <= (o.trailPeak - side * (o.trailOffset ?? 0) * tick)
                                                   : hi >= (o.trailPeak - side * (o.trailOffset ?? 0) * tick))) {
           const trailStop = o.trailPeak - side * (o.trailOffset ?? 0) * tick;
-          const tq = resolveQty(o, trailStop, b);
-          if (tq > 0) { o.fillPrice = trailStop; o.fillQty = tq; return true; }
+          const tq = resolveQty(o, trailStop, b, dir);
+          if (tq > 0) { o.fillPrice = trailStop + dir * cfg.slippage * tick; o.fillQty = tq; return true; }
         }
       }
     }
@@ -303,9 +367,13 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
           || o.trailPrice !== undefined || o.trailPoints !== undefined
           || o.trailOffset !== undefined));
     let price: number;
+    /** True when the fill level came from a stop — slippage applies there and
+     *  on market fills, never on limit fills. */
+    let fromStop = false;
     if (!conditional) {
       if (b !== r) return false;
       price = sameBar ? closeAt(ctx, b, uptoBar) : openAt(ctx, b, uptoBar);
+      fromStop = true;
     } else {
       if (b < r) return false;
       if (dir === 0) return false;
@@ -323,13 +391,24 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
       const limitPx = limit !== undefined && (dir > 0 ? lo <= limit : hi >= limit) ? adj(limit, false) : undefined;
       if (stopPx === undefined && limitPx === undefined) return false;
       // Conservative intra-bar ordering: the worse fill price wins.
-      price = stopPx !== undefined && limitPx !== undefined
-        ? (dir > 0 ? Math.max(stopPx, limitPx) : Math.min(stopPx, limitPx))
-        : (stopPx ?? limitPx)!;
+      if (stopPx === undefined) price = limitPx!;
+      else if (limitPx === undefined) { price = stopPx; fromStop = true; }
+      else {
+        price = dir > 0 ? Math.max(stopPx, limitPx) : Math.min(stopPx, limitPx);
+        fromStop = price === stopPx;
+      }
     }
     if (!Number.isFinite(price)) return false;
-    const qty = resolveQty(o, price, b);
+    if (fromStop && cfg.slippage > 0) price += dir * cfg.slippage * tick;
+    const qty = resolveQty(o, price, b, dir);
     if (!(qty > 0)) { o.seen = b; return false; }
+    // Margin: a position-increasing fill must be covered by equity.
+    if ((o.kind === 'entry' || o.kind === 'order') && !marginOk(b, price, qty, dir)) {
+      warnOnce(ctx, 'strategy|margin',
+        'strategy(): not enough money to open the position — the order is not filled');
+      o.seen = b;
+      return false;
+    }
     o.fillPrice = price;
     o.fillQty = qty;
     return true;
@@ -347,6 +426,16 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     if (o.bar > uptoBar) { o.seen = o.bar; continue; }
     // Pending orders settle through this event's bar before it is applied.
     advancePending(o.bar);
+    riskWalk(o.bar);
+    if (o.kind === 'risk') {
+      applyRisk(o.risk!);
+      o.seen = o.bar;
+      continue;
+    }
+    // A triggered rule stops new orders: permanent until the end of the run,
+    // intraday until the end of that trading day.
+    if (haltBar >= 0 && o.bar >= haltBar) { o.seen = o.bar; continue; }
+    if (sessionHaltDay >= 0 && sessionHaltDay === day) { o.seen = o.bar; continue; }
     if (o.kind === 'cancel') {
       const any = o.id === '' || o.id === 'strategy.cancel_all';
       for (const p of pending) {
@@ -366,6 +455,7 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     pending.push(o);
   }
   advancePending(uptoBar);
+  riskWalk(uptoBar);
   return sim;
 
   // ── nested helpers (closure over sim/ctx) ──
@@ -373,6 +463,196 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
   function fillDir(o: StratOrder): number {
     if (o.kind === 'entry' || o.kind === 'order') return o.dir;
     return -Math.sign(sim.qty); // exit/close trades against the open position
+  }
+
+  /** True when the active allow_entry_in rule permits opening in `d`. */
+  function dirAllowed(d: number): boolean {
+    const a = rules.allowEntryIn;
+    if (a === 'strategy.direction.long') return d > 0;
+    if (a === 'strategy.direction.short') return d < 0;
+    return true;
+  }
+
+  /** Effective fill direction. A strategy.entry() whose direction the active
+   *  allow_entry_in rule forbids can only reduce the opposite position (Pine:
+   *  "Instead of opening a short position … this command will close long
+   *  entries") and answers 0 when the strategy is flat. */
+  function effDir(o: StratOrder): number {
+    const d = fillDir(o);
+    if (o.kind !== 'entry' || d === 0 || dirAllowed(d)) return d;
+    return sim.qty !== 0 && Math.sign(sim.qty) !== d ? -Math.sign(sim.qty) : 0;
+  }
+
+  /** strategy.risk.max_position_size() — cap an entry so the resulting
+   *  position never exceeds the limit (a reversal counts only its new side,
+   *  the closing half frees the old one). */
+  function capEntryQty(q: number, dir: number): number {
+    const max = rules.maxPositionSize;
+    if (max === undefined || !(q > 0)) return q;
+    const adding = sim.qty !== 0 && Math.sign(sim.qty) === dir;
+    return adding ? Math.max(0, Math.min(q, max - Math.abs(sim.qty))) : Math.min(q, max);
+  }
+
+  /** Can the account cover the margin a position-increasing fill requires?
+   *  Required margin is the resulting position's value times the margin
+   *  ratio; a ratio of 0 disables every position-size limit (Pine). Equality
+   *  is allowed: percent_of_equity sizing lands exactly on equity. */
+  function marginOk(at: number, price: number, qty: number, dir: number): boolean {
+    const ratio = (dir > 0 ? cfg.margin_long : cfg.margin_short) / 100;
+    if (!(ratio > 0)) return true;
+    const traded = sim.qty !== 0 && Math.sign(sim.qty) !== dir ? qty + Math.abs(sim.qty) : qty;
+    const resulting = Math.abs(sim.qty + dir * traded);
+    return equityNow(at) >= resulting * price * pointValue * ratio;
+  }
+
+  /** Day key of bar `b` — the calendar day in the symbol's timezone. One bar
+   *  of a D/W/M chart opens on its own day, so the key is one-per-bar there,
+   *  matching Pine's "per 1 day (per 1 bar, if chart resolution is higher
+   *  than 1 day)". */
+  function dayKeyOf(b: number): number {
+    const t = timeAt(ctx, b, uptoBar);
+    if (!Number.isFinite(t)) return b;
+    const tz = tzOf(ctx);
+    return part(t, tz, 'year') * 10000 + part(t, tz, 'month') * 100 + part(t, tz, 'day');
+  }
+
+  /** Install one strategy.risk.* rule; the latest call for a rule wins. */
+  function applyRisk(r: RiskRuleSpec): void {
+    switch (r.rule) {
+      case 'allow_entry_in': rules.allowEntryIn = String(r.value); break;
+      case 'max_drawdown': rules.maxDrawdown = { value: Number(r.value), percent: r.percent }; break;
+      case 'max_intraday_loss': rules.maxIntradayLoss = { value: Number(r.value), percent: r.percent }; break;
+      case 'max_cons_loss_days': rules.maxConsLossDays = Number(r.value); break;
+      case 'max_intraday_filled_orders': rules.maxIntradayFilledOrders = Number(r.value); break;
+      case 'max_position_size': rules.maxPositionSize = Number(r.value); break;
+    }
+  }
+
+  /** Close the whole position at bar `b`'s close — the "all open positions
+   *  are closed" half of every strategy.risk.* rule. */
+  function flattenAt(b: number, label: string): void {
+    if (sim.qty === 0) return;
+    const price = closeAt(ctx, b, uptoBar);
+    if (!Number.isFinite(price)) return;
+    const qty = Math.abs(sim.qty);
+    applyFill({
+      bar: b, seq: -1, kind: 'close', id: '', fromEntry: '', dir: -Math.sign(sim.qty),
+      qty, qtySet: true, eqPct: 0, eqPctSet: false,
+      limit: undefined, stop: undefined, immediate: true, seen: b, comment: label,
+    }, b, price, qty);
+  }
+
+  /** A rule fired: cancel every pending order and flatten the position.
+   *  `permanent` rules stop the run for good, the intraday ones until the
+   *  end of the current trading day. */
+  function trigger(b: number, permanent: boolean, label: string): void {
+    for (const p of pending) if (p.cancelledAt === undefined) p.cancelledAt = b;
+    flattenAt(b, label);
+    if (permanent) haltBar = b;
+    else sessionHaltDay = day;
+  }
+
+  /** TV Broker Emulator margin call: when the equity left after the open
+   *  position is no longer enough to sustain it, the broker liquidates four
+   *  times the size needed to cover the loss. Checked on every bar's close. */
+  function marginCall(b: number): void {
+    if (sim.qty === 0) return;
+    const dir = Math.sign(sim.qty);
+    const ratio = (dir > 0 ? cfg.margin_long : cfg.margin_short) / 100;
+    // MarginLiquidationPrice divides by (ratio - direction): zero means the
+    // price is unattainable, i.e. a 100%-margin long is never called.
+    if (ratio - dir === 0) return;
+    const price = closeAt(ctx, b, uptoBar);
+    if (!Number.isFinite(price)) return;
+    const size = Math.abs(sim.qty);
+    const mvs = size * price * pointValue;
+    const marginRequired = mvs * ratio;
+    if (!(equityNow(b) <= marginRequired)) return;
+    // The documented algorithm books the open trade as a loss (step 3).
+    const openProfit = -Math.abs(mvs - size * sim.avgEntry * pointValue);
+    const equity = cfg.initial_capital + sim.realizedPnl + openProfit;
+    const moneyLost = (equity - marginRequired) / ratio;
+    const units = Math.trunc(Math.abs(moneyLost / price) * 1e8) / 1e8;
+    const liq = Math.min(size, units * 4);
+    if (!(liq > 0)) return;
+    applyFill({
+      bar: b, seq: -1, kind: 'close', id: '', fromEntry: '', dir: -dir,
+      qty: liq, qtySet: true, eqPct: 0, eqPctSet: false,
+      limit: undefined, stop: undefined, immediate: true, seen: b, comment: 'Margin call',
+    }, b, price, liq);
+  }
+
+  /** True when any strategy.risk.* rule is installed. */
+  function rulesActive(): boolean {
+    return rules.maxDrawdown !== undefined || rules.maxIntradayLoss !== undefined
+      || rules.maxConsLossDays !== undefined || rules.maxIntradayFilledOrders !== undefined;
+  }
+
+  /** A margin call is only reachable when the open position's margin ratio
+   *  makes MarginLiquidationPrice attainable — a 100%-margin long never is. */
+  function marginWatchable(): boolean {
+    if (sim.qty === 0) return false;
+    const dir = Math.sign(sim.qty);
+    return (dir > 0 ? cfg.margin_long : cfg.margin_short) / 100 - dir !== 0;
+  }
+
+  /** Evaluate the installed rules on every bar the replay has not observed
+   *  yet, up to `to`; the fills for those bars have already settled. */
+  function riskWalk(to: number): void {
+    const lim = Math.min(to, uptoBar);
+    // Nothing to observe: no rule installed and no position a margin call
+    // could touch. Keeps plain strategies off this per-bar loop entirely.
+    if (!rulesActive() && !marginWatchable()) {
+      if (lim > riskBar) riskBar = lim;
+      return;
+    }
+    for (let b = riskBar + 1; b <= lim; b++) {
+      const k = dayKeyOf(b);
+      if (k !== day) {
+        day = k;
+        dayStartEquity = b > 0 ? equityNow(b - 1) : cfg.initial_capital;
+        dayPeak = Math.max(dayStartEquity, equityNow(b));
+      }
+      const eq = equityNow(b);
+      if (eq > peakEquity) peakEquity = eq;
+      if (eq > dayPeak) dayPeak = eq;
+      riskBar = b;
+      if (haltBar >= 0 || sessionHaltDay === k) continue;
+      const maxFills = rules.maxIntradayFilledOrders;
+      if (maxFills !== undefined && (fillsByDay.get(k) ?? 0) >= maxFills) {
+        trigger(b, false, 'max_intraday_filled_orders');
+        continue;
+      }
+      const il = rules.maxIntradayLoss;
+      if (il !== undefined && il.value > 0) {
+        const loss = dayPeak - eq;
+        if (il.percent ? dayPeak > 0 && loss / dayPeak * 100 >= il.value : loss >= il.value) {
+          trigger(b, false, 'max_intraday_loss');
+          continue;
+        }
+      }
+      const dd = rules.maxDrawdown;
+      if (dd !== undefined && dd.value > 0) {
+        const drop = peakEquity - eq;
+        if (dd.percent
+          ? (peakEquity > 0 && drop / peakEquity * 100 >= dd.value) || eq <= 0
+          : drop >= dd.value) {
+          trigger(b, true, 'max_drawdown');
+          continue;
+        }
+      }
+      // max_cons_loss_days is judged on the day's last bar.
+      const nDays = rules.maxConsLossDays;
+      if (nDays !== undefined && nDays > 0 && (b === uptoBar || dayKeyOf(b + 1) !== k)) {
+        if (eq < dayStartEquity) consLoss++;
+        else consLoss = 0;
+        if (consLoss >= nDays) {
+          trigger(b, true, 'max_cons_loss_days');
+          continue;
+        }
+      }
+      marginCall(b);
+    }
   }
 
   function commission(qty: number, price: number): number {
@@ -392,7 +672,7 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
   }
 
   /** Contracts this order trades at `price`; 0/NaN → no fill. */
-  function resolveQty(o: StratOrder, price: number, atBar: number): number {
+  function resolveQty(o: StratOrder, price: number, atBar: number, dir: number): number {
     if (o.kind === 'entry' || o.kind === 'order') {
       const eqPct = o.mod?.eqPct ?? o.eqPct;
       const qty = o.mod?.qty ?? o.qty;
@@ -402,18 +682,23 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
       // default-qty substitution — qty=0 must never fill 1 contract.
       if (qtySet && !(qty > 0)) return 0;
       if (eqPctSet && !(eqPct > 0)) return 0;
-      if (eqPct > 0) return equityNow(atBar) * eqPct / (100 * price);
-      if (qty > 0) return qty;
-      switch (cfg.default_qty_type) {
+      let out: number;
+      if (eqPct > 0) out = equityNow(atBar) * eqPct / (100 * price);
+      else if (qty > 0) out = qty;
+      else switch (cfg.default_qty_type) {
         case 'strategy.percent_of_equity':
         case 'percent_of_equity':
-          return equityNow(atBar) * cfg.default_qty_value / (100 * price);
+          out = equityNow(atBar) * cfg.default_qty_value / (100 * price);
+          break;
         case 'strategy.cash':
         case 'cash':
-          return cfg.default_qty_value / price;
+          out = cfg.default_qty_value / price;
+          break;
         default:
-          return cfg.default_qty_value;
+          out = cfg.default_qty_value;
       }
+      // strategy.risk.max_position_size() caps strategy.entry() alone.
+      return o.kind === 'entry' ? capEntryQty(out, dir) : out;
     }
     // exit / close — contracts to close. Both honor qty/qty_percent
     // (TV: close has qty + qty_percent params, default qty_percent=100).
@@ -428,8 +713,10 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
   }
 
   function applyFill(o: StratOrder, bar: number, price: number, qty: number): void {
-    const dir = fillDir(o);
-    const isEntry = o.kind === 'entry' || o.kind === 'order';
+    const dir = effDir(o);
+    // A direction the allow_entry_in rule forbids turns the entry into a
+    // plain close: it must not open a leg or start a round trip.
+    const isEntry = o.kind === 'order' || (o.kind === 'entry' && dirAllowed(o.dir));
     // A reversal entry trades |position| + qty contracts: the fill closes the
     // old side and opens the new one in a single order (Pine behavior).
     const traded = isEntry && sim.qty !== 0 && Math.sign(sim.qty) !== dir
@@ -761,6 +1048,74 @@ registerBuiltin('strategy', 'cancel_all', (c, args, named) => {
   return { kind: 'void' };
 });
 
+// ── strategy.risk.* rules ───────────────────────────────────────────────────
+// Every call appends a ledger event; simulate() installs the rule when it
+// reaches that bar, so a rule declared on bar 0 governs the whole replay and
+// one declared on bar 5 leaves the earlier bars untouched.
+
+function pushRisk(ctx: BuiltinCtx, spec: RiskRuleSpec): void {
+  const orders = ordersOf(ctx);
+  orders.push({
+    bar: ctx.barIndex, seq: orders.length, seen: -1, kind: 'risk',
+    id: '', fromEntry: '', dir: 0, qty: 0, eqPct: 0,
+    limit: undefined, stop: undefined, immediate: false, risk: spec,
+  });
+}
+
+/** `type` argument of the money/percent rules → percent flag (cash otherwise). */
+function isPercentType(v: Value | undefined): boolean {
+  const s = strOf(v);
+  return s === 'strategy.percent_of_equity' || s === 'percent_of_equity';
+}
+
+registerBuiltin('strategy.risk', 'allow_entry_in', (c, args, named) => {
+  const bound = bindArgs(args, named, ['value'] as const);
+  pushRisk(c, {
+    rule: 'allow_entry_in',
+    value: strOf(bound.get('value'), 'strategy.direction.all'),
+    percent: false,
+  });
+  return { kind: 'void' };
+});
+
+registerBuiltin('strategy.risk', 'max_drawdown', (c, args, named) => {
+  const bound = bindArgs(args, named, ['value', 'type', 'alert_message'] as const);
+  pushRisk(c, {
+    rule: 'max_drawdown',
+    value: qtyOf(bound, 'value'),
+    percent: isPercentType(bound.get('type')),
+  });
+  return { kind: 'void' };
+});
+
+registerBuiltin('strategy.risk', 'max_intraday_loss', (c, args, named) => {
+  const bound = bindArgs(args, named, ['value', 'type', 'alert_message'] as const);
+  pushRisk(c, {
+    rule: 'max_intraday_loss',
+    value: qtyOf(bound, 'value'),
+    percent: isPercentType(bound.get('type')),
+  });
+  return { kind: 'void' };
+});
+
+registerBuiltin('strategy.risk', 'max_cons_loss_days', (c, args, named) => {
+  const bound = bindArgs(args, named, ['count', 'alert_message'] as const);
+  pushRisk(c, { rule: 'max_cons_loss_days', value: qtyOf(bound, 'count'), percent: false });
+  return { kind: 'void' };
+});
+
+registerBuiltin('strategy.risk', 'max_intraday_filled_orders', (c, args, named) => {
+  const bound = bindArgs(args, named, ['count', 'alert_message'] as const);
+  pushRisk(c, { rule: 'max_intraday_filled_orders', value: qtyOf(bound, 'count'), percent: false });
+  return { kind: 'void' };
+});
+
+registerBuiltin('strategy.risk', 'max_position_size', (c, args, named) => {
+  const bound = bindArgs(args, named, ['contracts'] as const);
+  pushRisk(c, { rule: 'max_position_size', value: qtyOf(bound, 'contracts'), percent: false });
+  return { kind: 'void' };
+});
+
 // ── lazy series constants ───────────────────────────────────────────────────
 
 registerLazyConstant('strategy', 'position_size', (c) => {
@@ -931,8 +1286,8 @@ export const STRATEGY_DECL_ORDER = [
  *  precision, scale) and the quota parameters declDrawQuotas reads are NOT here. */
 export const STRATEGY_UNSUPPORTED_PARAMS = [
   'calc_on_order_fills', 'calc_on_every_tick', 'max_bars_back',
-  'backtest_fill_limits_assumption', 'slippage', 'close_entries_rule',
-  'margin_long', 'margin_short', 'risk_free_rate', 'use_bar_magnifier',
+  'backtest_fill_limits_assumption', 'close_entries_rule',
+  'risk_free_rate', 'use_bar_magnifier',
 ] as const;
 
 export function strategyDecl(ctx: BuiltinCtx, node: StrategyDecl): void {
@@ -967,6 +1322,9 @@ export function strategyDecl(ctx: BuiltinCtx, node: StrategyDecl): void {
     process_orders_on_close: bool('process_orders_on_close', false),
     currency: str('currency', DEFAULT_CFG.currency),
     pyramiding: num('pyramiding', DEFAULT_CFG.pyramiding),
+    slippage: num('slippage', DEFAULT_CFG.slippage),
+    margin_long: num('margin_long', DEFAULT_CFG.margin_long),
+    margin_short: num('margin_short', DEFAULT_CFG.margin_short),
   };
   st.set(CFG_KEY, cfg);
   // Declared-but-unimplemented parameters are reported once per run instead of

@@ -19755,6 +19755,6 @@
   ],
   "alertconditions": [],
   "warnings": [
-    "strategy(): 'calc_on_every_tick', 'slippage' declared but not implemented — the run ignores them"
+    "strategy(): 'calc_on_every_tick' declared but not implemented — the run ignores it"
   ]
 }

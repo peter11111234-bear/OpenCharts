@@ -167,19 +167,38 @@ describe('strategyDecl', () => {
     strategyDecl(ctx, {
       type: 'strategy',
       args: [
-        { name: 'slippage', value: numN(1) },
+        { name: 'risk_free_rate', value: numN(1) },
         { name: 'calc_on_every_tick', value: boolN(true) },
         { name: 'initial_capital', value: numN(1234) },
       ],
     });
     // A second declaration in the same run must not repeat the warning.
-    strategyDecl(ctx, { type: 'strategy', args: [{ name: 'slippage', value: numN(2) }] });
+    strategyDecl(ctx, { type: 'strategy', args: [{ name: 'risk_free_rate', value: numN(2) }] });
     const hits = ctx.warnings.filter((w) => w.startsWith('strategy():'));
     expect(hits).toHaveLength(1);
-    expect(hits[0]).toContain("'slippage'");
+    expect(hits[0]).toContain("'risk_free_rate'");
     expect(hits[0]).toContain("'calc_on_every_tick'");
     // Supported parameters are not reported.
     expect(hits[0]).not.toContain("'initial_capital'");
+    expect(hits[0]).not.toContain("'slippage'");
+    expect(hits[0]).not.toContain("'margin_long'");
+  });
+
+  it('parses slippage and the margin percentages into the config', () => {
+    const { ctx } = mkRtCtx(mkBars(1));
+    strategyDecl(ctx, {
+      type: 'strategy',
+      args: [
+        { name: 'slippage', value: numN(5) },
+        { name: 'margin_long', value: numN(25) },
+        { name: 'margin_short', value: numN(50) },
+      ],
+    });
+    const cfg = ctx.state.get('strategy|cfg') as StratCfg;
+    expect(cfg.slippage).toBe(5);
+    expect(cfg.margin_long).toBe(25);
+    expect(cfg.margin_short).toBe(50);
+    expect(ctx.warnings.filter((w) => w.startsWith('strategy():'))).toHaveLength(0);
   });
 
   it('does not warn for a declaration that only uses supported parameters', () => {
@@ -759,3 +778,175 @@ plot(strategy.position_size)`;
     expect(numV(getConstant('strategy.opentrades', ctx))).toBe(1);
   });
 });
+
+// ── S5: slippage, margin and the strategy.risk.* rules ──────────────────────
+
+/** Explicit OHLC rows — the slippage/margin/risk tests need price paths the
+ *  linear mkBars ramp cannot express. */
+const ohlc = (rows: [number, number, number, number, number][]): BarData[] =>
+  rows.map(([openTime, open, high, low, close], i) => ({ openTime, open, high, low, close, volume: 1 + i }));
+
+const DAY = 86_400_000;
+
+const posSeries = (r: { plots: Map<string, { values: Value[] }> }): number[] =>
+  [...r.plots.values()][0]!.values.map(numV);
+
+const runStrat = (src: string, bars: BarData[]) =>
+  runScript(parse(src), bars, { symbol: 'TEST', timeframe: 'D' });
+
+describe('strategy slippage', () => {
+  it('worsens a market fill by slippage × mintick', async () => {
+    const r = await runStrat(`strategy("s", slippage = 5)
+if bar_index == 0
+  strategy.entry("L", strategy.long)
+plot(strategy.position_avg_price)`, mkBars(3, 10));
+    // bar1 open 11 → +5 × 0.01
+    expect(numV([...r.plots.values()][0]!.values.at(-1))).toBeCloseTo(11.05);
+  });
+
+  it('leaves a limit fill unslipped but slips a stop', async () => {
+    const avg = async (opt: string) => {
+      const r = await runStrat(`strategy("s", slippage = 5)
+if bar_index == 0
+  strategy.entry("L", strategy.long, ${opt})
+plot(strategy.position_avg_price)`, mkBars(3, 10));
+      return numV([...r.plots.values()][0]!.values.at(-1));
+    };
+    // bar1 low 10 touches the limit → fills at the limit itself
+    expect(await avg('limit = 10')).toBeCloseTo(10);
+    // bar1 high 13 touches the stop 12 → fills at 12 + 0.05
+    expect(await avg('stop = 12')).toBeCloseTo(12.05);
+  });
+});
+
+describe('strategy margin', () => {
+  it('rejects an entry the equity cannot cover', async () => {
+    const r = await runStrat(`strategy("s", initial_capital = 1000)
+if bar_index == 0
+  strategy.entry("L", strategy.long, qty = 1000)
+plot(strategy.position_size)`, mkBars(4, 10));
+    expect(posSeries(r)).toEqual([0, 0, 0, 0]);
+    expect(r.warnings.some(w => /not enough money/.test(w))).toBe(true);
+  });
+
+  it('margin_long = 0 disables every position-size limit', async () => {
+    const r = await runStrat(`strategy("s", initial_capital = 1000, margin_long = 0)
+if bar_index == 0
+  strategy.entry("L", strategy.long, qty = 1000)
+plot(strategy.position_size)`, mkBars(4, 10));
+    expect(posSeries(r).at(-1)).toBe(1000);
+  });
+
+  it('liquidates part of the position on a margin call', async () => {
+    // 150 contracts @100 on 10 000 of equity at 50% margin (required 7 500).
+    // At close 60 the equity left is 4 000 against 4 500 required → the broker
+    // liquidates 4 × (1 000 / 0.5 / 60) contracts. TV truncates that to whole
+    // contracts (16 × 4 = 64); this engine is fractional throughout, so it
+    // keeps the fractional size.
+    const bars = ohlc([
+      [0, 100, 101, 99, 100],
+      [DAY, 100, 101, 99, 100],
+      [2 * DAY, 100, 100, 59, 60],
+      [3 * DAY, 60, 61, 59, 60],
+    ]);
+    const r = await runStrat(`strategy("s", initial_capital = 10000, margin_long = 50)
+if bar_index == 0
+  strategy.entry("L", strategy.long, qty = 150)
+plot(strategy.position_size)`, bars);
+    const pos = posSeries(r);
+    expect(pos[1]).toBe(150);
+    expect(pos[2]).toBeCloseTo(150 - 4 * (1000 / 60), 4);
+    expect(pos[3]).toBeCloseTo(pos[2]!, 4);
+    // The position stays open — a margin call liquidates, it does not halt.
+    expect(pos[3]).toBeGreaterThan(0);
+  });
+});
+
+describe('strategy.risk.*', () => {
+  it('allow_entry_in(long) turns a short entry into a close', async () => {
+    const r = await runStrat(`strategy("s")
+strategy.risk.allow_entry_in(strategy.direction.long)
+if bar_index == 0
+  strategy.entry("L", strategy.long)
+if bar_index == 2
+  strategy.entry("S", strategy.short)
+plot(strategy.position_size)`, mkBars(5, 10));
+    // bar3: the forbidden short cannot open — it closes the long instead
+    expect(posSeries(r)).toEqual([0, 1, 1, 0, 0]);
+  });
+
+  it('max_position_size caps strategy.entry()', async () => {
+    const r = await runStrat(`strategy("s", default_qty_value = 100)
+strategy.risk.max_position_size(10)
+if bar_index == 0
+  strategy.entry("L", strategy.long)
+plot(strategy.position_size)`, mkBars(4, 10));
+    expect(posSeries(r).at(-1)).toBe(10);
+  });
+
+  it('max_drawdown flattens the position and stops the run', async () => {
+    const bars = ohlc([
+      [0, 100, 101, 99, 100],
+      [DAY, 100, 101, 99, 100],
+      [2 * DAY, 100, 100, 49, 50],
+      [3 * DAY, 50, 51, 49, 50],
+    ]);
+    const r = await runStrat(`strategy("s", initial_capital = 1000)
+strategy.risk.max_drawdown(50, strategy.percent_of_equity)
+if bar_index == 0
+  strategy.entry("L", strategy.long, qty = 10)
+if bar_index == 3
+  strategy.entry("L2", strategy.long, qty = 10)
+plot(strategy.position_size)`, bars);
+    // bar2 close 50 = −50% of the 1 000 peak → flatten; bar3 entry never opens
+    expect(posSeries(r)).toEqual([0, 10, 0, 0]);
+  });
+
+  it('max_intraday_loss halts only until the end of the day', async () => {
+    const bars = ohlc([
+      [0, 100, 101, 99, 100],
+      [60_000, 100, 101, 99, 100],
+      [120_000, 100, 100, 49, 50],
+      [180_000, 50, 51, 49, 50],
+    ]);
+    const r = await runStrat(`strategy("s", initial_capital = 1000)
+strategy.risk.max_intraday_loss(50, strategy.percent_of_equity)
+if bar_index == 0
+  strategy.entry("L", strategy.long, qty = 10)
+if bar_index == 3
+  strategy.entry("L2", strategy.long, qty = 10)
+plot(strategy.position_size)`, bars);
+    expect(posSeries(r)).toEqual([0, 10, 0, 0]);
+  });
+
+  it('max_intraday_filled_orders stops new orders for the rest of the day', async () => {
+    const r = await runStrat(`strategy("s")
+strategy.risk.max_intraday_filled_orders(2)
+if bar_index == 0
+  strategy.entry("L", strategy.long)
+if bar_index == 2
+  strategy.entry("S", strategy.short)
+if bar_index == 4
+  strategy.entry("L2", strategy.long)
+plot(strategy.position_size)`, mkBars(6, 10));
+    // fills at bar1 and bar3 reach the cap → bar4's entry is dropped
+    expect(posSeries(r)).toEqual([0, 1, 1, 0, 0, 0]);
+  });
+
+  it('max_cons_loss_days stops after N losing days', async () => {
+    const bars = ohlc([
+      [0, 100, 101, 99, 100],
+      [DAY, 100, 101, 94, 95],
+      [2 * DAY, 95, 96, 89, 90],
+      [3 * DAY, 90, 91, 84, 85],
+    ]);
+    const r = await runStrat(`strategy("s", initial_capital = 10000)
+strategy.risk.max_cons_loss_days(2)
+if bar_index == 0
+  strategy.entry("L", strategy.long, qty = 10)
+plot(strategy.position_size)`, bars);
+    // day1 −50, day2 −50 → two losing days → flatten on bar2's close
+    expect(posSeries(r)).toEqual([0, 10, 0, 0]);
+  });
+});
+

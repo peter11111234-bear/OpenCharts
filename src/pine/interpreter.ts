@@ -1096,22 +1096,29 @@ function evalMember(node: Member, frame: Frame): Value {
   const objNode = node.obj;
   const prop = node.prop;
 
-  // `ns.prop` where `ns` is not a bound identifier → constant / builtin / ctx record.
-  if (objNode.type === 'ident' && scope.lookup(objNode.name) === undefined) {
-    const key = `${objNode.name}.${prop}`;
+  // `ns.prop` / `ns.sub.prop` where the head is not a bound identifier →
+  // constant / builtin / ctx record. The chain flattens exactly like a dotted
+  // builtin call, so three-level constants (strategy.direction.long,
+  // strategy.oca.cancel, …) resolve instead of stopping at `ns.sub`.
+  const parts: string[] = [prop];
+  let head: Node = objNode;
+  while (head.type === 'member' && !head.computed) { parts.unshift(head.prop); head = head.obj; }
+  if (head.type === 'ident' && scope.lookup(head.name) === undefined) {
+    parts.unshift(head.name);
+    const key = parts.join('.');
     const c = getConstant(key, ctx);
     if (c !== undefined) return c;
     const b = BUILTINS.get(key);
     if (b) return { kind: 'function', v: b };
-    if (objNode.name === 'syminfo') {
+    if (head.name === 'syminfo') {
       const f = ctx.syminfo[prop];
       if (f !== undefined) return f;
     }
-    if (objNode.name === 'timeframe') {
+    if (head.name === 'timeframe') {
       const f = timeframeFields(ctx).get(prop);
       if (f !== undefined) return f;
     }
-    if (objNode.name === 'barstate') {
+    if (head.name === 'barstate') {
       const f = barstateUdt(ctx).fields.get(prop);
       if (f !== undefined) return f;
     }

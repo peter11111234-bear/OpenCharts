@@ -391,3 +391,37 @@
   * Residual (not fixed, out of scope): a named arg that matches no slot still
     binds nothing silently — no warn. Same failure class could hide behind any
     other builtin whose internal name drifts from TV's.
+
+- 2026-10-13 R21 - S5: strategy 保真度（slippage / margin / strategy.risk.*）:
+  * slippage（ticks）：只加在 market 與 stop 成交，limit 成交不加（Pine 原文
+    "added to or subtracted from the fill price of market/stop orders"）。
+    fillCandidate 以 fromStop 旗標決定；trailing stop 走同一條路徑。
+  * margin_long / margin_short：進場保證金閘（resulting position × price ×
+    pointvalue × ratio ≤ equity，等號放行 —— percent_of_equity 的成交額剛好
+    落在 equity 上）＋ TV Broker Emulator 的 margin call（CurrentEquity ≤
+    MarginRequired → 強平 4× 補足損失的部位）。ratio − direction = 0 時
+    MarginLiquidationPrice 不可達 → 100% 保證金的 long 永不被追繳。
+  * strategy.risk.* 六個全上：allow_entry_in / max_position_size /
+    max_drawdown / max_intraday_loss / max_cons_loss_days /
+    max_intraday_filled_orders。每次呼叫在 ledger 記一筆 risk 事件，replay
+    走到該 bar 才生效（保住 simulate 是 (orders, bars, cfg) 的純函式）。
+    觸發＝取消所有 pending + 當根收盤平倉；max_drawdown 與 max_cons_loss_days
+    永久停單，兩條 intraday 只停到當日收盤。
+  * 附帶修好 evalMember 只認 2 層常數：`strategy.direction.long` 這類 3 層
+    常數原本回 na 並報 "unknown constant" → 改成與呼叫路徑相同的鏈式攤平。
+  * 架構：tz 工具（tzOf / part / partsOf / tzOffsetMs / zonedMs）從
+    builtins/time.ts 抽到新檔 src/pine/tz.ts —— strategy.ts 位於
+    interpreter → strategy → mtf → interpreter 的 import 循環內，只能 import
+    碰不到 interpreter 的葉模組；time.ts 原址 re-export 保持相容。
+  * 效能：riskWalk 加「無規則且無可追繳部位就整段跳過」的前置判斷。未加前
+    turtle e2e（60s timeout）跑到 60.4s 逾時，加了之後 10.5s。
+  * 測試：strategy.test.ts +12（slippage 2、margin 3、risk 6、decl 1）。
+  * 驗證：src/pine 46 檔 / 818 passed / 1 skipped（166s）；golden 重生成後
+    只有 TRIS390 的 warnings 變（max|Δ|=0，其餘 8 個 byte-identical）；
+    tsc 在本次動到的檔案 0 錯誤（基線本來就是紅的：queries.ts 126、
+    parser.ts 58…）。
+  * 對照表同步：docs/pynecore-conformance.{json,html} 重生成（full 31→34、
+    missing 8→5），scratch/_gen_conformance.py 的資料表一併更新。
+  * 已知限制：追繳平倉不截斷成整數合約（本引擎全程用分數部位，TV 會截）；
+    risk 規則以事件密度近似逐 bar 評估；進場保證金不足時直接不成交並
+    warnOnce（TV 是拒絕並報錯），因此宣告 margin 的腳本可能少幾筆進場。
