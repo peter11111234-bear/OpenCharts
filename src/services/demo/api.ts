@@ -1,5 +1,8 @@
 import type { DrawingLine } from "../../pages/trading/constants.ts";
 import type { Candle } from "../schemas.ts";
+import type { JournalEntriesResponse } from "../api/journal.ts";
+import type { ReplaySessionResponse } from "../api/accounts.ts";
+import type { ClosedPositionsSummary, FillQuality } from "../queries.ts";
 import { getHistory } from "./candles.ts";
 import * as engine from "./engine.ts";
 import { DEMO_SYMBOLS } from "./instruments.ts";
@@ -156,11 +159,14 @@ export const demoApi = {
   getFills: () => Promise.resolve({ data: engine.getFills(), total: engine.getFills().length, page: 1, pageSize: 50, totalPages: 1 }),
   getClosedPositions: () =>
     Promise.resolve({ data: engine.getClosedPositions(), total: engine.getClosedPositions().length, page: 1, pageSize: 50, totalPages: 1 }),
-  getClosedPositionsSummary: () => Promise.resolve({ pnl: 0, commission: 0, swap: 0, tradeCount: 0 }),
-  getFillQuality: () => Promise.resolve({ avgScore: null, count: 0, entries: [] }),
+  getClosedPositionsSummary: (): Promise<ClosedPositionsSummary> =>
+    Promise.resolve({ pnl: 0, commission: 0, swap: 0, tradeCount: 0 }),
+  getFillQuality: (): Promise<FillQuality> =>
+    Promise.resolve({ avgScore: null, count: 0, entries: [] }),
 
   // ── Trade journal (localStorage-free demo: empty) ──
-  getJournalEntries: () => Promise.resolve({ entries: [], total: 0 }),
+  getJournalEntries: (): Promise<JournalEntriesResponse> =>
+    Promise.resolve({ entries: [], total: 0 }),
   createJournalEntry: () => Promise.resolve(null),
   updateJournalEntry: () => Promise.resolve(null),
   deleteJournalEntry: () => Promise.resolve({ success: true }),
@@ -171,8 +177,8 @@ export const demoApi = {
 
   // ── Feature gating / misc (terminal reads these on mount) ──
   getFeatureFlags: () => Promise.resolve({}),
-  isAiTraderEnabled: () => Promise.resolve({ enabled: false }),
+  isAiTraderEnabled: (): Promise<{ enabled: boolean }> => Promise.resolve({ enabled: false }),
   getAnnouncements: () => Promise.resolve([]),
   getAnnouncementsUnreadCount: () => Promise.resolve(0),
-  replayGetSession: () => Promise.resolve(null),
+  replayGetSession: (): Promise<ReplaySessionResponse | null> => Promise.resolve(null),
 };

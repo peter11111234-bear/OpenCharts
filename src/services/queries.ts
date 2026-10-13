@@ -179,7 +179,7 @@ export function useClosedPositions(accountId: string | null, page = 1) {
   });
 }
 
-type ClosedPositionsSummary = {
+export type ClosedPositionsSummary = {
   pnl: number;
   commission: number;
   swap: number;
@@ -202,7 +202,7 @@ export function useClosedPositionsSummary(
 }
 
 // ── Fill Quality Score ─────────────────────────────────
-type FillQuality = {
+export type FillQuality = {
   avgScore: number | null;
   count: number;
   entries: Array<{
