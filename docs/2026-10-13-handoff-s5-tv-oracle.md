@@ -1,8 +1,18 @@
-# 交接：S5 strategy 保真度 ＋ TV 標準庫 oracle
+# 交接：Pine ⇄ TV 標準庫對齊（S5 strategy 保真度 → S7 ta.\*/常數）
 
 日期：2026-10-13 ｜ 專案：`C:\Users\bear9\OpenCharts`（Pine Script v6 直譯器在 `src/pine/`）
 
 前一份交接：`docs/2026-10-13-fix-four-pain-points-handoff.md`（S1–S4）。本檔接續。
+
+**檔名說 s5，但內容涵蓋到 S7**（同一天同一條線，附錄直接往下加，沒有另開檔）：
+
+| 章節 | 內容 | commit |
+|---|---|---|
+| §0–§5 | S5 strategy 保真度 ＋ TV oracle 初版 | `a74c7ed` |
+| §6 | `strategy.*` 96/96 全註冊 | `8de652c` |
+| §7 | 「缺 312」的真實分解 ＋ 對齊報告改量 backlog | `3f7a95f` |
+| §8 | `ta.*` 13 ＋ 常數 75（backlog 238 → 150） | `962df6d` |
+| §9 | **交接清單：未完成事項**（先讀這節） | `962df6d` |
 
 ---
 
