@@ -40,6 +40,31 @@ export type AllPayoutsResponse = {
   summary: { totalPaidOut: number; pendingCount: number; totalRequests: number };
 };
 
+/** GET /accounts/:id/replay/session — the payload the replay UI indexes into
+ *  (`replaySession`/`tickBuffer`/`tradeEvents`/`meta`). Named so consumers can
+ *  refer to it instead of deriving `Awaited<ReturnType<…>>`. */
+export interface ReplaySessionResponse {
+  replaySession: {
+    id: string;
+    status: string;
+    speed: number;
+    cursorTimestamp: string | null;
+    sessionDate: string;
+  };
+  tickBuffer: Array<{ t: number; o: number; h: number; l: number; c: number; v: number }>;
+  tradeEvents: Array<{
+    id: string;
+    type: "entry" | "exit" | "violation";
+    timestamp: string;
+    symbolName: string | null;
+    side: string | null;
+    price: number | null;
+    pnl: number | null;
+    ruleCode?: string;
+  }>;
+  meta: { primarySymbol: string | null; sessionDate: string; tickCount: number };
+}
+
 export const accountsApi = {
   // ── Accounts ──
   getMyAccounts: () => request<Account[]>("/accounts/me/list"),
@@ -98,27 +123,7 @@ export const accountsApi = {
 
   // ── Replay ──
   replayGetSession: (accountId: string, date: string) =>
-    request<{
-      replaySession: {
-        id: string;
-        status: string;
-        speed: number;
-        cursorTimestamp: string | null;
-        sessionDate: string;
-      };
-      tickBuffer: Array<{ t: number; o: number; h: number; l: number; c: number; v: number }>;
-      tradeEvents: Array<{
-        id: string;
-        type: "entry" | "exit" | "violation";
-        timestamp: string;
-        symbolName: string | null;
-        side: string | null;
-        price: number | null;
-        pnl: number | null;
-        ruleCode?: string;
-      }>;
-      meta: { primarySymbol: string | null; sessionDate: string; tickCount: number };
-    }>(`/accounts/${accountId}/replay/session?date=${date}`),
+    request<ReplaySessionResponse>(`/accounts/${accountId}/replay/session?date=${date}`),
 
   replayStart: (accountId: string, sessionDate: string, speed = 1) =>
     request<{ speed: number; seed: number | null }>(`/accounts/${accountId}/replay/start`, {

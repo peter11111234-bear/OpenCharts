@@ -1,7 +1,7 @@
 import { useQuery, useMutation, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "./api";
-import type { AllPayoutsResponse } from "./api/accounts";
-import type { JournalEntriesResponse } from "./api/journal";
+import type { AllPayoutsResponse, ReplaySessionResponse } from "./api/accounts";
+import type { CreateJournalEntryInput, JournalEntriesResponse } from "./api/journal";
 import type { MarketDataCandlesPayload } from "./api/market-data";
 import type { PnlCalendarResponse } from "@propsim/types";
 import type {
@@ -17,6 +17,20 @@ import type {
   Candle,
   PlaceOrderInput,
 } from "./schemas";
+
+type ApiEndpoint = (...args: never[]) => unknown;
+
+/**
+ * The demo layer's terminal stubs resolve to placeholder payloads (`never[]`,
+ * `null`) and the back-office surface resolves to `unknown`, while the hooks
+ * below consume the real API's payloads. Name that payload at the call site —
+ * `callEndpoint<JournalEntriesResponse>(api.getJournalEntries, accountId)` —
+ * so the fetcher's resolved type propagates into `useQuery`/`useMutation`
+ * instead of the placeholder.
+ */
+function callEndpoint<T>(endpoint: ApiEndpoint, ...args: unknown[]): Promise<T> {
+  return (endpoint as (...a: unknown[]) => Promise<T>)(...args);
+}
 
 // ── Query Key Factories ─────────────────────────────────
 export const queryKeys = {
@@ -165,14 +179,22 @@ export function useClosedPositions(accountId: string | null, page = 1) {
   });
 }
 
+type ClosedPositionsSummary = {
+  pnl: number;
+  commission: number;
+  swap: number;
+  tradeCount: number;
+};
+
 export function useClosedPositionsSummary(
   accountId: string | null,
   from: string | null,
   to: string | null,
 ) {
-  return useQuery<{ pnl: number; commission: number; swap: number; tradeCount: number }>({
+  return useQuery<ClosedPositionsSummary>({
     queryKey: ["closedPositionsSummary", accountId, from, to] as const,
-    queryFn: () => api.getClosedPositionsSummary(accountId!, from!, to!),
+    queryFn: () =>
+      callEndpoint<ClosedPositionsSummary>(api.getClosedPositionsSummary, accountId!, from!, to!),
     enabled: !!(accountId && from && to),
     staleTime: 15_000,
     refetchInterval: 30_000,
@@ -180,23 +202,25 @@ export function useClosedPositionsSummary(
 }
 
 // ── Fill Quality Score ─────────────────────────────────
+type FillQuality = {
+  avgScore: number | null;
+  count: number;
+  entries: Array<{
+    id: string;
+    symbol: string;
+    side: string;
+    slippageBps: number;
+    latencyMs: number;
+    integrityCoupled: boolean;
+    qualityScore: number | null;
+    createdAt: string;
+  }>;
+};
+
 export function useFillQuality(accountId: string | null) {
-  return useQuery<{
-    avgScore: number | null;
-    count: number;
-    entries: Array<{
-      id: string;
-      symbol: string;
-      side: string;
-      slippageBps: number;
-      latencyMs: number;
-      integrityCoupled: boolean;
-      qualityScore: number | null;
-      createdAt: string;
-    }>;
-  }>({
+  return useQuery<FillQuality>({
     queryKey: ["fillQuality", accountId] as const,
-    queryFn: () => api.getFillQuality(accountId!),
+    queryFn: () => callEndpoint<FillQuality>(api.getFillQuality, accountId!),
     enabled: !!accountId,
     staleTime: 60_000,
   });
@@ -206,7 +230,7 @@ export function useFillQuality(accountId: string | null) {
 export function useAllPayouts() {
   return useQuery<AllPayoutsResponse>({
     queryKey: ["allPayouts"],
-    queryFn: () => api.getAllPayouts(),
+    queryFn: () => callEndpoint<AllPayoutsResponse>(api.getAllPayouts),
     staleTime: 15_000,
     refetchInterval: 30_000,
   });
@@ -265,7 +289,8 @@ export function useCandles(
     // completely fresh query — React Query won't reuse structural sharing or
     // stale cache from a previous replay / normal session.
     queryKey: [...queryKeys.market.candles(symbol, timeframe), limit ?? "auto", replayVersion ?? 0],
-    queryFn: () => api.getCandlesWithMeta(symbol, timeframe, limit),
+    queryFn: () =>
+      callEndpoint<MarketDataCandlesPayload>(api.getCandlesWithMeta, symbol, timeframe, limit),
     // Extract just the candles array for consumers — raw payload (with isPartial)
     // is still accessible via query.state.data inside refetchInterval below.
     select: (data) => data.candles,
@@ -576,7 +601,11 @@ export function useValidateCoupon() {
 export function useJournalEntries(accountId: string | null, opts?: { symbol?: string }) {
   return useQuery<JournalEntriesResponse>({
     queryKey: ["journal", accountId, opts?.symbol] as const,
-    queryFn: () => api.getJournalEntries(accountId!, { limit: 100, symbol: opts?.symbol }),
+    queryFn: () =>
+      callEndpoint<JournalEntriesResponse>(api.getJournalEntries, accountId!, {
+        limit: 100,
+        symbol: opts?.symbol,
+      }),
     enabled: !!accountId,
     staleTime: 10_000,
   });
@@ -585,8 +614,7 @@ export function useJournalEntries(accountId: string | null, opts?: { symbol?: st
 export function useCreateJournalEntry() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: Parameters<typeof api.createJournalEntry>[0]) =>
-      api.createJournalEntry(data),
+    mutationFn: (data: CreateJournalEntryInput) => api.createJournalEntry(data),
     onSuccess: (_d, vars) => qc.invalidateQueries({ queryKey: ["journal", vars.accountId] }),
   });
 }
@@ -740,7 +768,7 @@ export function useFeatureFlags() {
 export function useAiTraderEnabled() {
   return useQuery({
     queryKey: ["ai-trader", "enabled"] as const,
-    queryFn: () => api.isAiTraderEnabled(),
+    queryFn: () => callEndpoint<{ enabled: boolean }>(api.isAiTraderEnabled),
     staleTime: 60_000,
     retry: 1,
     refetchOnWindowFocus: true,
@@ -768,7 +796,7 @@ export function useCreateAiTraderPlan() {
         deterministicMode?: boolean;
         readOnlyMode?: boolean;
       };
-    }) => api.createAiTraderPlan(data),
+    }) => callEndpoint<{ autoExecuted?: boolean }>(api.createAiTraderPlan, data),
     onSuccess: (result, vars) => {
       qc.invalidateQueries({
         queryKey: ["ai-trader", "history", vars.accountId],
@@ -1093,7 +1121,12 @@ export function useProcessMergeRequest() {
 export function useReplaySession(accountId: string | null, sessionDate: string | null) {
   return useQuery({
     queryKey: queryKeys.replay.session(accountId!, sessionDate!),
-    queryFn: () => api.replayGetSession(accountId!, sessionDate!),
+    queryFn: () =>
+      callEndpoint<ReplaySessionResponse>(
+        api.replayGetSession,
+        accountId!,
+        sessionDate!,
+      ),
     enabled: !!accountId && !!sessionDate,
     // 30s, not Infinity — replaying *today* a second time must pick up trades
     // and candles recorded since the previous run.
@@ -1110,7 +1143,7 @@ export function useDailyPnl(
 ): ReturnType<typeof useQuery<PnlCalendarResponse>> {
   return useQuery<PnlCalendarResponse>({
     queryKey: ["daily-pnl", accountIds.slice().sort().join(","), from, to],
-    queryFn: () => api.getDailyPnl(accountIds, from, to),
+    queryFn: () => callEndpoint<PnlCalendarResponse>(api.getDailyPnl, accountIds, from, to),
     enabled: accountIds.length > 0 && !!from && !!to,
     staleTime: 60_000,
   });
