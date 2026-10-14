@@ -3,7 +3,7 @@ import type { Candle } from "../schemas.ts";
 import type { JournalEntriesResponse } from "../api/journal.ts";
 import type { ReplaySessionResponse } from "../api/accounts.ts";
 import type { ClosedPositionsSummary, FillQuality } from "../queries.ts";
-import { getHistory } from "./candles.ts";
+import { getHistory, type CandleRange } from "./candles.ts";
 import * as engine from "./engine.ts";
 import { DEMO_SYMBOLS } from "./instruments.ts";
 
@@ -132,10 +132,10 @@ export const demoApi = {
 
   // ── Symbols & market data ──
   getSymbols: () => Promise.resolve(DEMO_SYMBOLS),
-  getCandles: (symbol: string, timeframe: string, limit?: number) =>
-    Promise.resolve(getHistory(symbol, timeframe, limit)),
-  getCandlesWithMeta: (symbol: string, timeframe: string, limit?: number) =>
-    Promise.resolve(candlesMeta(getHistory(symbol, timeframe, limit))),
+  getCandles: (symbol: string, timeframe: string, limit?: number, range?: CandleRange) =>
+    Promise.resolve(getHistory(symbol, timeframe, limit, range)),
+  getCandlesWithMeta: (symbol: string, timeframe: string, limit?: number, range?: CandleRange) =>
+    Promise.resolve(candlesMeta(getHistory(symbol, timeframe, limit, range))),
   getTick: (symbol: string) => {
     const price = engine.getLastPrice(symbol);
     return Promise.resolve({ symbol, bid: price, ask: price, timestamp: Date.now() });
@@ -144,9 +144,10 @@ export const demoApi = {
   getEconomicCalendar: () => Promise.resolve([]),
 
   // ── Trading (paper engine) ──
-  placeOrder: (data: engine.PlaceOrderArgs) => Promise.resolve(engine.placeOrder(data)),
+  placeOrder: (data: engine.PlaceOrderArgs) => Promise.resolve().then(() => engine.placeOrder(data)),
   cancelOrder: (orderId: string) => Promise.resolve(engine.cancelOrder(orderId)),
-  modifyOrder: (orderId: string) => Promise.resolve(engine.getOrders().find((o) => o.id === orderId)),
+  modifyOrder: (orderId: string, modifications: engine.ModifyOrderArgs) =>
+    Promise.resolve().then(() => engine.modifyOrder(orderId, modifications) ?? null),
   cancelAllOrders: () => Promise.resolve({ success: true }),
   getOrders: () => Promise.resolve(engine.getOrders()),
   getPositions: () => Promise.resolve(engine.getPositions()),

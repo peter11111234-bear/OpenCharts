@@ -319,6 +319,7 @@ export function MarketDataBridge() {
         ev._entity &&
         (ev.eventType === "OrderPlaced" ||
           ev.eventType === "OrderFilled" ||
+          ev.eventType === "OrderUpdated" ||
           ev.eventType === "OrderCanceled")
       ) {
         const entity = ev._entity;

@@ -10,7 +10,6 @@ import {
   type ISeriesApi,
   type ISeriesPrimitive,
   LineStyle,
-  type LogicalRange,
   type SeriesMarker,
   type Time,
 } from "lightweight-charts";
@@ -44,6 +43,12 @@ import { queryKeys } from "../../services/queries.ts";
 import type { Candle, Order, Position, Symbol } from "../../services/schemas.ts";
 import { toast } from "../../services/toast.ts";
 import {
+  EMPTY_EXTENSION,
+  type HistoricalExtension,
+  prependExtension,
+  rebaseExtension,
+} from "./chartHistory.ts";
+import {
   CHART_COLORS,
   type DrawingLine,
   type DrawingTool,
@@ -52,6 +57,11 @@ import {
   TF_INTERVAL_MS,
   type Timeframe,
 } from "./constants.ts";
+import {
+  createLoadMoreState,
+  type LoadMoreState,
+  makeHistoryLoader,
+} from "./historyLoader.ts";
 import { ChartContextMenu } from "./ChartContextMenu.tsx";
 import { ChartSettingsDialog } from "./ChartSettingsDialog.tsx";
 import {
@@ -94,102 +104,6 @@ function requestGapRefetch(
 // ── Scroll-triggered history loading ─────────────────────────
 // When the user scrolls to the left edge of loaded data, fetch the preceding
 // window from the candle API and prepend it so the chart extends seamlessly.
-
-const LOAD_MORE_THRESHOLD = 20; // trigger when fewer than N bars remain on the left
-const LOAD_MORE_WINDOW = 500; // how many interval-widths to fetch per extension
-
-type LoadMoreState = {
-  loading: boolean;
-  noMoreData: boolean;
-  lastFetchedBeforeMs: number;
-  // When > 0, use this as toMs for the next fetch instead of getSeriesOldestMs.
-  // Set after an empty-range response so we skip over gaps (e.g. Forex weekends)
-  // rather than permanently locking noMoreData on the first empty window.
-  fetchFromMs: number;
-};
-
-function getSeriesOldestMs(series: ISeriesApi<"Candlestick">): number {
-  const data = series.data();
-  return data.length === 0 ? 0 : (data[0]!.time as number) * 1_000;
-}
-
-function isLoadMoreEligible(
-  state: LoadMoreState,
-  series: ISeriesApi<"Candlestick">,
-  range: LogicalRange,
-): boolean {
-  if (state.loading || state.noMoreData) return false;
-  const barsInfo = series.barsInLogicalRange(range);
-  if ((barsInfo?.barsBefore ?? Number.POSITIVE_INFINITY) > LOAD_MORE_THRESHOLD) return false;
-  // A shifted window from a previous empty-range response is always eligible —
-  // we need to try the window before the gap (e.g. before a Forex weekend).
-  if (state.fetchFromMs > 0) return true;
-  const oldestMs = getSeriesOldestMs(series);
-  if (oldestMs === 0) return false;
-  return state.lastFetchedBeforeMs === 0 || oldestMs < state.lastFetchedBeforeMs;
-}
-
-function fetchOlderRange(
-  symbol: string,
-  timeframe: string,
-  toMs: number,
-  state: LoadMoreState,
-  onLoaded: (bars: Candle[]) => void,
-): void {
-  const windowMs = LOAD_MORE_WINDOW * (TF_INTERVAL_MS[timeframe as Timeframe] ?? 60_000);
-  api
-    .getCandles(symbol, timeframe, undefined, { fromMs: toMs - windowMs, toMs })
-    .then((bars) => {
-      if (bars.length === 0) {
-        // Empty window — could be a gap (e.g. Forex weekend) rather than true
-        // end of history. Shift the fetch boundary back one more window so the
-        // next scroll event tries the range before this gap instead of stopping.
-        const nextToMs = toMs - windowMs;
-        if (nextToMs > 0) {
-          state.fetchFromMs = nextToMs;
-        } else {
-          state.noMoreData = true;
-        }
-      } else {
-        onLoaded(bars as Candle[]);
-      }
-    })
-    .catch(() => {
-      // Reset the fetch boundary so the user can retry by scrolling again.
-      // Without this, a transient network error permanently blocks history
-      // loading for the current view (lastFetchedBeforeMs stays set but no
-      // bars were prepended, so the eligibility guard never clears).
-      state.lastFetchedBeforeMs = 0;
-    })
-    .finally(() => {
-      state.loading = false;
-    });
-}
-
-function makeHistoryLoader(
-  symbol: string,
-  timeframeRef: { current: string },
-  seriesRef: { current: ISeriesApi<"Candlestick"> | null },
-  stateRef: { current: LoadMoreState },
-  onLoaded: (bars: Candle[]) => void,
-): (range: LogicalRange | null) => void {
-  return (range) => {
-    const series = seriesRef.current;
-    if (!range || !series) return;
-    const state = stateRef.current;
-    if (!isLoadMoreEligible(state, series, range)) return;
-    // Use the shifted boundary from a prior empty-range response when present,
-    // otherwise fall back to the series' current oldest bar.
-    const toMs = state.fetchFromMs > 0 ? state.fetchFromMs : getSeriesOldestMs(series);
-    if (toMs === 0) return;
-    state.loading = true;
-    state.lastFetchedBeforeMs = toMs;
-    state.fetchFromMs = 0;
-    // Read the timeframe from a ref: the chart (and this subscription) persists
-    // across TF changes, so the loader must always fetch the *current* TF.
-    fetchOlderRange(symbol, timeframeRef.current, toMs, state, onLoaded);
-  };
-}
 
 // ── Props ────────────────────────────────────────────────────
 
@@ -382,6 +296,10 @@ function paintServerVolume(live: LiveCandleData, barTime: Time, ctx: RtCtx): voi
 function applyServerCandle(live: LiveCandleData, ctx: RtCtx): void {
   const ts = toUnixSeconds(live.timestamp);
   if (Number.isNaN(ts) || ts <= 0 || !ctx.lastCandle.current) return;
+  // A tick whose bucket predates the last bar can only regress the watermarks
+  // below and make series.update throw into the catch; drop it. The sibling
+  // live-bar path guards the same way.
+  if (ts < (ctx.lastCandle.current.time as number)) return;
   if (ts - (ctx.lastCandle.current.time as number) > intervalSecOf(ctx.timeframe) * 1.5) {
     requestGapRefetch(ctx.gapAt, ctx.qc, ctx.symbol, ctx.timeframe);
   }
@@ -776,16 +694,18 @@ function addOrderOverlay(
   orderColor: string,
   out: IPriceLine[],
 ): void {
+  // A LIMIT carries its level in `price`; a STOP carries it in `stopPrice`.
+  const level = ord.type === "STOP" ? ord.stopPrice : ord.price;
   if (
     ord.symbolName !== symbol ||
     ord.status !== "PENDING" ||
-    !Number.isFinite(ord.price as number)
+    !Number.isFinite(level as number)
   ) {
     return;
   }
   out.push(
     series.createPriceLine({
-      price: ord.price as number,
+      price: level as number,
       color: orderColor,
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
@@ -1110,14 +1030,14 @@ export function ChartPanel({
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
 
   // Scroll-triggered historical extension — older bars prepended as the user
-  // scrolls left past what the initial deep-fetch already loaded.
-  const [historicalExtra, setHistoricalExtra] = useState<Candle[]>([]);
-  const loadMoreRef = useRef<LoadMoreState>({
-    loading: false,
-    noMoreData: false,
-    lastFetchedBeforeMs: 0,
-    fetchFromMs: 0,
-  });
+  // scrolls left past what the initial deep-fetch already loaded. Each batch is
+  // kept with the time base it arrived in: the demo history re-anchors its whole
+  // series whenever the wall clock leaves the anchored period, and bars held
+  // from the previous anchor would otherwise sit offset from the fresh payload.
+  const [historicalExtra, setHistoricalExtra] = useState<HistoricalExtension>(EMPTY_EXTENSION);
+  /** Time base the held extension is expressed in (see the merge below). */
+  const payloadAnchorRef = useRef(0);
+  const loadMoreRef = useRef<LoadMoreState>(createLoadMoreState());
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const priceLineRef = useRef<IPriceLine[]>([]);
   const drawingManagerRef = useRef<DrawingToolsManager | null>(null);
@@ -1160,13 +1080,8 @@ export function ChartPanel({
   // Reset historical extension whenever symbol or timeframe changes so stale
   // out-of-range candles from the previous view are never mixed into new data.
   useEffect(() => {
-    setHistoricalExtra([]);
-    loadMoreRef.current = {
-      loading: false,
-      noMoreData: false,
-      lastFetchedBeforeMs: 0,
-      fetchFromMs: 0,
-    };
+    setHistoricalExtra(EMPTY_EXTENSION);
+    loadMoreRef.current = createLoadMoreState();
     lastGapRefetchAtRef.current = 0;
   }, [selectedSymbol, timeframe]);
 
@@ -1284,12 +1199,21 @@ export function ChartPanel({
   }, []);
 
   // ── Extracted hooks ────────────────────────────────────────
-  // Merge scroll-loaded historical extension (older) with the live data (newer).
-  // useChartData deduplicates by timestamp, so overlap is safe.
-  const allCandles = useMemo(
-    () => (historicalExtra.length === 0 ? candles : [...historicalExtra, ...candles]),
-    [historicalExtra, candles],
-  );
+  // The newest history bar doubles as the payload's time base. The demo shift
+  // pins it to the current period, so it only moves when the shift re-anchors.
+  const payloadAnchor = candles.length === 0 ? 0 : Number(candles[candles.length - 1]!.time);
+  useEffect(() => {
+    payloadAnchorRef.current = payloadAnchor;
+  }, [payloadAnchor]);
+
+  // Merge the scroll-loaded extension (older) with the live data (newer),
+  // sliding the extension by however far the payload has moved since it was
+  // fetched so the seam stays contiguous. useChartData deduplicates by
+  // timestamp, so overlap is safe.
+  const allCandles = useMemo(() => {
+    if (historicalExtra.bars.length === 0 || candles.length === 0) return candles;
+    return [...rebaseExtension(historicalExtra, payloadAnchor), ...candles];
+  }, [historicalExtra, candles, payloadAnchor]);
   const { chartData, volumeData } = useChartData(allCandles, colors);
 
   const {
@@ -1615,15 +1539,18 @@ export function ChartPanel({
     // symbol/timeframe/theme change: the cleanup sets it to true before
     // unsubscribing so any in-flight `onLoaded` callback is silently dropped.
     let historyLoadCancelled = false;
-    const handleRangeChange = makeHistoryLoader(
-      selectedSymbol,
+    const handleRangeChange = makeHistoryLoader({
+      symbol: selectedSymbol,
       timeframeRef,
-      candleSeriesRef,
-      loadMoreRef,
-      (bars) => {
-        if (!historyLoadCancelled) setHistoricalExtra((prev) => [...bars, ...prev]);
+      seriesRef: candleSeriesRef,
+      stateRef: loadMoreRef,
+      baseRef: payloadAnchorRef,
+      fetchCandles: (symbol, timeframe, range) =>
+        api.getCandles(symbol, timeframe, undefined, range),
+      onLoaded: (bars, base) => {
+        if (!historyLoadCancelled) setHistoricalExtra((prev) => prependExtension(prev, bars, base));
       },
-    );
+    });
     chart.timeScale().subscribeVisibleLogicalRangeChange(handleRangeChange);
 
     // Signal listener-binding hooks that a live chart instance now exists.

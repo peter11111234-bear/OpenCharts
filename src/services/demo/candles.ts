@@ -40,20 +40,63 @@ function currentBucketSec(timeframe: string): number {
   return nowSec - (nowSec % interval);
 }
 
-/** Per-(symbol,timeframe) time delta that maps the last real bar onto "now". */
-function shiftDelta(bars: Candle[], timeframe: string): number {
+// The shift is memoised per series. Recomputing it on every call slid the whole
+// series forward by whole periods whenever the wall clock crossed a bucket
+// boundary, so a second fetch returned bars offset from the ones already on the
+// chart (duplicate/near-duplicate candles). The anchor instead pins one time
+// base for as long as the wall clock stays in the bucket it was pinned to.
+//
+// A tail request may re-anchor once the clock leaves that bucket: the chart is
+// rebuilt from its payload, and a frozen anchor would leave the visible tail
+// stopped at the session's first access while every repair refetch returned a
+// byte-identical payload. A windowed request never re-anchors — its whole job is
+// to stay contiguous with the bars already on screen.
+const anchorBySeries = new Map<string, { delta: number; bucket: number }>();
+
+/** Per-series shift that maps the last real bar onto the current period. */
+function shiftDelta(symbol: string, timeframe: string, bars: Candle[], refresh: boolean): number {
+  const key = `${symbol}_${timeframe}`;
+  const bucket = currentBucketSec(timeframe);
+  const cached = anchorBySeries.get(key);
+  if (cached && (!refresh || cached.bucket === bucket)) return cached.delta;
   if (bars.length === 0) return 0;
-  const lastReal = bars[bars.length - 1]!.time;
-  return currentBucketSec(timeframe) - lastReal;
+  const delta = bucket - bars[bars.length - 1]!.time;
+  anchorBySeries.set(key, { delta, bucket });
+  return delta;
 }
 
-/** Real history for a symbol/timeframe, shifted so the last bar is the current period. */
-export function getHistory(symbol: string, timeframe: string, limit?: number): Candle[] {
+/** Millisecond bounds, matching the market-data contract's `range` argument. */
+export type CandleRange = { fromMs: number; toMs: number };
+
+/**
+ * Real history for a symbol/timeframe, shifted so the last bar is the current
+ * period. `range` windows the result to [fromMs, toMs] inclusive at both ends,
+ * matching how the live backend treats the same millisecond bounds — the
+ * "load older history" caller passes its oldest visible bar as toMs, so the
+ * boundary bar comes back too and the chart's dedupe swallows it.
+ */
+export function getHistory(
+  symbol: string,
+  timeframe: string,
+  limit?: number,
+  range?: CandleRange,
+): Candle[] {
   const bars = rawSeries(symbol, timeframe);
   if (bars.length === 0) return [];
-  const delta = shiftDelta(bars, timeframe);
-  const shifted = bars.map((c) => ({ ...c, time: c.time + delta }));
-  return limit && limit < shifted.length ? shifted.slice(-limit) : shifted;
+  // Only a tail request (no range window) is allowed to move the time base.
+  const delta = shiftDelta(symbol, timeframe, bars, range === undefined);
+  let out = bars.map((c) => ({ ...c, time: c.time + delta }));
+  if (range) {
+    const fromSec = Math.floor(range.fromMs / 1000);
+    const toSec = Math.ceil(range.toMs / 1000);
+    out = out.filter((c) => c.time >= fromSec && c.time <= toSec);
+  }
+  return limit && limit < out.length ? out.slice(-limit) : out;
+}
+
+/** Drop the memoised anchors. For tests and HMR, which reuse the module. */
+export function resetShiftCache(): void {
+  anchorBySeries.clear();
 }
 
 /** Fine-grained close series (1m) used by the feed to replay real ticks. */

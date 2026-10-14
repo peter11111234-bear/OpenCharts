@@ -61,7 +61,7 @@ export const shioajiApi = {
     getOrderMode() === "sim"
       ? modifyLiveOrder(orderId, mods)
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      : (demoApi.modifyOrder as (id: string, m?: any) => unknown)(orderId),
+      : (demoApi.modifyOrder as (id: string, m?: { price?: number; quantity?: number }) => unknown)(orderId, mods),
 
   cancelAllOrders: async () => {
     if (getOrderMode() !== "sim") return demoApi.cancelAllOrders();
