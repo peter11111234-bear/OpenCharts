@@ -62,6 +62,7 @@ import {
   type LoadMoreState,
   makeHistoryLoader,
 } from "./historyLoader.ts";
+import { orderLevel } from "./orderOverlay.ts";
 import { ChartContextMenu } from "./ChartContextMenu.tsx";
 import { ChartSettingsDialog } from "./ChartSettingsDialog.tsx";
 import {
@@ -694,13 +695,8 @@ function addOrderOverlay(
   orderColor: string,
   out: IPriceLine[],
 ): void {
-  // A LIMIT carries its level in `price`; a STOP carries it in `stopPrice`.
-  const level = ord.type === "STOP" ? ord.stopPrice : ord.price;
-  if (
-    ord.symbolName !== symbol ||
-    ord.status !== "PENDING" ||
-    !Number.isFinite(level as number)
-  ) {
+  const level = orderLevel(ord);
+  if (ord.symbolName !== symbol || ord.status !== "PENDING" || level === null) {
     return;
   }
   out.push(
