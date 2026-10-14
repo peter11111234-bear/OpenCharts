@@ -18,9 +18,9 @@
 import type { BarRange, DataProvider, OHLCV, ProviderInfo, SymbolDescriptor, SymbolInfo } from "@luxalgo/vela";
 import { bucketStart, getShioajiHistory } from "./candles.ts";
 import { TW_INSTRUMENTS, getTwInstrument } from "./instruments.ts";
+import { startShioajiFeed } from "./feed.ts";
 import { subscribeChannel } from "../demo/bus.ts";
 import { wsClient } from "../ws.ts";
-
 const TAIPEI_OFFSET_MS = 8 * 3600 * 1000;
 
 /** Vela canonical → our timeframe key. */
@@ -155,8 +155,9 @@ export class ShioajiVelaProvider implements DataProvider {
     const name = this.toInstrumentName(ticker);
     const tf = normalizeTimeframe(timeframe);
 
-    // feed.ts only runs after connect(); it's idempotent, safe to call again.
+    // Start both the wsClient and the real Shioaji SSE feed. Both are idempotent.
     wsClient.connect();
+    void startShioajiFeed();
     let agg: OHLCV | undefined;
     // CandleUpdate carries the RUNNING total of the current 1m bar, so the
     // multi-tf aggregate adds only the delta between updates. Baseline resets
