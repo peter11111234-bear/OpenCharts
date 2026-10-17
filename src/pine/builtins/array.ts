@@ -103,12 +103,15 @@ const mut = (
     return a === null ? NA : f(a, bound);
   };
 
-registerBuiltin('array', 'push', mut(['id', 'value'], (a, b) => {
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const ARRAY_ID_VALUE_ORDER = ['id', 'value'] as const;
+
+registerBuiltin('array', 'push', mut(ARRAY_ID_VALUE_ORDER, (a, b) => {
   a.push(snap(b.get('value')));
   return VOID;
 }), { idx: [1], names: ['value'] });
 
-registerBuiltin('array', 'unshift', mut(['id', 'value'], (a, b) => {
+registerBuiltin('array', 'unshift', mut(ARRAY_ID_VALUE_ORDER, (a, b) => {
   a.unshift(snap(b.get('value')));
   return VOID;
 }), { idx: [1], names: ['value'] });
@@ -116,22 +119,31 @@ registerBuiltin('array', 'unshift', mut(['id', 'value'], (a, b) => {
 registerBuiltin('array', 'pop', mut(['id'], (a) => (a.length === 0 ? NA : a.pop()!)));
 registerBuiltin('array', 'shift', mut(['id'], (a) => (a.length === 0 ? NA : a.shift()!)));
 
-registerBuiltin('array', 'set', mut(['id', 'index', 'value'], (a, b) => {
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const ARRAY_ID_INDEX_VALUE_ORDER = ['id', 'index', 'value'] as const;
+
+registerBuiltin('array', 'set', mut(ARRAY_ID_INDEX_VALUE_ORDER, (a, b) => {
   a[resolveIdx(b, 'index', a.length, a.length - 1)] = snap(b.get('value'));
   return VOID;
 }), { idx: [2], names: ['value'] });
 
-registerBuiltin('array', 'insert', mut(['id', 'index', 'value'], (a, b) => {
+registerBuiltin('array', 'insert', mut(ARRAY_ID_INDEX_VALUE_ORDER, (a, b) => {
   a.splice(resolveIdx(b, 'index', a.length, a.length), 0, snap(b.get('value')));
   return VOID;
 }), { idx: [2], names: ['value'] });
 
-registerBuiltin('array', 'remove', mut(['id', 'index'], (a, b) => {
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const ARRAY_ID_INDEX_ORDER = ['id', 'index'] as const;
+
+registerBuiltin('array', 'remove', mut(ARRAY_ID_INDEX_ORDER, (a, b) => {
   const [r] = a.splice(resolveIdx(b, 'index', a.length, a.length - 1), 1);
   return r ?? NA;
 }));
 
-registerBuiltin('array', 'fill', mut(['id', 'value', 'index', 'length'], (a, b) => {
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const ARRAY_FILL_ORDER = ['id', 'value', 'index', 'length'] as const;
+
+registerBuiltin('array', 'fill', mut(ARRAY_FILL_ORDER, (a, b) => {
   const v = snap(b.get('value'));
   const start = Math.max(0, idxOf(b, 'index', 0));
   const lenV = b.get('length');
@@ -153,7 +165,7 @@ registerBuiltin('array', 'reverse', mut(['id'], (a) => {
 // ── Access ──────────────────────────────────────────────────────────────────
 
 registerBuiltin('array', 'get', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'index']);
+  const bound = bind(args, named, ARRAY_ID_INDEX_ORDER);
   const a = asArr(bound.get('id'));
   if (a === null) return NA;
   return a[resolveIdx(bound, 'index', a.length, a.length - 1)] ?? NA;
@@ -174,8 +186,11 @@ registerBuiltin('array', 'last', (_ctx, args, named) => {
   return a !== null && a.length > 0 ? a[a.length - 1]! : NA;
 });
 
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const ARRAY_SLICE_ORDER = ['id', 'index_from', 'index_to'] as const;
+
 registerBuiltin('array', 'slice', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'index_from', 'index_to']);
+  const bound = bind(args, named, ARRAY_SLICE_ORDER);
   const a = asArr(bound.get('id'));
   if (a === null) return NA;
   // v6: negative bounds count from the end; out-of-range bounds clip.
@@ -228,25 +243,23 @@ export function valueEq(a: Value, b: Value): boolean {
 }
 
 registerBuiltin('array', 'includes', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'value']);
+  const bound = bind(args, named, ARRAY_ID_VALUE_ORDER);
   const a = asArr(bound.get('id'));
-  const raw = bound.get('value');
-  if (a === null || raw === undefined) return NA;
-  // The `value` arg is declared value-semantic (builtins/scalarDeclPatch.ts), so
-  // it arrives as a plain scalar — compare it directly.
-  const v = raw;
+  const v = bound.get('value');
+  if (a === null || v === undefined) return NA;
+  // The `value` arg is declared value-semantic (builtins/scalarDeclPatch.ts):
+  // this single binding is already a plain scalar — compare it directly.
   return { kind: 'bool', v: a.some((e) => valueEq(e, v)) };
 }, { idx: [1], names: ['value'] });
 const indexOfFn =
   (fromEnd: boolean): BuiltinFn =>
   (_ctx, args, named) => {
-    const bound = bind(args, named, ['id', 'value']);
+    const bound = bind(args, named, ARRAY_ID_VALUE_ORDER);
     const a = asArr(bound.get('id'));
-    const raw = bound.get('value');
-    if (a === null || raw === undefined) return NA;
-    // Declared value-semantic ⇒ plain scalar here; the search compares the
-    // current-bar value, not a series handle.
-    const v = raw;
+    const v = bound.get('value');
+    if (a === null || v === undefined) return NA;
+    // Declared value-semantic ⇒ this single binding is a plain scalar; the
+    // search compares the current-bar value, not a series handle.
     let found = -1;
     if (fromEnd) {
       for (let i = a.length - 1; i >= 0; i--) {
@@ -297,13 +310,13 @@ registerBuiltin('array', 'sort_indices', (_ctx, args, named) => {
 const binSearch =
   (edge: 'any' | 'left' | 'right'): BuiltinFn =>
   (_ctx, args, named) => {
-    const bound = bind(args, named, ['id', 'value']);
+    const bound = bind(args, named, ARRAY_ID_VALUE_ORDER);
     const a = asArr(bound.get('id'));
-    const raw = bound.get('value');
-    if (a === null || raw === undefined) return NA;
-    // Declared value-semantic ⇒ plain scalar; cmp/valueEq need a plain value or
-    // the negative insertion hint is meaningless.
-    const v = raw;
+    const v = bound.get('value');
+    if (a === null || v === undefined) return NA;
+    // Declared value-semantic ⇒ this single binding is a plain scalar;
+    // cmp/valueEq need a plain value or the negative insertion hint is
+    // meaningless.
     // TV: returns index if found, else negative insertion hint.
     let lo = 0;
     let hi = a.length;
@@ -384,8 +397,11 @@ const varianceCore = (xs: number[], biased: boolean): number | null => {
   return xs.reduce((a, b) => a + (b - m) * (b - m), 0) / (xs.length - ddof);
 };
 
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const ARRAY_BIASED_ORDER = ['id', 'biased'] as const;
+
 registerBuiltin('array', 'variance', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'biased']);
+  const bound = bind(args, named, ARRAY_BIASED_ORDER);
   const a = asArr(bound.get('id'));
   if (a === null) return NA;
   const biasedV = bound.get('biased');
@@ -395,7 +411,7 @@ registerBuiltin('array', 'variance', (_ctx, args, named) => {
 });
 
 registerBuiltin('array', 'stdev', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'biased']);
+  const bound = bind(args, named, ARRAY_BIASED_ORDER);
   const a = asArr(bound.get('id'));
   if (a === null) return NA;
   const biasedV = bound.get('biased');
@@ -418,8 +434,11 @@ registerBuiltin('array', 'some', (_ctx, args, named) => {
   return { kind: 'bool', v: a.some((e) => e.kind !== 'na' && truthy(e)) };
 });
 
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const ARRAY_JOIN_ORDER = ['id', 'separator'] as const;
+
 registerBuiltin('array', 'join', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'separator']);
+  const bound = bind(args, named, ARRAY_JOIN_ORDER);
   const a = asArr(bound.get('id'));
   if (a === null) return NA;
   const sepV = bound.get('separator');
@@ -438,13 +457,12 @@ registerBuiltin('array', 'abs', (_ctx, args, named) => {
 });
 
 registerBuiltin('array', 'percentrank', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'value']);
+  const bound = bind(args, named, ARRAY_ID_VALUE_ORDER);
   const a = asArr(bound.get('id'));
-  const raw = bound.get('value');
-  if (a === null || raw === undefined) return NA;
-  // Declared value-semantic ⇒ plain scalar; otherwise the kind check below
-  // never passes and every call returns na.
-  const v = raw;
+  const v = bound.get('value');
+  if (a === null || v === undefined) return NA;
+  // Declared value-semantic ⇒ this single binding is a plain scalar;
+  // otherwise the kind check below never passes and every call returns na.
   const n = numsOf(a);
   if (n.length === 0 || (v.kind !== 'int' && v.kind !== 'float')) return NA;
   const below = n.filter((x) => x <= v.v).length;
@@ -452,7 +470,7 @@ registerBuiltin('array', 'percentrank', (_ctx, args, named) => {
 });
 
 registerBuiltin('array', 'standardize', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'biased']);
+  const bound = bind(args, named, ARRAY_BIASED_ORDER);
   const a = asArr(bound.get('id'));
   if (a === null) return NA;
   const biasedV = bound.get('biased');
@@ -470,8 +488,11 @@ registerBuiltin('array', 'standardize', (_ctx, args, named) => {
   );
 });
 
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const ARRAY_COV_ORDER = ['id1', 'id2', 'biased'] as const;
+
 registerBuiltin('array', 'covariance', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id1', 'id2', 'biased']);
+  const bound = bind(args, named, ARRAY_COV_ORDER);
   const a = asArr(bound.get('id1'));
   const b = asArr(bound.get('id2'));
   if (a === null || b === null) return NA;
@@ -495,7 +516,7 @@ registerBuiltin('array', 'covariance', (_ctx, args, named) => {
 });
 
 registerBuiltin('array', 'correlation', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id1', 'id2', 'biased']);
+  const bound = bind(args, named, ARRAY_COV_ORDER);
   const a = asArr(bound.get('id1'));
   const b = asArr(bound.get('id2'));
   if (a === null || b === null) return NA;
@@ -523,8 +544,11 @@ registerBuiltin('array', 'correlation', (_ctx, args, named) => {
   return denom === 0 ? NA : { kind: 'float', v: sxy / denom };
 });
 
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const ARRAY_PERCENTILE_ORDER = ['id', 'percentage'] as const;
+
 registerBuiltin('array', 'percentile_linear_interpolation', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'percentage']);
+  const bound = bind(args, named, ARRAY_PERCENTILE_ORDER);
   const a = asArr(bound.get('id'));
   const p = bound.get('percentage');
   if (a === null || !p || p.kind === 'na') return NA;
@@ -538,7 +562,7 @@ registerBuiltin('array', 'percentile_linear_interpolation', (_ctx, args, named) 
 });
 
 registerBuiltin('array', 'percentile_nearest_rank', (_ctx, args, named) => {
-  const bound = bind(args, named, ['id', 'percentage']);
+  const bound = bind(args, named, ARRAY_PERCENTILE_ORDER);
   const a = asArr(bound.get('id'));
   const p = bound.get('percentage');
   if (a === null || !p || p.kind === 'na') return NA;

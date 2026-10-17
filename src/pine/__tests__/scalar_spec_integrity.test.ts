@@ -10,14 +10,17 @@
 //                family that stopped declaring one of the seven option slots
 //                the implementation reads (the F-A class); a non-prefix idx
 //                with no `order`, and an `order` that cannot reach its own
-//                names (the R2-I1 class); a FAMILY_ORDER key that names no
-//                table entry.
-//   NOT caught — under-declaration outside the input.* families (their expected
-//                slot set is not derivable from an exported order), and whether
-//                the hist side (`histSpecHas`, interpreter.ts:1531) still maps a
-//                raw positional index to the order slot by index alone — a
-//                pre-existing twin of R2-I1 that needs the same `order`
-//                plumbing on `HistSpec`.
+//                names (the R2-I1 class); an `order` that drifts from its
+//                family's exported constant (the D3b class); an `order` with
+//                no FAMILY_ORDER key (it would skip the D3b comparison
+//                silently); a FAMILY_ORDER
+//                key that names no table entry; under-declaration outside the
+//                input.* families (the na-ident sweep's necessary set,
+//                fixtures/scalarGuardedSlots.ts).
+//   NOT caught — whether the hist side (`histSpecHas`, interpreter.ts:1531)
+//                still maps a raw positional index to the order slot by index
+//                alone — a pre-existing twin of R2-I1 that needs the same
+//                `order` plumbing on `HistSpec`.
 // `scratch/perf/wrapA-na-ident-audit.mts` remains the runtime probe for the
 // guarded-read set as a whole; this file guards the declaration table itself.
 import { describe, expect, it } from 'vitest';
@@ -29,6 +32,19 @@ import { BUILTINS, SCALAR_BUILTINS } from '../builtins/registry';
 import { SCALAR_ARGS } from '../builtins/scalarDeclPatch';
 import { PLOT_ORDER, SHAPE_ORDER, PLOTBAR_ORDER, PLOTCANDLE_ORDER, HLINE_ORDER } from '../builtins/plot';
 import { INPUT_ORDER, ENUM_ORDER } from '../builtins/input';
+import {
+  ARRAY_BIASED_ORDER,
+  ARRAY_COV_ORDER,
+  ARRAY_FILL_ORDER,
+  ARRAY_ID_INDEX_ORDER,
+  ARRAY_ID_INDEX_VALUE_ORDER,
+  ARRAY_ID_VALUE_ORDER,
+  ARRAY_JOIN_ORDER,
+  ARRAY_PERCENTILE_ORDER,
+  ARRAY_SLICE_ORDER,
+} from '../builtins/array';
+import { TOSTRING_ORDER, FORMAT_TIME_ORDER } from '../builtins/str';
+import { GUARDED_SLOTS, GUARDED_SLOT_ORDER } from './fixtures/scalarGuardedSlots';
 
 /** Families whose `bindArgs` order is exported; the declaration table must
  *  agree with each of them index-by-index. Every key here must also name a
@@ -56,6 +72,32 @@ const FAMILY_ORDER: Record<string, readonly string[]> = {
   'input.source': INPUT_ORDER,
   input: INPUT_ORDER,
   'input.enum': ENUM_ORDER,
+  // array.*/str.* orders live next to the `bindArgs` sites they describe
+  // (module-qualified `*_ORDER` exports, one constant per parameter-list
+  // shape) — the table's `order` references the same constants, so `names`
+  // stays the hand-written second source these checks compare against.
+  'array.slice': ARRAY_SLICE_ORDER,
+  'array.fill': ARRAY_FILL_ORDER,
+  'array.variance': ARRAY_BIASED_ORDER,
+  'array.stdev': ARRAY_BIASED_ORDER,
+  'array.standardize': ARRAY_BIASED_ORDER,
+  'array.covariance': ARRAY_COV_ORDER,
+  'array.join': ARRAY_JOIN_ORDER,
+  'array.percentile_linear_interpolation': ARRAY_PERCENTILE_ORDER,
+  'array.percentile_nearest_rank': ARRAY_PERCENTILE_ORDER,
+  'array.percentrank': ARRAY_ID_VALUE_ORDER,
+  'array.includes': ARRAY_ID_VALUE_ORDER,
+  'array.indexof': ARRAY_ID_VALUE_ORDER,
+  'array.lastindexof': ARRAY_ID_VALUE_ORDER,
+  'array.binary_search': ARRAY_ID_VALUE_ORDER,
+  'array.binary_search_leftmost': ARRAY_ID_VALUE_ORDER,
+  'array.binary_search_rightmost': ARRAY_ID_VALUE_ORDER,
+  'array.get': ARRAY_ID_INDEX_ORDER,
+  'array.remove': ARRAY_ID_INDEX_ORDER,
+  'array.set': ARRAY_ID_INDEX_VALUE_ORDER,
+  'array.insert': ARRAY_ID_INDEX_VALUE_ORDER,
+  'str.tostring': TOSTRING_ORDER,
+  'str.format_time': FORMAT_TIME_ORDER,
 };
 
 /** The seven option slots `recordAndOverride` reads for every `input.*`
@@ -93,7 +135,7 @@ describe('ScalarSpec table integrity', () => {
     const mismatched: string[] = [];
     for (const [name, spec] of Object.entries(SCALAR_ARGS)) {
       const order = FAMILY_ORDER[name];
-      if (order === undefined) continue; // array.*/math.*/str.*/color.* read by name, no shared order list
+      if (order === undefined) continue; // no exported order list (array.new, math.*, color.*, most str.*) — read by name
       spec.idx.forEach((pos, i) => {
         if (order[pos] !== spec.names[i]) {
           mismatched.push(`${name}: idx ${pos} → order '${order[pos]}', declared '${spec.names[i]}'`);
@@ -143,5 +185,55 @@ describe('ScalarSpec table integrity', () => {
     // The order check above iterates FAMILY_ORDER keys, so a key whose table
     // entry does not exist would quietly check nothing.
     expect(Object.keys(FAMILY_ORDER).filter((k) => SCALAR_ARGS[k] === undefined)).toEqual([]);
+  });
+
+  it('declares every guarded-read slot the na-ident sweep derived', () => {
+    // GUARDED_SLOTS is the NECESSARY set (fixtures/scalarGuardedSlots.ts):
+    // every positional slot of every family was measured, literal `na` vs an
+    // `na`-bound ident at the same slot, with SCALAR_BUILTINS cleared — the
+    // slots that still differed are the ones a `kind` test reads. One-way on
+    // purpose: extra declarations are fine (`input.*` option slot 5 `options`
+    // and other unread slots are declared but not necessary); a MISSING one
+    // lets a series wrapper reach a `kind` test.
+    const missing: string[] = [];
+    for (const [family, slots] of Object.entries(GUARDED_SLOTS)) {
+      const spec = SCALAR_ARGS[family];
+      const order = FAMILY_ORDER[family] ?? GUARDED_SLOT_ORDER[family];
+      for (const slot of slots) {
+        const pos = order?.indexOf(slot) ?? -1;
+        const where = pos >= 0 ? `${family}[${pos}] ${slot}` : `${family}.${slot}`;
+        if (spec === undefined) { missing.push(where); continue; }
+        if (!spec.names.includes(slot)) { missing.push(`${where} (not in names)`); continue; }
+        if (pos >= 0 && !spec.idx.includes(pos)) missing.push(`${where} (names has it, idx does not cover ${pos})`);
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  it('keeps each declared order equal to its family constant', () => {
+    // The table's `order` must spell the same list as the family's exported
+    // constant — compared value by value, NOT by identity: an inline literal
+    // that re-spells the same list passes, a drifted one fails (the D3b class).
+    // The one-way assertion first guarantees the comparison below cannot be
+    // skipped silently, so the only entries the `family === undefined` continue
+    // can still meet are order-less ones (`math.round`, APPEND_MODEL).
+    const unkeyed = Object.entries(SCALAR_ARGS)
+      .filter(([name, spec]) => spec.order !== undefined && FAMILY_ORDER[name] === undefined)
+      .map(([name]) => name);
+    expect(unkeyed).toEqual([]);
+    const drifted: string[] = [];
+    for (const [name, spec] of Object.entries(SCALAR_ARGS)) {
+      if (spec.order === undefined) continue;
+      const family = FAMILY_ORDER[name];
+      if (family === undefined) continue;
+      const len = Math.max(spec.order.length, family.length);
+      for (let i = 0; i < len; i++) {
+        if (spec.order[i] !== family[i]) {
+          drifted.push(`${name}: order[${i}] = '${spec.order[i] ?? '<end>'}', family '${family[i] ?? '<end>'}'`);
+          break; // one line per family, naming the first mismatch
+        }
+      }
+    }
+    expect(drifted).toEqual([]);
   });
 });

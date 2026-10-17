@@ -5,25 +5,33 @@
 // the initial capital as denominator, per the reference.
 // strategy.equity/openprofit live in strategy.ts (its owner's region).
 //
-// Historical equity needs simulate() evaluated *as of* each past bar. The
-// ctx OHLC Series history is relative to the current bar, and simulate()
-// prices fills at `get(upto - b)`, which only lands on bar b when
-// upto == ctx.barIndex. shifted() wraps ctx so simulate(uptoBar=b) reads bar
-// b's prices correctly for any b ≤ barIndex.
+// The equity curve is recorded by the resumable stepper (strategy.ts): every
+// `simAt` run writes one mark-to-market entry per bar into `SimCache.equity`
+// after that bar's fills, risk rules and margin call settle. This module folds
+// that recorded prefix into the running peak/drawdown and trough/runup; it
+// never replays past bars itself. There is nothing to fold with no orders (no
+// `strategy|simCache` leaf is created), so that case keeps the historical flat
+// curve — initial capital every bar, dd/runup 0.
 
-import { NA, type BuiltinCtx, type Value } from '../contracts';
+import { NA, type BuiltinCtx } from '../contracts';
 import { registerLazyConstant } from './registry';
 import { numVal, type RtCtx } from './util';
-import { cfgOf, pctOfCapital, simulate, type StratOrder } from './strategy';
+import { execsAt, pctOfCapital, type StratOrder } from './strategy';
 
 const ORDERS_KEY = 'strategy|orders';
+/** Mirrors strategy.ts's private CACHE_KEY — the SimCache `equity` sink lives
+ *  under this state key. Read by value to avoid exporting the key. */
+const CACHE_KEY = 'strategy|simCache';
 const DD_KEY = 'strategy|ddCache';
 
 interface DdCache {
-  /** orders.length the equity curve was computed against (invalidation key). */
+  /** orders.length the fold was computed against (invalidation key). */
   count: number;
-  /** equity[k] = equity at bar k (mark-to-market at that bar's close). */
-  equity: number[];
+  /** Number of `SimCache.equity` entries folded so far (the fold cursor). */
+  len: number;
+  /** equity[len - 1] as last folded — a moved tail means the sink rewound and
+   *  re-recorded (forming-bar tick / orders change), so refold from 0. */
+  lastEq: number | undefined;
   peak: number;
   dd: number;
   /** Running equity trough + the largest trough-to-peak recovery. */
@@ -31,58 +39,53 @@ interface DdCache {
   runup: number;
 }
 
-/** Offset every get(n) by (cur − b) so simulate(uptoBar=b) sees bar-b prices. */
-function shifted(ctx: BuiltinCtx, b: number): BuiltinCtx {
-  const d = ctx.barIndex - b;
-  if (d === 0) return ctx;
-  const s = (x: { get(n: number): Value }) => ({
-    get: (n: number) => x.get(n + d),
-  });
-  return {
-    ...ctx,
-    open: s(ctx.open),
-    high: s(ctx.high),
-    low: s(ctx.low),
-    close: s(ctx.close),
-    // `time` too: simulate() derives its day boundaries (`risk.*` daily rules)
-    // and leg exit times from it, and an unshifted series would make every bar
-    // read the CURRENT bar's time — contradicting this wrapper's contract.
-    time: s(ctx.time),
-  } as BuiltinCtx;
+/** Reset the running accumulators so the next fold starts from entry 0. */
+function resetFold(c: DdCache): void {
+  c.len = 0;
+  c.lastEq = undefined;
+  c.peak = -Infinity;
+  c.dd = 0;
+  c.trough = Infinity;
+  c.runup = 0;
 }
 
-/** Mark-to-market equity at bar `b` (uses that bar's close for open P&L). */
-function equityAt(ctx: BuiltinCtx, orders: StratOrder[], b: number): number {
-  const cfg = cfgOf(ctx);
-  if (orders.length === 0 || b < 0) return cfg.initial_capital;
-  const sc = shifted(ctx, b);
-  const sim = simulate(sc, orders, cfg, b);
-  const cv = sc.close.get(0);
-  const close = cv.kind === 'int' || cv.kind === 'float' ? cv.v : NaN;
-  const open = sim.qty !== 0 && Number.isFinite(close)
-    ? sim.qty * (close - sim.avgEntry)
-    : 0;
-  return cfg.initial_capital + sim.realizedPnl + open;
-}
-
-/** Extend the memoized equity curve to the current bar and return its cache.
- *  One replay per new bar, so reading any equity metric every bar is cheap. */
+/** Extend the fold to the current bar and return its cache. One fold pass per
+ *  new equity entry, so reading any equity metric every bar is cheap. */
 function equityCurve(ctx: BuiltinCtx): DdCache {
   const rt = ctx as RtCtx;
   rt.state ??= new Map();
   const orders = (rt.state.get(ORDERS_KEY) as StratOrder[] | undefined) ?? [];
   const bar = ctx.barIndex;
   let cache = rt.state.get(DD_KEY) as DdCache | undefined;
-  if (!cache || cache.count !== orders.length) {
-    cache = {
-      count: orders.length, equity: [],
-      peak: -Infinity, dd: 0, trough: Infinity, runup: 0,
-    };
+  if (!cache) {
+    cache = { count: orders.length, len: 0, lastEq: undefined, peak: -Infinity, dd: 0, trough: Infinity, runup: 0 };
     rt.state.set(DD_KEY, cache);
+  } else if (cache.count !== orders.length) {
+    // The ledger grew or shrank; the folded values no longer correspond. The
+    // sink below is re-recorded against the new ledger, so refold from 0. The
+    // cache object is mutated in place (never swapped) so a checkpoint restore
+    // restates its fields on the same instance.
+    cache.count = orders.length;
+    resetFold(cache);
   }
-  for (let b = cache.equity.length; b <= bar; b++) {
-    const eq = equityAt(ctx, orders, b);
-    cache.equity.push(eq);
+  // No orders ⇒ no `strategy|simCache` leaf; the flat initial-capital curve
+  // reports dd/runup 0 (the historical behaviour).
+  if (orders.length === 0) {
+    resetFold(cache);
+    return cache;
+  }
+  // Drive the resumable stepper to `bar`; it records `SimCache.equity` as it
+  // goes. `execsAt` is the exported door into simAt — its result is unused.
+  execsAt(ctx, bar);
+  const src = (rt.state.get(CACHE_KEY) as { equity: number[] } | undefined)?.equity ?? [];
+  // `src` is append-only in the steady state, but a forming-bar tick or an
+  // orders change rewinds and re-records it. If it rewound below our cursor, or
+  // the last folded entry moved, the accumulators are stale — refold from 0.
+  if (src.length < cache.len || (cache.len > 0 && !Object.is(src[cache.len - 1], cache.lastEq))) {
+    resetFold(cache);
+  }
+  for (let b = cache.len; b < src.length; b++) {
+    const eq = src[b]!;
     if (eq > cache.peak) cache.peak = eq;
     const dd = cache.peak - eq;
     if (dd > cache.dd) cache.dd = dd;
@@ -90,6 +93,8 @@ function equityCurve(ctx: BuiltinCtx): DdCache {
     const ru = eq - cache.trough;
     if (ru > cache.runup) cache.runup = ru;
   }
+  cache.len = src.length;
+  cache.lastEq = src.length > 0 ? src[src.length - 1] : undefined;
   return cache;
 }
 

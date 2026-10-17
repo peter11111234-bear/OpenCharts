@@ -1,6 +1,6 @@
 // ── strategy incremental parity & read-order immunity test ─────────────────
 // Tests that:
-// 1. Calling strategy.max_drawdown (which replays one-shot simulate per bar)
+// 1. Calling strategy.max_drawdown (which folds the stepper's recorded equity)
 //    does NOT corrupt or wipe the resumable stepper cursor used by simAt.
 // 2. Reading order-invariant: [drawdown then equity] vs [equity then drawdown]
 //    must produce identical position_size, equity, and execs across bars.
@@ -50,12 +50,14 @@ describe('strategy stepper parity & read-order immunity', () => {
     const pos1: number[] = [];
     const eq1: number[] = [];
     const dd1: number[] = [];
+    const ru1: number[] = [];
 
     // Scenario 2: Always read max_drawdown FIRST, then equity/pos
     const s2 = mkRtCtx(bars);
     const pos2: number[] = [];
     const eq2: number[] = [];
     const dd2: number[] = [];
+    const ru2: number[] = [];
 
     for (let b = 0; b < bars.length; b++) {
       s1.barCtx.seek(b);
@@ -75,13 +77,15 @@ describe('strategy stepper parity & read-order immunity', () => {
         callStrategy('entry', [{ kind: 'string', v: 'S' }, { kind: 'string', v: 'strategy.short' }], {}, s2.ctx);
       }
 
-      // S1: Equity then Drawdown
+      // S1: Equity then Drawdown then Runup
       pos1.push(numV(getConstant('strategy.position_size', s1.ctx)));
       eq1.push(numV(getConstant('strategy.equity', s1.ctx)));
       dd1.push(numV(getConstant('strategy.max_drawdown', s1.ctx)));
+      ru1.push(numV(getConstant('strategy.max_runup', s1.ctx)));
 
-      // S2: Drawdown then Equity (hazard path if cursor is wiped!)
+      // S2: Drawdown/Runup then Equity (hazard path if cursor is wiped!)
       dd2.push(numV(getConstant('strategy.max_drawdown', s2.ctx)));
+      ru2.push(numV(getConstant('strategy.max_runup', s2.ctx)));
       eq2.push(numV(getConstant('strategy.equity', s2.ctx)));
       pos2.push(numV(getConstant('strategy.position_size', s2.ctx)));
     }
@@ -90,6 +94,7 @@ describe('strategy stepper parity & read-order immunity', () => {
     expect(pos2).toEqual(pos1);
     expect(eq2).toEqual(eq1);
     expect(dd2).toEqual(dd1);
+    expect(ru2).toEqual(ru1);
 
     // Assert executions are identical
     const execs1 = execsAt(s1.ctx, bars.length - 1);
@@ -166,18 +171,18 @@ describe('strategy stepper parity & read-order immunity', () => {
   });
 
   it('max_drawdown agrees with the drawdown of the per-bar equity series', () => {
-    // Invariant between the two equity implementations: the curve replays past
-    // bars through `shifted()`, while the per-bar samples come from simAt. Any
-    // divergence between them (e.g. a series the wrapper fails to offset) shows
-    // up here. A daily rule is installed so the replay's derived day boundaries
-    // are exercised too.
+    // Invariant between the two equity implementations: the curve folds the
+    // stepper's recorded `SimCache.equity`, while the per-bar samples come from
+    // simAt directly. Any divergence between them shows up here. A daily rule
+    // is installed so the derived day boundaries are exercised too. The closes
+    // both rise and fall so the runup fold is non-degenerate as well.
     const mkDaily = (closes: number[]) =>
       closes.map((c, i) => ({
         openTime: Date.UTC(2026, 0, 1 + i),
         closeTime: Date.UTC(2026, 0, 1 + i) + 86_399_999,
         open: c, high: c + 1, low: c - 1, close: c, volume: 1000,
       }));
-    const bars = mkDaily([100, 90, 95, 80, 85, 70]);
+    const bars = mkDaily([100, 90, 105, 95, 120, 80]);
     const { ctx, barCtx } = mkRtCtx(bars);
     callStrategy('risk.max_cons_loss_days', [{ kind: 'int', v: 1 }], {}, ctx);
 
@@ -193,10 +198,15 @@ describe('strategy stepper parity & read-order immunity', () => {
     }
     let peak = -Infinity;
     let dd = 0;
+    let trough = Infinity;
+    let ru = 0;
     for (const e of eqs) {
       if (e > peak) peak = e;
       if (peak - e > dd) dd = peak - e;
+      if (e < trough) trough = e;
+      if (e - trough > ru) ru = e - trough;
     }
     expect(numV(getConstant('strategy.max_drawdown', ctx))).toBeCloseTo(dd, 6);
+    expect(numV(getConstant('strategy.max_runup', ctx))).toBeCloseTo(ru, 6);
   });
 });

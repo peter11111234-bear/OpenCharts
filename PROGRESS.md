@@ -797,3 +797,14 @@
 * **新增 Minor 記帳**：`histSpecHas` 裸索引（既有同形）、非 input 家族 under-declaration 無單測、`named[n]` 原型鏈裸讀、`positionalSlots` 成本（最壞 8.44 µs/call）、`liftNums` 既有參數對調語意。
 * **R4 窄幅再審（`R4-RevRound3Fix`）⇒ 0 Critical／0 Important／0 Minor，P8 收斂**：I1 的歷史壓平已修（四種拼法包 `ta.sma` 全 `[na,na,101,102,103,104]`）；豁免守門三種突變都會紅（含「假鍵＋把 order 加回」→ 紅於 stale 斷言）；F2 的 7 個 `str.*` 全受惠且不誤傷 `ta.*`／`nz`；`named` 物件不被共享故 canon 無副作用。
 * **R4 新列殘留風險（皆改前既有）**：① 最重要——`liftNums` 按呼叫順序 append（`math.ts:100`），與 UDF／`bindArgs` 的 named-to-slot 契約語意相反，建議對照 TV 文件定案；② `hasP`（`math.ts:210-212`）漏看經 `number=` 送達的 precision ⇒ 非整數結果被截斷；③ 豁免 stale 斷言對假鍵類會被 unbacked 先擋（fail-safe）；④ `histSpecHas` 孿生缺口。
+### 2026-10-17 wrapC 後續工單（P0–P9；B7／B2／B3／A2 落地＋R1/R2 回修＋P9 分支補測）
+
+* **成果**：`array.ts` 四處兩段式綁定收成單次 `bound.get`（B7）；新 `fixtures/scalarGuardedSlots.ts`（144 必要槽／51 家族，由「清空 `SCALAR_BUILTINS` 後仍 DIFFER」導出）＋單向斷言（B2）；11 個家族 `*_ORDER` 常數、41 條 `order` 全部改指常數、`FAMILY_ORDER` 41 keys ＋「order ≡ 家族常數」斷言（B3）；`strategy.ts` 新增 `curveEquity`／`put`／`SimCache.equity[]` 逐 bar 記帳、`strategyEquity.ts` 改讀 sink 並刪 `shifted`／`equityAt`（A2-S1/S2）。
+* **P8 R1 三視角**：4 Important＋2 Minor（F1 記帳污染、F2 遲到成交不回寫、F3 註解孤兒、F4 fixture 死表項、F5 守門單向缺口、F6 文件含本機路徑）；回修 `R2-FixA2`（事件迴圈改 `riskWalk(o.bar)` → `applyEvent` → `advancePending`；`riskWalk` 內逐 bar 交錯；`applyFill` 尾端對 `bar ≤ riskBar` 截尾回寫）與 `R2-FixGuard`（刪 10 死表項、補反向斷言、修註解），先紅後綠 7 個 it。
+* **P8 R2 再審**：`R2-RevA2Fix` 0C/0I/0M（correct 0.86）／`R2-RevGuardFix` 0C/0I/2Minor（註解措辭記帳不修）。
+* **P9 advisor 必補**：SimCache 三條失效分支（orders 減／增／清空）原僅有 forming-bar OHLC 被 fuzz 覆蓋 ⇒ 新增 3 支定向測試＋`oracleMismatches()` helper。**停用分支自證首版 2/3 mismatch**：`BR-shrink` 情境兩 ledger 數值恰好同值、`BR-append` 斷言前多讀一根 bar 讓 resume 補回 ⇒ 改為可分辨情境（1% 手續費＋bar3 開盤 110；斷言提前到同 bar 重讀之後），重跑 **3/3 red**。
+* **P7 五閘（本輪樹）**：G1 **72 檔／1024 passed｜1 skipped**（＋3）、G2 `tsc` **rc=0**、G3 四支 digest **逐字不變**（`1e63vl8`／`kb0glc`／`1580h2`／`p4gddl`，app＝direct PASS）、G4 golden **14｜1**、G5 `s1-inc-probe` **PARITY OK**；突變 9 案例 **0 mismatch**。
+* **接手輪差分審查（新增，待裁決）**：以「受測 sink vs 凍結 oracle」隨機差分（1200 劇本）＋定點重現，發現 **`strategy.risk.max_cons_loss_days` 不滿足逐位相等且 sink 值隨讀取樣式改變**：根因是該規則閘門 `(b === uptoBar || dayKeyOf(b + 1) !== k)`（`strategy.ts:784`）與可 resume 的逐 bar 交錯互動；舊 `equityAt(b)` 逐 bar 重算本身前後自相矛盾（bar3 說 3 平倉、bar5 說 5 平倉）。除該規則外 0 mismatch；四支 digest／golden／parity 不受影響。詳見 `docs/2026-10-17-followup-consloss-finding.md`，重現 `scratch/_r2-consloss.mts`、`scratch/_r2-diff.mts`，列為 handoff §4.8 待裁決。
+* **受管 JEV**：`taskwf-review` 兩條發現皆 **Important**（0.63／0.88）；去重 noul 0.38（低信心）⇒ 主 LLM 判不同根因；`taskwf-accept` 0.80（QA 報告逐條有證據）。
+* **R3 P8**：本輪 diff 僅該測試檔（18:56 後 `src` 唯一 mtime 變更）；三視角因 `opencode-go` 全日額度 429 降級為主代理自審（已在報告標明）；F3/F4/F5 守門落地複核無發現（22 條與 `FAMILY_ORDER` 不重疊、51 家族全覆蓋、41 條 order 全有 key）。
+* **殘留**：`max_cons_loss_days` 已裁決（走選項①：記為刻意語意改變，已在 `strategy_equity_stepper.test.ts` 補 `it` 逐 bar 釘住新值＋釘住與 `equityAt(5)` 的分歧，生產碼未動）；`C:/Users/bear9/jev-laya-bench/taskwf_gate.py` 兩處文件未去識別（Minor）；A2 效能縮放未量；r2 報告殘留 1–6 仍有效。

@@ -141,8 +141,11 @@ export function fmtTime(ms: number, pat: string, tz?: string): string {
 
 // ── str.tostring / str.tonumber ─────────────────────────────────────────────
 
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const TOSTRING_ORDER = ['value', 'format'] as const;
+
 registerBuiltin('str', 'tostring', (ctx, args, named) => {
-  const bound = bindArgs(args, named, ['value', 'format']);
+  const bound = bindArgs(args, named, TOSTRING_ORDER);
   const raw = bound.get('value') ?? named['v'];
   if (!raw) return strVal('NaN');
   const v = cur(raw);
@@ -206,8 +209,11 @@ registerBuiltin('str', 'format', (ctx, args, named) => {
   return strVal(pineFormat(ctx, asStr(tpl), args.slice(1).map(cur), named));
 });
 
+/** Exported so scalarDeclPatch.ts and the ScalarSpec integrity test share one order source. */
+export const FORMAT_TIME_ORDER = ['time', 'format', 'timezone'] as const;
+
 registerBuiltin('str', 'format_time', (ctx, args, named) => {
-  const bound = bindArgs(args, named, ['time', 'format', 'timezone']);
+  const bound = bindArgs(args, named, FORMAT_TIME_ORDER);
   const t = bound.get('time');
   if (!t || t.kind === 'na') return NA;
   const v = cur(t);

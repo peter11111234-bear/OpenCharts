@@ -226,9 +226,10 @@ type CtxRunSlot = { [RUN_STATE]?: RunState };
  *  long run lasted (5000-bar tapes made that visible). Here the RunState dies
  *  with its ctx, and there is no per-call table lookup at all.
  *
- *  Non-enumerable: `{ ...ctx }` copies (strategyEquity's `shifted`) must NOT
- *  inherit the parent's RunState — they keep getting their own, exactly as the
- *  WeakMap-keyed table behaved. */
+ *  Non-enumerable: `{ ...ctx }` copies (the frozen oracle's context clone in
+ *  `__tests__/strategy_equity_stepper.test.ts`) must NOT inherit the parent's
+ *  RunState — they keep getting their own, exactly as the WeakMap-keyed table
+ *  behaved. */
 function runOf(ctx: BuiltinCtx): RunState {
   const cached = (ctx as BuiltinCtx & CtxRunSlot)[RUN_STATE];
   if (cached !== undefined) return cached;
@@ -3293,11 +3294,14 @@ async function runScriptInner(
 // `request.*` state lives in the per-session MTF store, checkpointed like
 // everything else (mtf.ts mtfCheckpoint/mtfRestore), and strategy state lives
 // entirely in `ctx.state` (the `strategy|orders` array leaf + memo/config
-// plain objects), all inside the ctx.state snapshot. Order FILLING is a pure
-// replay (`strategy.simulate` is a function of (orders, bars, cfg, uptoBar)),
-// so rolling the order list back to the committed bar and re-running the
-// forming bar reproduces TV's per-tick recompute. What still forces a full
-// re-run is tape SHAPE (shrink, or a rewritten prefix — see incAdvance).
+// plain objects), all inside the ctx.state snapshot. Order FILLING continues a
+// resumable replay instead: `simAt` keeps its `SimRun` cursor next to the memo
+// in ctx.state['strategy|simCache'] and drops it — together with the memo and
+// the recorded equity prefix — when the orders list shrinks, gains an order, or
+// the forming bar's OHLC moves (`SimCache` in strategy.ts). Rolling the order
+// list back to the committed bar and re-running the forming bar therefore
+// reproduces TV's per-tick recompute. What still forces a full re-run is tape
+// SHAPE (shrink, or a rewritten prefix — see incAdvance).
 
 /** Checkpoint payload — one snapshot per committed bar boundary. */
 interface IncCkpt {

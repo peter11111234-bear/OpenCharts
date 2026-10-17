@@ -8,10 +8,12 @@
 // instead of the same spec repeated at ~60 `registerBuiltin` call sites.
 // Imported LAST from builtins/index.ts so every module has registered first.
 //
-// `order` carries the family's `bindArgs` parameter list. `idx` holds slots of
-// that list, but the funnel only sees the raw positional array, so a named arg
-// claiming a lower slot shifts every positional after it — `order` is what lets
-// `callBuiltin` resolve where a positional actually landed (reviewer finding
+// `order` carries the family's `bindArgs` parameter list — always the same
+// exported `*_ORDER` constant the implementation binds with, so the table and
+// the binding cannot drift. `idx` holds slots of that list, but the funnel only
+// sees the raw positional array, so a named arg claiming a lower slot shifts
+// every positional after it — `order` is what lets `callBuiltin` resolve where
+// a positional actually landed (reviewer finding
 // R2-I1). It is declared for every entry whose `idx` is not a 0-based prefix
 // (asserted by `scalar_spec_integrity.test.ts`); the remaining entries keep the
 // index-equals-slot shortcut on purpose, see that test's NOT-caught list.
@@ -19,34 +21,47 @@ import { BUILTINS, SCALAR_BUILTINS } from './registry';
 import type { ScalarSpec } from './registry';
 import { PLOT_ORDER, SHAPE_ORDER, PLOTBAR_ORDER, PLOTCANDLE_ORDER, HLINE_ORDER } from './plot';
 import { INPUT_ORDER, ENUM_ORDER } from './input';
+import {
+  ARRAY_BIASED_ORDER,
+  ARRAY_COV_ORDER,
+  ARRAY_FILL_ORDER,
+  ARRAY_ID_INDEX_ORDER,
+  ARRAY_ID_INDEX_VALUE_ORDER,
+  ARRAY_ID_VALUE_ORDER,
+  ARRAY_JOIN_ORDER,
+  ARRAY_PERCENTILE_ORDER,
+  ARRAY_SLICE_ORDER,
+} from './array';
+import { TOSTRING_ORDER, FORMAT_TIME_ORDER } from './str';
 
 /** Dotted builtin name → args that must arrive as a plain value.
  *  Exported so `scalar_spec_integrity.test.ts` can assert that every name still
  *  resolves, that `idx` and `names` stay in lockstep, that each `idx` still
- *  points at the matching entry of its family's `bindArgs` order, and that
- *  every non-prefix `idx` carries the `order` the funnel needs. */
+ *  points at the matching entry of its family's `bindArgs` order, that every
+ *  non-prefix `idx` carries the `order` the funnel needs, and that each `order`
+ *  equals its family's exported constant element-by-element. */
 export const SCALAR_ARGS: Record<string, ScalarSpec> = {
   // ── array.* ──────────────────────────────────────────────────────────────
-  'array.slice': { idx: [1, 2], names: ['index_from', 'index_to'], order: ['id', 'index_from', 'index_to'] },
-  'array.fill': { idx: [2, 3], names: ['index', 'length'], order: ['id', 'value', 'index', 'length'] },
-  'array.variance': { idx: [1], names: ['biased'], order: ['id', 'biased'] },
-  'array.stdev': { idx: [1], names: ['biased'], order: ['id', 'biased'] },
-  'array.standardize': { idx: [1], names: ['biased'], order: ['id', 'biased'] },
-  'array.covariance': { idx: [2], names: ['biased'], order: ['id1', 'id2', 'biased'] },
-  'array.join': { idx: [1], names: ['separator'], order: ['id', 'separator'] },
-  'array.percentile_linear_interpolation': { idx: [1], names: ['percentage'], order: ['id', 'percentage'] },
-  'array.percentile_nearest_rank': { idx: [1], names: ['percentage'], order: ['id', 'percentage'] },
-  'array.percentrank': { idx: [1], names: ['value'], order: ['id', 'value'] },
-  'array.includes': { idx: [1], names: ['value'], order: ['id', 'value'] },
-  'array.indexof': { idx: [1], names: ['value'], order: ['id', 'value'] },
-  'array.lastindexof': { idx: [1], names: ['value'], order: ['id', 'value'] },
-  'array.binary_search': { idx: [1], names: ['value'], order: ['id', 'value'] },
-  'array.binary_search_leftmost': { idx: [1], names: ['value'], order: ['id', 'value'] },
-  'array.binary_search_rightmost': { idx: [1], names: ['value'], order: ['id', 'value'] },
-  'array.get': { idx: [1], names: ['index'], order: ['id', 'index'] },
-  'array.set': { idx: [1], names: ['index'], order: ['id', 'index', 'value'] },
-  'array.insert': { idx: [1], names: ['index'], order: ['id', 'index', 'value'] },
-  'array.remove': { idx: [1], names: ['index'], order: ['id', 'index'] },
+  'array.slice': { idx: [1, 2], names: ['index_from', 'index_to'], order: ARRAY_SLICE_ORDER },
+  'array.fill': { idx: [2, 3], names: ['index', 'length'], order: ARRAY_FILL_ORDER },
+  'array.variance': { idx: [1], names: ['biased'], order: ARRAY_BIASED_ORDER },
+  'array.stdev': { idx: [1], names: ['biased'], order: ARRAY_BIASED_ORDER },
+  'array.standardize': { idx: [1], names: ['biased'], order: ARRAY_BIASED_ORDER },
+  'array.covariance': { idx: [2], names: ['biased'], order: ARRAY_COV_ORDER },
+  'array.join': { idx: [1], names: ['separator'], order: ARRAY_JOIN_ORDER },
+  'array.percentile_linear_interpolation': { idx: [1], names: ['percentage'], order: ARRAY_PERCENTILE_ORDER },
+  'array.percentile_nearest_rank': { idx: [1], names: ['percentage'], order: ARRAY_PERCENTILE_ORDER },
+  'array.percentrank': { idx: [1], names: ['value'], order: ARRAY_ID_VALUE_ORDER },
+  'array.includes': { idx: [1], names: ['value'], order: ARRAY_ID_VALUE_ORDER },
+  'array.indexof': { idx: [1], names: ['value'], order: ARRAY_ID_VALUE_ORDER },
+  'array.lastindexof': { idx: [1], names: ['value'], order: ARRAY_ID_VALUE_ORDER },
+  'array.binary_search': { idx: [1], names: ['value'], order: ARRAY_ID_VALUE_ORDER },
+  'array.binary_search_leftmost': { idx: [1], names: ['value'], order: ARRAY_ID_VALUE_ORDER },
+  'array.binary_search_rightmost': { idx: [1], names: ['value'], order: ARRAY_ID_VALUE_ORDER },
+  'array.get': { idx: [1], names: ['index'], order: ARRAY_ID_INDEX_ORDER },
+  'array.set': { idx: [1], names: ['index'], order: ARRAY_ID_INDEX_VALUE_ORDER },
+  'array.insert': { idx: [1], names: ['index'], order: ARRAY_ID_INDEX_VALUE_ORDER },
+  'array.remove': { idx: [1], names: ['index'], order: ARRAY_ID_INDEX_ORDER },
   'array.new': { idx: [0, 1], names: ['size', 'initial_value'] },
   // ── math.* ───────────────────────────────────────────────────────────────
   // math.round binds through `liftNums`, which APPENDS named args after the
@@ -65,9 +80,9 @@ export const SCALAR_ARGS: Record<string, ScalarSpec> = {
   'color.rgb': { idx: [0, 1, 2], names: ['red', 'green', 'blue'] },
   'color.from_gradient': { idx: [0, 1, 2], names: ['value', 'bottom_value', 'top_value'] },
   // ── str.* ────────────────────────────────────────────────────────────────
-  'str.tostring': { idx: [1], names: ['format'], order: ['value', 'format'] },
+  'str.tostring': { idx: [1], names: ['format'], order: TOSTRING_ORDER },
   'str.format': { idx: [0], names: ['template'] },
-  'str.format_time': { idx: [1], names: ['format'], order: ['time', 'format', 'timezone'] },
+  'str.format_time': { idx: [1], names: ['format'], order: FORMAT_TIME_ORDER },
   'str.replace': { idx: [0, 1, 2], names: ['source', 'target', 'replacement'] },
   'str.replace_all': { idx: [0, 1, 2], names: ['source', 'target', 'replacement'] },
   'str.contains': { idx: [0, 1], names: ['source', 'str'] },

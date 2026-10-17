@@ -344,9 +344,15 @@ export interface SimRun {
  *
  * `prev` continues an earlier run: the bars it already observed are not
  * replayed and its cursors are carried over.
+ *
+ * `sink`, when given, receives the equity curve this run observes: one entry
+ * per bar `0..uptoBar`, written after that bar's fills, risk rules and margin
+ * call have settled (a fill settling later re-books its bar's entry). The
+ * caller owns the array — it is never stored on the `SimRun`.
  */
 export function simulateRun(
-  ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, uptoBar: number, prev?: SimRun,
+  ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, uptoBar: number,
+  prev?: SimRun, sink?: number[],
 ): SimRun {
   const resume = prev !== undefined && prev.bar <= uptoBar;
   const sim: Sim = resume ? cloneSim(prev!.sim) : emptySim();
@@ -382,7 +388,10 @@ export function simulateRun(
   const fillsByDay = resume ? new Map(prev!.fillsByDay) : new Map<number, number>();
   const pointValue = pointValueOf(ctx);
 
-  /** Touch-check every pending order through `limit`, filling on touch. */
+  /** Touch-check every pending order through `limit`, filling on touch. Called
+   *  once per bar as `riskWalk` settles it (so a fill lands on its own bar)
+   *  and once after each event (so a same-bar fill of a just-placed order, or
+   *  a dup-id `seen` rewind, settles before the run leaves the bar). */
   const advancePending = (limit: number): void => {
     const lim = Math.min(limit, uptoBar);
     for (let k = 0; k < pending.length; k++) {
@@ -521,25 +530,44 @@ export function simulateRun(
     const o = orders[ev]!;
     if (o.bar > uptoBar) break; // Future order: stop before advancing i or its cursor
     i = ev + 1;
-    // Pending orders settle through this event's bar before it is applied.
-    advancePending(o.bar);
+    // The walk settles this event's bar first: its fills land before the bar's
+    // rules run and before its equity mark is booked, so the event acts on
+    // exactly the bar it lands on.
     riskWalk(o.bar);
+    applyEvent(o);
+    // The event may have queued an order that still fills on this very bar
+    // (process_orders_on_close / immediately) or rewound a duplicate's `seen`
+    // so its new limit/stop re-checks this bar. Those fills settle AFTER the
+    // bar's mark was booked — applyFill re-books it (tail rewrite).
+    advancePending(o.bar);
+  }
+  riskWalk(uptoBar);
+  const out: SimRun = {
+    bar: uptoBar, sim, pending, i, cursors, rules, riskBar, haltBar, sessionHaltDay,
+    day, dayStartEquity, dayPeak, peakEquity, consLoss, fillsByDay,
+  };
+
+  // ── nested helpers (closure over sim/ctx) ──
+
+  /** Apply one order event: install a risk rule, drop the order (halt), cancel
+   *  matches, modify a pending duplicate, or queue it for settlement. */
+  function applyEvent(o: StratOrder): void {
     if (o.kind === 'risk') {
       applyRisk(o.risk!);
       curOf(o).seen = o.bar;
-      continue;
+      return;
     }
     // A triggered rule stops new orders: permanent until the end of the run,
     // intraday until the end of that trading day.
-    if (haltBar >= 0 && o.bar >= haltBar) { curOf(o).seen = o.bar; continue; }
-    if (sessionHaltDay >= 0 && sessionHaltDay === day) { curOf(o).seen = o.bar; continue; }
+    if (haltBar >= 0 && o.bar >= haltBar) { curOf(o).seen = o.bar; return; }
+    if (sessionHaltDay >= 0 && sessionHaltDay === day) { curOf(o).seen = o.bar; return; }
     if (o.kind === 'cancel') {
       const any = o.id === '' || o.id === 'strategy.cancel_all';
       for (const p of pending) {
         if (any || p.id === o.id || (o.fromEntry !== '' && p.id === o.fromEntry)) curOf(p).cancelledAt = o.bar;
       }
       curOf(o).seen = o.bar;
-      continue;
+      return;
     }
     // Duplicate pending entry id → modify in place (Pine semantics).
     if (o.kind === 'entry' || o.kind === 'order') {
@@ -549,22 +577,14 @@ export function simulateRun(
         dCur.mod = { qty: o.qty, qtySet: o.qtySet, eqPct: o.eqPct, eqPctSet: o.eqPctSet, limit: o.limit, stop: o.stop, bar: o.bar };
         dCur.seen = o.bar - 1; // Re-check modified limit/stop against the current bar in advancePending
         curOf(o).seen = o.bar;
-        continue;
+        return;
       }
       // Same-direction entry while positioned → ignored unless pyramiding.
-      if (sim.qty !== 0 && Math.sign(sim.qty) === o.dir && sim.openTrades >= cfg.pyramiding + 1) { curOf(o).seen = o.bar; continue; }
+      if (sim.qty !== 0 && Math.sign(sim.qty) === o.dir && sim.openTrades >= cfg.pyramiding + 1) { curOf(o).seen = o.bar; return; }
     }
     curOf(o).seen = o.bar - 1; // next advance checks from this order's bar
     pending.push(o);
   }
-  advancePending(uptoBar);
-  riskWalk(uptoBar);
-  const out: SimRun = {
-    bar: uptoBar, sim, pending, i, cursors, rules, riskBar, haltBar, sessionHaltDay,
-    day, dayStartEquity, dayPeak, peakEquity, consLoss, fillsByDay,
-  };
-
-  // ── nested helpers (closure over sim/ctx) ──
 
   function fillDir(o: StratOrder): number {
     if (o.kind === 'entry' || o.kind === 'order') return o.dir;
@@ -705,62 +725,75 @@ export function simulateRun(
     return (dir > 0 ? cfg.margin_long : cfg.margin_short) / 100 - dir !== 0;
   }
 
-  /** Evaluate the installed rules on every bar the replay has not observed
-   *  yet, up to `to`; the fills for those bars have already settled. */
+  /** Settle every bar the replay has not observed yet, up to `to` — ONE BAR AT
+   *  A TIME: the bar's fills land first, then its risk rules and margin call
+   *  run against that settled state, then its equity mark is booked. That
+   *  ordering is the sink's contract (`sink[b]` = bar b fully settled): a fill
+   *  from a later bar can never leak into an earlier mark, and the rules never
+   *  judge a bar on fills that settle after it. A fill that lands after its
+   *  mark (a same-bar fill of an order just placed, a dup-id `seen` rewind)
+   *  re-books it — see applyFill. */
   function riskWalk(to: number): void {
     const lim = Math.min(to, uptoBar);
-    // Nothing to observe: no rule installed and no position a margin call
-    // could touch. Keeps plain strategies off this per-bar loop entirely.
-    if (!rulesActive() && !marginWatchable()) {
-      if (lim > riskBar) riskBar = lim;
-      return;
-    }
     for (let b = riskBar + 1; b <= lim; b++) {
-      const k = dayKeyOf(b);
-      if (k !== day) {
-        day = k;
-        dayStartEquity = b > 0 ? equityNow(b - 1) : cfg.initial_capital;
-        dayPeak = Math.max(dayStartEquity, equityNow(b));
+      advancePending(b);
+      // The rule machinery only matters with an installed rule or a position a
+      // margin call could touch — re-checked per bar, since a fill earlier in
+      // this walk may just have opened a callable position. Without it the
+      // mark below is simply the bar's pre-rule value.
+      if (rulesActive() || marginWatchable()) {
+        const k = dayKeyOf(b);
+        if (k !== day) {
+          day = k;
+          dayStartEquity = b > 0 ? equityNow(b - 1) : cfg.initial_capital;
+          dayPeak = Math.max(dayStartEquity, equityNow(b));
+        }
+        const eq = equityNow(b);
+        if (eq > peakEquity) peakEquity = eq;
+        if (eq > dayPeak) dayPeak = eq;
+        // A triggered rule stops this bar's rule evaluation. `break ruleBlock`
+        // (not `continue`) so the equity write below still runs and reports the
+        // bar's post-rule value: a trigger or a margin call books a fill on `b`.
+        ruleBlock: {
+          if (haltBar >= 0 || sessionHaltDay === k) break ruleBlock;
+          const maxFills = rules.maxIntradayFilledOrders;
+          if (maxFills !== undefined && (fillsByDay.get(k) ?? 0) >= maxFills) {
+            trigger(b, false, 'max_intraday_filled_orders');
+            break ruleBlock;
+          }
+          const il = rules.maxIntradayLoss;
+          if (il !== undefined && il.value > 0) {
+            const loss = dayPeak - eq;
+            if (il.percent ? dayPeak > 0 && loss / dayPeak * 100 >= il.value : loss >= il.value) {
+              trigger(b, false, 'max_intraday_loss');
+              break ruleBlock;
+            }
+          }
+          const dd = rules.maxDrawdown;
+          if (dd !== undefined && dd.value > 0) {
+            const drop = peakEquity - eq;
+            if (dd.percent
+              ? (peakEquity > 0 && drop / peakEquity * 100 >= dd.value) || eq <= 0
+              : drop >= dd.value) {
+              trigger(b, true, 'max_drawdown');
+              break ruleBlock;
+            }
+          }
+          // max_cons_loss_days is judged on the day's last bar.
+          const nDays = rules.maxConsLossDays;
+          if (nDays !== undefined && nDays > 0 && (b === uptoBar || dayKeyOf(b + 1) !== k)) {
+            if (eq < dayStartEquity) consLoss++;
+            else consLoss = 0;
+            if (consLoss >= nDays) {
+              trigger(b, true, 'max_cons_loss_days');
+              break ruleBlock;
+            }
+          }
+          marginCall(b);
+        }
       }
-      const eq = equityNow(b);
-      if (eq > peakEquity) peakEquity = eq;
-      if (eq > dayPeak) dayPeak = eq;
+      put(b, curveEquity(cfg, sim, closeAt(ctx, b, uptoBar)));
       riskBar = b;
-      if (haltBar >= 0 || sessionHaltDay === k) continue;
-      const maxFills = rules.maxIntradayFilledOrders;
-      if (maxFills !== undefined && (fillsByDay.get(k) ?? 0) >= maxFills) {
-        trigger(b, false, 'max_intraday_filled_orders');
-        continue;
-      }
-      const il = rules.maxIntradayLoss;
-      if (il !== undefined && il.value > 0) {
-        const loss = dayPeak - eq;
-        if (il.percent ? dayPeak > 0 && loss / dayPeak * 100 >= il.value : loss >= il.value) {
-          trigger(b, false, 'max_intraday_loss');
-          continue;
-        }
-      }
-      const dd = rules.maxDrawdown;
-      if (dd !== undefined && dd.value > 0) {
-        const drop = peakEquity - eq;
-        if (dd.percent
-          ? (peakEquity > 0 && drop / peakEquity * 100 >= dd.value) || eq <= 0
-          : drop >= dd.value) {
-          trigger(b, true, 'max_drawdown');
-          continue;
-        }
-      }
-      // max_cons_loss_days is judged on the day's last bar.
-      const nDays = rules.maxConsLossDays;
-      if (nDays !== undefined && nDays > 0 && (b === uptoBar || dayKeyOf(b + 1) !== k)) {
-        if (eq < dayStartEquity) consLoss++;
-        else consLoss = 0;
-        if (consLoss >= nDays) {
-          trigger(b, true, 'max_cons_loss_days');
-          continue;
-        }
-      }
-      marginCall(b);
     }
   }
 
@@ -778,6 +811,23 @@ export function simulateRun(
   function equityNow(atBar: number): number {
     return cfg.initial_capital + sim.realizedPnl
       + (sim.qty !== 0 ? sim.qty * (closeAt(ctx, atBar, uptoBar) - sim.avgEntry) : 0);
+  }
+
+  /** Equity of `sim` marked at `close` — `equityNow`'s formula plus the
+   *  finite-close guard the reported curve needs. `equityNow` itself stays
+   *  ungated: margin, sizing and the risk rules share it. */
+  function curveEquity(cfg: StratCfg, sim: Sim, close: number): number {
+    return cfg.initial_capital + sim.realizedPnl
+      + (sim.qty !== 0 && Number.isFinite(close) ? sim.qty * (close - sim.avgEntry) : 0);
+  }
+
+  /** Record bar `b`'s equity into the caller's sink (a no-op without one),
+   *  rewinding any tail first so a re-entered bar overwrites instead of
+   *  appending and the sink stays a dense prefix. */
+  function put(b: number, v: number): void {
+    if (sink === undefined) return;
+    if (sink.length > b) sink.length = b;
+    sink[b] = v;
   }
 
   /** Contracts this order trades at `price`; 0/NaN → no fill. */
@@ -965,6 +1015,19 @@ export function simulateRun(
         }
       }
     }
+    // A fill can settle after its bar's equity mark was booked — a same-bar
+    // fill of an order placed on that bar (process_orders_on_close /
+    // immediately) or a dup-id `seen` rewind re-checking the modified bar.
+    // Re-book the mark so `sink[b]` stays "bar b fully settled" instead of
+    // freezing at the pre-fill value. `put` truncates the tail first; the loop
+    // re-books any later marks from the settled state (only the just-settled
+    // bar is exactly re-markable, and in practice the fill always settles on
+    // the last booked bar, so the loop body runs once).
+    if (bar <= riskBar) {
+      for (let rb = bar; rb <= riskBar; rb++) {
+        put(rb, curveEquity(cfg, sim, closeAt(ctx, rb, uptoBar)));
+      }
+    }
   }
   return out;
 }
@@ -986,6 +1049,9 @@ interface SimCache {
   byBar: Map<number, Sim>;
   /** Cursor of the run that last left the order scratch behind. */
   run?: SimRun;
+  /** Equity curve the run recorded, dense over `0..run.bar`. Lives here — not
+   *  on `Sim`/`SimRun`, which `cloneSim` copies on every resume. */
+  equity: number[];
   /** OHLC of the bar the memo was built from — any field moving invalidates it. */
   bar?: number;
   open?: number;
@@ -1004,6 +1070,7 @@ function simAt(ctx: BuiltinCtx, uptoBar: number): Sim {
       cache.count = 0;
       cache.byBar.clear();
       cache.run = undefined;
+      cache.equity.length = 0;
     }
     return emptySim();
   }
@@ -1017,7 +1084,7 @@ function simAt(ctx: BuiltinCtx, uptoBar: number): Sim {
     c.bar = uptoBar; c.open = o0; c.high = h0; c.low = l0; c.close = c0;
   };
   if (!cache) {
-    cache = { count: orders.length, byBar: new Map() };
+    cache = { count: orders.length, byBar: new Map(), equity: [] };
     store(cache);
     st.set(CACHE_KEY, cache);
   } else {
@@ -1026,6 +1093,7 @@ function simAt(ctx: BuiltinCtx, uptoBar: number): Sim {
       cache.count = orders.length;
       cache.byBar.clear();
       cache.run = undefined;
+      cache.equity.length = 0;
     } else if (orders.length > cache.count) {
       // Orders appended: invalidate cached answers at or after the first new order's bar
       const firstNewBar = orders[cache.count]?.bar ?? 0;
@@ -1035,6 +1103,7 @@ function simAt(ctx: BuiltinCtx, uptoBar: number): Sim {
       if (cache.run && cache.run.bar >= firstNewBar) {
         cache.run = undefined;
       }
+      cache.equity.length = Math.min(cache.equity.length, firstNewBar);
       cache.count = orders.length;
     }
     if (
@@ -1046,12 +1115,15 @@ function simAt(ctx: BuiltinCtx, uptoBar: number): Sim {
       if (cache.run && cache.run.bar >= uptoBar) {
         cache.run = undefined;
       }
+      cache.equity.length = Math.min(cache.equity.length, uptoBar);
     }
   }
   const hit = cache.byBar.get(uptoBar);
   if (hit) return hit;
   const prev = cache.run && cache.run.bar <= uptoBar ? cache.run : undefined;
-  const run = simulateRun(ctx, orders, cfgOf(ctx), uptoBar, prev);
+  // `cache` came from ctx.state at the top of THIS call, so `equity` is the live
+  // array — a checkpoint restore swaps the field for a clone, never mutates it.
+  const run = simulateRun(ctx, orders, cfgOf(ctx), uptoBar, prev, cache.equity);
   if (cache.byBar.size >= 256) cache.byBar.clear();
   store(cache);
   cache.run = run;

@@ -211,14 +211,18 @@ plot(close, "c")
     let seed = 0x2f6e2b1;
     const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
     const src = `//@version=6
-indicator("f")
+strategy("f")
 var n = 0
 n := n + 1
 m = ta.sma(close, 4) + ta.ema(close, 6)
 plot(n, "n")
 plot(m, "m")
+plot(strategy.max_drawdown, "dd")
+plot(strategy.max_runup, "runup")
 if close > 103
     label.new(bar_index, high, "x")
+if bar_index == 0
+    strategy.entry("L", strategy.long)
 `;
     const parsed = parse(src);
     let bars = tape(12);

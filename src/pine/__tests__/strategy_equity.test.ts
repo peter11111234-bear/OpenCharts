@@ -91,6 +91,34 @@ describe('strategy equity plumbing', () => {
     expect(numV(getConstant('strategy.max_drawdown', ctx))).toBeCloseTo(4);
   });
 
+  it('max_runup tracks the deepest trough-to-peak, then holds after a pullback', () => {
+    const { ctx, barCtx } = mkRtCtx(mkBars([10, 10, 8, 6, 9, 12, 11]));
+    callStrategy('entry', [{ kind: 'string', v: 'L' }, { kind: 'string', v: 'strategy.long' }], {}, ctx);
+    // equity = [100000,100000,99998,99996,99999,100002,100001]; the trough
+    // bottoms at 99996 (bar3), so runup peaks at 100002−99996 = 6 at bar5 and
+    // holds after the bar6 pullback (100001−99996 = 5 < 6).
+    const ru: number[] = [];
+    for (let b = 0; b < 7; b++) {
+      if (b > 0) barCtx.seek(b);
+      ru.push(numV(getConstant('strategy.max_runup', ctx)));
+    }
+    expect(ru).toEqual([0, 0, 0, 0, 3, 6, 6]);
+  });
+
+  it('a forming-bar tick re-records the curve so a same-bar re-read sees new drawdown', () => {
+    // Deliberate change (P4 §2.4), treated as a bug fix: the recorder
+    // re-records the forming bar on a tick, so re-reading max_drawdown at the
+    // same bar reflects the new close instead of holding the first-read value.
+    const bars = mkBars([10, 10, 8]);
+    const { ctx, barCtx } = mkRtCtx(bars);
+    callStrategy('entry', [{ kind: 'string', v: 'L' }, { kind: 'string', v: 'strategy.long' }], {}, ctx);
+    barCtx.seek(1); // fills at open 10, close 10 → equity 100000, dd 0
+    expect(numV(getConstant('strategy.max_drawdown', ctx))).toBeCloseTo(0);
+    // Tick: bar1 close 10 → 6 shows a −4 mark-to-market loss on the open long.
+    barCtx.updateBar({ ...bars[1]!, close: 6, high: 10, low: 4 });
+    expect(numV(getConstant('strategy.max_drawdown', ctx))).toBeCloseTo(4);
+  });
+
   it('max_drawdown is 0 with no orders and stays 0 while flat', () => {
     const { ctx, barCtx } = mkRtCtx(mkBars([10, 11, 12]));
     expect(numV(getConstant('strategy.max_drawdown', ctx))).toBe(0);
