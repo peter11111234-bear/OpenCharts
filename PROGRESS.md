@@ -522,3 +522,278 @@
   實測 27／8／9 個手寫註冊完全不看 `named`（多數 `get_*`／`delete`／`set_xloc`）→ 具名呼叫會靜默 no-op，
   屬先前就存在的另一類，盤點與切片見 `docs/2026-10-13-remaining-work.md` D5。
 
+## 2026-10-14（S11）na 座標被壓成 0 → 價格軸塌到 0（使用者回報的 K 棒壓扁）
+
+* 症狀：`/vela` 5 分 K，捲到 10/12 19:00 附近**往左**捲，價格軸由 48250–49500 塌成 0–48500，K 棒壓扁。
+* 根因（兩條證據）：(1) Vela `computePaneScale`（`vela-src/src/renderers/native/core/autoscale.ts`）把可見範圍內每個
+  drawing 的價格折進價格軸，只排除 `null`/`NaN`、**不排除 0**；(2) Pine 繪圖座標為 `na` 時，`draw.ts` 的
+  `numArg(...,0)`／`asNum` 把它壓成 0。使用者自己的腳本 見高K4.55 之 golden fixture 就有 **11 條** na 座標被記成 0
+  （`drawings[2]` 的 x1/x2/y1/y2 全 0），任一被捲進可見範圍即觸發。
+* 修法（surgical，不碰 `@luxalgo/vela`／`vela-src`）：
+  - `src/pine/builtins/util.ts`：`naCoordArg`（繪圖座標專用：`na`＝不畫、**缺參數也＝na**、只認 `int/float`）、
+    `asNumOrNa`（多參數 setter 用的位置值版本）；兩者都保留 `undefined` 而不壓 0。
+  - `src/pine/builtins/draw.ts`：`line.new`／`label.new`／`box.new` 座標改用 `naCoordArg`；`PROP_TABLES` 座標欄位新增
+    `'coord'` 型別（表驅動 `set_x1/set_y1/set_x/set_y/set_left/top/right/bottom` 因此保留 na；`width`／`size` 等 `num` 仍壓 0）；
+    手寫 `line/label/box.set_xloc` 改 `asNumOrNa`；`line.get_price` 任一座標或 barIndex 為 na 時回 `na`（原本 `Number()||0`）。
+  - `src/pine/engine.ts`：`yloc === 'price'` 且價格座標為 na 的 label/marker 直接 `continue`（不再 `?? 0`）。
+  - `src/services/shioaji/candles.ts`：kbars 畸形列（OHLC 非有限、`datetime` 無法解析）**丟棄**，不再補 0 價 K 棒；volume 非有限 → 0。
+* 驗證：`npx tsc --noEmit` **0**；`src/pine` **62 檔 / 953 passed / 1 skipped**；`golden.test.ts` **15 檔全綠**
+  （見高K4.55 13.3s）；`src/services` 綠。實機（headless Chromium，:5173/vela）：na 座標探針腳本（每 25 bar 一組
+  `line.new(...,na)`＋`label.new(...,na)`）模型 **0 物件**；500 根 5 分 K（起 2026-10-12 18:55 台北＝回報的 19:00 區間）
+  逐窗掃描 pane scale.min ∈ **48137–48833**，8/8 窗無一塌到 0；**正對照**：價格 100 的正常 label 仍被折入
+  （min −6023）→ 折入機制仍在，證明上面是「不再產生 0」而非「折入失效」。
+  golden `見高K4.55.golden.json` 重生：11 條路徑 `0 → null`，其餘 0 差異（`max|Δ|=0`）。
+* P8 三視角 review（正確性／安全／可維護性各 1 代理）＋ 2 輪影響面審計：3 個獨立來源都指出
+  `label/box.set_xloc` 與「必填座標漏參數」兩個**同類**破口 → 本輪一併修掉。受管 JEV（`taskwf-review`）
+  判 F1 為 pre-existing 另案（fix now 0.0 / 另案記錄 1.0）。
+* 殘留（另案記錄於 `docs/2026-10-13-remaining-work.md` D10）：非 overlay 副窗的
+  `plotshape(location.abovebar/belowbar)` 會把該 pane 的蠟燭 high/low 折進**副窗自己的**軸（pre-existing；
+  使用者的腳本用 `absolute`／`top`／`bottom` 不會踩到）；`plotshape/plotchar` 從未寫 `opts.textcolor`；
+  `MarkerPoint.price` 不在 Vela 契約內。
+* 已知限制：使用者那支重型腳本（95 KB、`request.security` MTF）在 app 主執行緒直呼 `chart.runIndicator` 會凍結頁面
+  （VelaPage 的 `parked-pine` 機制就是為此存在），因此實機 E2E 用小型探針腳本做**機制**驗證；該腳本自身的模型正確性
+  由 `golden.test.ts`（同一支腳本、500 bar、in-process）覆蓋。
+
+## 2026-10-14（S12）開啟：指標載入效能（Pine 直譯器）＋ TV 對齊工作流
+
+* 需求：指標載入慢，成本主要在 Pine 直譯器；要求與 TradingView 對齊，並用 REA 擷取 TV 端實測。
+* 流程：task-workflow P0–P9（P7 QA ＋ P8 三視角 review）＋ `code-review` skill 四軸 diff review；
+  JEV 一律走受管管道（gate `taskwf-verify` / `taskwf-blocker` / `taskwf-accept` / `taskwf-review`）。
+* P0/P1 定稿 → `docs/2026-10-14-pine-perf-align.md`（驗收 A1–A8 每條標 code/jev、非目標、N1–N6 依賴圖）。
+* P2 三軸探索進行中：phase 級 baseline harness（見高K4.55／MACD701_v72／TRIS390／final × 500、1000 根真實 5m）
+  ＋ 兩套圖譜熱點盤點；結論與候選熱點記於 `docs/2026-10-13-remaining-work.md` §G。
+* Review 固定點：`b9fcd81`（`git stash create` 快照 ＝ 優化前完整工作樹，含 S11 未提交改動）
+  → P8 用 `git diff b9fcd81` 只審本次效能改動。Rollback：`git checkout b9fcd81 -- src/pine`。
+* 卡點（外部，唯一需要使用者配合）：TV 端 CDP。Chrome 155 的預設 profile 不給開 CDP，需獨立 profile：
+  `--remote-debugging-port=9222 --user-data-dir="C:\Users\bear9\tv-cdp"`，登入後保持圖表分頁開著
+  → REA `list_browser_targets` / `inspect_web_page` / `export_web_scripts` / `recover_javascript_sources` /
+  `observe_web_execution`，並回填 A6 的 TV per-bar 對齊門檻。
+* 更正前的記載：PROGRESS 2026-10-05 進度列「`contracts.ts:57` ＋ `series.ts:53,88` unshift O(n²) 待優化」——
+  經讀碼確認**主路徑不成立**（指標載入走 `BarSeries` ring＋head，`Series.unshift` 只在 pinets shim／測試觸發）。
+
+### 2026-10-14（S12）收尾：量測、JEV、TV 通道與環境教訓
+
+* **軸一 baseline（`scratch/perf/phase-baseline.md`）**：run（N=500/1000）＝見高K4.55 15,866／32,905 ms、
+  TRIS390 6,070／13,066 ms、MACD701_v72 993／1,882 ms、final 13.2／22.2 ms；**成長倍率 1.68–2.15×＝線性**（無 O(n²) 訊號）；
+  parse 最大僅 38 ms（95 KB）→ H10 排除。缺口：`model`/`total` 欄回 `error`（新 harness 補）。
+* **受管 JEV 判定**：`taskwf-verify` 六條宣稱 0.79–0.94 全過；`taskwf-blocker` 判「TV 對齊延後」與「舊 harness 缺欄」
+  皆為 `risk`（信心 1.00）→ 優化主線可動工，A6 標未量測。
+* **TV 通道已建立**：Chrome 155 @ `127.0.0.1:9222`（獨立 profile `C:\Users\bear9\tv-cdp`，
+  啟動檔 `C:\Users\bear9\tv-cdp-launch.cmd`）；REA `list_browser_targets`／`inspect_web_page` 均成功
+  （target `02A2B9BFE1A8E48505FAD38F1AB14867`，`tw.tradingview.com/chart/l14iDw0v/`）。
+* **TV 實測（272 s 視窗）**：`ScriptDuration` 只 +24 ms、`TaskDuration` +32.6 s、DOM 5,684 不變、無 study worker、
+  CPU profile 93% idle、console 無 Pine 錯誤 → **TV 端停滯不是客戶端 per-bar 計算**（消費者嘗試掛 95 KB 指標時）。
+* **環境教訓（重要）**：當時 CPU **100%**，元凶是我方背景：`bun`（agent host 3,978 s／2.2 GB）＋ 3 個並行子代理
+  ＋ ai-memory；使用者回報「TV 以前很快、現在很慢」即由此而來。→ **凡要量 TV 或本機效能，必須先靜機**；
+  收工已清掉所有 failed/exited 服務（shioaji-prod/sim、四支 vite、omp.browser.headed、chrome-cdp、vela-cdp）。
+* 明日續作順序見 `docs/2026-10-14-pine-perf-align.md`〈TV 實測〉末段（開啟動檔 → 確認靜機 → 分三步掛指標 →
+  量測 → 先用新 harness 補本地 baseline 再量 TV）。
+
+### 2026-10-14（S12）尾聲：TV 靜態逆向結論與 harness 交付
+
+* **TV 靜態逆向（`scratch/tv-recon/`，98 page bundle 5.11 MiB＋webpack 展開的 1,492 chunk 89.4 MB 全抓）**：
+  **TradingView 客戶端沒有 Pine runtime** —— `pinejs`/`PineJS`/wasm/bytecode 0 命中（我另用 `grep -rl` 獨立複核）；
+  client 只送 `create_study`（`46286:20482`），伺服器回 `study_loading` → `du`（已算好的值），
+  編譯走 `translate_source`（`74429:38754`）。`request.security`／`ta.*` 只出現在**參考文件** bundle。
+  客戶端容器 `PlotList`（`48903:3586`，陣列＋可移動視窗）是唯一可對照的資料結構。
+* **⇒ 原驗收 A6「per-bar ≤ TV × k」在客戶端不可量測**（TV 的每 bar 成本在他們的伺服器）。已提三個替代版本
+  （A6'：客戶端增量成本對齊，建議；A6''：WS 往返延遲只當參考；A6'''：取消），**待使用者裁決後才改 plan doc**。
+  可量測且真正對應差距的對齊點是**架構層**：TV「算一次＋只串流增量」 vs 我們 `incRun` **不適用含 MTF／strategy 的腳本**
+  （`interpreter.ts:3078-3082`）→ 那幾支每次全量重算（H1）。
+* **harness 交付（P6）**：`scripts/perf/pine-bench.mjs`（25 KB）＋ `lib/**`＋README（20 KB）＋固化 fixture
+  ＋ `bench/pine/*.json`。H1/H3/H5 過；**H2 未過（同設定兩跑 total 差 71.9%／重腳本 19.2%）**，但 `model` digest 與所有
+  counters 逐位元一致 → 內容確定、抖動來自環境（當時 15 個 `node.exe`）→ **H2 需靜機重測**。
+  `modelCache*` 在 Node 下為 no-op → `CACHE_N_A` 正確。
+* **新發現（可能阻擋 A5）**：`high452_phase3.pine:74:17` `input(close,…)` 被 `assertScript` 的 `[input-const]` 擋下
+  → `prepare` 拋 `ParseError`；該檔為 6/10 舊檔，待確認 app 內實際版本是否同樣被擋（若是則為獨立缺陷）。
+
+### 2026-10-14（S12）收工：乾淨 baseline、門檻定案、舊檔釐清
+
+* **舊檔問題已釐清（非缺陷）**：從 Vela workspace 備份 blob（`%TEMP%\vela-ws-backup-20261014.json`）抽出**真實 app 腳本**
+  → `scratch/perf/app-scripts/script-a1dcdea6-95114.pine`（95,114 chars、sha1 前綴 `a1dcdea6`、v6、**無** `input(close,…)`）
+  可正常 prepare 並跑完整模型；磁碟上的 `high452_phase3.pine`（`84b5bf44`、91,271 chars、6/10）才是被 gate 擋的過期檔。
+  → **後續量測一律用抽出的 app 版本**。
+* **乾淨 baseline（`bench/pine/s12-clean1.json`，500 根，`app` 路徑，repeat 3）**：
+  app K55 total **12,946.9 ms（25.9 ms/bar）**、TRIS390 **6,923.8（13.8）**、MACD701_v72 **1,501.9（3.0）**、final 27.3；
+  counters：K55 `evalNodes 2,867,049`（5,734/bar）、`setAt 395,385`（791/bar）、`ensureBar 506,940`、`callHistWrites 10,643`；
+  TRIS390 `setAt 413,282`（827/bar）、`mtf evals 8,458／hits 12,444`。
+  H3（app vs direct）K55 6.9%、TRIS390 2.3% PASS；**model digest 四支 app/direct 全一致**。
+* **A3/A4 門檻定案**：A3 = 各腳本 total 相對上列 baseline 降幅 ≥50%（K55 ≤6,470 ms／≤12.9 ms/bar、TRIS390 ≤3,460、
+  MACD701 ≤750）；A4 = (1000/500) 倍率 ≤2.2 且不得上升。A5 樣本改為真實 app 版；A6 待裁決。
+* **P5 REAL PLAN v1 定稿**（切法依量測排序）：S1 `incRun` 支援 MTF／strategy（唯一真正對齊 TV 架構者，單獨一輪）、
+  S2 `mtf.evalAt` 快取鍵改 callsite key、S3 `evalArg`/callHist 減量、S4 `ta.*` 餘留 O(L)、S5 `assembleRunResult`、S6 parse（最後做）。
+
+### 2026-10-15（S13）P6 Round-1／Round-2 落地：K55 −57.2%，A3 對 K55 達標
+
+* **Round-1（4 片，各自單檔）**：S2 `mtf.ts` producer 不變值快取（`mtf evals −65.5%`，並**否證**原 H2「caller Scope 身分」假設）；
+  S3 `interpreter.ts` 熱點不是 callHist 而是**每 node 讀 debugFlag**（403,439 → 300 次；profile self **6.7%**）；
+  S4 `ta.ts` 身分改走 `readTarget()` ＋ `ta.vwma` 滾動窗（`ta.*` gets/bar **1,018.7 → 371.8**）；
+  S7 `series.ts` `freezeReader` 接受 live-anchor 虛擬 series（移除 `math.sum(ta.tr,L)` 的**二次項**，46,210 次逐值比對 0 mismatch）。
+* **Round-2（3 片）**：S8＋S10 `interpreter.ts`（派生 series 身分穩定 ＋ CowSeries 重用；
+  K55 `ta.highest/lowest` **51.6 → 3.1 gets/bar**）；S9 `ta.ts` `winAgg` per-VS 值快取（varlen cycle **−91.7%**）；
+  S11 `series.ts` 新增 `CellSeries` ＋ **Parent 套 5 行整合**（K55 `setAt 395,385 → 356,262`）。
+  註：S8 與 `ta.ts` 的 `constSeriesNum` **兩 token 互為前提**（單套 S8 會讓 `見高K4.55` 7 根 plotshape 變 na）→ 已一併落地並留 A/B 證據。
+* **A3（500 根，`app` 路徑）**：K55 **12,946.9 → 5,538.8 ms（−57.2%，達標）**、TRIS390 6,923.8 → **3,765.4（−45.6%，差 8.8%）**、
+  MACD701_v72 1,501.9 → **931.1（−38.0%，差 19.4%）**、final（小數值噪音）。
+* **語意**：harness `checks.modelsMatchAcrossPaths` 的 model 內容 digest **四支全部與 baseline 逐字相同**；
+  golden **14 passed / 0 差異**；全套 **62 檔 / 954 passed / 1 skipped**；`tsc --noEmit` 0。
+* **重複性仍 FAIL**（`totalMaxAbsPct 59.22%`，機器從未靜機）→ A3 最終數字待靜機複測。
+* Round-3 已開：R3A `mtf.ts` 單位成本／R3B `interpreter.ts` 每 node 成本／R3C `ta.ts` 餘留 O(L)。
+* 檔案：`docs/2026-10-14-pine-perf-align.md`（Round-1／2 總結、A3 判定、Round-3 候選）；`bench/pine/s12-{clean1,round1,round2}.json`。
+
+### 2026-10-15（S13）P6 Round-3 落地：K55 −64.4%；A3 對兩支 MTF 腳本遇結構天花板
+
+* **R3A `mtf.ts`**（5 處：`tfToMs`/`tfParts` 記憶化、`tfOwned`+`tfDirty` 併為單一 WeakSet、`evalAt` 路由判定記憶化、`emit*` 閉包提升、`ensureTfFrame` 守衛內聯）：
+  每次 `evalAt` 的 gate 開銷 **1,662 ns/call**（`WeakSet.add` 375–625 ns vs `has` ~25 ns）。
+  **關鍵事實**：`evals` 幾乎與 chart 根數無關（100 根 2,922 vs 500 根 2,903）→ 成本由 **requested series 長度**驅動；
+  mtf 在 500 根 app 路徑只佔 ~650–700 ms／3,765 ms（≈18%），其中 **~52% 是 `FETCH_WARMUP` 歷史重播**（減掉會改值）
+  ⇒ **mtf 膠水層天花板 ~55–75 ms（1.5–2%）**，補不了 TRIS390 的 305 ms 缺口。
+* **R3B `interpreter.ts`**（6 處：`runOf` last-ctx memo、`udtMethodAt` 兩層 Map、`bindCallArgs` 提升、刪除 write-only `siteStack`、
+  `evalCall` 傳 `run`、`NOT_SECURITY_CALL` 跳過）：決定性單位成本 × 實際次數 ≈ **8.6 ms／100 根 K55（≈0.8%）**（量級誠實地小）；
+  `interpreter.ts` self 56.65% → 51.67%（方向）。
+* **R3C `builtins/ta.ts`**（`winAgg` 來源值環抽成共用 `winRingReader`）：K55 `ta.stoch` 38.1→**6.2**、`ta.highestbars` 36.5→**3.1**、
+  `ta.lowestbars` 25.7→**3.1** gets/bar；`ta.*` 總 245.4→**158.5（−35.4%）**。
+  **否決的捷徑**：直接用 `winAgg` deque index 取極值索引（更 O(1)）因 **NaN 破壞「同值取最新」不變式**而退回（probe 量到 55/60,000 不一致）。
+* **A3（500 根 app）**：K55 **12,946.9 → 4,611.0（−64.4%）**、TRIS390 4,010.3（−42.1%）、MACD701 996.3（−33.7%）、final（噪音）。
+  **model 內容 digest 四支三輪後全部仍與 baseline 逐字相同**（零行為變化）。
+* **變異量化**（同樹連跑兩次、`--repeat 5`）：TRIS390 median 3,120.5 vs 3,416.9（+9.5%）、單次內 min–max ±17%；
+  MACD701 859.7 vs 865.2 → R2→R3 的 +6.5% **落在變異內，不是回歸**；TRIS390 的 A3 門檻（3,460）**在此環境無法穩定判定**。
+* **待裁決**：A3 是否維持「每支 ≥50%」，或改為 K55 ≥50%（已達）＋ TRIS390 ≥40%＋ MACD701 ≥30%＋四支 digest 不變（結構原因已證）。
+
+### 2026-10-15（S13）P8 review → Round-4 修正 → 再審 → P9 交付
+
+* **P8（3 reviewer × 六軸）**：無 P0/P1 正確性缺陷；雙樹差分探針（40+ 形狀）無值差異。
+  4 個 Important：**F1**（身分規則兩套互相抵消,0.92）、**S1**（`wring` 表 Θ(bars²) 記憶體,0.81）、**F2**（跨檔前提未註明,0.87）、**C1**（verdict-3 未先讀快取,0.64）；
+  Minor：C2（vwma 1 ulp）、C3（forming-bar ring latch）、S2（模組級強引用，JEV 0.33 → Parent 判 Minor）、F3/F4/F5。
+  JEV 去重：**F1∩S1 同根因**（0.79）→ 一個修法。
+* **Round-4 修正**：**F1＋S1** 以「取穩定的一端」統一（`series.ts` 新增 `ForwardingSeries.bind?` 契約 ＋ `stableSeries()`，`ta.ts` 5 個身分鍵改走它並加 `WIN_RING_MAX=512`；同時合併重複 hop-walk＝F4）
+  → churn 形狀 ring **120 張/7,260 entries → 2/121**、`gets/bar` **60.5 → 1.01**、240 根維持線性。
+  **C1** 補 per-caller 讀取（**可達性已證**：容器型 tf-invariant 節點 93 evals/0 hits → 23/70）；**S2** RunState 改掛 ctx 的 non-enumerable symbol；**F3** 補反向契約。
+* **再審**：四組修正全部修好、**未發現新缺陷**；`hits` 守恆（93=23+70）。⇒ **P8 Critical/Important 歸零**。
+* **A3 現況（500 根 app）**：K55 **−61.9%**（12,946.9→4,928.6）✅、TRIS390 **−53.0%**（→3,251.6）✅、MACD701 **−42.8%**（→859.2）❌、final 噪音；
+  四支 model 內容 digest 與 baseline **逐字相同**。
+* **A4**：六組 0.91–1.09 → 無超線性 ✅。**JEV `taskwf-accept`：A7 0.80 ✓、A8 0.87 ✓**。
+* **P9 交付**：工具 `scripts/perf/pine-bench.mjs`（＋README/fixtures/lib）、結果 `bench/pine/*.json`（43）、計畫與證據 `docs/2026-10-14-pine-perf-align.md`；
+  清理 TV bundle/chunk 原始下載（91 MB）與所有引擎複本 → `scratch/` 120 MB → **23 MB**（`src/**` 未動）。
+* **未收斂（待使用者裁決）**：A3 的 MACD701（−42.8% vs 50%，其成本仍集中 MTF 每次 eval）、**A5 實機載入未量**、**A6 待裁決**（TV 無客戶端 runtime）、harness H2 需靜機複測。
+* 本輪總 diff：`ta.ts`/`interpreter.ts`/`mtf.ts`/`series.ts` 四檔 **+806/−166**；rollback `git checkout b9fcd81 -- src/pine`。
+
+
+### 2026-10-15（R5）S1 增量支援 strategy/security 落地 ＋ `wvs` 上限
+
+* **S1（`interpreter.ts`＋`mtf.ts`）**：移除 `incEligible` → **全部腳本可走 `incRun` 增量**；`IncCkpt` 納入 `argSites`（reviewer 缺口 1）＋ `stateArrays`（`strategy|orders` 的陣列葉進快照面）。
+  Parity（100 根＋6 tick、逐值含 na、比對 plots/drawings/fills/alerts/logs）：TRIS390（strategy＋29 security）**6/6 相同**、K55 app **6/6 相同**；
+  每 tick **10.9×／26.8×** 快於 cold（`evalNodes` 1/54、`setAt` 1/8~1/23）。`spec.cw` 以「**證明有界**」取代硬上限（每次 checkpoint 清空 ⇒ 長度 ≤ 一根 bar 的 distinct 寫入數）。
+  測試前提依裁定更新：`engine.test.ts` 斷言 `runs 1/2/3` → **1/2/3/4**（收緊，非放寬）。
+* **`wvs` 上限**：`ta.ts` 新增 `WIN_LEN_MAX = 64`（clear-on-full）→ 240 根 growL states **240→64**、`ta.highest` deque **4,483→1,891**；
+  10 個 shape 逐值（含 na）**0 差異**、K55 `gets/bar` 17 列**逐項不變**。
+* **殘留（明列）**：strategy `ctx.state` plains 每 checkpoint 深拷貝 → 成本隨歷史成長、**非 O(1)**（5,000 根未量，本輪最大未量化項）；
+  `cw` 無硬上限；僅驗 100 根＋6 tick；adaptive tick-skip 在非空 tape 實質不可達（`engine.ts` 未動）；同型 `dvs`/`stv` 未收。
+* **A5 實機**：破解 app 的 parked-pine 機制（boot 剝離 → idle 延遲還原）→ 優化後 app 內引擎實跑 **9,919 ms／500 根**（指標 `k55` 確實掛上跑完）。
+  「優化前」對照待 `src/pine` 可動時補（程序見 `scratch/perf/a5-real-app.md`）。
+
+### 2026-10-15（R5-T7）T7 正確性缺陷：修復完成（`series.ts` 快照長度水位）
+
+* **根因（推翻原「繪圖層 rollback 不完整」假說）**：tf-frame `BarSeries` 在**同一次 rollback 被 rewind 兩次**（`restoreCkpt` 的 `seriesSnaps` 先、`restoreSpec` 的 `SpecSnap.snaps` 後）。第一次 `drop>0` 把 `buf` 換成切片；第二次 `drop===0` 走 else 分支，把**別名而未截斷的原陣列**接回 ⇒ 終態 `lastBar=44` 卻 `buf.length=46` ⇒ `rAt`/`atOffset` 位移一格 ⇒ `[1]` 塌成 `[0]` ⇒ `prevWickLine`/`prevBodyBox`（即 `drawings[4]/[5]`，**不是** roll 對）拿到 roll 值。鐵證 `scratch/perf/iso/rewind.json`（`snapLastBar=44, snapBufLen=46, before{bufLen:45}→after{bufLen:46}`）。
+* **修法**：`series.ts` 的 `IncSnap` 新增 `len`（快照當下 `buf.length`）作為水位；`incRewind` 收斂成 `if (this.buf.length !== snap.len) this.buf = snap.buf.slice(0, snap.len);`（別名且長度已對時不重新分配＝維持原效能）。單檔 +13/−6，patch `scratch/perf/iso/t7-fix-series.diff`。
+* **真樹驗收**：`--bars 500 --ticks 5` **0 mismatch**；`npx vitest run src/pine` **954 passed｜1 skipped（62 檔）**；`tsc --noEmit` 0；四支 digest `ze7byn`/`kb0glc`/`1580h2`/`p4gddl` **逐字不變**。另：100／400 根不退步、修前對照每 tick 都紅。
+* **順帶更正**：400 vs 500 是 tape 相位（`N ≡ 500 mod 12`）而非閾值；`見高K4.55.golden.json` 的 `0→null` 是 na 座標修復的既定結果、working copy 正確。
+* 詳見 `docs/2026-10-15-r5-T7-rootcause.md`。
+
+### 2026-10-15（取證／復原線）六探子結論＋四處更正
+
+* **樹曾被回退**：窗口 B 的 T7 程序在 18:00–18:06 把 `src/pine` 清成基線 `b9fcd81`（R5 成果未提交）。19:37 以 runner pre-flight 快照還原（`%TEMP%\r5-snapshot-B-20261015-1800`，逐檔 md5 相同），並 `git reset -q -- src/pine` 清掉被 checkout 汙染的 index（否則 `git checkout -- src/pine` 會再清一次）。還原後 `npx vitest run src/pine` **954 passed | 1 skipped**、`tsc --noEmit` **0**。
+* **六個唯讀探子**對凍結樹取證，四處更正既有文件（細節：`docs/2026-10-15-r5-forensics-summary.md`）：
+  1. **T7 根因＝(d) 上游雙 rewind**：`interpreter.ts:3546` 先、`mtf.ts:2396→2346/2354` 後，病灶 `series.ts:114-128` ⇒ tf-frame 序列的 `[1]` 在 forming bar 被讀成當前值。原 (a)(b)(c) 三假說（殘留物件／props 未還原／handle 失效）**全被推翻**；`id` 不是身分標記（`context.ts:264-270 incRestore` 會重編號）。活化律＝forming bar 是新框首根（`slotInFrame==0`）；最小分歧根數 **150、非單調**。
+  2. **T8 主導項＝每根 `simAt` miss 的 ramp**：`replaySteps` ＝ **B(B−1)/2**（4,950／19,900／124,750）；epoch cache 丟棄貢獻 **0 步**，不是主因（與 audit 更正段指向不同）。且 `simulate` **非純函式**（改寫共享 orders 的 `o.seen` 與 OCA 兄弟狀態，`strategy.ts:447/452/480`）⇒ 真修法需「自持游標的可快照 stepper」。
+  3. **T11 前提更正**：「per-caller 命中＝0」只對 MACD701／K55／final 成立；**TRIS390 殘差 7481@500／1692@100 且跨樹逐位元相同**。寫鍵＝UDF 內每次 invocation 新配的 `callScope`（`interpreter.ts:1733`）⇒ 寫了永遠讀不回；穩定身分已存在＝`spec.callerKey`（`mtf.ts:2040`）。`invHits` 必須用**顯式計數器**（`hits−agHits` 是反推值，不可當命中證據）。
+  4. **T12 五項全在**：`cwPeak` 恆 0、`spec.cw` 冷載入 Θ(bars)（≈2 pushes/bar）、C2 只記錄、C3 1 行（逐值 diff 分辨不出，需 probe）、`bind` 契約待 `series.ts` owner。
+* **新儀器（零引擎改動）**：per-spec evals/hits（`scratch/perf/mtf-perspec-optimized.{mjs,json}`；TRIS390 100 根 total 626／3265／130，基線 1701／2190／1007）；T7 二分/位移探針；T8 歸因探針；T9 distinct-len（真實腳本每群 ≤9；`growL-*` 無界形 240）。
+* **T10 前提更正**：「adaptive tick-skip 是死碼」**不成立**——`src/pine/__tests__/engine.test.ts:309-366` 明載豁免設計並有測試 `heavy run → forming-bar ticks keep running (no skip)`（舊稱，2026-10-16 更正：`heavy run + live session → forming-bar ticks keep running (skip exempted)`）⇒ **行為不改，只更正文件**。
+* **交付**：`docs/2026-10-15-r5-fix-plan.md`（P1–P10 修復清單＋所有權矩陣）、`r5-patch-design-notes.md`（T8a 錨點／非純函式證據／T6② 設計與不變式／T9 覆蓋缺口）、`r5-forensics-summary.md`；patch `scratch/perf/patches/r5-t6tw-t12-cwpeak-trim.patch`（T6②＋T12#1/#2，`git apply --check` 乾淨）＋`apply-all.sh`（含閘門）；回退來源 `scratch/perf/r5-pine-optimized-b9/pine`。
+* **附註**：`docs/2026-10-15-r5-autorun-status.json` 自 13:45 起因多餘 `}` 無法 `JSON.parse`（`windows.B.started` 因此為 null），20:21 已修復並加「開工前必讀」。
+
+### 2026-10-15（R5 收尾，窗口 D）計畫 v4.2 執行完畢
+
+* **裁決**：D1＝C（T11 不做，`mtf.ts` 未動）／D2＝A（保留 `spec.cw ??= []`，只加 `resetPeak()`＋`trimCw()`）／D3＝B（實作二層有界表）。
+* **T12#4**：`ta.ts:412` 守衛逐字在；新 `wring_latch.test.ts`，**判別力已驗**（還原守衛 ⇒ FAIL `expected 525, received 1050`）。**T10**：`engine.ts` 與 R5 基線 **IDENTICAL**，只改 2 處過時措辭（`interpreter.ts` 的 `ineligible scripts` —— 「Eligibility: EVERY script」已不存在；`engine.ts` 的 `ineligible/absent` → `no resume path`）。
+* **T9**：新 `ta_state_bound.test.ts`（**修前 FAIL：dmi +2160／kc +1320 → 修後 PASS**）；新增 `bound2`／`memoVs`／`stateVs`／`emaSelf`／`rmaStep`／`rmaVsBound`／`emaVsBound`，**12 站點**（原記 13，QA ROUND 1 更正：dmi 7 ＋ kc 5）——計畫表只列 6，漏了 dmi 4 條 `rmaVs` 鏈（落 `stv`，佔 dmi 成長 2/3）。
+* **T6②**：`MtfHooks.resetPeak`／`trimCw` ＋ 4 接線。探針：`cwPushes` 逐項不變；`cwPeak` **298/1200 → 3/3**（TRIS390）、**0/3495 → 10/10**（MACD701）⇒ 由 Θ(bars) 變常數。
+* **閘門**：`npx vitest run src/pine` **64 檔／958 passed ｜ 1 skipped**（基線 954，＋4 支新測試）；`tsc` rc=0；golden **14 passed** 無差異；四支 digest `ze7byn`／`kb0glc`／`1580h2`／`p4gddl` **逐字相同**；`s1-inc-probe` **`PARITY OK`**；`t7-bisect` 300/400/500 全 `match`。
+* **改動檔**：`mtf.ts`／`interpreter.ts`／`engine.ts`／`builtins/ta.ts`（`series.ts` 不變）；**未 commit**（依 `AGENTS.md` 的 commit discipline，待人工覆核）。
+* **未做**：T3／T4（負載 59–79）、T8a、T6①、T6③（計畫列 Out of scope）；T11 的效能病態仍在（TRIS390 殘差 7481@500）。詳見 `docs/2026-10-15-r5-autorun-report.md`〈R5 收尾報告〉。
+
+### 2026-10-17（續作）A1′ 落地完成＋step 5＋Stage 3 可行性
+
+* **背景**：原 `A1PrimeLand` 子代理於 07:10 機器意外關機時中斷（session `01a14396`）。續作先核對落地狀態，再收尾。
+* **核對**：`diff -rq src %TEMP%/wrapchk/shadow/src` 只 3 筆差異（`math.ts` 為較新的 `tonumber` 熱修、`str.ts` 為本次 step 5、測試檔只在 repo）⇒ A1′ 的 hunk 與 shadow 相同、無夾帶。機制＝`registry.ts` 的 `SCALAR_BUILTINS`（函式物件為 key）＋`interpreter.ts:1551` `callBuiltin` 單一漏斗；宣告表在 `builtins/scalarDeclPatch.ts`（57 builtins）。
+* **step 5**：`str.ts:183` `pineFormat.lookup` 加 `unwrapped()`（修前 `expected '0.25' to be '25.00%'` → 修後綠）；`draw.ts:641` **判定無判別力故不改**（四條 `coerce` 全走 `asStr`/`asColor`，兩者本就 `series → cur()`）。測試檔 `wrap_eval_a1prime.test.ts` 14 passed。
+* **閘門（全數重跑）**：`tsc --noEmit` rc=0；`npx vitest run src/pine` **69 檔／990 passed｜1 skipped**；四支 digest `1e63vl8`／`kb0glc`／`1580h2`／`p4gddl` **逐字不變**（app=direct 全 PASS）；golden **14 passed｜1 skipped**（未 re-baseline）；`s1-inc-probe` **PARITY OK**。
+* **覆蓋率實測**（新探針 `scratch/perf/wrapA-coverage-audit.mts`，引擎路徑 A/B）：`array.variance/stdev/standardize/covariance`、`percentile_linear_interpolation/nearest_rank`、`fill.length` 皆由宣告表覆蓋（＝tb 計畫 §9.3 的 6 站）；**位置引數**在 11 個 builtin（`plot`/`plotshape`/`plotchar`/`plotbar`/`plotcandle`/`hline`/`input.*` 家族）未宣告 ⇒ 缺口仍在，試補 `idx` 已證可關閉。
+* **Stage 3 試作（已還原）**：移除 6 處逐站補丁（`array.ts:73/236/248/306/448`＋`math.ts:304`）後，4 支相關測試檔 20 passed、全套 **991 passed｜1 skipped**、四支 digest 逐字不變 ⇒ A1′ 已取代這些補丁。唯一例外：`array.new` 的 `?? NA` 必須保留（漏斗只 unwrap，不補 NA）。
+* 詳見 `docs/superpowers/plans/2026-10-17-wrapeval-option-a.md` §11。
+
+### 2026-10-17（續作第二批）把 §11.4 的宣告面缺口與 2 個動態 key 讀取點全部修掉
+
+* **判別式**（新探針 `scratch/perf/wrapA-na-ident-audit.mts`，引擎路徑）：同一位置傳**字面 `na`** vs **綁到 na 的 ident**；不一致即缺陷。修前 **12/14 缺陷 → 修後 0/14**。
+* **修的站點**：`plot` 位置 title/linewidth/style/display、`hline` linestyle/linewidth、`plotbar`/`plotcandle` title/display、`input.*` 位置 minval/maxval/step/options/group/inline/tooltip（以上補宣告 `idx`）；`draw.ts:204` `coerceIn`（`set_<prop>` 的 str prop）與 `strategy.ts:1104` `strOf`（14 個呼叫點）改就地 `unwrapped()`。
+* **站點數對帳**：`WrapAExternal.ClassASweep.md` 逐列＝**59 列／8 檔**（str 22、plot 12、array 9、input 7、math 5、color 2、strategy 1、draw 1）；§9.1 的「74 站」為無清單可複現的估算，引用改用 59。
+* **靜態收斂稽核**：全 `builtins/*` 重掃 `kind ===`／`switch(.kind)`，剩餘守衛皆在已 unwrap 的區域（`core.ts unser`、`log.ts cur`、`draw.ts` polyline 的 `unwrapped`、`array.ts valueEq/cmp` 元素、`session.ts ctx.syminfo`）⇒ 本類無殘留候選。
+* **閘門**：`tsc` rc=0；`npx vitest run src/pine` **70 檔／1000 passed｜1 skipped**；四支 digest `1e63vl8`／`kb0glc`／`1580h2`／`p4gddl` **逐字不變**；golden **14 passed｜1 skipped**；`s1-inc-probe` **PARITY OK**。
+* **回歸釘**：新檔 `src/pine/__tests__/scalar_arg_na_ident.test.ts`（9 `it`）。
+* 詳見同計畫書 §11.8。
+
+### 2026-10-17（續作第三批）reviewer 回修 F1／F2＋Stage 3 落地
+
+* **Stage 3 已執行並通過閘門**：回退 6 處逐站補丁（`array.ts:74/237/249/306/447`、`math.ts:302`），保留 `array.new` 的 `?? NA`、`math.ts` 移除已無用的 `unwrapped` import。`tsc` rc=0；`npx vitest run src/pine` **70 檔／1000 passed｜1 skipped**；四支 digest `1e63vl8`／`kb0glc`／`1580h2`／`p4gddl` **逐字不變**；golden **14 passed｜1 skipped**；`s1-inc-probe` **PARITY OK**。
+* **獨立複核（reviewer 子代理）**：14/14 判別式一致、11 條新 `idx` 與 `bindArgs` 順序**零錯位**（另寫 Part B 探針逐一塞真值驗落點）、`coerceIn` 的 `coord` na 語意未變、`str.ts:183` 無副作用、57 條宣告全數命中。**發現 F1（Important）**：`input.bool/color/timeframe/session/symbol/text_area/time/source` 與裸 `input()` 共 9 個註冊同樣走 `scalarInput → recordAndOverride`，未宣告 ⇒ 位置路徑 11/59、具名路徑 2/18 仍 DIFFER。**F2（Minor）**：`plotchar` 的 `display` 宣告是死條目。
+* **回修**：補 9 條宣告（宣告面 57 → **65**）、移除 `plotchar` 死條目、回歸測試 9 → **11** `it`。以 reviewer 自己的探針複驗：Part A **0/59**、具名 **0/18**、followup 煙霧測試正常（`input.source` 的 `defval` 仍 `"close"`）。
+* 詳見同計畫書 §11.8／§11.9。
+
+### 2026-10-17 T3／T4 靜機量測完成（R5 遺留的效能交付）
+
+* **前置**：全部工作停手後 `quiet-gate` 取得 **PASS**（`samples=[14.5, 23.4, 13.3]%`，門檻 25%；三服務埠全 down）。先前 08:0x 一次是 `NOISY`（31.9／46.6／31.7%），干擾來自本機自己的 node 程序。
+* **T3（A3，500 根 app、repeat 5 median，對 baseline `b9fcd81`）**：K55 **4,382.5（−66.1%）** ≥50% ✅／TRIS390 **3,362.1（−51.4%）** ≥40% ✅／MACD701_v72 **884.3（−41.1%）** ≥30% ✅。硬條件：四支 digest app=direct 逐字相同（`50rj53`／`3huclf`／`18qepy0`／`1kzvcjg`）、golden 14 passed｜1 skipped 零差異 ✅。
+* **T4（A6）**：TRIS390 live tick median **79.2 ms**、cold/live **34.1×**；K55 **92.3 ms**、**51.4×** ⇒ 皆「≤100 ms 且增量 ≤ cold÷10」，兩者 `PARITY OK`。
+* **殘項**：T3 的 **A4 成長倍率未量**（pine-bench 的 `growth` 為空；需另跑成長探針）。詳見 `docs/2026-10-15-r5-fix-plan.md`〈量測結果（2026-10-17）〉。
+* **G6 決定不跑**：效果量 ≈0 < 噪音底（離散 7–35%；2 次／臂曾出現 −29% 假效果）⇒ 記「無可量測差異」，協定留在計畫書 §11.6。
+
+### 2026-10-17 T8a（D1）查證：stepper 早已落地，量測確認 O(B)
+
+* **查證發現**：`simulate` 的續跑 stepper **已由 R5 線實作**（`docs/2026-10-15-t8-stepper-dossier.md` 寫於實作之前）——`SimRun`（`strategy.ts:322-341`）＋ `OrderCursor`（`:299-317`，刻意與 `StratOrder` 分離 ⇒ 無共用 scratch 危害）＋ `simulateRun(ctx, orders, cfg, uptoBar, prev?)`（`:349`）＋ `:522` 的 future-order guard 已修（`break` 而非標記 seen）＋ `simAt` 以 `cache.run` 續跑（`:1046-1058`）。⇒ 計畫 §1 的取捨已固化為「選項 ②」，無需再決策。
+* **驗收量測**（探針 `scratch/perf/t8-replay-attrib.mjs`，產物 `scratch/perf/t8-replay-attrib-postfix.json`）：`replayMs` **793.09→49.67／3,321.78→165.90／23,422.09→667.05 ms**（bars 100/200/500；−93.7%／−95.0%／−97.2%）；每次 replay 中位 **0.26–0.32 ms**、p95 ≤0.68 ms（**與 B 無關**）、max 8.2/18.4/47.1 ms（每次只少數幾趟＝每 epoch 首趟與失效後完整重放）；`epochRebuilds` 4/8/20 → **1**。⇒ 總工作量＝一趟完整＋(B−1) 次單根推進＝**O(B)**（舊制 4,950／19,900／124,750）。
+* **方法註記**：本輪為探針新增 `advancedSteps`，但它在 B 上恆等於 B、**只是下界、不具判別力**；判別力來自每趟 ms 分布（若仍從 0 重放，500 根中位會是 ~47 ms，實測 0.263 ms）。
+* **D1 未改任何 `src/`**（只動 `scratch/perf/`），閘門沿用 reviewer 回修後的結果。
+* **新殘項 R2（不在 P2 範圍）**：`strategyEquity.ts` 的 `equityAt` 仍對每個過去 bar 從 0 重放 ⇒ 讀 `strategy.max_drawdown`／`max_runup` 的腳本有超二次項——實測 100 根 21.51 vs **798.21 ms**、500 根 148.43 vs **108,204.61 ms**（5× bars ⇒ 135.6×）。修法＝T8a 計畫 §1 的選項 ①。
+* 詳見 `docs/superpowers/plans/2026-10-17-t8a-snapshot-stepper.md` §9。
+
+### 2026-10-17 T8b（P3，記憶體）查證：已完成
+
+* 修法＝`IncCkpt.seriesCount`（`interpreter.ts:3290` 的註解即描述此病）＋ `incRestoreCkpt`（`:3609-3613`）還原時把 `s.seriesSet` 裁回該計數，刪掉「被丟棄的 forming-bar eval 期間誕生」的序列。
+* **實測**（新探針 `scratch/perf/t8b-series-growth.mjs`，現行 API `incRunStart`／`incAdvance`，100 根 + 6 次 forming tick）：build 後 `seriesSet = 12`，**tick 1..6 全部 = 12（Δ = 0）** ⇒ 每 tick 成長 **0**（原為 +150@B=100／+201@B=500）。驗收達成。
+* 舊探針 `t8-series-growth2.mjs` 已失效（import 的 `evalOneBar` 不再匯出）。
+* 另：`D2 `T6①`` 經查證**已結案不做**（`2026-10-16-t6a-chart-tf-security-fastpath.md` 附錄 B.6 定案：前提「tf 幀是圖表 tape 的複製品」已否證，快路徑在驗收配置下零收益，已完整回退、patch 另存）；`D4 T11` 亦已由使用者裁定不做；`D5 T12 剩項` 三項皆已在樹上（`siteAnchor` 契約 `interpreter.ts:416`／`series.ts:600`、T12#4 ring latch、`resetPeak`/`trimCw`）。
+* **D3 T6③（P7）查證**：實作在樹上（`EMPTY_NAMED`：`builtins/util.ts:193` 定義／`:215` 早退、`interpreter.ts:1401/1464/1527/1558` 使用）。驗收以**計數器對帳**通過——MACD701_v72 @100（app）：`evalNodeCounts.total` **32,742 → 32,742**、`seriesWrites.setAt` **17,274 → 17,274**、`mtf.evals` **4,509 → 4,509**（基線取自 `docs/2026-10-15-t6-three-dossier.md:90`；實測資料 `bench/pine/pine-bench-20261017-082112.json`）⇒ 三者逐位元不變，且該量測落在 A1′／第二批／F1 回修／Stage 3 **之後**，順帶證明那幾批未動到這些計數器。
+
+### 2026-10-17 P8 Code Review（R1→R2 回修、R3 再審）
+
+* **R1（三視角）**：`0 Critical`；3 條 Important（受管 JEV `taskwf-review` 分級）＋ 7 Minor ⇒ 回修 **F-A**（宣告表漏 `input.string` 2/3/4、`input.price` 5）、**F-B**（`registerBuiltin` 死參數 `scalar`）、**F-C**（宣告面零守門）＋回歸：`tsc` rc=0、`vitest run src/pine` 1005 passed｜1 skipped、四支 digest 逐字不變、golden 14｜1、`PARITY OK`。
+* **R2（正確性 `RevClose`、新面 `RevNew`）**：`0 Critical`；Important 3（其中兩條同根因）、Minor 2。
+  * **R2-I1 混用具名＋位置時解包錯位**（`ScalarSpec.idx` 語意是 order 槽，但 `callBuiltin` 拿它索引原始位置陣列；`bindArgs` 卻把位置參數填進未被具名佔用的槽）⇒ F-A 的錯分支在該路徑復活：`plot(series = close, na)` 的 title 變 `"NaN"`、連 `fill()` 依賴的 sink 識別鍵都變；探針 **5/5 diverge**。受管 JEV：**Important 0.91**、「是否需契約級修法」noul **0.83（true）**。advisor（`opencode-go/mimo-v2.6-pro`）選 **B**；使用者裁決走 **B 收斂**。
+  * **修法**：`ScalarSpec` 增 `order?` ＋ 新增 `positionalSlots()`（鏡射 `bindArgs` 的具名先佔槽與 `series`→`source` 別名）；`callBuiltin` 無具名時維持 `args[ix]` 快路徑，有具名且帶 `order` 時先換算再解包（順帶修掉「不該解包的槽被錯位壓平」）。**42 條**（idx 非 0 起前綴者全數）補 `order`：19 條重用 `plot.ts`／`input.ts` 常數，23 條字面清單（逐一由 `array.ts`／`math.ts`／`str.ts` 實作讀出）。新守門斷言：非前綴 idx 必須帶 `order`、order 須涵蓋其 idx 與 names。
+  * **R2-I2／I-3（守門）**：`FAMILY_ORDER` 漏 `input.string`／`input.price`（恰是 F-A 主角，it(3) 靜默跳過，JEV Important 0.99）＋ 守門檢不出 under-declaration（JEV Important 0.89）⇒ 補兩鍵＋反向斷言，並新增 `input.*` 七槽完整性斷言、`names` 重複斷言、檔頭改寫成精確覆蓋聲明。
+  * **驗證**：RevClose 混用探針 **0/7 differing**（修前 5/5）；突變自證 `M3`／`M6a` 由綠轉紅、`M4` 仍綠（已明列未覆蓋）；`maint-audit` 167 槽 0／`drift` 0 misalign／`rev-probe` 0/45／`wrapA` 0/14／`wrapB` 0/59／具名 0/18 全不退步；**五閘（11:33–11:41）**`tsc` rc=0、`vitest run src/pine` **1007 passed｜1 skipped**、四支 digest 逐字不變、golden 14｜1、`PARITY OK`。
+  * **留下缺口（記帳）**：`histSpecHas`（`interpreter.ts:1531`）仍以「原始位置＝order 槽」配對 `HistSpec`（與 R2-I1 同形的**既有**問題，需同一套 order 管線）；非 `input.*` 家族的 under-declaration 仍無單測覆蓋。
+* **R3（三視角，tier=heavy）**：`R3-RevOrder`（契約保真；R2-I1 closed）／`R3-RevGuard`（突變證守門；抓到 I1）／`R3-RevSecurity`（信任邊界；抓到 F2）——結果見下一節。
+* **流程註記**：`taskwf_gate.py tier --nodes 6 --files 4` ⇒ **heavy**（P8 三視角並行）；第 2 次回頭重入（R3）前已記 `advisor P8`；子代理命名一律 `R<輪次>-…`（新規則，已寫進 `task-workflow.md` P8 節）。詳細報告：`docs/superpowers/plans/2026-10-17-wrapeval-option-a.md` §11.9／§11.11／§11.12。
+
+### 2026-10-17 P8 Round 3（三視角再審＋兩條 Important 回修）
+
+* **0 Critical、2 Important、5 Minor**（Minor 記帳不修，清單見計畫 §11.13）。
+* **R3-I1（R2 引入）**：`math.round` 走 append 模型（`math.ts:100` `args.concat(namedValues(...))`）而非 `bindArgs`，R2 給它補的 `order` 反而把它推進錯的映射 ⇒ `math.round(number = 2, close)` 的 `args[0]`（實作讀歷史的 `number` 槽）被壓平，`ta.sma` 偏移一根 bar。修法：收回該條 `order`＋守門新增 `APPEND_MODEL` 顯式豁免（附「豁免鍵必須是真條目且仍無 order」反向斷言）。
+* **R3-F2（先於 R2）**：具名解包漏 `series=`→`source` 別名（`bindArgs` 與 `positionalSlots` 都做 canon，唯獨具名迴圈沒做）⇒ `str.contains(series = naIdent,"x")` 得 `false` 而非 `na`；JEV 定級 **Important 0.97**（另兩位評 Minor，以受管 JEV 為準）。修法：具名迴圈加 canon（僅當宣告名為 `source` 且未顯式給）。
+* **驗證**：新探針收進 repo（`scratch/perf/wrapC-mixed-alias-audit.mts`）——`H4 == H5 == H6 == H7`（偏移消失）、`C1 == C2`、`C3 == C4`；`tsc` rc=0；守門 5 passed；探針 6 項不退步；**五閘** `1007 passed｜1 skipped`、四支 digest 逐字不變、golden 14｜1、`PARITY OK`。
+* **三視角獨立結論**：`R3-RevOrder` 23/23 字面 order 與實作一致、19 條常數全查一致、`positionalSlots` ≡ `bindArgs`（3010 組合 0 分歧）、R2-I1 closed；`R3-RevGuard` 新守門三個斷言皆以突變自證會紅，並列出仍漏抓者；`R3-RevSecurity` 跨執行狀態無可達壓平、無新增動態執行／I/O。
+* **新增 Minor 記帳**：`histSpecHas` 裸索引（既有同形）、非 input 家族 under-declaration 無單測、`named[n]` 原型鏈裸讀、`positionalSlots` 成本（最壞 8.44 µs/call）、`liftNums` 既有參數對調語意。
+* **R4 窄幅再審（`R4-RevRound3Fix`）⇒ 0 Critical／0 Important／0 Minor，P8 收斂**：I1 的歷史壓平已修（四種拼法包 `ta.sma` 全 `[na,na,101,102,103,104]`）；豁免守門三種突變都會紅（含「假鍵＋把 order 加回」→ 紅於 stale 斷言）；F2 的 7 個 `str.*` 全受惠且不誤傷 `ta.*`／`nz`；`named` 物件不被共享故 canon 無副作用。
+* **R4 新列殘留風險（皆改前既有）**：① 最重要——`liftNums` 按呼叫順序 append（`math.ts:100`），與 UDF／`bindArgs` 的 named-to-slot 契約語意相反，建議對照 TV 文件定案；② `hasP`（`math.ts:210-212`）漏看經 `number=` 送達的 precision ⇒ 非整數結果被截斷；③ 豁免 stale 斷言對假鍵類會被 unbacked 先擋（fail-safe）；④ `histSpecHas` 孿生缺口。

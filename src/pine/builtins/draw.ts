@@ -11,8 +11,8 @@ import type { Arg, BuiltinCtx, DrawObj, DrawSink, Node, Value } from '../contrac
 import { NA } from '../contracts';
 import { registerBuiltin, registerConstant, registerLazyConstant } from './registry';
 import {
-  RtCtx, bindArgs, bindDeclArgs, truthy, asNum, asStr, asColor, strArg,
-  numArg, colorArg, numVal, boolArg, warnOnce, unwrapped,
+  RtCtx, bindArgs, bindDeclArgs, truthy, asNum, asNumOrNa, asStr, asColor, strArg,
+  numArg, naCoordArg, colorArg, numVal, boolArg, warnOnce, unwrapped,
 } from './util';
 
 // ── Enum constants ──────────────────────────────────────────────────────────
@@ -193,35 +193,48 @@ function asObj(v: Value | undefined): DrawObj | undefined {
   }
 }
 
-type PropType = 'num' | 'str' | 'bool';
+type PropType = 'num' | 'coord' | 'str' | 'bool';
 
-function coerceIn(v: Value | undefined, t: PropType): number | string | boolean {
-  if (v === undefined || v.kind === 'na') return t === 'num' ? 0 : t === 'bool' ? false : '';
-  if (t === 'num') return asNum(v);
-  if (t === 'bool') return truthy(v);
-  return v.kind === 'color' ? asColor(v) : asStr(v);
+/** `na` handling differs by prop type. `num` is a count/size/width whose TV
+ *  default really is 0, so na still coerces. `coord` is an x/y coordinate: na
+ *  means "not drawn" (TradingView), and coercing it to 0 parks the object on
+ *  bar 0 / price 0 — Vela folds a visible drawing's price into the price-pane
+ *  autoscale, so one na coordinate yanks the axis floor to 0 and squashes every
+ *  candle. Keep na as `undefined`; the engine drops the object instead. */
+function coerceIn(v: Value | undefined, t: PropType): number | string | boolean | undefined {
+  // evalArg may hand this over as `{kind:'series'}` (a bare ident, a literal, or
+  // a history-requiring expr). Unwrap first: the `kind === 'na'` guard below
+  // would otherwise miss and the `str` path would store the literal text 'NaN'.
+  const u = unwrapped(v);
+  if (t === 'coord') return u === undefined ? undefined : asNumOrNa(u);
+  if (u === undefined || u.kind === 'na') return t === 'num' ? 0 : t === 'bool' ? false : '';
+  if (t === 'num') return asNum(u);
+  if (t === 'bool') return truthy(u);
+  return u.kind === 'color' ? asColor(u) : asStr(u);
 }
 
 function coerceOut(raw: unknown, t: PropType): Value {
   if (raw === undefined || raw === null) return NA;
-  if (t === 'num') return numVal(Number(raw));
+  if (t === 'num' || t === 'coord') return numVal(Number(raw));
   if (t === 'bool') return raw ? { kind: 'bool', v: true } : { kind: 'bool', v: false };
   return { kind: 'string', v: String(raw) };
 }
 
+// Coordinate props are `coord` (na stays na — see coerceIn); every other numeric
+// prop is a size/width/count whose default is genuinely 0.
 const PROP_TABLES: Record<string, Record<string, PropType>> = {
   line: {
-    x1: 'num', y1: 'num', x2: 'num', y2: 'num',
+    x1: 'coord', y1: 'coord', x2: 'coord', y2: 'coord',
     xloc: 'str', extend: 'str', color: 'str', style: 'str', width: 'num',
   },
   label: {
-    x: 'num', y: 'num', text: 'str', xloc: 'str', yloc: 'str',
+    x: 'coord', y: 'coord', text: 'str', xloc: 'str', yloc: 'str',
     color: 'str', style: 'str', textcolor: 'str', size: 'str',
     textalign: 'str', tooltip: 'str',
     text_font_family: 'str', text_formatting: 'str',
   },
   box: {
-    left: 'num', top: 'num', right: 'num', bottom: 'num',
+    left: 'coord', top: 'coord', right: 'coord', bottom: 'coord',
     border_color: 'str', border_width: 'num', border_style: 'str',
     extend: 'str', xloc: 'str', bgcolor: 'str',
     text: 'str', text_size: 'str', text_color: 'str',
@@ -276,8 +289,10 @@ registerBuiltin('line', 'new', (c, args, named) => {
     'force_overlay',
   ] as const);
   const props: Record<string, unknown> = {
-    x1: numArg(bound, 'x1', 0), y1: numArg(bound, 'y1', 0),
-    x2: numArg(bound, 'x2', 0), y2: numArg(bound, 'y2', 0),
+    // Coordinates keep `na`: an na endpoint means "not drawn" (TradingView) — `numArg`'s
+    // 0 default parked the line at price 0 and collapsed the chart's price axis.
+    x1: naCoordArg(bound, 'x1'), y1: naCoordArg(bound, 'y1'),
+    x2: naCoordArg(bound, 'x2'), y2: naCoordArg(bound, 'y2'),
     xloc: strArg(bound, 'xloc', 'xloc.bar_index'),
     extend: strArg(bound, 'extend', 'extend.none'),
     // Absent → TV default blue; explicit color=na → invisible (engine flag).
@@ -294,12 +309,12 @@ registerBuiltin('line', 'new', (c, args, named) => {
 
 registerBuiltin('line', 'set_xy1', (c, args) => {
   const obj = asObj(args[0]);
-  if (obj) drawSink(c as RtCtx).update(obj, { x1: asNum(args[1] ?? NA), y1: asNum(args[2] ?? NA) });
+  if (obj) drawSink(c as RtCtx).update(obj, { x1: asNumOrNa(args[1] ?? NA), y1: asNumOrNa(args[2] ?? NA) });
   return { kind: 'void' };
 });
 registerBuiltin('line', 'set_xy2', (c, args) => {
   const obj = asObj(args[0]);
-  if (obj) drawSink(c as RtCtx).update(obj, { x2: asNum(args[1] ?? NA), y2: asNum(args[2] ?? NA) });
+  if (obj) drawSink(c as RtCtx).update(obj, { x2: asNumOrNa(args[1] ?? NA), y2: asNumOrNa(args[2] ?? NA) });
   return { kind: 'void' };
 });
 registerBuiltin('line', 'set_first_point', (c, args) => {
@@ -315,11 +330,11 @@ registerBuiltin('line', 'set_second_point', (c, args) => {
   return { kind: 'void' };
 });
 // TV signature (id, x1, x2, xloc) — writes both endpoints too; overrides the
-// prop-table generated setter which only stored xloc.
+// prop-table generated setter which only stored xloc. Coordinates keep `na`.
 registerBuiltin('line', 'set_xloc', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) drawSink(c as RtCtx).update(obj, {
-    x1: asNum(args[1] ?? NA), x2: asNum(args[2] ?? NA), xloc: asStr(args[3] ?? NA),
+    x1: asNumOrNa(args[1] ?? NA), x2: asNumOrNa(args[2] ?? NA), xloc: asStr(args[3] ?? NA),
   });
   return { kind: 'void' };
 });
@@ -328,11 +343,16 @@ registerBuiltin('line', 'get_price', (c, args) => {
   const ctx = c as RtCtx;
   const obj = asObj(args[0]);
   if (!obj) return NA;
-  const barIndex = args[1] !== undefined ? asNum(args[1]) : ctx.barIndex;
-  const x1 = Number(obj.props.x1) || 0;
-  const y1 = Number(obj.props.y1) || 0;
-  const x2 = Number(obj.props.x2) || 0;
-  const y2 = Number(obj.props.y2) || 0;
+  const barIndex = args[1] !== undefined ? asNumOrNa(args[1]) : ctx.barIndex;
+  // A line with an `na` coordinate is not drawn; TV returns `na` from get_price
+  // too. The old `|| 0` turned both into price 0 and a script that plots the
+  // result fed that 0 straight into the price-pane autoscale.
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+  const x1 = num(obj.props.x1), y1 = num(obj.props.y1);
+  const x2 = num(obj.props.x2), y2 = num(obj.props.y2);
+  if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined) return NA;
+  if (typeof barIndex !== 'number' || !Number.isFinite(barIndex)) return NA;
   const price = x2 === x1 ? y1 : y1 + ((y2 - y1) * (barIndex - x1)) / (x2 - x1);
   return numVal(price);
 });
@@ -367,7 +387,8 @@ registerBuiltin('label', 'new', (c, args, named) => {
     'text_font_family', 'force_overlay', 'text_formatting',
   ] as const);
   const props: Record<string, unknown> = {
-    x: numArg(bound, 'x', 0), y: numArg(bound, 'y', 0),
+    // na coordinate → not drawn (see line.new above).
+    x: naCoordArg(bound, 'x'), y: naCoordArg(bound, 'y'),
     text: strArg(bound, 'text', ''),
     xloc: strArg(bound, 'xloc', 'xloc.bar_index'),
     yloc: strArg(bound, 'yloc', 'yloc.price'),
@@ -389,7 +410,7 @@ registerBuiltin('label', 'new', (c, args, named) => {
 
 registerBuiltin('label', 'set_xy', (c, args) => {
   const obj = asObj(args[0]);
-  if (obj) drawSink(c as RtCtx).update(obj, { x: asNum(args[1] ?? NA), y: asNum(args[2] ?? NA) });
+  if (obj) drawSink(c as RtCtx).update(obj, { x: asNumOrNa(args[1] ?? NA), y: asNumOrNa(args[2] ?? NA) });
   return { kind: 'void' };
 });
 registerBuiltin('label', 'set_point', (c, args) => {
@@ -402,7 +423,7 @@ registerBuiltin('label', 'set_point', (c, args) => {
 // prop-table generated setter which only stored xloc.
 registerBuiltin('label', 'set_xloc', (c, args) => {
   const obj = asObj(args[0]);
-  if (obj) drawSink(c as RtCtx).update(obj, { x: asNum(args[1] ?? NA), xloc: asStr(args[2] ?? NA) });
+  if (obj) drawSink(c as RtCtx).update(obj, { x: asNumOrNa(args[1] ?? NA), xloc: asStr(args[2] ?? NA) });
   return { kind: 'void' };
 });
 
@@ -438,8 +459,9 @@ registerBuiltin('box', 'new', (c, args, named) => {
     'text_font_family', 'force_overlay',
   ] as const);
   const props: Record<string, unknown> = {
-    left: numArg(bound, 'left', 0), top: numArg(bound, 'top', 0),
-    right: numArg(bound, 'right', 0), bottom: numArg(bound, 'bottom', 0),
+    // na coordinate → not drawn (see line.new above).
+    left: naCoordArg(bound, 'left'), top: naCoordArg(bound, 'top'),
+    right: naCoordArg(bound, 'right'), bottom: naCoordArg(bound, 'bottom'),
     border_color: colorArg(bound, 'border_color') ?? '#2962FF',
     border_width: numArg(bound, 'border_width', 1),
     border_style: strArg(bound, 'border_style', 'line.style_solid'),
@@ -461,12 +483,12 @@ registerBuiltin('box', 'new', (c, args, named) => {
 
 registerBuiltin('box', 'set_lefttop', (c, args) => {
   const obj = asObj(args[0]);
-  if (obj) drawSink(c as RtCtx).update(obj, { left: asNum(args[1] ?? NA), top: asNum(args[2] ?? NA) });
+  if (obj) drawSink(c as RtCtx).update(obj, { left: asNumOrNa(args[1] ?? NA), top: asNumOrNa(args[2] ?? NA) });
   return { kind: 'void' };
 });
 registerBuiltin('box', 'set_rightbottom', (c, args) => {
   const obj = asObj(args[0]);
-  if (obj) drawSink(c as RtCtx).update(obj, { right: asNum(args[1] ?? NA), bottom: asNum(args[2] ?? NA) });
+  if (obj) drawSink(c as RtCtx).update(obj, { right: asNumOrNa(args[1] ?? NA), bottom: asNumOrNa(args[2] ?? NA) });
   return { kind: 'void' };
 });
 registerBuiltin('box', 'set_top_left_point', (c, args) => {
@@ -486,7 +508,7 @@ registerBuiltin('box', 'set_bottom_right_point', (c, args) => {
 registerBuiltin('box', 'set_xloc', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) drawSink(c as RtCtx).update(obj, {
-    left: asNum(args[1] ?? NA), right: asNum(args[2] ?? NA), xloc: asStr(args[3] ?? NA),
+    left: asNumOrNa(args[1] ?? NA), right: asNumOrNa(args[2] ?? NA), xloc: asStr(args[3] ?? NA),
   });
   return { kind: 'void' };
 });

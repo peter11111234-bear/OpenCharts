@@ -26,10 +26,10 @@
 
 ### TODO checklist
 
-- [ ] **N1**（P2）`CowSeries.writable` 對 `SecSeries`：`currentBar<0` → `base=-1` → 副本空 → 別名 `s[1]` 讀 na。**修法已定**：`writable` 在 `currentBar<0` 時 fallback `src.size()`（同非 BarSeries 分支）。
+- [x] **N1**（P2）`CowSeries.writable` 對 `SecSeries`：`currentBar<0` → `base=-1` → 副本空 → 別名 `s[1]` 讀 na。~~**修法已定**：`writable` 在 `currentBar<0` 時 fallback `src.size()`（同非 BarSeries 分支）。~~ **作廢**：見 `docs/superpowers/plans/2026-10-16-tb-pine-debt-three.md` F3（`SecSeries.size()` 是 tf 域值，混進 chart 域 `base` 會 seed 未來 bar，故禁止此修法）；本債已由 482b776 修復。**已結案（2026-10-16）：已由 482b776 修復；驗證：shift 檢查 s1[i]==s[i-1] 全通過（`scratch/perf/tb-b1-shift-check.mjs`）。**
   - 證據：`docs/superpowers/audits/audit-cow-alias.md:38-49`（含 repro）
-  - 檔案：`src/pine/interpreter.ts`（`CowSeries.writable`）、`src/pine/mtf.ts:1105-1111`（同構副本）
-- [ ] **N2**（latent）`array.from(...)` 仍存 live series 而非快照（TV 快照）。參照 R18 的 `snap()` 修法（`src/pine/builtins/array.ts`）。
+  - 檔案：`src/pine/interpreter.ts`（`CowSeries.writable`）、`src/pine/mtf.ts:1105-1111`（同構副本）**（行號更正 2026-10-17：現為 `mtf.ts:1261-1269`／`interpreter.ts:342-350`（`:1264` 逐字相同）；`:1105-1111` 現為 `alignToChart` 的 `SecSeries` 包裝）**
+- [x] **N2**（latent）`array.from(...)` 仍存 live series 而非快照（TV 快照）。參照 R18 的 `snap()` 修法（`src/pine/builtins/array.ts`）。**已結案（2026-10-16，Tier B B3）**：`array.ts` 的 `array.from` 已改為逐元素過 `snap()`；測試 `src/pine/__tests__/array_from_snapshot.test.ts`。
   - 證據：`2026-10-13-mzigzag-hp-fix-handoff.md §2 B`
 - [ ] **N3**（perf）Handoff B：KJ 瀏覽器首跑時間未重測（修 A/B 後應約 8s/500 bars）。
   - 證據：`2026-10-12-pine-tv-alignment-handoff.md §2 B`

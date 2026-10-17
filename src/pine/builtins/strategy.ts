@@ -19,7 +19,7 @@
 
 import { NA, VTRUE, type BuiltinCtx, type Node, type StrategyDecl, type Value } from '../contracts';
 import { getConstant, registerBuiltin, registerConstant, registerLazyConstant } from './registry';
-import { asStr, bindArgs, curNum, numVal, truthy, warnOnce, bindDeclArgs, type RtCtx } from './util';
+import { asStr, bindArgs, curNum, numVal, truthy, unwrapped, warnOnce, bindDeclArgs, type RtCtx } from './util';
 import { declDrawQuotas } from './draw';
 import { part, tzOf } from '../tz';
 
@@ -71,10 +71,6 @@ export interface StratOrder {
   stop?: number;
   /** strategy.close(immediately=true) → fill at close(bar). */
   immediate: boolean;
-  /** Last bar this order was touch-checked in a replay; -1 = none. */
-  seen: number;
-  /** Bar a cancel event retired this order (fills at cancel bar already done). */
-  cancelledAt?: number;
   /** OCA group name + strategy.oca.* type ('cancel' | 'reduce'). */
   ocaName?: string;
   ocaType?: string;
@@ -86,15 +82,8 @@ export interface StratOrder {
   trailPrice?: number;
   trailPoints?: number;
   trailOffset?: number;
-  /** Per-replay scratch: most favorable price seen since the position opened. */
-  trailPeak?: number;
-  /** Per-replay scratch: resolved qty/price of the pending fill. */
-  fillQty?: number;
-  fillPrice?: number;
   /** Order comment (TV paints it next to the trade marker). */
   comment?: string;
-  /** Duplicate-id / OCA-reduce modifications applied during replay. */
-  mod?: { qty: number; qtySet?: boolean; eqPct: number; eqPctSet?: boolean; limit?: number; stop?: number };
   /** `kind === 'risk'` payload — one strategy.risk.* call. */
   risk?: RiskRuleSpec;
 }
@@ -285,37 +274,112 @@ const emptySim = (): Sim => ({
   positionEntryName: '', maxContractsAll: 0, maxContractsLong: 0, maxContractsShort: 0,
 });
 
+/** Snapshot an existing simulation state so incremental resume does not mutate history. */
+const cloneSim = (s: Sim): Sim => ({
+  qty: s.qty,
+  avgEntry: s.avgEntry,
+  realizedPnl: s.realizedPnl,
+  closedTrades: s.closedTrades,
+  openTrades: s.openTrades,
+  execs: s.execs.slice(),
+  curTrade: s.curTrade,
+  openLegs: s.openLegs.map(l => ({ ...l })),
+  closed: s.closed.slice(),
+  positionEntryName: s.positionEntryName,
+  maxContractsAll: s.maxContractsAll,
+  maxContractsLong: s.maxContractsLong,
+  maxContractsShort: s.maxContractsShort,
+});
+
 // ── replay ──────────────────────────────────────────────────────────────────
 
+/** Replay cursor — state an order carries during simulation. Kept separate
+ *  from StratOrder so orders remain pure immutable descriptors and replays
+ *  do not clobber each other's scratch state. */
+export interface OrderCursor {
+  seen: number;
+  cancelledAt?: number;
+  trailPeak?: number;
+  fillQty?: number;
+  fillPrice?: number;
+  /** `bar` is the bar a same-id rewrite took effect on. Absent for a scratch
+   *  written by another mechanism (OCA reduce), which must not move the
+   *  order's activation bar. */
+  mod?: { qty: number; qtySet?: boolean; eqPct: number; eqPctSet?: boolean; limit?: number; stop?: number; bar?: number };
+}
+
+const cloneCursors = (src: Map<number, OrderCursor>): Map<number, OrderCursor> => {
+  const m = new Map<number, OrderCursor>();
+  for (const [k, v] of src) {
+    m.set(k, { ...v, mod: v.mod ? { ...v.mod } : undefined });
+  }
+  return m;
+};
+
+/** Replay cursor — the state `simulate`'s event loop carries across bars.
+ *  Resuming replays only the bars after `bar`, so a build pass costs O(B)
+ *  instead of Σ N = B(B−1)/2. */
+export interface SimRun {
+  bar: number;
+  sim: Sim;
+  pending: StratOrder[];
+  i: number;
+  cursors: Map<number, OrderCursor>;
+  rules: ActiveRules;
+  riskBar: number;
+  haltBar: number;
+  sessionHaltDay: number;
+  day: number;
+  dayStartEquity: number;
+  dayPeak: number;
+  peakEquity: number;
+  consLoss: number;
+  fillsByDay: Map<number, number>;
+}
+
 /**
- * Simulate through the end of `uptoBar`. Pure in (orders, bars, cfg):
- * scratch fields on orders are rewritten each call, so results do not
- * depend on call order or call sites.
+ * Simulate through the end of `uptoBar`. Pure in (orders, bars, cfg) — every
+ * run-local cursor lives in the returned `SimRun`, so a result does not depend
+ * on call order or call sites.
+ *
+ * `prev` continues an earlier run: the bars it already observed are not
+ * replayed and its cursors are carried over.
  */
-export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, uptoBar: number): Sim {
-  const sim: Sim = emptySim();
-  if (uptoBar < 0) return sim;
+export function simulateRun(
+  ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, uptoBar: number, prev?: SimRun,
+): SimRun {
+  const resume = prev !== undefined && prev.bar <= uptoBar;
+  const sim: Sim = resume ? cloneSim(prev!.sim) : emptySim();
+  const cursors: Map<number, OrderCursor> = resume ? cloneCursors(prev!.cursors) : new Map();
+  const curOf = (o: StratOrder): OrderCursor => {
+    let c = cursors.get(o.seq);
+    if (!c) { c = { seen: -1 }; cursors.set(o.seq, c); }
+    return c;
+  };
+  const fresh = (): SimRun => ({
+    bar: uptoBar < 0 ? -1 : uptoBar, sim,
+    pending: [], i: 0, cursors, rules: { allowEntryIn: 'strategy.direction.all' },
+    riskBar: -1, haltBar: -1, sessionHaltDay: -1, day: -1,
+    dayStartEquity: cfg.initial_capital, dayPeak: cfg.initial_capital,
+    peakEquity: cfg.initial_capital, consLoss: 0, fillsByDay: new Map(),
+  });
+  if (uptoBar < 0) return fresh();
   const n = orders.length;
   const tick = mintickOf(ctx);
-  // Reset all replay scratch so the result is a pure function of (orders, bars).
-  for (const o of orders) {
-    o.seen = -1; o.cancelledAt = undefined; o.trailPeak = undefined;
-    o.fillQty = undefined; o.fillPrice = undefined; o.mod = undefined;
-  }
-  const pending: StratOrder[] = [];
-  let i = 0;
+  let pending: StratOrder[] = resume ? prev!.pending.slice() : [];
+  let i = resume ? prev!.i : 0;
 
   // ── strategy.risk.* state (see riskWalk) ──
-  const rules: ActiveRules = { allowEntryIn: 'strategy.direction.all' };
-  let riskBar = -1;        // last bar the rule engine has observed
-  let haltBar = -1;        // permanent halt began on this bar (-1 = trading)
-  let sessionHaltDay = -1; // day key an intraday halt began in
-  let day = -1;            // day key of the bar being evaluated
-  let dayStartEquity = cfg.initial_capital;
-  let dayPeak = cfg.initial_capital;
-  let peakEquity = cfg.initial_capital;
-  let consLoss = 0;
-  const fillsByDay = new Map<number, number>();
+  let rules: ActiveRules = resume ? { ...prev!.rules } : { allowEntryIn: 'strategy.direction.all' };
+  let riskBar = resume ? prev!.riskBar : -1;        // last bar the rule engine has observed
+  let haltBar = resume ? prev!.haltBar : -1;        // permanent halt began on this bar (-1 = trading)
+  let sessionHaltDay = resume ? prev!.sessionHaltDay : -1; // day key an intraday halt began in
+  let day = resume ? prev!.day : -1;                // day key of the bar being evaluated
+  let dayStartEquity = resume ? prev!.dayStartEquity : cfg.initial_capital;
+  let dayPeak = resume ? prev!.dayPeak : cfg.initial_capital;
+  let peakEquity = resume ? prev!.peakEquity : cfg.initial_capital;
+  let consLoss = resume ? prev!.consLoss : 0;
+  const fillsByDay = resume ? new Map(prev!.fillsByDay) : new Map<number, number>();
   const pointValue = pointValueOf(ctx);
 
   /** Touch-check every pending order through `limit`, filling on touch. */
@@ -323,20 +387,21 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     const lim = Math.min(limit, uptoBar);
     for (let k = 0; k < pending.length; k++) {
       const o = pending[k]!;
-      for (let b = o.seen + 1; b <= lim; b++) {
-        if (o.cancelledAt !== undefined && b > o.cancelledAt) break;
+      const cur = curOf(o);
+      for (let b = cur.seen + 1; b <= lim; b++) {
+        if (cur.cancelledAt !== undefined && b > cur.cancelledAt) break;
         if (fillCandidate(o, b)) {
-          applyFill(o, b, o.fillPrice!, o.fillQty!);
+          applyFill(o, b, cur.fillPrice!, cur.fillQty!);
           if (rules.maxIntradayFilledOrders !== undefined) {
-            const k = dayKeyOf(b);
-            fillsByDay.set(k, (fillsByDay.get(k) ?? 0) + 1);
+            const dayK = dayKeyOf(b);
+            fillsByDay.set(dayK, (fillsByDay.get(dayK) ?? 0) + 1);
           }
-          o.seen = b;
+          cur.seen = b;
           break;
         }
-        o.seen = b;
+        cur.seen = b;
       }
-      if (o.fillPrice !== undefined || (o.cancelledAt !== undefined && o.seen >= o.cancelledAt)) {
+      if (cur.fillPrice !== undefined || (cur.cancelledAt !== undefined && cur.seen >= cur.cancelledAt)) {
         pending.splice(k, 1);
         k--;
       }
@@ -350,8 +415,10 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
    *  derive levels from profit/loss ticks and trail_* params. */
   const fillCandidate = (o: StratOrder, b: number): boolean => {
     if (o.kind === 'cancel') return false;
-    const sameBar = o.immediate || (cfg.process_orders_on_close && o.bar === b);
-    const r = sameBar ? o.bar : o.bar + 1;
+    const c = curOf(o);
+    const effBar = c.mod?.bar ?? o.bar;
+    const sameBar = o.immediate || (cfg.process_orders_on_close && effBar === b);
+    const r = sameBar ? effBar : effBar + 1;
     const dir = effDir(o);
     const lo = lowAt(ctx, b, uptoBar);
     const hi = highAt(ctx, b, uptoBar);
@@ -359,8 +426,12 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     // Exit extras: profit/loss ticks → limit/stop prices vs avg entry;
     // trail_* → trailing stop armed when the excursion reaches the activation
     // level, then the stop trails the extreme by trail_offset ticks.
-    let limit = o.mod?.limit ?? o.limit;
-    let stop = o.mod?.stop ?? o.stop;
+
+    // A same-id modification REPLACES the order's parameters, so `mod` is
+    // authoritative even when it clears limit/stop (an omitted level means
+    // "market" for the modified order, not "keep the old level").
+    let limit = c.mod ? c.mod.limit : o.limit;
+    let stop = c.mod ? c.mod.stop : o.stop;
     if (o.kind === 'exit' && sim.qty !== 0) {
       const side = Math.sign(sim.qty); // +1 long, -1 short
       if (o.profitTicks !== undefined && limit === undefined) limit = sim.avgEntry + side * o.profitTicks * tick;
@@ -368,19 +439,19 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
       if ((o.trailPrice !== undefined || o.trailPoints !== undefined) && b >= r) {
         const act = o.trailPrice ?? sim.avgEntry + side * (o.trailPoints ?? 0) * tick;
         // Track the favorable extreme only while the position is open.
-        if (o.trailPeak === undefined) o.trailPeak = sim.avgEntry;
+        if (c.trailPeak === undefined) c.trailPeak = sim.avgEntry;
         const cur = side > 0 ? highAt(ctx, b, uptoBar) : lowAt(ctx, b, uptoBar);
         if (Number.isFinite(cur)) {
-          o.trailPeak = side > 0 ? Math.max(o.trailPeak, cur) : Math.min(o.trailPeak, cur);
+          c.trailPeak = side > 0 ? Math.max(c.trailPeak, cur) : Math.min(c.trailPeak, cur);
         }
-        const armed = side > 0 ? o.trailPeak >= act : o.trailPeak <= act;
+        const armed = side > 0 ? c.trailPeak >= act : c.trailPeak <= act;
         // Trailing stop = peak − offset (no open-gap adj: the level is set
         // intra-bar at the extreme, so the open never gaps past it).
-        if (armed && Number.isFinite(lo) && (side > 0 ? lo <= (o.trailPeak - side * (o.trailOffset ?? 0) * tick)
-                                                  : hi >= (o.trailPeak - side * (o.trailOffset ?? 0) * tick))) {
-          const trailStop = o.trailPeak - side * (o.trailOffset ?? 0) * tick;
+        if (armed && Number.isFinite(lo) && (side > 0 ? lo <= (c.trailPeak - side * (o.trailOffset ?? 0) * tick)
+                                                  : hi >= (c.trailPeak - side * (o.trailOffset ?? 0) * tick))) {
+          const trailStop = c.trailPeak - side * (o.trailOffset ?? 0) * tick;
           const tq = resolveQty(o, trailStop, b, dir);
-          if (tq > 0) { o.fillPrice = trailStop + dir * cfg.slippage * tick; o.fillQty = tq; return true; }
+          if (tq > 0) { c.fillPrice = trailStop + dir * cfg.slippage * tick; c.fillQty = tq; return true; }
         }
       }
     }
@@ -427,16 +498,16 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     if (!Number.isFinite(price)) return false;
     if (fromStop && cfg.slippage > 0) price += dir * cfg.slippage * tick;
     const qty = resolveQty(o, price, b, dir);
-    if (!(qty > 0)) { o.seen = b; return false; }
+    if (!(qty > 0)) { c.seen = b; return false; }
     // Margin: a position-increasing fill must be covered by equity.
     if ((o.kind === 'entry' || o.kind === 'order') && !marginOk(b, price, qty, dir)) {
       warnOnce(ctx, 'strategy|margin',
         'strategy(): not enough money to open the position — the order is not filled');
-      o.seen = b;
+      c.seen = b;
       return false;
     }
-    o.fillPrice = price;
-    o.fillQty = qty;
+    c.fillPrice = price;
+    c.fillQty = qty;
     return true;
   };
 
@@ -444,45 +515,54 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     let ev = -1;
     for (let j = i; j < n; j++) {
       const o = orders[j]!;
-      if (o.seen < o.bar) { ev = j; break; }
+      if (curOf(o).seen < o.bar) { ev = j; break; }
     }
     if (ev < 0) break;
     const o = orders[ev]!;
+    if (o.bar > uptoBar) break; // Future order: stop before advancing i or its cursor
     i = ev + 1;
-    if (o.bar > uptoBar) { o.seen = o.bar; continue; }
     // Pending orders settle through this event's bar before it is applied.
     advancePending(o.bar);
     riskWalk(o.bar);
     if (o.kind === 'risk') {
       applyRisk(o.risk!);
-      o.seen = o.bar;
+      curOf(o).seen = o.bar;
       continue;
     }
     // A triggered rule stops new orders: permanent until the end of the run,
     // intraday until the end of that trading day.
-    if (haltBar >= 0 && o.bar >= haltBar) { o.seen = o.bar; continue; }
-    if (sessionHaltDay >= 0 && sessionHaltDay === day) { o.seen = o.bar; continue; }
+    if (haltBar >= 0 && o.bar >= haltBar) { curOf(o).seen = o.bar; continue; }
+    if (sessionHaltDay >= 0 && sessionHaltDay === day) { curOf(o).seen = o.bar; continue; }
     if (o.kind === 'cancel') {
       const any = o.id === '' || o.id === 'strategy.cancel_all';
       for (const p of pending) {
-        if (any || p.id === o.id || (o.fromEntry !== '' && p.id === o.fromEntry)) p.cancelledAt = o.bar;
+        if (any || p.id === o.id || (o.fromEntry !== '' && p.id === o.fromEntry)) curOf(p).cancelledAt = o.bar;
       }
-      o.seen = o.bar;
+      curOf(o).seen = o.bar;
       continue;
     }
     // Duplicate pending entry id → modify in place (Pine semantics).
     if (o.kind === 'entry' || o.kind === 'order') {
       const dupe = pending.find(p => (p.kind === 'entry' || p.kind === 'order') && p.id === o.id && p.dir === o.dir);
-      if (dupe) { dupe.mod = { qty: o.qty, qtySet: o.qtySet, eqPct: o.eqPct, eqPctSet: o.eqPctSet, limit: o.limit, stop: o.stop }; o.seen = o.bar; continue; }
+      if (dupe) {
+        const dCur = curOf(dupe);
+        dCur.mod = { qty: o.qty, qtySet: o.qtySet, eqPct: o.eqPct, eqPctSet: o.eqPctSet, limit: o.limit, stop: o.stop, bar: o.bar };
+        dCur.seen = o.bar - 1; // Re-check modified limit/stop against the current bar in advancePending
+        curOf(o).seen = o.bar;
+        continue;
+      }
       // Same-direction entry while positioned → ignored unless pyramiding.
-      if (sim.qty !== 0 && Math.sign(sim.qty) === o.dir && sim.openTrades >= cfg.pyramiding + 1) { o.seen = o.bar; continue; }
+      if (sim.qty !== 0 && Math.sign(sim.qty) === o.dir && sim.openTrades >= cfg.pyramiding + 1) { curOf(o).seen = o.bar; continue; }
     }
-    o.seen = o.bar - 1; // next advance checks from this order's bar
+    curOf(o).seen = o.bar - 1; // next advance checks from this order's bar
     pending.push(o);
   }
   advancePending(uptoBar);
   riskWalk(uptoBar);
-  return sim;
+  const out: SimRun = {
+    bar: uptoBar, sim, pending, i, cursors, rules, riskBar, haltBar, sessionHaltDay,
+    day, dayStartEquity, dayPeak, peakEquity, consLoss, fillsByDay,
+  };
 
   // ── nested helpers (closure over sim/ctx) ──
 
@@ -564,7 +644,7 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     applyFill({
       bar: b, seq: -1, kind: 'close', id: '', fromEntry: '', dir: -Math.sign(sim.qty),
       qty, qtySet: true, eqPct: 0, eqPctSet: false,
-      limit: undefined, stop: undefined, immediate: true, seen: b, comment: label,
+      limit: undefined, stop: undefined, immediate: true, comment: label,
     }, b, price, qty);
   }
 
@@ -572,7 +652,10 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
    *  `permanent` rules stop the run for good, the intraday ones until the
    *  end of the current trading day. */
   function trigger(b: number, permanent: boolean, label: string): void {
-    for (const p of pending) if (p.cancelledAt === undefined) p.cancelledAt = b;
+    for (const p of pending) {
+      const c = curOf(p);
+      if (c.cancelledAt === undefined) c.cancelledAt = b;
+    }
     flattenAt(b, label);
     if (permanent) haltBar = b;
     else sessionHaltDay = day;
@@ -604,7 +687,7 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     applyFill({
       bar: b, seq: -1, kind: 'close', id: '', fromEntry: '', dir: -dir,
       qty: liq, qtySet: true, eqPct: 0, eqPctSet: false,
-      limit: undefined, stop: undefined, immediate: true, seen: b, comment: 'Margin call',
+      limit: undefined, stop: undefined, immediate: true, comment: 'Margin call',
     }, b, price, liq);
   }
 
@@ -700,10 +783,11 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
   /** Contracts this order trades at `price`; 0/NaN → no fill. */
   function resolveQty(o: StratOrder, price: number, atBar: number, dir: number): number {
     if (o.kind === 'entry' || o.kind === 'order') {
-      const eqPct = o.mod?.eqPct ?? o.eqPct;
-      const qty = o.mod?.qty ?? o.qty;
-      const qtySet = o.mod?.qtySet ?? o.qtySet ?? false;
-      const eqPctSet = o.mod?.eqPctSet ?? o.eqPctSet ?? false;
+      const c = curOf(o);
+      const eqPct = c.mod?.eqPct ?? o.eqPct;
+      const qty = c.mod?.qty ?? o.qty;
+      const qtySet = c.mod?.qtySet ?? o.qtySet ?? false;
+      const eqPctSet = c.mod?.eqPctSet ?? o.eqPctSet ?? false;
       // Explicit non-positive qty/qty_percent = zero contracts, NOT a
       // default-qty substitution — qty=0 must never fill 1 contract.
       if (qtySet && !(qty > 0)) return 0;
@@ -855,39 +939,124 @@ export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, u
     if (o.ocaName !== undefined && o.ocaName !== '') {
       for (const p of pending) {
         if (p === o || p.ocaName !== o.ocaName) continue;
+        const pCur = curOf(p);
         const t = p.ocaType ?? o.ocaType ?? 'none';
-        if (t.endsWith('cancel')) p.cancelledAt = bar - 1;
+        if (t.endsWith('cancel')) pCur.cancelledAt = bar - 1;
         else if (t.endsWith('reduce')) {
-          const rem = Math.max(0, (p.mod?.qty ?? p.qty) - qty);
+          const rem = Math.max(0, (pCur.mod?.qty ?? p.qty) - qty);
           if (rem <= 0) {
             // Reduced to nothing → the sibling must never fill (resolveQty
             // would otherwise fall back to default_qty_value and refill it).
-            p.cancelledAt = bar - 1;
+            pCur.cancelledAt = bar - 1;
           } else {
-            p.mod = { qty: rem, eqPct: p.mod?.eqPct ?? p.eqPct, limit: p.mod?.limit ?? p.limit, stop: p.mod?.stop ?? p.stop };
+            // Presence-based on purpose: once a same-id rewrite cleared
+            // `limit`/`stop`, an undefined level means the order IS a market
+            // order, so re-reading `p.limit` here would resurrect a dead
+            // level. `bar` is carried over (never set) so a reduce does not
+            // move when the order can first fill.
+            pCur.mod = {
+              qty: rem,
+              eqPct: pCur.mod ? pCur.mod.eqPct : p.eqPct,
+              limit: pCur.mod ? pCur.mod.limit : p.limit,
+              stop: pCur.mod ? pCur.mod.stop : p.stop,
+              bar: pCur.mod?.bar,
+            };
           }
         }
       }
     }
   }
+  return out;
+}
+
+/** One-shot replay: `simulateRun` without keeping the cursor. Kept for the
+ *  callers that ask for a bar out of order (strategyEquity's dd curve), where
+ *  a stored cursor would have to restart anyway. */
+export function simulate(ctx: BuiltinCtx, orders: StratOrder[], cfg: StratCfg, uptoBar: number): Sim {
+  return simulateRun(ctx, orders, cfg, uptoBar).sim;
 }
 
 // ── deterministic-read cache ────────────────────────────────────────────────
 // Simulation is a pure function of (orders.length, uptoBar, ctx). Memoize per
 // orders-array so repeated lazy reads on the same bar don't replay.
 
-interface SimCache { count: number; byBar: Map<number, Sim> }
+interface SimCache {
+  count: number;
+  /** Exact-answer memo — most reads repeat a bar already simulated. */
+  byBar: Map<number, Sim>;
+  /** Cursor of the run that last left the order scratch behind. */
+  run?: SimRun;
+  /** OHLC of the bar the memo was built from — any field moving invalidates it. */
+  bar?: number;
+  open?: number;
+  high?: number;
+  low?: number;
+  close?: number;
+}
 
 function simAt(ctx: BuiltinCtx, uptoBar: number): Sim {
   const st = stateOf(ctx);
   if (!st) return emptySim();
   const orders = st.get(ORDERS_KEY) as StratOrder[] | undefined;
-  if (!orders || orders.length === 0) return emptySim();
   let cache = st.get(CACHE_KEY) as SimCache | undefined;
-  if (!cache || cache.count !== orders.length) { cache = { count: orders.length, byBar: new Map() }; st.set(CACHE_KEY, cache); }
-  let r = cache.byBar.get(uptoBar);
-  if (!r) { r = simulate(ctx, orders, cfgOf(ctx), uptoBar); cache.byBar.set(uptoBar, r); }
-  return r;
+  if (!orders || orders.length === 0) {
+    if (cache) {
+      cache.count = 0;
+      cache.byBar.clear();
+      cache.run = undefined;
+    }
+    return emptySim();
+  }
+  // Fills read open/high/low as well as close, so the memo must be keyed on the
+  // whole forming bar: a wick-only tick changes the answer.
+  const o0 = openAt(ctx, uptoBar, uptoBar);
+  const h0 = highAt(ctx, uptoBar, uptoBar);
+  const l0 = lowAt(ctx, uptoBar, uptoBar);
+  const c0 = closeAt(ctx, uptoBar, uptoBar);
+  const store = (c: SimCache): void => {
+    c.bar = uptoBar; c.open = o0; c.high = h0; c.low = l0; c.close = c0;
+  };
+  if (!cache) {
+    cache = { count: orders.length, byBar: new Map() };
+    store(cache);
+    st.set(CACHE_KEY, cache);
+  } else {
+    if (orders.length < cache.count) {
+      // Rollback shrank the orders list: wipe cache completely
+      cache.count = orders.length;
+      cache.byBar.clear();
+      cache.run = undefined;
+    } else if (orders.length > cache.count) {
+      // Orders appended: invalidate cached answers at or after the first new order's bar
+      const firstNewBar = orders[cache.count]?.bar ?? 0;
+      for (const b of cache.byBar.keys()) {
+        if (b >= firstNewBar) cache.byBar.delete(b);
+      }
+      if (cache.run && cache.run.bar >= firstNewBar) {
+        cache.run = undefined;
+      }
+      cache.count = orders.length;
+    }
+    if (
+      cache.bar === uptoBar
+      && (cache.open !== o0 || cache.high !== h0 || cache.low !== l0 || cache.close !== c0)
+    ) {
+      // Intraday tick moved the forming bar: drop its memo and its cursor.
+      cache.byBar.delete(uptoBar);
+      if (cache.run && cache.run.bar >= uptoBar) {
+        cache.run = undefined;
+      }
+    }
+  }
+  const hit = cache.byBar.get(uptoBar);
+  if (hit) return hit;
+  const prev = cache.run && cache.run.bar <= uptoBar ? cache.run : undefined;
+  const run = simulateRun(ctx, orders, cfgOf(ctx), uptoBar, prev);
+  if (cache.byBar.size >= 256) cache.byBar.clear();
+  store(cache);
+  cache.run = run;
+  cache.byBar.set(uptoBar, run.sim);
+  return run.sim;
 }
 
 /** Final-bar executions for engine → IndicatorModel.trades. */
@@ -933,13 +1102,16 @@ function optNum(bound: Map<string, Value>, name: string): number | undefined {
 }
 
 function strOf(v: Value | undefined, def = ''): string {
-  if (v === undefined || v.kind === 'na') return def;
-  return asStr(v);
+  // evalArg may wrap the arg as `{kind:'series'}`; without unwrapping the
+  // `kind === 'na'` guard misses and the caller stores the text 'NaN'.
+  const u = unwrapped(v);
+  if (u === undefined || u.kind === 'na') return def;
+  return asStr(u);
 }
 
-function pushOrder(ctx: BuiltinCtx, o: Omit<StratOrder, 'bar' | 'seq' | 'seen'>): void {
+function pushOrder(ctx: BuiltinCtx, o: Omit<StratOrder, 'bar' | 'seq'>): void {
   const orders = ordersOf(ctx);
-  orders.push({ ...o, bar: ctx.barIndex, seq: orders.length, seen: -1 });
+  orders.push({ ...o, bar: ctx.barIndex, seq: orders.length });
 }
 
 // ── builtins ────────────────────────────────────────────────────────────────
@@ -1097,7 +1269,7 @@ registerBuiltin('strategy', 'cancel_all', (c, args, named) => {
 function pushRisk(ctx: BuiltinCtx, spec: RiskRuleSpec): void {
   const orders = ordersOf(ctx);
   orders.push({
-    bar: ctx.barIndex, seq: orders.length, seen: -1, kind: 'risk',
+    bar: ctx.barIndex, seq: orders.length, kind: 'risk',
     id: '', fromEntry: '', dir: 0, qty: 0, eqPct: 0,
     limit: undefined, stop: undefined, immediate: false, risk: spec,
   });

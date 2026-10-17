@@ -185,6 +185,13 @@ export function drainBindWarnings(): string[] {
   return bindWarnQ.splice(0, bindWarnQ.length);
 }
 
+/** Shared frozen empty named-arg record. `invokeBuiltin` hands this out for
+ *  every call with no `name=value` argument, so the hot path stops allocating
+ *  a fresh `{}` per call. No builtin writes into `named` (every `named[...]=`
+ *  in the tree sits at a call site, never inside a builtin), and the freeze
+ *  makes a future writer fail loudly instead of corrupting the shared object. */
+export const EMPTY_NAMED: Readonly<Record<string, Value>> = Object.freeze({});
+
 /**
  * Bind positional+named args against a Pine parameter order.
  * Named args win their slot; positional args fill remaining slots in order —
@@ -202,8 +209,10 @@ export function bindArgs(
   // when its alias target is — otherwise `ta.bb(series=…)` silently binds
   // nothing and returns na (observed: TD_BB Basis/Upper/Lower all-na).
   const out = new Map<string, Value>();
-  // All-positional fast path: no named args → skip the named-merge loop.
-  if (Object.keys(named).length === 0) {
+  // All-positional fast path: no named args → skip the named-merge loop. The
+  // shared singleton short-circuits ahead of `Object.keys`, which used to
+  // allocate an array on every call just to ask whether it was empty.
+  if (named === EMPTY_NAMED || Object.keys(named).length === 0) {
     for (let i = 0; i < Math.min(args.length, order.length); i++) {
       out.set(order[i]!, args[i]!);
     }
@@ -243,6 +252,39 @@ export function numArg(bound: Map<string, Value>, name: string, def: number): nu
   if (v === undefined) return def;
   const u = v.kind === 'series' ? v.v.cur() : v;
   return u.kind === 'na' ? def : asNum(u);
+}
+
+/**
+ * Drawing COORDINATE arg — unlike {@link numArg}, `na` stays `undefined`.
+ * On TradingView an na coordinate means the object is not drawn; coercing it to 0
+ * (the old `numArg(..., 0)` / `asNum`) parked lines/labels/boxes at price 0, and the
+ * chart folds a visible drawing's price into the pane autoscale — so one na coordinate
+ * anywhere in the loaded window dragged the price axis down to 0 and squashed the
+ * candles. `undefined` reaches the model builder, which drops the object instead.
+ * A MISSING arg is na too: a drawing coordinate has no Pine signature default
+ * (line.new/label.new/box.new declare x1…bottom as required), so `line.new(x1, y1, x2)`
+ * must not park the missing endpoint at price 0 where TradingView rejects the call.
+ * Only int/float counts as a coordinate. `na`, an unparsable string (asNum maps it
+ * to 0) and any other kind are all na: TradingView rejects the call, we just don't
+ * draw — 0 is a PRICE, and parking a drawing on it collapses the pane autoscale.
+ * Optional numeric props (width/size/counts) keep using {@link numArg}.
+ */
+export function naCoordArg(bound: Map<string, Value>, name: string): number | undefined {
+  const v = bound.get(name);
+  if (v === undefined) return undefined;
+  const u = v.kind === 'series' ? v.v.cur() : v;
+  if (u.kind !== 'int' && u.kind !== 'float') return undefined;
+  return Number.isFinite(u.v) ? u.v : undefined;
+}
+
+/**
+ * {@link naCoordArg} for positional (already-bound) values, e.g. the multi-arg
+ * `set_*` setters: not a number → `undefined`.
+ */
+export function asNumOrNa(v: Value): number | undefined {
+  const u = v.kind === 'series' ? v.v.cur() : v;
+  if (u.kind !== 'int' && u.kind !== 'float') return undefined;
+  return Number.isFinite(u.v) ? u.v : undefined;
 }
 
 export function strArg(bound: Map<string, Value>, name: string, def: string): string {

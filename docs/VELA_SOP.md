@@ -28,6 +28,11 @@ OpenCharts Vela 交易終端是由前端 Vite、本機 Shioaji 行情伺服器�
 | **前端 OpenCharts (Vite)** | `5173` | `/` (HTTP 200) | `http://localhost:5173/vela` | `cd C:\Users\bear9\OpenCharts && npx vite --port 5173` |
 | **行情伺服器 (Shioaji)** | `8080` | `/api/v1/health` (回傳 healthy) | `http://127.0.0.1:8080` | `powershell -NoProfile -File scripts/scratch/up-backend.ps1` |
 | **決策 Sidecar (Jev)** | `8787` | `/health` (HTTP 200) | `http://127.0.0.1:8787` | 同上（由 `up-backend.ps1` 自動拉起 `scripts/jev-sidecar.py`） |
+| **影子收集器 (Jev shadow)** | 無（只寫檔） | 看 `logs/jev-shadow.jsonl` 的 mtime | `logs/jev-shadow.jsonl` | `python scripts/jev-shadow.py`；由 `scripts/jev-shadow-watchdog.ps1` 常駐看護 |
+
+> **長期背景程序由誰看護**：`scripts/jev-shadow-watchdog.ps1` 同時看顧 **sidecar** 與 **shadow 收集器**，每 60s 檢查一次並自動重啟。
+> 由 `start-trading-day.ps1` 步驟 4.5 每交易日 08:30 重開。**不要**同時再跑 `jev-sidecar-watchdog.ps1`（兩者會搶同一個 port）。
+> 詳見 `docs/JEV_SHADOW_OPS.md`。
 
 ---
 

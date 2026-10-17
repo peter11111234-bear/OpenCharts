@@ -105,10 +105,23 @@ function sinkAt(ctx: RtCtx, idx: number): PlotSink {
 
 // ── plot ────────────────────────────────────────────────────────────────────
 
-const PLOT_ORDER = [
+export const PLOT_ORDER = [
   'series', 'title', 'color', 'linewidth', 'style', 'trackprice',
   'histbase', 'offset', 'join', 'editable', 'show_last', 'display',
   'format', 'precision', 'force_overlay',
+] as const;
+
+/** plotbar / plotcandle / hline own order lists, exported so the ScalarSpec
+ *  integrity test can check each declared `idx` against them. */
+export const PLOTBAR_ORDER = [
+  'open', 'high', 'low', 'close', 'title', 'color', 'editable', 'show_last', 'display',
+] as const;
+export const PLOTCANDLE_ORDER = [
+  'open', 'high', 'low', 'close', 'title', 'color', 'wickcolor',
+  'editable', 'show_last', 'bordercolor', 'display',
+] as const;
+export const HLINE_ORDER = [
+  'price', 'title', 'color', 'linestyle', 'linewidth', 'editable', 'display',
 ] as const;
 
 registerBuiltin('', 'plot', (c, args, named) => {
@@ -141,7 +154,7 @@ registerBuiltin('', 'plot', (c, args, named) => {
 
 // ── plotshape / plotchar / plotarrow ────────────────────────────────────────
 
-const SHAPE_ORDER = [
+export const SHAPE_ORDER = [
   'series', 'title', 'style', 'location', 'color', 'offset', 'text',
   'textcolor', 'editable', 'size', 'show_last', 'display',
 ] as const;
@@ -243,9 +256,7 @@ registerBuiltin('', 'plotarrow', (c, args, named) => {
 registerBuiltin('', 'plotbar', (c, args, named) => {
   const ctx = c as RtCtx;
   if (inLocalScope(ctx, 'plotbar')) return NA;
-  const bound = bindArgs(args, named, [
-    'open', 'high', 'low', 'close', 'title', 'color', 'editable', 'show_last', 'display',
-  ] as const);
+  const bound = bindArgs(args, named, PLOTBAR_ORDER);
   const idx = plotIndex(ctx);
   const opts: PlotOpts & Record<string, unknown> = { style: 'bar' };
   const color = colorArg(bound, 'color');
@@ -269,10 +280,7 @@ registerBuiltin('', 'plotbar', (c, args, named) => {
 registerBuiltin('', 'plotcandle', (c, args, named) => {
   const ctx = c as RtCtx;
   if (inLocalScope(ctx, 'plotcandle')) return NA;
-  const bound = bindArgs(args, named, [
-    'open', 'high', 'low', 'close', 'title', 'color', 'wickcolor',
-    'editable', 'show_last', 'bordercolor', 'display',
-  ] as const);
+  const bound = bindArgs(args, named, PLOTCANDLE_ORDER);
   const idx = plotIndex(ctx);
   const opts: PlotOpts & Record<string, unknown> = { style: 'candle' };
   const color = colorArg(bound, 'color');
@@ -302,9 +310,7 @@ registerBuiltin('', 'plotcandle', (c, args, named) => {
 registerBuiltin('', 'hline', (c, args, named) => {
   const ctx = c as RtCtx;
   if (inLocalScope(ctx, 'hline')) return NA;
-  const bound = bindArgs(args, named, [
-    'price', 'title', 'color', 'linestyle', 'linewidth', 'editable', 'display',
-  ] as const);
+  const bound = bindArgs(args, named, HLINE_ORDER);
   const price = bound.get('price') ?? NA;
   const pv = price.kind === 'series' ? price.v.cur() : price;
   if (pv.kind === 'na') return NA; // hline(na) draws nothing, allocates no slot

@@ -17,6 +17,52 @@ export const BUILTINS: Map<string, BuiltinFn> = new Map();
 export interface HistSpec { idx: readonly number[]; names: readonly string[] }
 export const HIST_BUILTINS = new Map<BuiltinFn, HistSpec | true>();
 
+/** Which args of a builtin must arrive as a PLAIN value, never a series
+ *  wrapper. evalArg wraps builtin args for three reasons: a bare ident bound to
+ *  a BarSeries slot (every declared variable), a num/bool literal on the
+ *  litFastPath, and a scalar expression when `noHist` is false. Builtins that
+ *  read an arg through `.cur()`-style helpers (`asNum`/`asStr`/`truthy`/
+ *  `unwrapped`) don't care; builtins that test `v.kind === 'na'`,
+ *  `switch (v.kind)` or `v.kind === 'array'` see 'series' instead of the real
+ *  kind and take the wrong branch. Its `ScalarSpec` is declared in the
+ *  option-A table (`builtins/scalarDeclPatch.ts`), which `callBuiltin` reads
+ *  through `SCALAR_BUILTINS`; there is no per-registration entry point on
+ *  purpose, so that one list stays auditable.
+ *  NEVER declare an arg that must keep its history (ta.* source/vs,
+ *  nz, plot's value). Scalar wins over HistSpec when both name one slot. */
+export interface ScalarSpec {
+  idx: readonly number[];
+  names: readonly string[];
+  /** The family's `bindArgs` order. `idx` holds order slots, but `callBuiltin`
+   *  sees only the raw positional array — and `bindArgs` fills positionals into
+   *  the slots no named arg claimed, so the two differ as soon as a named arg
+   *  takes a lower slot. Required whenever `idx` is not exactly
+   *  `[0, 1, … names.length-1]`; absent means "risk not modelled yet", and the
+   *  unwrap then stays index-equals-slot (see the integrity test's NOT-caught
+   *  list). */
+  order?: readonly string[];
+}
+export const SCALAR_BUILTINS = new Map<BuiltinFn, ScalarSpec>();
+
+/** Raw positional index -> the `bindArgs` order slot that positional actually
+ *  lands in, for one call: a named arg claims its slot, positionals fill the
+ *  rest in order (`util.ts` bindArgs). Mirrors that function's `series` →
+ *  `source` alias so the two cannot disagree. */
+export function positionalSlots(
+  order: readonly string[],
+  named: Record<string, Value>,
+  argCount: number,
+): number[] {
+  const keys = Object.keys(named);
+  const slotOf: number[] = [];
+  for (let s = 0; s < order.length && slotOf.length < argCount; s++) {
+    const slot = order[s]!;
+    const claimed = keys.some((k) => (!order.includes(k) && k === 'series' && order.includes('source') ? 'source' : k) === slot);
+    if (!claimed) slotOf.push(s);
+  }
+  return slotOf;
+}
+
 /** Resolve per-arg history need. Positional args match by index (named args
  *  don't consume positional slots); named args match by name. */
 export function histSpecHas(spec: HistSpec | true | undefined, posIdx: number, name?: string): boolean {

@@ -306,11 +306,15 @@ describe('regressions — R2 verification findings', () => {
   });
 });
 
-// ── adaptive tick policy ────────────────────────────────────────────────────
-// A run slower than HEAVY_RUN_MS flips the session to per-bar updates:
-// forming-bar ticks (same tail time, new data) are skipped; a new bar still
-// re-runs. Cheap scripts keep per-tick behavior. Verified by counting runs
-// through a latency-controlled runProgram subclass.
+// ── request() skip policy ───────────────────────────────────────────────────
+// request() drops a call only when ALL of these hold: the call is not forced,
+// the last run took longer than HEAVY_RUN_MS (500 ms, measured across the whole
+// run including queue wait), no live IncLive exists, and the tape key
+// (length:lastTime) is unchanged. For a NON-empty tape that conjunction is
+// unreachable: such a run always leaves a live session, so `!incHolder.live` is
+// false and the tick runs. It IS reachable for a repeated empty-tape request,
+// whose session is never live — a case pinned by its own test below. Counting
+// runs through a latency-controlled runProgram subclass.
 
 class DelayedEngine extends PineInterpreterEngine {
   runs = 0;
@@ -327,9 +331,10 @@ class DelayedEngine extends PineInterpreterEngine {
   }
 }
 
-describe('adaptive tick policy', () => {
-  // strategy decls are incremental-ineligible → the session never gets a
-  // live IncLive, so the heavy-run tick skip still applies to this fixture.
+describe('tick policy', () => {
+  // EVERY script gets a live IncLive (strategy decls included — S1), so a heavy
+  // run on a non-empty tape leaves `!incHolder.live` false and its ticks always
+  // run. If this regresses, the skip has become reachable for this fixture.
   const src = '//@version=6\nstrategy("a")\nplot(close)\n';
 
   const exec = async (engine: PineInterpreterEngine, bars: OHLCV[]) => {
@@ -353,31 +358,57 @@ describe('adaptive tick policy', () => {
     tape.bars = same;
   };
 
-  it('heavy run → forming-bar ticks skipped, new bar still re-runs', async () => {
+  it('heavy run → forming-bar ticks keep running (no skip)', async () => {
     const engine = new DelayedEngine(600);
     const { tape, session, c } = await exec(engine, mkBars(10));
     await c.waitFor(1); // initial run
     expect(engine.runs).toBe(1);
 
-    // Same tail time (forming bar), mutated close → tick: skipped. runs++
-    // executes synchronously inside runProgram, so a started run is
-    // observable the same tick notifyBars() returns — no wait needed.
+    // Same tail time (forming bar), mutated close → tick. A heavy run on a
+    // non-empty tape always leaves a live session, so the skip cannot fire and
+    // the tick runs.
     tickSameBar(tape);
     session.notifyBars();
-    expect(engine.runs).toBe(1);
-
-    // Input update forces a run even under the policy.
-    session.update({});
     await c.waitFor(2);
     expect(engine.runs).toBe(2);
+
+    // Input update forces a run either way.
+    session.update({});
+    await c.waitFor(3);
+    expect(engine.runs).toBe(3);
 
     // New bar (len + 1) is a bar close → re-run.
     const grown = tape.bars.slice();
     grown.push({ time: 10 * 3600000, open: 1, high: 2, low: 0, close: 1, volume: 1 });
     tape.bars = grown;
     session.notifyBars();
-    await c.waitFor(3);
-    expect(engine.runs).toBe(3);
+    await c.waitFor(4);
+    expect(engine.runs).toBe(4);
+    session.stop();
+  });
+
+  it('repeated empty-tape request is dropped while the last run is slow', async () => {
+    // The reachable case for the skip: an empty tape leaves `live: null` and
+    // `active: false`, and tapeKey([]) is the stable string "0:0". execute()'s
+    // initial request is length-guarded ("Skip the zero-bar first run"), so the
+    // run starts from notifyBars() — which carries no length guard.
+    const engine = new DelayedEngine(600);
+    const { tape, session, c } = await exec(engine, []);
+    session.notifyBars();
+    await c.waitFor(1); // the empty-tape run still emits, and sets lastRunMs
+    expect(engine.runs).toBe(1);
+
+    // Same tape key, still no live session, last run over HEAVY_RUN_MS → the
+    // request is dropped. runs++ executes synchronously inside runProgram, so a
+    // started run is observable the same tick notifyBars() returns.
+    session.notifyBars();
+    expect(engine.runs).toBe(1);
+
+    // New data changes the tape key → the request is let through again.
+    tape.bars = mkBars(1);
+    session.notifyBars();
+    await c.waitFor(2);
+    expect(engine.runs).toBe(2);
     session.stop();
   });
 

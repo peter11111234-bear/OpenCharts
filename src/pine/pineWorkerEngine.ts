@@ -36,7 +36,11 @@ export class PineWorkerEngine extends PineInterpreterEngine {
     // shouldAbort/sessionCtx/incSession are dropped — stop() terminates the
     // session's worker via abortRun; incHolder is the in-process holder
     // (non-cloneable) — the worker keys its own sessions by incKey.
-    const { fetchSeries, shouldAbort: _shouldAbort, sessionCtx: _ctx, incHolder, ...rest } = opts;
+    // `incSession` MUST be listed here: an IncLive carries the session ctx (and
+    // a `callUdf` closure), so structured-cloning it throws DataCloneError.
+    // RunOptions's doc says the worker keys its own map, and ClientRunOpts
+    // already omits it — this destructure is what enforces that at runtime.
+    const { fetchSeries, shouldAbort: _shouldAbort, sessionCtx: _ctx, incHolder, incSession: _incSession, ...rest } = opts;
     return client.run({ parsed, bars: barData, opts: { ...rest, fetchSeries } })
       .then((r) => {
         // Mirror the worker's session liveness into the holder — the engine's
@@ -48,7 +52,8 @@ export class PineWorkerEngine extends PineInterpreterEngine {
         // Construction/transport failure flips client.unavailable → in-process
         // retry keeps behavior. A 'disposed' rejection (stop raced the run) must
         // NOT re-run the script the caller already cancelled.
-        if (client.unavailable) return super.runProgram(parsed, barData, opts);
+        const isDataClone = e instanceof Error && (e.name === 'DataCloneError' || e.message.includes('clone'));
+        if (client.unavailable || isDataClone) return super.runProgram(parsed, barData, opts);
         throw e;
       });
   }

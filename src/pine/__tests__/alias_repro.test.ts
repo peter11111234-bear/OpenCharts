@@ -2,8 +2,8 @@
 // same bug tracked as P1 in PROGRESS.md R2):
 // `x = <series-aliasing expr>; x := …` writes through into the shared slot —
 // an input.source alias corrupts ctx.close; a UDF-returned series corrupts
-// the callee's slot. Marked it.fails until the alias write-through is fixed;
-// flip to `it` when the bug lands.
+// the callee's slot. Alias write-through fix landed — these are plain it()
+// (was it.fails).
 import { describe, expect, it } from 'vitest';
 import { parse } from '../parser';
 import { runScript } from '../interpreter';

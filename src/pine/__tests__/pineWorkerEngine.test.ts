@@ -125,6 +125,89 @@ x := 1   // reassign undeclared → PineRuntimeError at line 3
     expect(err.message).toMatch(/undeclared/i);
   });
 
+  it('a live tick reuses the worker session; its model equals a cold run of the same bars', async () => {
+    // Coverage gap this closes: every other test here is mode:'static' and
+    // one-shot, so nothing ever ticked a worker-backend session. The worker
+    // realm runs its OWN incRunStart/incAdvance (pineWorker.ts keys IncLive by
+    // incKey), so the tick path — including the forming-bar rollback — had no
+    // cross-realm coverage at all.
+    //
+    // The tick rewrites the FORMING bar: that is the only case incAdvance
+    // does not bail to 'fallback' (a changed closed bar trips
+    // `firstDiff <= live.committed` and forces a cold run), so it is the case
+    // restoreCkpt + re-eval must get right — the repo's own invariant from
+    // inc-parity.test.ts: "var counter must not double-apply on forming-bar
+    // rollback".
+    //
+    // Note this test does NOT cover the trimCw guard: trimCw only drops a
+    // rollback write-log, and mtfCheckpoint/mtfRestore restore from a full
+    // snapshot, so removing that guard changes no value (verified by mutation
+    // — the suite stayed green). trimCw is a memory bound; cwPeak and the
+    // digest probes are its instrument, not this.
+    const src = `//@version=6
+indicator("t")
+x = request.security("ES", "120", close)
+var n = 0
+n := n + 1
+plot(n, title="n")
+plot(x, title="x")
+`;
+    const fetched: BarData[] = [
+      { openTime: 0, open: 0, high: 0, low: 0, close: 42, volume: 0 },
+      { openTime: 3600000, open: 0, high: 0, low: 0, close: 43, volume: 0 },
+    ];
+    const fetchSeries = (): Promise<OHLCV[]> =>
+      Promise.resolve(fetched.map(b => ({ ...b, time: b.openTime })) as OHLCV[]);
+
+    const client = new PineRunClient({ factory: () => new FakeWorker() });
+    const engine = new PineWorkerEngine(() => client);
+
+    // 5 bars ⇒ lastClosed = 3, so trimCw fires on bars 0..2 during the build
+    // and the session's checkpoint sits at bar 3.
+    const startLive = async (bars: OHLCV[]) => {
+      const prepared = await engine.prepare(src, 't1');
+      const tape = { bars };
+      const models: IndicatorModel[] = [];
+      const waiters: (() => void)[] = [];
+      const waitFor = (k: number): Promise<void> => {
+        const { promise, resolve } = Promise.withResolvers<void>();
+        if (models.length >= k) resolve();
+        else waiters.push(() => { if (models.length >= k) resolve(); });
+        return promise;
+      };
+      const session = engine.execute(
+        mkReq(prepared, tape.bars, { mode: 'live', getBars: () => tape.bars, fetchSeries }),
+        { onModel: (m) => { models.push(m); waiters.splice(0).forEach(w => w()); } },
+      );
+      return { tape, models, waitFor, session };
+    };
+
+    const live = await startLive(mkBars(5));
+    await live.waitFor(1);
+    // Rewrite the FORMING bar (index 4), same time — the rollback path.
+    const revised = live.tape.bars.slice();
+    revised[4] = { ...revised[4]!, close: 108.25 };
+    live.tape.bars = revised;
+    live.session.notifyBars();
+    await live.waitFor(2);
+    const alive = client.incAlive;
+    live.session.stop();
+
+    // Oracle: a fresh live session on the same final tape (same lastClosed).
+    const cold = await startLive(revised);
+    await cold.waitFor(1);
+    cold.session.stop();
+
+    expect(alive).toBe(true);                                   // tick reused the worker's session
+    expect(live.models).toHaveLength(2);
+    // 5 bars ⇒ n counts bars seen: 5 at the forming bar, never 6. A rollback
+    // that failed to undo the first bar-4 evaluation would double-apply it.
+    expect(pointsOf(live.models[1]!, 0)[4]!.value).toBe(5);
+    expect(pointsOf(cold.models[0]!, 1).some(p => p.value !== null)).toBe(true);
+    expect(pointsOf(live.models[1]!)).toEqual(pointsOf(cold.models[0]!));
+    expect(pointsOf(live.models[1]!, 1)).toEqual(pointsOf(cold.models[0]!, 1));
+  });
+
   it('concurrent execute() sessions on one engine each get their own worker', async () => {
     // Regression: Vela creates ONE engine per chart but a chart can host
     // several pine indicators → several execute() sessions. A shared client

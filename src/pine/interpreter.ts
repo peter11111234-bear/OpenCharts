@@ -56,11 +56,11 @@ import {
 import { PineRuntimeError, pineErr, wrapPineError } from './errors';
 import { debugFlag, markStage } from './debugFlags';
 import { FOR_IN } from './parser';
-import { BarSeries, ForwardingSeries, LitSeries, histGetAt, setActiveSeriesSet, valueAt, type IncSnap } from './series';
+import { BarSeries, CellSeries, ForwardingSeries, LitSeries, histGetAt, setActiveSeriesSet, valueAt, type IncSnap } from './series';
 import { Scope, blockFrame, seriesOf, type Frame } from './scope';
 import { BarCtx, MemoryDrawSink, type DrawSnap } from './context';
-import { BUILTINS, HIST_BUILTINS, getConstant, histSpecHas, kindBuiltin, registerConstant } from './builtins/registry';
-import { truthy, drainBindWarnings, type RtCtx } from './builtins/util';
+import { BUILTINS, HIST_BUILTINS, SCALAR_BUILTINS, getConstant, histSpecHas, kindBuiltin, positionalSlots, registerConstant } from './builtins/registry';
+import { EMPTY_NAMED, truthy, drainBindWarnings, type RtCtx } from './builtins/util';
 import { declDrawQuotas, INDICATOR_DECL_ORDER, warnUnsupportedIndicatorParams } from './builtins/draw';
 import { strategyDecl, execsAt } from './builtins/strategy';
 import {
@@ -99,6 +99,15 @@ export interface MtfHooks {
   /** Refetch every spec's feed for a live session (tape grew → higher-tf
    *  bars may have closed). No-op for stores without specs. */
   refresh?(ctx: BuiltinCtx, frame?: Frame): Promise<void>;
+  /** Drop the rollback write-log. Safe once the only checkpoint a session can
+   *  restore sits at or after the current bar: the log records writes made
+   *  after that checkpoint, so earlier ones roll back through the SpecSnap's
+   *  own membership instead. Without this the log grew with the whole tape on
+   *  every cold load (~2 entries/bar), none of it ever replayed. */
+  trimCw?(): void;
+  /** Zero the write-log peak (`__mtfStats` is a module singleton that nothing
+   *  else resets) so a caller can read a per-run absolute value. */
+  resetPeak?(): void;
   /** mtf.ts binds evaluator adapters for its tf child frames. */
   bindEval?: (
     e: (n: Node, s: Scope, c: BuiltinCtx) => Value,
@@ -157,17 +166,22 @@ interface RunState {
   pruneCutoff: number;
   /** `expr[n]` on non-Ident obj → lazily tracked BarSeries. */
   callHist: Map<Node, BarSeries>;
+  /** Arg site (siteKey object) → identity anchor for a series ARG that its
+   *  expression re-creates every bar. `inner` is the last raw series seen (the
+   *  churn detector); `wrap` is the SiteSeries handed out once churn is
+   *  proven. Sites that keep returning the same object stay unwrapped. */
+  argSites: Map<object, { inner: Series; wrap: SiteSeries | null }>;
   /** Call node → stable callsite id for plot/alert routing. */
   callsites: Map<Node, string>;
   callsiteSeq: number;
-  /** Stack of active callsite ids (UDF nesting). Empty = top level. */
-  siteStack: string[];
   /** Site-path trie: callsite string → … → node → stable key object for
    *  declSlots/callHist/tupleKeys. Root map keyed by callsite string. */
   siteTrie: Map<unknown, unknown>;
-  /** Parallel to siteStack: siteCtx[i] is the trie node reached after
-   *  siteStack[0..i] — maintained on push/pop so siteKey() is one Map.get
-   *  instead of a depth+2 trie walk. */
+  /** Site-path stack: siteCtx[i] is the trie node reached after the i-th
+   *  pushed callsite — maintained on push/pop so siteKey() is one Map.get
+   *  instead of a depth+2 trie walk. This array IS the call depth (siteKey /
+   *  evalCall read its length); the parallel string stack that used to sit
+   *  beside it had no reader, so it was dropped. */
   siteCtx: Map<unknown, unknown>[];
   warned: Set<string>;
   /** Top-level frame of the current bar (ctx.callUdf re-enters here). */
@@ -180,41 +194,72 @@ interface RunState {
   paramCows: Map<object, Map<string, CowSeries>>;
   /** UDF body Node[] → compiled JitState (lazy; undefined until first use). */
   udfJit: WeakMap<Node[], JitState | null>;
+  /** Diagnostic switches resolved ONCE per bar (evalOneBar), not per node /
+   *  per UDF call: `debugFlag()` probes globalThis + process.env, which cost
+   *  ~7% of a real script's run when read on every evalNode (measured
+   *  2026-10-15, TRIS390 60 bars / 121 ms of 1809 ms). One probe per bar keeps
+   *  a live-session (incRun) toggle effective, and matches the per-run rule
+   *  `compiledEnabled()` already documents for the same class of switch. */
+  evalCount: boolean;
+  udfJitOn: boolean;
  /** Call node → selfType → resolved UdtMethodDef (null = none). Registry
   *  resets per runScript, so the cache lives on RunState, not module level. */
- udtMethodCache: WeakMap<Node, Map<string, UdtMethodDef | null>>;
+ udtMethodCache: WeakMap<Node, Map<string, Map<string, UdtMethodDef | null>>>;
 }
 
-const runStates = new WeakMap<BuiltinCtx, RunState>();
+/** ctx → RunState slot, keyed by a symbol so it stays off the ctx's
+ *  string-keyed surface (Object.keys / JSON / `{...ctx}`). */
+const RUN_STATE: unique symbol = Symbol('pine.runState');
 
+type CtxRunSlot = { [RUN_STATE]?: RunState };
+
+/** `runOf` runs on EVERY evalNode, evalArg, evalBlock, evalCall/
+ *  evalCallDispatch and evalMember — ~14 call sites, hundreds of thousands of
+ *  calls per pass (measured: 2.2% of a 100-bar K55 pass in self time). The slot
+ *  is written exactly ONCE per ctx (creation, below) and never replaced, so a
+ *  plain property load returns what a side-table lookup would.
+ *
+ *  The slot lives on the ctx itself rather than in a module-level
+ *  ctx→RunState table: a module-level `last…` pair was a strong reference that
+ *  kept the previous (discarded) session — ctx plus its whole RunState — alive
+ *  until the next `runOf` handed over, i.e. a delayed release for as long as a
+ *  long run lasted (5000-bar tapes made that visible). Here the RunState dies
+ *  with its ctx, and there is no per-call table lookup at all.
+ *
+ *  Non-enumerable: `{ ...ctx }` copies (strategyEquity's `shifted`) must NOT
+ *  inherit the parent's RunState — they keep getting their own, exactly as the
+ *  WeakMap-keyed table behaved. */
 function runOf(ctx: BuiltinCtx): RunState {
-  let r = runStates.get(ctx);
-  if (!r) {
-    r = {
-      declSlots: new Map(),
-      declCows: new Map(),
-      declAliased: new Set(),
-      trackedSlots: new Set(),
-      ensureList: [],
-      topLevelBody: false,
-      topStmtIdx: -1,
-      pruneCutoff: Infinity,
-      callHist: new Map(),
-      callsites: new Map(),
-      callsiteSeq: 0,
-      siteStack: [],
-      siteTrie: new Map(),
-      siteCtx: [],
-      warned: new Set(),
-      topFrame: null,
-      misc: new Map(),
-      tupleKeys: new Map(),
-      paramCows: new Map(),
-      udfJit: new WeakMap(),
-      udtMethodCache: new WeakMap(),
-    };
-    runStates.set(ctx, r);
-  }
+  const cached = (ctx as BuiltinCtx & CtxRunSlot)[RUN_STATE];
+  if (cached !== undefined) return cached;
+  const r: RunState = {
+    declSlots: new Map(),
+    declCows: new Map(),
+    declAliased: new Set(),
+    trackedSlots: new Set(),
+    ensureList: [],
+    topLevelBody: false,
+    topStmtIdx: -1,
+    pruneCutoff: Infinity,
+    callHist: new Map(),
+    argSites: new Map(),
+    callsites: new Map(),
+    callsiteSeq: 0,
+    siteTrie: new Map(),
+    siteCtx: [],
+    warned: new Set(),
+    topFrame: null,
+    misc: new Map(),
+    tupleKeys: new Map(),
+    paramCows: new Map(),
+    udfJit: new WeakMap(),
+    udtMethodCache: new WeakMap(),
+    // Diagnostic switches: initial value for a RunState born mid-run (MTF tf
+    // child frames); evalOneBar refreshes both once per bar.
+    evalCount: debugFlag('evalCount'),
+    udfJitOn: udfJitDefault(),
+  };
+  Object.defineProperty(ctx, RUN_STATE, { value: r, enumerable: false, writable: false, configurable: false });
   return r;
 }
 
@@ -346,6 +391,68 @@ class CowSeries extends ForwardingSeries {
   }
 }
 
+/**
+ * Identity anchor for a call ARG whose expression builds a NEW series object
+ * every bar (`math.min(cnt + 1, 10)` → math.ts lifts the result into a fresh
+ * LiftedSeries per call). Every consumer that memoizes by series identity
+ * loses its state per bar: ta.ts's `CONST_SERIES` const-detector then re-scans
+ * the whole history each bar (`ta.highest(math.min(cnt + 1, 10))` = O(bar)
+ * `Series.get` per bar, superlinear across the run).
+ *
+ * Reads delegate to the CURRENT inner via `readTarget()`, so every value a
+ * builtin sees is exactly the one the raw series would have answered — only
+ * the identity handed to identity-keyed state is per-site stable. `bind()` is
+ * the per-bar hand-off; the wrapper itself is created once per arg site.
+ *
+ * Only plain BarSeries-family inners are wrapped (BarSeries / LiftedSeries /
+ * LitSeries — all absolute-bar-indexed, so an offset recorded earlier can
+ * never change underneath the wrapper: the invariant identity-keyed memos
+ * assume). ForwardingSeries (CowSeries/SecSeries — their own churn is handled
+ * at the binding site) and live-anchor computed series are never wrapped.
+ */
+class SiteSeries extends ForwardingSeries {
+  private inner: BarSeries;
+  /** The `bind` contract's explicit discriminant — see `ForwardingSeries`. */
+  readonly siteAnchor = true as const;
+
+  constructor(inner: BarSeries) {
+    super();
+    this.inner = inner;
+  }
+
+  bind(inner: BarSeries): void {
+    this.inner = inner;
+  }
+
+  override readTarget(): Series {
+    return this.inner;
+  }
+  override get currentBar(): number {
+    return this.inner.currentBar;
+  }
+  override get(n: number): Value {
+    return this.inner.get(n);
+  }
+  override cur(): Value {
+    return this.inner.cur();
+  }
+  override size(): number {
+    return this.inner.size();
+  }
+  override atOffset(bar: number, n: number): Value {
+    return this.inner.atOffset(bar, n);
+  }
+  override ensureBar(bar: number): void {
+    this.inner.ensureBar(bar);
+  }
+  override setAt(bar: number, v: Value): void {
+    this.inner.setAt(bar, v);
+  }
+  override set(v: Value): void {
+    this.inner.set(v);
+  }
+}
+
 /** Pine default stringification (`+` concat, warnings). */
 export function pineStr(v: Value): string {
   switch (v.kind) {
@@ -379,16 +486,15 @@ export function pineStr(v: Value): string {
 function siteKey(run: RunState, node: object): object {
   // Empty stack → the node itself is the key (top-level decls).
   if (run.siteCtx.length === 0) return node;
-  // siteCtx mirrors siteStack — leaf map reached via the top entry.
+  // Leaf map reached via the top of the site stack.
   const leafMap = run.siteCtx[run.siteCtx.length - 1]!;
   let leaf = leafMap.get(node) as object | undefined;
   if (leaf === undefined) { leaf = {}; leafMap.set(node, leaf); }
   return leaf;
 }
 
-/** Push a callsite onto both stacks; siteCtx walks (and grows) the trie. */
+/** Push a callsite onto the site stack; siteCtx walks (and grows) the trie. */
 function pushSite(run: RunState, site: string): void {
-  run.siteStack.push(site);
   const parent = run.siteCtx.length ? run.siteCtx[run.siteCtx.length - 1]! : run.siteTrie;
   let child = parent.get(site) as Map<unknown, unknown> | undefined;
   if (child === undefined) { child = new Map(); parent.set(site, child); }
@@ -411,6 +517,37 @@ function trackSeries(run: RunState, s: BarSeries): void {
     run.trackedSlots.add(s);
     run.ensureList.push(s);
   }
+}
+
+/**
+ * Hand a call ARG's series value to a builtin with a per-site STABLE identity
+ * when the site's expression rebuilds the object every bar (see SiteSeries).
+ *
+ * Churn is detected, never assumed: the first value is returned untouched, so
+ * a site that keeps handing back the same object (ctx price series, decl
+ * slots, callHist/LitSeries slots) never allocates a wrapper and pays one Map
+ * hit per arg. Only a site seen returning a SECOND, different object gets a
+ * SiteSeries, and only for wrap-eligible inners (plain BarSeries family);
+ * anything else keeps the raw passthrough.
+ */
+function stableArgSeries(run: RunState, key: object, v: Series): Series {
+  const e = run.argSites.get(key);
+  if (e === undefined) {
+    run.argSites.set(key, { inner: v, wrap: null });
+    return v;
+  }
+  if (e.inner === v) return e.wrap ?? v;
+  if (v instanceof BarSeries && !(v instanceof ForwardingSeries)) {
+    if (e.wrap) e.wrap.bind(v);
+    else e.wrap = new SiteSeries(v);
+    e.inner = v;
+    return e.wrap;
+  }
+  // Ineligible (or no longer eligible) inner: pass it through raw and drop the
+  // previous anchor so a later eligible churn can start wrapping again.
+  e.inner = v;
+  e.wrap = null;
+  return v;
 }
 
 /** Child nodes of an AST node (skips scalars like loc/type/name). Shared
@@ -564,12 +701,17 @@ function bindDeclared(
     }
     if (!cow) {
       cow = new CowSeries(v.v);
-    } else {
+    } else if (cow.source !== v.v) {
       // Fresh wrapper each bind: the previous wrapper object may live inside
       // array slots (vals[i] = tmpV) and must keep reading its old inner.
       // The materialized `:=` copy is adopted so write history survives.
       cow = cow.rebind(v.v);
     }
+    // Same inner → keep the existing wrapper: re-pointing is a no-op (it
+    // already forwards there), and a fresh wrapper per bar churns the identity
+    // every identity-keyed consumer memoizes on — `src = input.source(close)`
+    // built one CowSeries per bar. The same rule (and the `source` getter it
+    // needs) is what the paramCows rebind below already follows.
     if (!persistent) cow.seed(() => valueAt(v.v, bar), bar);
     run.declCows.set(key, cow);
     // Non-persistent decls re-init every bar: seed the materialized copy with
@@ -681,7 +823,7 @@ function evalNode(node: Node, frame: Frame): Value {
   const { scope, ctx } = frame;
   const run = runOf(ctx);
   const bar = ctx.barIndex;
-  if (debugFlag('evalCount')) {
+  if (run.evalCount) {
     __evalNodeCounts.set(node.type, (__evalNodeCounts.get(node.type) ?? 0) + 1);
   }
 
@@ -1189,9 +1331,10 @@ function evalCall(node: Call, frame: Frame): Value {
   rt.callsite = site;
   pushSite(run, site);
   try {
-    return evalCallDispatch(node, frame);
+    // `run` is handed over: the dispatch already needs it, and re-resolving it
+    // through runOf here was one more lookup per call on the hot path.
+    return evalCallDispatch(node, frame, run);
   } finally {
-    run.siteStack.pop();
     run.siteCtx.pop();
     rt.callsite = prevSite;
   }
@@ -1202,30 +1345,44 @@ function evalCall(node: Call, frame: Frame): Value {
 // after the first dispatch of a given callsite.
 const RESOLVED_BUILTIN = new WeakMap<Call, { headName: string; fn: BuiltinFn | undefined }>();
 
-/** getUdtMethod memoized per (callsite node, selfType) — a call node's method
- * name and its receiver's runtime type are bar-stable; caching skips
- * normalizeSelfType + map-key allocation per invocation (~2% UDT-heavy). */
+/** Call nodes that mtf's per-call security hook answered `null` for — i.e. the
+ *  node is statically NOT a `request.security` call. Permanent per node, same
+ *  contract as RESOLVED_BUILTIN above: mtf.tryEvalSecurity's ONLY null return
+ *  is its first line `!isSecurityCall(node)` (mtf.ts), a pure shape test on the
+ *  node, so the verdict can never change for the same Call node. Skipping the
+ *  hook keeps ~54k non-security calls per 100-bar pass off mtf's property-load
+ *  chain (measured 0.9% self time). A node that IS a security call always
+ *  re-enters the hook. */
+const NOT_SECURITY_CALL = new WeakSet<Call>();
+
+/** getUdtMethod memoized per (callsite node, selfType, method name) — a call
+ *  node's method name and its receiver's runtime type are bar-stable; caching
+ *  skips normalizeSelfType + map-key allocation per invocation (~2% UDT-heavy).
+ *  Two nested maps, not one `${selfType}.${name}` string: the concat allocated
+ *  a fresh string + hash per call, and neither half can contain '.' (selfType
+ *  is a UDT typeName or a Value kind; `name` is a non-computed member prop, so
+ *  an identifier) — the pair map holds exactly the same mapping. */
 function udtMethodAt(run: RunState, node: Call, selfType: string, name: string): UdtMethodDef | undefined {
   let byType = run.udtMethodCache.get(node);
   if (!byType) { byType = new Map(); run.udtMethodCache.set(node, byType); }
-  const key = `${selfType}.${name}`;
-  let hit = byType.get(key);
+  let byName = byType.get(selfType);
+  if (byName === undefined) { byName = new Map(); byType.set(selfType, byName); }
+  let hit = byName.get(name);
   if (hit === undefined) {
     hit = getUdtMethod(selfType, name) ?? null;
-    byType.set(key, hit);
+    byName.set(name, hit);
   }
   return hit ?? undefined;
 }
 
-
-function evalCallDispatch(node: Call, frame: Frame): Value {
+function evalCallDispatch(node: Call, frame: Frame, run: RunState): Value {
   const { scope, ctx } = frame;
-  const run = runOf(ctx);
 
   // request.security — lazy args; mtf.ts evaluates expr in tf child frames.
-  if (mtf) {
+  if (mtf && !NOT_SECURITY_CALL.has(node)) {
     const sec = mtf.tryEvalSecurity(node, frame);
     if (sec !== null) return sec;
+    NOT_SECURITY_CALL.add(node);
   }
 
   const callee = node.callee;
@@ -1239,7 +1396,9 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
     isUdtType(callee.obj.name)
   ) {
     const args: Value[] = [];
-    const named: Record<string, Value> = {};
+    const named: Record<string, Value> = node.args.some((a) => a.name !== undefined)
+      ? {}
+      : (EMPTY_NAMED as Record<string, Value>);
     for (const a of node.args) {
       const v = evalExpr(a.value, frame);
       if (a.name) named[a.name] = v;
@@ -1300,7 +1459,9 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
       const b = kindBuiltin(obj.kind, prop);
       if (b) {
         const args: Value[] = [obj];
-        const named: Record<string, Value> = {};
+        const named: Record<string, Value> = node.args.some((a) => a.name !== undefined)
+          ? {}
+          : (EMPTY_NAMED as Record<string, Value>);
         const spec = HIST_BUILTINS.get(b);
         // pos starts at 1: args[0] is the receiver ('id' slot), callsite
         // positionals bind order[1..].
@@ -1358,7 +1519,12 @@ function evalCallDispatch(node: Call, frame: Frame): Value {
 
 function invokeBuiltin(b: BuiltinFn, node: Call, frame: Frame): Value {
   const args: Value[] = [];
-  const named: Record<string, Value> = {};
+  // No `name=value` argument (the common case) → share the frozen singleton
+  // instead of allocating a throwaway `{}` per call. Identical behaviour: the
+  // loop below only writes a key when `a.name` is truthy.
+  const named: Record<string, Value> = node.args.some((a) => a.name !== undefined)
+    ? {}
+    : (EMPTY_NAMED as Record<string, Value>);
   const spec = HIST_BUILTINS.get(b);
   let pos = 0;
   for (const a of node.args) {
@@ -1376,6 +1542,45 @@ function callBuiltin(
   named: Record<string, Value>,
   node: Call,
 ): Value {
+  // The declaration table (`builtins/scalarDeclPatch.ts`, read through
+  // SCALAR_BUILTINS) marks the slots that must arrive as a plain value: a
+  // builtin's own `kind === 'na'` / `switch (v.kind)` test would otherwise see
+  // 'series'. Unwrap here — the one funnel every builtin call passes through
+  // (interp and JIT, function and method form), so the three arg paths cannot
+  // drift apart.
+  const sc = SCALAR_BUILTINS.get(b);
+  if (sc !== undefined) {
+    // `idx` holds bindArgs order slots. With no named arg the raw positional
+    // index equals its slot, so the common case stays a plain `args[ix]` read;
+    // a named arg claiming a lower slot shifts every positional after it, and
+    // `order` (declared for every spec whose idx is not a 0-based prefix) is
+    // what resolves where each positional actually landed.
+    const slots = named !== EMPTY_NAMED && sc.order !== undefined && args.length > 0
+      ? positionalSlots(sc.order, named, args.length)
+      : undefined;
+    for (let i = 0; i < sc.idx.length; i++) {
+      const raw = slots === undefined ? sc.idx[i]! : slots.indexOf(sc.idx[i]!);
+      if (raw < 0) continue;
+      const v = args[raw];
+      if (v !== undefined && v.kind === 'series') args[raw] = v.v.cur();
+    }
+    if (named !== EMPTY_NAMED) {
+      for (let i = 0; i < sc.names.length; i++) {
+        const n = sc.names[i]!;
+        // `series=` is TV's spelling of a `source` parameter: bindArgs
+        // canonicalises it (util.ts:222) and so does positionalSlots, so this
+        // loop must too — otherwise a wrapped value reaches the builtin's own
+        // `kind === 'na'` test (str.ts:254) and takes the wrong branch.
+        // Only when the declared name is `source` and no explicit `source=` was
+        // given, so an explicit binding always wins.
+        const key = named[n] === undefined && n === 'source' && named['series'] !== undefined
+          ? 'series'
+          : n;
+        const v = named[key];
+        if (v !== undefined && v.kind === 'series') named[key] = v.v.cur();
+      }
+    }
+  }
   try {
     return b(ctx, args, named);
   } catch (e) {
@@ -1480,7 +1685,9 @@ function evalArg(a: Arg, frame: Frame, litFastPath = false, noHist = false): Val
     return { kind: 'series', v: ls };
   }
   const v = evalExpr(a.value, frame);
-  if (v.kind === 'series') return v;
+  if (v.kind === 'series') {
+    return { kind: 'series', v: stableArgSeries(run, siteKey(run, a.value), v.v) };
+  }
   // Only numeric/bool scalars are time series in Pine (`x[1]` is valid on them).
   // Arrays, maps, UDTs, strings, colors and drawings pass through untouched so
   // builtins receive the real value instead of a fresh BarSeries wrapper.
@@ -1502,18 +1709,25 @@ function evalArg(a: Arg, frame: Frame, litFastPath = false, noHist = false): Val
   return { kind: 'series', v: s };
 }
 
+/** Param never reads its own history → its scalar arg can skip callHist.
+ *  (Module-level, not a per-call closure: bindCallArgs runs on the hot path.) */
+function paramNoHist(flags: Map<string, ParamFlag> | undefined, p: Param): boolean {
+  return flags !== undefined && flags.get(p.name)?.hist === false;
+}
+
 /** Bind callsite args (named first, then positional) against a param list.
  *  `flags` = paramFlags(params, body) — when given, scalar args bound to a
  *  param that never reads history skip callHist (evalArg noHist). */
 function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame,
                       flags?: Map<string, ParamFlag>): Value[] {
   const out: Value[] = new Array<Value>(params.length);
-  const noHist = (p: Param) => flags !== undefined && flags.get(p.name)?.hist === false;
   // Fast path: all-positional calls (the common case) skip the Set +
   // positionals staging array — eval args straight into param order.
-  if (!callArgs.some(a => a.name !== undefined)) {
+  let allPositional = true;
+  for (const a of callArgs) if (a.name !== undefined) { allPositional = false; break; }
+  if (allPositional) {
     const n = Math.min(callArgs.length, params.length);
-    for (let i = 0; i < n; i++) out[i] = evalArg(callArgs[i]!, frame, false, noHist(params[i]!));
+    for (let i = 0; i < n; i++) out[i] = evalArg(callArgs[i]!, frame, false, paramNoHist(flags, params[i]!));
     for (let i = n; i < params.length; i++) {
       const d = params[i]!.default;
       out[i] = d !== undefined ? evalExpr(d, frame) : NA;
@@ -1530,7 +1744,7 @@ function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame,
           warn(runOf(frame.ctx), frame.ctx,
             `duplicate named argument '${a.name}=' — ignored (this parameter is already bound)`);
         } else {
-          out[i] = evalArg(a, frame, false, noHist(params[i]!));
+          out[i] = evalArg(a, frame, false, paramNoHist(flags, params[i]!));
           filled.add(i);
         }
         continue;
@@ -1549,7 +1763,7 @@ function bindCallArgs(callArgs: Arg[], params: Param[], frame: Frame,
   for (const a of positionals) {
     while (p < params.length && filled.has(p)) p++;
     if (p >= params.length) break;
-    out[p] = evalArg(a, frame, false, noHist(params[p]!));
+    out[p] = evalArg(a, frame, false, paramNoHist(flags, params[p]!));
     filled.add(p);
     p++;
   }
@@ -1612,9 +1826,7 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
       // bind the raw value; scalar x[1] is unreachable and `:=` can't fire.
       const pf = flags.get(p.name);
       if (pf && !pf.hist && !pf.mut) { callScope.define(p.name, a); return; }
-      const s = new BarSeries();
-      s.setAt(bar, a);
-      callScope.define(p.name, s);
+      callScope.define(p.name, new CellSeries(bar, a));
     }
   });
   const callFr: Frame = { scope: callScope, ctx };
@@ -1626,7 +1838,7 @@ function callUdfValue(fn: UdfDecl, args: Value[], frame: Frame, callNode?: Node)
   const wasTop = run.topLevelBody, wasIdx = run.topStmtIdx;
   run.topLevelBody = false; run.topStmtIdx = -1;
   try {
-    if (udfJitEnabled() && Array.isArray(fn.body)) {
+    if (run.udfJitOn && Array.isArray(fn.body)) {
       const js = udfJitState(fn.body, run, ctx);
       if (js) {
         // Swap the JitState's frame to this call's scope — R bindings read
@@ -1777,14 +1989,10 @@ function evalFor(node: ForStmt, frame: Frame): Value {
             ? item.v
             : [{ kind: 'int', v: count - 1 } as Value, item];
         for (const [j, nm] of kv.entries()) {
-          const lv = new BarSeries();
-          lv.setAt(bar, pair[j] ?? NA);
-          fr.scope.define(nm, lv);
+          fr.scope.define(nm, new CellSeries(bar, pair[j] ?? NA));
         }
       } else {
-        const lv = new BarSeries();
-        lv.setAt(bar, item);
-        fr.scope.define(node.varName, lv);
+        fr.scope.define(node.varName, new CellSeries(bar, item));
       }
       try {
         last = evalBlock(node.body, fr);
@@ -1815,9 +2023,7 @@ function evalFor(node: ForStmt, frame: Frame): Value {
       break;
     }
     const fr = blockFrame(frame, node.varName);
-    const lv = new BarSeries();
-    lv.setAt(bar, { kind: 'int', v: i });
-    fr.scope.define(node.varName, lv);
+    fr.scope.define(node.varName, new CellSeries(bar, { kind: 'int', v: i }));
     try {
       last = evalBlock(node.body, fr);
     } catch (e) {
@@ -2175,12 +2381,14 @@ function jitEnabled(): boolean {
  *  10-stmt hot UDF loses (79 vs 67ms). The call preamble + scope swap cost
  *  more than the emit saves. Opt back in via `__pineJitUdf=true` /
  *  PINE_JIT_UDF=1; `__pineNoJitUdf` / PINE_JIT_UDF=0 also forces off.
- *  Compile failures silently fall back to the interpreted body. */
-function udfJitEnabled(): boolean {
+ *  Compile failures silently fall back to the interpreted body.
+ *  Resolved once per bar into `RunState.udfJitOn` — reading the two handles
+ *  on every call meant two `debugFlag()` probes (globalThis + process.env)
+ *  per UDF invocation. */
+function udfJitDefault(): boolean {
   // NoJit wins over Jit when both flags exist — a stale off-flag must not
   // be overridden by an experiment opt-in left set on globalThis.
-  if (debugFlag('noJitUdf')) return false;
-  return debugFlag('jitUdf');
+  return debugFlag('noJitUdf') ? false : debugFlag('jitUdf');
 }
 
 /** Compile-or-fetch the per-UDF-body JitState. Cached on run.udfJit keyed by
@@ -2308,7 +2516,7 @@ function jitRuntime(state: JitState, run: RunState, ctx: BuiltinCtx) {
     },
     // ── call dispatch — evalCallDispatch verbatim; args materialize per-target
     // kind so litFastPath/series semantics match evalArg exactly.
-    // `evalCall` bookkeeping verbatim — rt.callsite/siteStack so plotIndex
+    // `evalCall` bookkeeping verbatim — rt.callsite/siteCtx so plotIndex
     // resolves a stable sink id under JIT.
     call: (idx: number, ds: JitArg[]): Value => {
       const node = state.nodes[idx] as Call;
@@ -2319,7 +2527,6 @@ function jitRuntime(state: JitState, run: RunState, ctx: BuiltinCtx) {
       try {
         return jitCallDispatch(state, run, ctx, node, ds);
       } finally {
-        run.siteStack.pop();
         run.siteCtx.pop();
         rt.callsite = prevSite;
       }
@@ -2393,9 +2600,10 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
                        node: Call, ds: JitArg[]): Value {
   const scope = state.cur.scope;
   const frame = state.cur;
-  if (mtf) {
+  if (mtf && !NOT_SECURITY_CALL.has(node)) {
     const sec = mtf.tryEvalSecurity(node, frame);
     if (sec !== null) return sec;
+    NOT_SECURITY_CALL.add(node);
   }
   const callee = node.callee;
   if (callee.type === 'member' && !callee.computed && callee.prop === 'new'
@@ -2493,7 +2701,9 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
 /** evalArg tail — wrap a plain-evaluated arg in its callsite BarSeries
  * (callHist), mirroring evalArg's post-evalExpr path. */
 function jitArgFinish(state: JitState, run: RunState, ctx: BuiltinCtx, idx: number, v: Value, noHist = false): Value {
-  if (v.kind === 'series') return v;
+  if (v.kind === 'series') {
+    return { kind: 'series', v: stableArgSeries(run, siteKey(run, state.nodes[idx]!), v.v) };
+  }
   if (v.kind !== 'int' && v.kind !== 'float' && v.kind !== 'bool') return v;
   if (noHist) return v;
   const key = siteKey(run, state.nodes[idx]!);
@@ -2896,6 +3106,11 @@ async function buildSess(
 function evalOneBar(s: PineSess, bar: number): 'ok' | 'ret' | PineRuntimeError {
   const { run, ctx } = s;
   if (ctx.barIndex !== bar) s.barCtx.seek(bar);
+  // Diagnostic switches, re-probed once per bar instead of once per evalNode /
+  // per UDF call (see RunState.evalCount). A toggle between live-session ticks
+  // still lands on the next bar.
+  run.evalCount = debugFlag('evalCount');
+  run.udfJitOn = udfJitDefault();
   try {
     // Decl slots created while topLevelBody is set are written every bar —
     // their ensureBar is a no-op, so slotFor keeps them out of ensureList
@@ -3074,9 +3289,15 @@ async function runScriptInner(
 // re-evaluated per tick after rolling back to the committed checkpoint. See
 // docs/superpowers/plans/2026-10-11-pine-incremental-live.md.
 //
-// Eligibility: indicator decls without request.* — MTF specs own bar-aligned
-// eval state that the rollback model doesn't cover yet, and strategy order
-// execution is event-driven, not per-bar deterministic.
+// Eligibility: EVERY script. The two former exclusions are covered now —
+// `request.*` state lives in the per-session MTF store, checkpointed like
+// everything else (mtf.ts mtfCheckpoint/mtfRestore), and strategy state lives
+// entirely in `ctx.state` (the `strategy|orders` array leaf + memo/config
+// plain objects), all inside the ctx.state snapshot. Order FILLING is a pure
+// replay (`strategy.simulate` is a function of (orders, bars, cfg, uptoBar)),
+// so rolling the order list back to the committed bar and re-running the
+// forming bar reproduces TV's per-tick recompute. What still forces a full
+// re-run is tape SHAPE (shrink, or a rewritten prefix — see incAdvance).
 
 /** Checkpoint payload — one snapshot per committed bar boundary. */
 interface IncCkpt {
@@ -3084,6 +3305,13 @@ interface IncCkpt {
   bar: number;
   scopeVars: Map<string, Series | Value>;
   seriesSnaps: Map<BarSeries, IncSnap>;
+  /** `s.seriesSet.size` when this checkpoint was taken. Every BarSeries born
+   *  while the session's registry is installed joins that Set and nothing ever
+   *  removes it, so a discarded forming-bar eval leaks its series for good —
+   *  the registry grows ~+150 per tick (B=100) while the live set is constant.
+   *  The Set is insertion-ordered, so everything past this count at restore
+   *  time is exactly the garbage born during the re-evaluated bar. */
+  seriesCount: number;
   /** series → buf-index → cloned container Value (hasContainers only). */
   containers: Map<BarSeries, Map<number, Value>>;
   declSlots: Map<object, BarSeries>;
@@ -3095,14 +3323,18 @@ interface IncCkpt {
   misc: Map<string, BarSeries>;
   tupleKeys: Map<Node, Map<string, object>>;
   paramCows: Map<object, Map<string, CowSeries>>;
+  /** Arg-site anchors (site key → churn detector + stable wrapper). */
+  argSites: Map<object, { inner: Series; wrap: SiteSeries | null }>;
   /** ctx.state leaf entries needing rollback:
    *   vs — VS objects (last + memo > bar pruned, snap/restore if present)
    *   nummaps — Map<number,*> leaves (entries > bar deleted)
    *   plains — plain objects (fields overwritten by stored clone)
+   *   arrays — array leaves (truncated + refilled in place; strategy orders)
    *   maps — structural maps (membership restored to stored key list) */
   stateVs: { e: { last: number; memo?: Map<number, number | undefined>; snap?(): unknown; restore?(s: unknown): void }; snap: unknown; last: number }[];
   stateNumMaps: Map<number, unknown>[];
   statePlains: { obj: Record<string, unknown>; fields: Record<string, unknown> }[];
+  stateArrays: { arr: unknown[]; items: unknown[] }[];
   stateMaps: { map: Map<unknown, unknown>; keys: unknown[] }[];
   drawSnap: DrawSnap;
   drawProps: Map<DrawObj, Record<string, unknown>>;
@@ -3151,6 +3383,10 @@ export interface CtxStateSnap {
   vs: { e: { last: number; memo?: Map<number, number | undefined>; snap?(): unknown; restore?(s: unknown): void }; snap: unknown; last: number }[];
   nummaps: Map<number, unknown>[];
   plains: { obj: Record<string, unknown>; fields: Record<string, unknown> }[];
+  /** Array leaves (e.g. strategy.ts's `strategy|orders` record list). The live
+   *  array keeps its identity — restore truncates and refills it in place, so
+   *  a holder that captured the array reference sees the rolled-back content. */
+  arrays: { arr: unknown[]; items: unknown[] }[];
   maps: { map: Map<unknown, unknown>; keys: unknown[] }[];
 }
 
@@ -3158,7 +3394,7 @@ export interface CtxStateSnap {
  *  prune, structural maps keep membership, VS objects snap/restore. `ids`
  *  shared with the caller's cloneDeep pass preserves cross-references. */
 export function snapCtxState(state: Map<unknown, unknown> | undefined, ids: Map<unknown, unknown>): CtxStateSnap {
-  const out: CtxStateSnap = { vs: [], nummaps: [], plains: [], maps: [] };
+  const out: CtxStateSnap = { vs: [], nummaps: [], plains: [], arrays: [], maps: [] };
   const walk = (m: Map<unknown, unknown>) => {
     for (const v of m.values()) {
       if (v instanceof Map) {
@@ -3179,6 +3415,14 @@ export function snapCtxState(state: Map<unknown, unknown> | undefined, ids: Map<
           out.maps.push({ map: v, keys: [...v.keys()] });
           walk(v);
         }
+        continue;
+      }
+      if (Array.isArray(v)) {
+        // Record lists (strategy orders, alert/fill scratch) append during the
+        // forming bar — snapshot membership + element payloads so the rollback
+        // drops exactly what the discarded eval added. Element identity is
+        // preserved inside one pass via `ids` (see cloneDeep).
+        out.arrays.push({ arr: v, items: cloneDeep(v, ids) });
         continue;
       }
       if (v !== null && typeof v === 'object') {
@@ -3208,6 +3452,10 @@ export function restoreCtxState(ck: CtxStateSnap, bar: number, ids: Map<unknown,
     if (e.snap !== undefined && e.e.restore) e.e.restore(e.snap);
   }
   for (const m of ck.nummaps) for (const k of [...m.keys()]) if (k > bar) m.delete(k);
+  for (const a of ck.arrays) {
+    a.arr.length = 0;
+    for (const x of a.items) a.arr.push(cloneDeep(x, ids));
+  }
   for (const p of ck.plains) {
     for (const k of Object.keys(p.obj)) delete p.obj[k];
     Object.assign(p.obj, cloneDeep(p.fields, ids));
@@ -3298,8 +3546,14 @@ function checkpoint(s: PineSess, bar: number): IncCkpt {
   const scopeVars = new Map<string, Series | Value>();
   for (const [n, v] of s.scope.varsCopy()) scopeVars.set(n, cloneDeep(v, ids));
   // ctx.state leaf classification — see IncCkpt doc.
-  const { vs: stateVs, nummaps: stateNumMaps, plains: statePlains, maps: stateMaps } =
+  const { vs: stateVs, nummaps: stateNumMaps, plains: statePlains, arrays: stateArrays, maps: stateMaps } =
     snapCtxState(ctx.state, ids);
+  // Member-check the top-level map too, so a leaf FIRST created while
+  // evaluating the forming bar (e.g. `strategy|orders` when the session's
+  // first order lands there) is dropped by the rollback instead of surviving
+  // to be appended a second time. Every checkpoint now sits on a committed
+  // bar — the incremental driver never snapshots the pre-bar state.
+  if (ctx.state) stateMaps.push({ map: ctx.state, keys: [...ctx.state.keys()] });
   const drawSnap = s.drawSink.incSnap();
   const drawProps = new Map<DrawObj, Record<string, unknown>>();
   for (const o of s.drawSink.objects) drawProps.set(o, cloneDeep(o.props, ids));
@@ -3313,6 +3567,7 @@ function checkpoint(s: PineSess, bar: number): IncCkpt {
     bar,
     scopeVars,
     seriesSnaps,
+    seriesCount: s.seriesSet.size,
     containers,
     declSlots: new Map(run.declSlots),
     declCows: new Map(run.declCows),
@@ -3323,7 +3578,11 @@ function checkpoint(s: PineSess, bar: number): IncCkpt {
     misc: new Map(run.misc),
     tupleKeys: new Map([...run.tupleKeys].map(([k, v]) => [k, new Map(v)])),
     paramCows: new Map([...run.paramCows].map(([k, v]) => [k, new Map(v)])),
-    stateVs, stateNumMaps, statePlains, stateMaps,
+    // Arg-site anchors: the entry objects are mutated in place (`inner`/`wrap`
+    // are re-pointed), so the snapshot needs its own copies. `wrap` is a
+    // SiteSeries — a REFERENCE (it re-binds per bar, never cloned).
+    argSites: new Map([...run.argSites].map(([k, e]) => [k, { inner: e.inner, wrap: e.wrap }])),
+    stateVs, stateNumMaps, statePlains, stateArrays, stateMaps,
     drawSnap, drawProps,
     sinkLen: ctx.plots.length,
     sbufLens,
@@ -3358,6 +3617,19 @@ function restoreCkpt(s: PineSess, ck: IncCkpt): void {
   const ids = new Map<unknown, unknown>();
   // Series: rewind to snap; series born during the forming bar → unseen (null).
   for (const se of s.seriesSet) se.incRewind(ck.seriesSnaps.get(se) ?? null);
+  // …and drop them from the registry. Rewinding alone leaves them in the Set
+  // (which drifts one entry per series per re-evaluated bar, for the life of
+  // the session); the insertion order makes everything past the checkpoint's
+  // size the exact set born during that re-evaluated bar. They are unreachable
+  // from the restored state by construction — the re-eval re-creates every
+  // series the committed state can still see — so nothing is lost by removing
+  // them, and nothing keeps growing if we don't.
+  if (s.seriesSet.size > ck.seriesCount) {
+    const leaked: BarSeries[] = [];
+    let i = 0;
+    for (const se of s.seriesSet) if (i++ >= ck.seriesCount) leaked.push(se);
+    for (const se of leaked) s.seriesSet.delete(se);
+  }
   // Container slot payloads — the fresh clones re-share identity within this
   // restore pass (two names bound to the same array see the same clone).
   for (const [se, slots] of ck.containers) {
@@ -3393,8 +3665,29 @@ function restoreCkpt(s: PineSess, ck: IncCkpt): void {
     restoreMap(live, saved);
     run.paramCows.set(k, live);
   }
+  // Arg-site anchors: drop sites first seen during the discarded eval (their
+  // wrapper dies with the entry — the next eval re-detects churn from scratch,
+  // exactly like a fresh run) and re-point survivors at the committed inner.
+  for (const k of [...run.argSites.keys()]) if (!ck.argSites.has(k)) run.argSites.delete(k);
+  for (const [k, e] of ck.argSites) {
+    const live = run.argSites.get(k);
+    if (live) {
+      live.inner = e.inner;
+      live.wrap = e.wrap;
+      if (live.wrap && e.inner instanceof BarSeries && !(e.inner instanceof ForwardingSeries)) {
+        live.wrap.bind(e.inner);
+      }
+    } else {
+      run.argSites.set(k, { inner: e.inner, wrap: e.wrap });
+      if (e.wrap && e.inner instanceof BarSeries && !(e.inner instanceof ForwardingSeries)) {
+        e.wrap.bind(e.inner);
+      }
+    }
+  }
   // ctx.state
-  restoreCtxState({ vs: ck.stateVs, nummaps: ck.stateNumMaps, plains: ck.statePlains, maps: ck.stateMaps }, ck.bar, ids);
+  restoreCtxState(
+    { vs: ck.stateVs, nummaps: ck.stateNumMaps, plains: ck.statePlains, arrays: ck.stateArrays, maps: ck.stateMaps },
+    ck.bar, ids);
   // MTF per-spec tf state (request.* scripts only).
   if (ck.mtfSnap !== undefined) mtf?.restore?.(ck.mtfSnap);
   // Drawings: object list + props payloads (identity preserved).
@@ -3454,23 +3747,15 @@ function restoreCkpt(s: PineSess, ck: IncCkpt): void {
   ctx.scopeDepth = 0;
   run.topLevelBody = false;
   run.topStmtIdx = -1;
-  run.siteStack.length = 0;
   run.siteCtx.length = 0;
-}
-
-/** Does the script qualify for incremental resume? Strategy order execution
- *  is event-driven — it falls back to a fresh run per tick. request.* state
- *  lives in the per-session MTF store, checkpointed like everything else. */
-function incEligible(parsed: ParsedInput): boolean {
-  if (!Array.isArray(parsed)) return parsed.decl?.type !== 'strategy';
-  return true;
 }
 
 /** First incremental run: build, evaluate every bar, checkpoint after each
  *  CLOSED bar — the forming (last) bar's state is discarded per tick, so the
  *  checkpoint must be taken at its predecessor, before it evaluates.
- *  Returns null session for empty tapes/ineligible scripts (caller falls
- *  back to plain runScript). */
+ *  Returns a null session for an empty tape, an aborted run, or a tape whose
+ *  only checkpoint would be the pre-bar seed (no closed bar was ever reached)
+ *  — the caller then has no session to advance and rebuilds on the next call. */
 export async function incRunStart(
   parsed: ParsedInput,
   bars: BarData[],
@@ -3479,16 +3764,23 @@ export async function incRunStart(
   const decl = Array.isArray(parsed) ? null : (parsed.decl ?? null);
   const body = Array.isArray(parsed) ? parsed : parsed.body;
   const empty = (): RunResult => emptyResult(body, decl);
-  if (bars.length === 0 || !incEligible(parsed)) return { live: null, result: await runScriptInner(parsed, bars, opts) };
+  if (bars.length === 0) return { live: null, result: await runScriptInner(parsed, bars, opts) };
 
   const s = await buildSess(parsed, bars, opts, new Set());
   if (s) s.emitCache = new Map(); // incremental sessions keep assembled plot arrays
   if (!s) return { live: null, result: empty() };
   if (opts.shouldAbort?.()) return { live: null, result: empty() };
 
-  // committed = last CLOSED bar; a one-bar tape has no closed bar yet —
-  // its checkpoint is the empty pre-bar state.
-  const live: IncLive = { s, ckpt: checkpoint(s, -1), committed: -1, key: opts.incKey, dead: false };
+  // committed = last CLOSED bar. The session is only created once a checkpoint
+  // exists at that boundary: the pre-bar seed cannot be restored — it predates
+  // every leaf and series the run creates, so a tick would APPEND instead of
+  // replace (an append-only ledger like `strategy|orders` grows a copy per
+  // tick) — and such tapes are cheap to re-run in full anyway.
+  let committed = -1;
+  let ckpt: IncCkpt | null = null;
+  // `cwPeak` is a module-level monotone max; zero it so a caller reads this
+  // run's absolute value instead of a stale high-water mark.
+  mtf?.resetPeak?.();
   try {
     let barErr: PineRuntimeError | null = null;
     let sliceStart = nowMs();
@@ -3497,10 +3789,15 @@ export async function incRunStart(
       const r = evalOneBar(s, bar);
       if (r === 'ret') break;
       if (r !== 'ok') { barErr = r; break; }
-      if (bar <= lastClosed) live.committed = bar;
+      if (bar <= lastClosed) committed = bar;
       // Single checkpoint at the committed boundary — per-bar checkpoints
       // were O(N^2) snapshots on first load (60s+ on 500-bar scripts).
-      if (bar === lastClosed) live.ckpt = checkpoint(s, bar);
+      if (bar === lastClosed) ckpt = checkpoint(s, bar);
+      // The only checkpoint this session can restore sits at `lastClosed`, so
+      // the log's pre-`lastClosed` share can never be replayed — it just grew
+      // with the tape. A tape that never reaches `lastClosed` (one bar, or a
+      // `return` at/before it) gets no checkpoint, hence no session.
+      if (bar < lastClosed) mtf?.trimCw?.();
       if (nowMs() - sliceStart > 16) {
         await yieldTask();
         sliceStart = nowMs();
@@ -3513,6 +3810,8 @@ export async function incRunStart(
   }
   markStage('assemble');
   if (opts.shouldAbort?.()) return { live: null, result: empty() };
+  if (ckpt === null) return { live: null, result: assembleRunResult(s) };
+  const live: IncLive = { s, ckpt, committed, key: opts.incKey, dead: false };
   return { live, result: assembleRunResult(s) };
 }
 
@@ -3560,12 +3859,17 @@ export async function incAdvance(
     // rewindCursor moves the cursor back with the series so the upcoming
     // seeks re-push the bars (no double-write: the series state was rolled
     // back to the same point).
+    // `cwPeak` is a module-level monotone max; zero it so a caller reads this
+    // run's absolute value instead of a stale high-water mark.
+    mtf?.resetPeak?.();
     restoreCkpt(s, live.ckpt);
     s.barCtx.rewindCursor(live.ckpt.bar);
-    // Tape grew → higher-tf feeds may carry freshly closed bars. Refresh
-    // AFTER the checkpoint restore (restore rewrote spec.bars to its snap);
-    // refresh's resetTfFrame drops tf frames only when content changed.
-    if (bars.length > oldLen && s.mtf !== undefined && mtf?.refresh) {
+    // Tape grew or tail bar crossed into a new bucket → higher-tf feeds may
+    // carry freshly closed bars. Refresh AFTER the checkpoint restore (restore
+    // rewrote spec.bars to its snap); refresh's resetTfFrame drops tf frames
+    // only when content changed.
+    const tailMoved = last >= 0 && oldLen > 0 && bars[last]!.openTime !== old[oldLen - 1]!.openTime;
+    if ((bars.length > oldLen || tailMoved) && s.mtf !== undefined && mtf?.refresh) {
       await mtf.refresh(s.ctx, s.frame0);
     }
     // Commit newly closed bars: evaluate (committed+1 .. last-1); the old
@@ -3598,12 +3902,9 @@ export async function incRun(
     const prior = opts.incSession ?? null;
     // Key mismatch = the run's inputs/syminfo/source changed since this
     // session was built — resuming it would emit stale-input results.
-    if (prior && prior.key === opts.incKey && incEligible(parsed)) {
+    if (prior && prior.key === opts.incKey) {
       const r = await incAdvance(prior, bars);
       if (r !== 'fallback') return { live: prior, result: r };
-    }
-    if (!incEligible(parsed)) {
-      return { live: null, result: await runScriptInner(parsed, bars, opts) };
     }
     return incRunStart(parsed, bars, opts);
   });

@@ -50,8 +50,25 @@ const blockHook = (stmts: Node[], scope: Scope, ctx: BuiltinCtx): Value =>
 
 // ── timeframe helpers ───────────────────────────────────────────────────────
 
+/** Timeframe-string memo: the parse is pure, and `tfToMs`/`tfParts` are called
+ *  per chart bar (mtf's chart→tf mapping, `session.*`, `timeframe.*`) with the
+ *  SAME handful of strings — the regexes were pure overhead. Capped so a script
+ *  feeding unbounded dynamic tf strings can't grow the table forever. */
+const TF_MEMO_MAX = 512;
+const tfMsMemo = new Map<string, number | null>();
+const tfPartsMemo = new Map<string, { n: number; unit: string }>();
+
 /** Parse a Pine timeframe string → milliseconds, or null for calendar units. */
 export function tfToMs(tf: string): number | null {
+  let cached = tfMsMemo.get(tf);
+  if (cached !== undefined) return cached;
+  cached = computeTfToMs(tf);
+  if (tfMsMemo.size >= TF_MEMO_MAX) tfMsMemo.clear();
+  tfMsMemo.set(tf, cached);
+  return cached;
+}
+
+function computeTfToMs(tf: string): number | null {
   const m = /^(\d*)\s*([a-zA-Z]*)$/.exec(tf.trim());
   if (!m) return null;
   const n = m[1] === '' ? 1 : parseInt(m[1]!, 10);
@@ -65,10 +82,15 @@ export function tfToMs(tf: string): number | null {
 }
 
 function tfParts(tf: string): { n: number; unit: string } {
+  let cached = tfPartsMemo.get(tf);
+  if (cached !== undefined) return cached;
   const m = /^(\d*)\s*([a-zA-Z]*)$/.exec(tf.trim());
   const n = !m || m[1] === '' ? 1 : parseInt(m[1]!, 10);
   const unit = (m?.[2] ?? '').toUpperCase();
-  return { n, unit: unit === '' ? 'MIN' : unit };
+  cached = { n, unit: unit === '' ? 'MIN' : unit };
+  if (tfPartsMemo.size >= TF_MEMO_MAX) tfPartsMemo.clear();
+  tfPartsMemo.set(tf, cached);
+  return cached;
 }
 
 /** TV's timeframe-string spelling: `<quantity><unit>` with the unit omitted for
@@ -179,7 +201,14 @@ interface SecuritySpec {
   loaded: number;                 // tf bars pushed into series so far
   nodeCache: Map<Node, WeakMap<Scope, Map<number, Value>>>; // node → caller scope → tfBarIndex → value
   agnosticCache: Map<Node, Map<number, Value>> | null; // caller-agnostic evals: node → tfBarIndex → value
+  invCache: Map<Node, Value> | null;   // tf-bar-invariant nodes: node → value (no tfBarIndex — same at every j)
+  invVerdicts: Map<Node, boolean> | null;             // tf-bar-invariance verdict per node (AST-level)
   agnosticSafe: Map<Node, boolean> | null;            // gate verdict per expr node (survives tf rebuilds)
+  /** Combined evalAt routing verdict per node (AST-level, same lifetime as
+   *  agnosticSafe/invVerdicts): 1 = caller-scoped, 2 = caller-agnostic,
+   *  3 = tf-bar-invariant. Lets the per-eval hot path skip re-entering both
+   *  gate walkers (each of which allocated closures + a recursion Set). */
+  verdicts: Map<Node, 1 | 2 | 3> | null;
   prodVerdicts: Map<Node, boolean> | null;            // producer-walk verdicts shared across the spec's gated exprs
   lastEmit?: Map<object, number>; // gaps_on: last tfIdx that emitted, per caller callsite
   warned: Set<string>;
@@ -211,7 +240,9 @@ interface SecuritySpec {
 type CwEntry = { m: { delete(k: unknown): boolean }; k: unknown } | { o: Record<string, unknown>; k: string };
 
 function cwMap(spec: SecuritySpec, m: { delete(k: unknown): boolean }, k: unknown): void {
-  spec.cw?.push({ m, k });
+  if (!spec.cw) return;
+  __mtfStats.cwPushes++;
+  spec.cw.push({ m, k });
 }
 
 interface MtfStore {
@@ -517,7 +548,8 @@ export function prepareSecurity(body: Node[], _frame0?: unknown): void {
       bars: null, scope: null, pivot: null, callerScope: null, callerKey: null, durableCache: null, seenCallers: new WeakSet(), ctx: null,
       series: {}, loaded: 0,
       nodeCache: new Map(),
-      agnosticCache: null, agnosticSafe: null, prodVerdicts: null,
+      agnosticCache: null, invCache: null, invVerdicts: null,
+      agnosticSafe: null, prodVerdicts: null, verdicts: null,
       warned: new Set(),
       varScope: null, varProg: [], varUpto: -1, varInited: new Set(),
       ltfEvaledThrough: -1,
@@ -684,9 +716,19 @@ export async function refreshSecurity(ctx: BuiltinCtx, _frame?: Frame): Promise<
     }));
   }
   const results = await Promise.all(keys.map(k => jobs.get(k)!));
-  const sameFeed = (a: BarData[] | null, b: BarData[]): boolean =>
-    a !== null && a.length === b.length &&
-    (a.length === 0 || (a[0]!.openTime === b[0]!.openTime && a[a.length - 1]!.closeTime === b[b.length - 1]!.closeTime));
+  const sameFeed = (a: BarData[] | null, b: BarData[]): boolean => {
+    if (a === null || a.length !== b.length) return false;
+    if (a.length === 0) return true;
+    const a0 = a[0]!, b0 = b[0]!;
+    if (a0.openTime !== b0.openTime) return false;
+    const aLast = a[a.length - 1]!, bLast = b[b.length - 1]!;
+    return aLast.openTime === bLast.openTime &&
+           aLast.closeTime === bLast.closeTime &&
+           aLast.close === bLast.close &&
+           aLast.high === bLast.high &&
+           aLast.low === bLast.low &&
+           aLast.open === bLast.open;
+  };
   keys.forEach((k, i) => {
     const fresh = results[i]!;
     const old = store.fetched.get(k);
@@ -762,29 +804,29 @@ function mkVal(x: number): Value {
 
 let tfAnchor: BuiltinCtx | null = null;
 
-/** Series owned by the active tf frame (spec OHLC ctx + shadows) — reads
- *  anchor on the tf bar index. */
-const tfOwned = new WeakSet<BarSeries>();
-/** Series written while a tf eval is active (callHist slots, var replay) —
- *  they carry tf-domain bar indexes, so reads must anchor on tfAnchor too. */
-const tfDirty = new WeakSet<BarSeries>();
+/** Series that must anchor their reads on the active tf bar: the tf frame's
+ *  own OHLC/shadows AND anything written (or born) while a tf eval is active —
+ *  callHist slots, `math.*` lazy lifts, var replay. Both sets were only ever
+ *  OR'd together on the read path, so one WeakSet keeps a single hash probe
+ *  per `get`/`cur`/`atOffset` instead of two. */
+const tfSeries = new WeakSet<BarSeries>();
 
 const barSeriesGet = BarSeries.prototype.get;
 const barSeriesCur = BarSeries.prototype.cur;
 const barSeriesSetAt = BarSeries.prototype.setAt;
 BarSeries.prototype.setAt = function (this: BarSeries, bar: number, v: Value): void {
-  if (tfAnchor !== null) tfDirty.add(this);
+  if (tfAnchor !== null) tfSeries.add(this);
   return barSeriesSetAt.call(this, bar, v);
 };
 BarSeries.prototype.get = function (this: BarSeries, n: number): Value {
   // Only tf-domain series re-anchor; caller-scope chart series keep their own
   // (chart-bar) index so `f(p) => security(.., p)` reads the live chart value.
-  if (tfAnchor !== null && (tfOwned.has(this) || tfDirty.has(this)))
+  if (tfAnchor !== null && tfSeries.has(this))
     return this.atOffset(tfAnchor.barIndex, n);
   return barSeriesGet.call(this, n);
 };
 BarSeries.prototype.cur = function (this: BarSeries): Value {
-  if (tfAnchor !== null && (tfOwned.has(this) || tfDirty.has(this)))
+  if (tfAnchor !== null && tfSeries.has(this))
     return this.atOffset(tfAnchor.barIndex, 0);
   return barSeriesCur.call(this);
 };
@@ -794,7 +836,7 @@ BarSeries.prototype.atOffset = function (this: BarSeries, bar: number, n: number
   if (tfAnchor !== null) {
     // tf-domain series read at the tf bar; caller chart series read at their
     // own lastBar (the live chart bar) — never the foreign tf index.
-    if (tfOwned.has(this) || tfDirty.has(this)) return barSeriesAtOffset.call(this, tfAnchor.barIndex, n);
+    if (tfSeries.has(this)) return barSeriesAtOffset.call(this, tfAnchor.barIndex, n);
     return barSeriesAtOffset.call(this, this.currentBar, n);
   }
   return barSeriesAtOffset.call(this, bar, n);
@@ -802,11 +844,11 @@ BarSeries.prototype.atOffset = function (this: BarSeries, bar: number, n: number
 
 // Frozen readers (math.ts lazy lifts) must replay exactly what a live get(i)
 // would have answered: tf-domain series anchor on the tf bar, everything else
-// on its own lastBar. touch() mirrors the tfDirty marking a write performs.
+// on its own lastBar. touch() mirrors the tfSeries marking a write performs.
 seriesHooks.anchor = (s) =>
-  tfAnchor !== null && (tfOwned.has(s) || tfDirty.has(s)) ? tfAnchor.barIndex : s.currentBar;
+  tfAnchor !== null && tfSeries.has(s) ? tfAnchor.barIndex : s.currentBar;
 seriesHooks.touch = (s) => {
-  if (tfAnchor !== null) tfDirty.add(s);
+  if (tfAnchor !== null) tfSeries.add(s);
 };
 
 /**
@@ -1078,6 +1120,7 @@ function resetTfFrame(spec: SecuritySpec): void {
   spec.loaded = 0;
   spec.nodeCache.clear();
   spec.agnosticCache?.clear();        // agnosticSafe survives: gate verdicts are AST-level
+  spec.invCache = null;               // invVerdicts survives: verdicts are AST-level too
   spec.durableCache = null;
   spec.seenCallers = new WeakSet();
   spec.lastEmit = undefined;
@@ -1103,7 +1146,7 @@ function ensureTfFrame(spec: SecuritySpec, frame: { scope: Scope; ctx: BuiltinCt
   if (spec.ctx) return;
   const bars = spec.bars ?? [];
   const cap = Math.max(bars.length + 8, 64);
-  const mk = () => { const b = new BarSeries(cap); tfOwned.add(b); return b; };
+  const mk = () => { const b = new BarSeries(cap); tfSeries.add(b); return b; };
   const s: Record<string, BarSeries> = {
     open: mk(), high: mk(), low: mk(), close: mk(), volume: mk(), time: mk(),
     hl2: mk(), hlc3: mk(), ohlc4: mk(), hlcc4: mk(),
@@ -1311,8 +1354,15 @@ function warnOnce(spec: SecuritySpec, ctx: BuiltinCtx, msg: string): void {
 const EMPTY_SCOPE = new Scope();
 
 /** Perf-probe counters (baseline probe + bench test): evalAt cache miss/hit
- *  + agnostic gate verdicts (per expr node). */
-export const __mtfStats = { evals: 0, hits: 0, gatePass: 0, gateFail: 0, agHits: 0, prodWalks: 0 };
+ *  + agnostic gate verdicts (per expr node) + tf-bar-invariant cache hits.
+ *  `cwPushes`/`cwPeak` size the rollback write-log (`spec.cw`): pushes are
+ *  cumulative; `cwPeak` is the largest log observed at a checkpoint. On the
+ *  tick path that is the writes of ONE bar, because mtfCheckpoint clears the
+ *  log (see cwMap); on a cold load it is one bar too, because the caller trims
+ *  at every closed-bar boundary (`MtfHooks.trimCw`). `cwPeak` is still a
+ *  monotone max across runs — call `resetPeak()` first to read a per-run
+ *  absolute value. */
+export const __mtfStats = { evals: 0, hits: 0, gatePass: 0, gateFail: 0, agHits: 0, invHits: 0, prodWalks: 0, cwPushes: 0, cwPeak: 0 };
 // Browser QA reads these via window.__mtfStats (exposed once at module load).
 try { (globalThis as Record<string, unknown>).__mtfStats = __mtfStats; } catch { /* non-DOM */ }
 
@@ -1711,18 +1761,127 @@ function exprSafeForAgnostic(spec: SecuritySpec, node: Node): boolean {
   return safe;
 }
 
-/** Evaluate `node` at tf bar `j` inside spec's tf frame. Caller-agnostic exprs
- *  share one cache keyed (node, j); caller-dependent exprs keep the
- *  (node, caller scope, j) path — an ephemeral UDF frame can bind different
- *  params per invocation, so two callers must never share an entry. */
+/** Verdict: evaluating `node` in this spec's tf frame yields the same value at
+ *  EVERY tf bar (and for every caller). Only nodes built from scalar literals,
+ *  `input.*` calls over invariant args, and other invariant globals qualify —
+ *  everything else (tf series idents, `ta.*`/UDF calls, histrefs, members,
+ *  `:=`-mutated globals, unknown idents) rejects. A `:=` global is replayed per
+ *  tf bar and a series ident reads the tf frame, so both are j-dependent.
+ *
+ *  Why it matters: evalAt's caches all key on the tf bar `j`, so a producer
+ *  that ignores its tf-bar context (an `input.int` constant feeding a security
+ *  expression, reached once per chart bar per SPEC) pays one full computeAt
+ *  per distinct j — for a chart-tf request that is one wasted eval per chart
+ *  bar. Verdicts memoize on the spec like `prodVerdicts` / `agnosticSafe`
+ *  (AST-level: they survive tf-frame rebuilds). `seen` on the walk path is the
+ *  live recursion stack, so DAG sharing reuses the memo and only a node still
+ *  being walked counts as a cycle (same rule as the agnostic gate). */
+function tfInvariant(spec: SecuritySpec, node: Node): boolean {
+  const memo = spec.invVerdicts ??= new Map();
+  const seen = new Set<Node>();
+  const walk = (n: Node): boolean => {
+    const hit = memo.get(n);
+    if (hit !== undefined) return hit;
+    if (seen.has(n)) return false;              // cycle → reject
+    seen.add(n);
+    const ok = walkNode(n);
+    seen.delete(n);
+    memo.set(n, ok);
+    return ok;
+  };
+  const walkNode = (n: Node): boolean => {
+    switch (n.type) {
+      // `var float x` / `float x` decls without a value carry an na producer.
+      case 'num': case 'str': case 'bool': case 'color': case 'na':
+        return true;
+      case 'ident': {
+        // A chart/tf series name always resolves to the tf frame's own series
+        // (ensureTfFrame shadows SERIES_NAMES before globals) — never a
+        // producer, so it can't be j-invariant.
+        if ((SERIES_NAMES as readonly string[]).includes(n.name)) return false;
+        const def = store.globals.get(n.name);
+        if (!def || def.writes.length > 0) return false;
+        return def.node !== null && walk(def.node);
+      }
+      case 'call': {
+        const c = n.callee;
+        const isInput = c.type === 'ident'
+          ? c.name === 'input'
+          : c.type === 'member' && c.obj.type === 'ident' && c.obj.name === 'input';
+        if (!isInput) return false;
+        // `input.source(close)` / `input(…)` over a series arg is chart- or
+        // tf-domain — the arg walk rejects those.
+        return n.args.every(a => walk(a.value));
+      }
+      case 'unary': return walk(n.arg);
+      case 'binary': return walk(n.left) && walk(n.right);
+      case 'ternary': return walk(n.test) && walk(n.cons) && walk(n.alt);
+      case 'arraylit': return n.items.every(walk);
+      default: return false;
+    }
+  };
+  return walk(node);
+}
+
+/** Evaluate `node` at tf bar `j` inside spec's tf frame. Three cache paths, in
+ *  check order:
+ *   - tf-bar-invariant nodes (literal/`input.*`-derived producers, see
+ *     `tfInvariant`) share one j-less entry — the value cannot differ per j;
+ *   - caller-agnostic exprs share one cache keyed (node, j);
+ *   - everything else keeps the (node, caller scope, j) path — an ephemeral
+ *     UDF frame can bind different params per invocation, so two callers must
+ *     never share an entry.
+ *  A tf-bar-invariant node whose payload is mutable (array/udt/…) or
+ *  `series`-anchored cannot use the j-less entry (it would share one object
+ *  across j and callers), so it too lands on the (node, caller, j) path —
+ *  which is READ before computing, in both cases. */
 function evalAt(spec: SecuritySpec, node: Node, j: number): Value {
   // History before the first tf bar is na — never evaluate at a negative index
   // (advanceTo is a no-op there, leaving the ctx pointed at a stale bar).
   if (j < 0) return NA;
-  const agnostic = exprSafeForAgnostic(spec, node);
   const caller = spec.callerScope ?? EMPTY_SCOPE;
+  // Routing verdict, memoized per (spec, node): 1 = caller-scoped, 2 =
+  // caller-agnostic, 3 = tf-bar-invariant. Both gates run on the FIRST visit
+  // only (their verdicts are AST-level, so gatePass/gateFail/prodWalks still
+  // count exactly one verdict per node); afterwards a single map hit replaces
+  // two function calls, two closure allocations and a recursion Set.
+  // tf-bar-invariant node: one value for ALL j — a j-keyed cache would still
+  // recompute it once per distinct j (and per spec), so its j-less entry is
+  // checked first. Only an immutable payload may live there (see the mutable
+  // carve-out below); the mutable case is served by the per-caller path, which
+  // reads before computing like the agnostic path's mutable case does.
+  const vm = spec.verdicts ??= new Map();
+  let verdict = vm.get(node);
+  if (verdict === undefined) {
+    // Both gates run on the first visit only, in the original order, so
+    // gatePass/gateFail/prodWalks keep counting exactly one verdict per node.
+    const agnostic = exprSafeForAgnostic(spec, node);
+    verdict = tfInvariant(spec, node) ? 3 : (agnostic ? 2 : 1);
+    vm.set(node, verdict);
+  }
   let v: Value;
-  if (agnostic) {
+  if (verdict === 3) {
+    const m = spec.invCache ??= new Map();
+    const hit = m.get(node);
+    if (hit !== undefined) { __mtfStats.hits++; __mtfStats.invHits++; return hit; }
+    // A mutable / `series`-anchored payload never reaches `m` (the carve-out
+    // below), so it is served by the per-caller (node, caller, j) path — read
+    // it FIRST, exactly like the agnostic path's mutable case: without this the
+    // value was recomputed on every evalAt and the write below re-logged the
+    // same j in spec.cw (the checkpoint rollback log grew once per eval).
+    const pc = spec.nodeCache.get(node)?.get(caller)?.get(j);
+    if (pc !== undefined) { __mtfStats.hits++; return pc; }
+    v = computeAt(spec, node, j);
+    // Same sharing rule as the agnostic cache: a payload that can carry
+    // mutations (array/udt/…) or that anchors on a tf bar (`series`) is never
+    // shared across j — it falls through to the per-caller write below, just
+    // like the agnostic path's mutable case.
+    if (!(v.kind in MUTABLE_KINDS) && v.kind !== 'series') {
+      cwMap(spec, m, node);
+      m.set(node, v);
+      return v;
+    }
+  } else if (verdict === 2) {
     const m = spec.agnosticCache ??= new Map();
     const hit = m.get(node)?.get(j);
     if (hit !== undefined) {
@@ -1829,8 +1988,16 @@ const SECURITY_PARAMS: Record<'security' | 'security_lower_tf', { all: readonly 
  * Interpreter hook: call inside evalExpr's Call case BEFORE evaluating args.
  * Returns the security() value for this chart bar, or null when `node` is not
  * a request.security call (fall through to normal call handling).
+ *
+ * The `null` exit is CONTRACTUAL, not incidental: interpreter.ts caches it in
+ * `NOT_SECURITY_CALL` (a WeakSet keyed by the Call node) and never calls this
+ * hook for that node again, so its ONLY legal meaning is the `!isSecurityCall`
+ * shape test below. Any new `return null` further down would permanently drop
+ * that callsite from evaluation — return a Value (NA for "nothing to serve")
+ * instead.
  */
 export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
+  // Only null exit — see the NOT_SECURITY_CALL contract above (interpreter.ts).
   if (node.type !== 'call' || !isSecurityCall(node)) return null;
   const spec = store.byNode.get(node);
   if (!spec) return NA; // not scanned (e.g. built dynamically) — graceful na
@@ -1885,7 +2052,7 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   // expression must resolve params/locals against the live caller.
   spec.callerScope = frame.scope;
   spec.callerKey = callsiteKey(ctx, spec.node);
-  ensureTfFrame(spec, frame);
+  if (!spec.ctx) ensureTfFrame(spec, frame);   // per-bar guard inlined: the build itself is once per tf frame
   // Caller-agnostic caches live outside nodeCache so the seenCallers routing
   // swap below can't orphan them. They lazy-init at their consumers
   // (evalAt / exprSafeForAgnostic) — one owner each (CR1).
@@ -1996,27 +2163,10 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   // instead of reaching back into tf bars. gaps_on skipped bars emit NA — the
   // value TV produces there.
   // Per-callsite key computed above — UDF callsites of the same node each
-  // keep their own emit history and dedup slot.
+  // keep their own emit history and dedup slot. Both helpers are module-level:
+  // they were rebuilt as closures on every chart bar (one `__name` +
+  // allocation each) purely to capture (spec, callerKey, bar).
   const callerKey = spec.callerKey ?? spec.node;
-  const emit = (e: Node, v: Value): void => {
-    const hist = (spec.chartHist ??= new Map());
-    let by = hist.get(e);
-    if (!by) { by = new Map(); cwMap(spec, hist, e); hist.set(e, by); }
-    let s = by.get(callerKey);
-    if (!s) { s = new BarSeries(); cwMap(spec, by, callerKey); by.set(callerKey, s); }
-    s.setAt(ctx.barIndex, v.kind === 'series' ? v.v.cur() : v);
-  };
-  const emitAll = (v: Value): void => {
-    const last = (spec.lastChartBar ??= new Map());
-    if (last.get(callerKey) === ctx.barIndex) return;   // dedup same-bar re-entry
-    if (spec.exprs.length === 1) emit(spec.exprs[0]!, v);
-    else {
-      const arr = v.kind === 'array' ? v.v : [];
-      spec.exprs.forEach((e, i) => emit(e, arr[i] ?? NA));
-    }
-    cwMap(spec, last, callerKey);
-    last.set(callerKey, ctx.barIndex);
-  };
 
   if (spec.gaps === 'on') {
     // Per-callsite like lastChartBar: two UDF callsites of this node on the same
@@ -2024,7 +2174,7 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     // that a spec-scoped dedup would force after A emitted.
     const emitted = (spec.lastEmit ??= new Map());
     if (emitted.get(callerKey) === j) {
-      emitAll(NA);
+      emitChartAll(spec, callerKey, ctx.barIndex, NA);
       return NA;                                // only first chart bar per tf bar emits
     }
     cwMap(spec, emitted, callerKey);
@@ -2040,8 +2190,32 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
   const res = spec.exprs.length === 1
     ? evalAt(spec, spec.exprs[0]!, j)
     : { kind: 'array' as const, v: spec.exprs.map(e => evalAt(spec, e, j)) };
-  emitAll(res);
+  emitChartAll(spec, callerKey, ctx.barIndex, res);
   return res;
+}
+
+/** One expr node's chart-domain emit slot (see `emitChartAll`). */
+function emitChartOne(spec: SecuritySpec, callerKey: object, bar: number, e: Node, v: Value): void {
+  const hist = (spec.chartHist ??= new Map());
+  let by = hist.get(e);
+  if (!by) { by = new Map(); cwMap(spec, hist, e); hist.set(e, by); }
+  let s = by.get(callerKey);
+  if (!s) { s = new BarSeries(); cwMap(spec, by, callerKey); by.set(callerKey, s); }
+  s.setAt(bar, v.kind === 'series' ? v.v.cur() : v);
+}
+
+/** Record this chart bar's mapped security() value into chart-domain history
+ *  (deduped per caller callsite so a re-entered call node emits once). */
+function emitChartAll(spec: SecuritySpec, callerKey: object, bar: number, v: Value): void {
+  const last = (spec.lastChartBar ??= new Map());
+  if (last.get(callerKey) === bar) return;   // dedup same-bar re-entry
+  if (spec.exprs.length === 1) emitChartOne(spec, callerKey, bar, spec.exprs[0]!, v);
+  else {
+    const arr = v.kind === 'array' ? v.v : [];
+    spec.exprs.forEach((e, i) => emitChartOne(spec, callerKey, bar, e, arr[i] ?? NA));
+  }
+  cwMap(spec, last, callerKey);
+  last.set(callerKey, bar);
 }
 
 
@@ -2078,6 +2252,7 @@ interface SpecSnap {
   lastEmit: Map<object, number> | undefined;
   lastChartBar: Map<object, number> | undefined;
   agnosticCache: SecuritySpec['agnosticCache'];
+  invCache: SecuritySpec['invCache'];
   nodeCache: SecuritySpec['nodeCache'];
   durableCache: SecuritySpec['durableCache'];
   chartHist: SecuritySpec['chartHist'];
@@ -2125,6 +2300,7 @@ function snapSpec(spec: SecuritySpec, ids: Map<unknown, unknown>): SpecSnap {
     lastEmit: spec.lastEmit ? new Map(spec.lastEmit) : undefined,
     lastChartBar: spec.lastChartBar ? new Map(spec.lastChartBar) : undefined,
     agnosticCache: spec.agnosticCache,
+    invCache: spec.invCache,
     nodeCache: spec.nodeCache,
     durableCache: spec.durableCache,
     chartHist: spec.chartHist,
@@ -2163,6 +2339,7 @@ function restoreSpec(spec: SecuritySpec, ck: SpecSnap, ids: Map<unknown, unknown
   spec.lastEmit = ck.lastEmit ? new Map(ck.lastEmit) : undefined;
   spec.lastChartBar = ck.lastChartBar ? new Map(ck.lastChartBar) : undefined;
   spec.agnosticCache = ck.agnosticCache;
+  spec.invCache = ck.invCache;
   spec.nodeCache = ck.nodeCache;
   spec.durableCache = ck.durableCache;
   spec.chartHist = ck.chartHist;
@@ -2206,6 +2383,7 @@ function restoreSpec(spec: SecuritySpec, ck: SpecSnap, ids: Map<unknown, unknown
     spec.nodeCache = new Map();
     spec.durableCache = null;
     spec.agnosticCache?.clear();
+    spec.invCache?.clear();
     spec.loaded = Math.max(0, spec.loaded - 1);
     spec.ltfEvaledThrough = Math.min(spec.ltfEvaledThrough, spec.loaded - 1);
   }
@@ -2218,6 +2396,7 @@ function mtfCheckpoint(): unknown {
   const specs: [SecuritySpec, SpecSnap][] = [];
   for (const spec of store.byNode.values()) {
     spec.cw ??= [];
+    if (spec.cw.length > __mtfStats.cwPeak) __mtfStats.cwPeak = spec.cw.length;
     specs.push([spec, snapSpec(spec, ids)]);
     spec.cw.length = 0; // baseline — post-checkpoint writes accumulate here
   }
@@ -2231,6 +2410,17 @@ function mtfRestore(snap: unknown): void {
   for (const [spec, ck] of s.specs) restoreSpec(spec, ck, ids);
 }
 
+/** Drop every spec's rollback write-log. Only safe where the writes it records
+ *  can no longer be replayed — see `MtfHooks.trimCw`. O(#specs), not O(log). */
+function mtfTrimCw(): void {
+  for (const spec of store.byNode.values()) if (spec.cw) spec.cw.length = 0;
+}
+
+/** Zero the write-log peak. `__mtfStats` is a module singleton that nothing
+ *  else resets, so without this a caller can only ever read a stale
+ *  high-water mark (a per-window delta after the first run is always 0). */
+function mtfResetPeak(): void { __mtfStats.cwPeak = 0; }
+
 
 // ── interpreter registration seam ───────────────────────────────────────────
 // interpreter.ts can't statically import this module (it keeps the dependency
@@ -2242,5 +2432,7 @@ registerMtf({
   sessionStore, activate: activateStore, refresh: refreshSecurity,
   checkpoint: () => mtfCheckpoint(),
   restore: mtfRestore,
+  trimCw: mtfTrimCw,
+  resetPeak: mtfResetPeak,
   bindSnap: (c, sn, rs) => { cloneH = c; snapStateH = sn; restoreStateH = rs; },
 });

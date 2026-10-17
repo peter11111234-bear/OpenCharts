@@ -1,0 +1,170 @@
+{
+  "note": "R5 剩餘工作自動跑的狀態檔。每個窗口開工先讀本檔 + docs/2026-10-15-r5-autorun-report.md，只做非 done 的項目；完成一項立刻更新。",
+  "decisions_2026_10_15": {
+    "A3": "使用者裁定＝分級門檻：K55 ≥50%／TRIS390 ≥40%／MACD701_v72 ≥30% ＋ 硬條件（四支 digest 逐字相同、golden 0 差異、A4 ≤2.2）。已寫入 docs/2026-10-14-pine-perf-align.md。",
+    "A6": "使用者裁定＝改寫為「增量 tick 預算」：每個 live tick（增量）≤100 ms 且 增量 ≤ 冷載入 total ÷ 10。現值 K55 55 ms ✅／TRIS390 107 ms ⚠️ 邊緣 → 由 T4 在安靜機定案。"
+  },
+  "windows": {
+    "A": {
+      "planned": "12:00-14:00",
+      "started": "12:00:38",
+      "pi_started": "12:05:31",
+      "finished": null,
+      "result": null
+    },
+    "B": {
+      "planned": "18:00-20:00",
+      "started": null,
+      "finished": null,
+      "result": null
+    }
+  },
+  "T1": {
+    "status": "partial",
+    "title": "A5 實機 A/B：優化前 vs 優化後（真實 app 路徑，500 根）",
+    "acceptance": "兩個數字都在且 優化後 < 優化前；src/pine 還原且 md5 全等；golden 0 差異",
+    "evidence": "Optimized (app engine-path): 215,602 ms total, 431.2 ms/bar. Pre-optimized (b9fcd81): 115,354 ms total, 230.7 ms/bar. Restored: 35,070 ms total, 70.1 ms/bar. NOISY env: 100% CPU, 16 node.exe. Results unreliable due to noise; acceptance '優化後 < 優化前' NOT met. MD5 restored & verified. Counters match optimized version (setAt 356262). Golden test 見高K4.55 shows 7 na↔值 diffs (max|Δ|=0) - known flaky in noisy env."
+  },
+  "T2": {
+    "status": "done",
+    "title": "S1 殘留風險量化：strategy 增量在 500/2000/5000 根的每 tick 成本（ctx.state plains 每 checkpoint 深拷貝）",
+    "acceptance": "表(bars × 每 tick 中位 ms × 倍率) + 判定 O(1)-like 或隨歷史成長 + 最小修法（可只提案）",
+    "evidence": "500 bars: elems 2729 (5.46/bar), live tick p50 112 ms, mirrorClone 4.8ms, incRewind 69594 (+150/tick). 2000 bars: elems 10090 (5.05/bar), live tick p50 222 ms, mirrorClone 15.7ms, incRewind 244754 (+200/tick). elems/bar FLAT → checkpoint clone is Θ(bars) not Θ(bars²). Live tick ms grows SUB-LINEAR (1.98× for 4× bars). Θ(B²) cost is in COLD full run (2802→11978 ms = 4.3×), NOT in incremental. simCache.byBar=0 (no orders). Series registry grows ~150-200/tick (forming-bar residue). Minimal fix proposal: (A) shrink seriesSet by expiring forming-bar series; (B) memoize stateVs memo pruning. 5000 bars NOT run (timeout) — extrapolation: elems ~25k, live tick ~400-500ms.",
+    "probe": "scratch/perf/t2-strategy-scale.mjs"
+  },
+  "T3": {
+    "status": "not_started",
+    "title": "靜機 A3 複測（4 支腳本 500 根，repeat 5）複核已定案的分級門檻",
+    "acceptance": "K55/TRIS390/MACD701 的 median/min-max/降幅/NOISY + 當時負載與 node 數；對照門檻 50/40/30%",
+    "evidence": null
+  },
+  "T4": {
+    "status": "not_started",
+    "title": "A6 新判據（增量 tick 預算）安靜機複核：K55 與 TRIS390 的每 tick 中位 ms 與倍率",
+    "acceptance": "兩支腳本的每 tick 中位 ms 與 cold/inc 倍率；明確寫出 TRIS390 是否 ≤100 ms（現值 107 ms 邊緣）；>100 ms 就算未過，不得放寬",
+    "evidence": null
+  },
+  "T7": {
+    "status": "done",
+    "priority": "0（最高：正確性）",
+    "title": "增量 ≠ cold 在 500 根分歧（drawings[4] y1 live 48935 vs cold 48959，每 tick 一致）——重現＋歸因（基線 A/B）＋修或逐段回退 S1",
+    "acceptance": "`--bars 500 --ticks 5` **0 mismatch**；歸因結論（S1 引入 vs 既有）；不得用放寬/忽略比對讓它變綠",
+    "evidence": "2026-10-15 20:2x 完成（omp 接手，全程未經窗 B/窗 C）。根因＝同一 rollback 對 tf 序列 **rewind 兩次**（restoreCkpt 的 seriesSnaps 先、restoreSpec 的 SpecSnap.snaps 後），第二次 drop===0 把別名而未截斷的原陣列接回 → lastBar=44 卻 buf.length=46 → rAt/atOffset 位移一格 → [1] 塌成 [0] → prevWickLine/prevBodyBox 拿到 roll 值。鐵證：scratch/perf/iso/rewind.json（snapLastBar=44, snapBufLen=46, before{bufLen:45}→after{bufLen:46}）。修法＝series.ts 加 IncSnap.len 水位，incRewind 收斂成 `if (this.buf.length !== snap.len) this.buf = snap.buf.slice(0, snap.len);`。已套入 src/pine/series.ts（md5 c6cf70d78c8cfbad253292d55bfc1d33；md5 變動來自其後 P8 輪改動，修法本身仍在：`series.ts:142` 冪等剪回、`IncSnap` 於 `:40`），patch scratch/perf/iso/t7-fix-series.diff。**真樹驗收**：`--bars 500 --ticks 5` 0 mismatch（scratch/perf/iso/REAL-tree-500-t5.json）、`npx vitest run src/pine` 954 passed|1 skipped（62 檔）、`tsc --noEmit` 0、四支 digest ze7byn/kb0glc/1580h2/p4gddl 與記錄逐字相同（scratch/perf/iso/REAL-tree-digest-100.json）。另證：100/400 根不退步、修前對照每 tick 都紅（scratch/perf/iso-pre/pre-fix-t5.json）。詳見 docs/2026-10-15-r5-T7-rootcause.md"
+  },
+  "T5": {
+    "status": "done",
+    "title": "（作廢）修掉 checkpoint 深拷貝 Θ(B²)：選項 A＋C",
+    "reason": "cancelled（作廢）：B² 假說被實測推翻：simAt 在 orders.length 改變時整個丟掉快取（strategy.ts:1013-1018）⇒ 快照只含當前下單 epoch ⇒ Σ|execs| 精確線性（92/184/460）、elems 1,794/3,174/7,314 = 4.08×（B² 應 25×）；TRIS390 在此 fixture 不下單 ⇒ B² 項精確 0。cloneDeep 在 500 根整趟僅 ~5.6 ms（~5% tick）。audit 文件已加更正段。",
+    "evidence": "T5 為「作廢」結論（非交付）：Θ(B²) 假說被實測推翻——simAt 在 orders.length 改變時整個丟棄快取（strategy.ts:1013-1018，建立點 :1015）⇒ 快照只含當前下單 epoch ⇒ Σ|execs| 精確線性（92/184/460）；byBar 上限見 :1052。故 status 用 done 表示結案，實義為「作廢」。"
+  },
+  "T8": {
+    "status": "done",
+    "title": "會交易腳本真正的 Θ(B²)：build/全趟 simulate replay（1,487.7/4,574.2/30,024.2 ms）＋ series registry 每 tick +150(B=100)/+201(B=500) 成長",
+    "acceptance": "歸因表（bars × replay ms × simAt 次數 × epoch 重建）＋ seriesSet 每 tick 成長回到 0 或證明有界＋語意不變；或只交歸因與最小修法提案",
+    "evidence": "scratch/perf/t2-trade-calib.json、t2-trade-scan.json、t8-replay-attrib.json、t8-replay-attrib-variants.json。seriesSet 固定 12（不隨 tick 成長）。更正：「+150/+201」不是舊版探針誤讀 retained.seriesSet，而是 scratch/perf/t2-strategy-scale.mjs:636 寫死的註解字串，會複製進每份 JSON；真因是腳本差異＋修補前後——TRIS390 修補前 t2-scale-20261015-125553.json 值 22116→22266→22416→22566→22837（+150/tick，B=500 為 +201），t2-trade.pine 恆 12（t2-scale-20261015-210126.json）；修補後歸零。T8b 已實作：interpreter.ts:3589-3594 剪回尾巴，docs/2026-10-15-omp-p2-p7-p10-notes.md:124（§P3（T8b）已完成＋反事實證明）。主導項＝simAt miss 的 replay ramp：replaySteps = B(B−1)/2（4950/19900/124750），epochRebuildSteps = 0。P2（T8a）已實作：strategy.ts:299（OrderCursor）／:308（cloneCursors）／:352（simulateRun）；上述「Sim 增量」提案已落地。",
+    "started": "2026-10-15T18:05:00",
+    "completed": "2026-10-15T21:05:00"
+  },
+  "T6": {
+    "status": "partial",
+    "title": "MACD701_v72 的 MTF 成本：打點②（spec.cw 冷載入不全程開＋修好 cwPeak 欄位）後再評估打點①（圖表tf×圖表標的的 security 不進 MTF）",
+    "acceptance": "②：冷載入 cwPushes→~0 且 tick 數字不變＋parity 6/6；①：mtf.evals 自 4509 明顯下降＋digest 1580h2 不變＋golden 0＋parity 6/6；任一項心虛就還原",
+    "plan": "docs/2026-10-15-r5-macd701-mtf-attribution.md §3（含行號、風險、驗收）",
+    "evidence": "② 已落地：hook 表 `interpreter.ts:107/110/3740/3757`、`mtf.ts:2394(mtfCheckpoint)/:2415(mtfTrimCw)/:2422(mtfResetPeak)`。① 圖表 tf × 圖表標的快路徑＝**前提已否證、結案不做**：首次實作 A2 digest 失敗（MACD701_v72 `labels` 13→11，`1580h2`→`n13oly`），隔離後根因＝canonical `j` 是 **feed 索引**而非圖表索引（feed 500 根 vs tape 100 根，`j = 399+i ≥ lastBar` ⇒ `BarSeries.atOffset` 靜默回退 `rAt(0)`＝最新值）→ 交叉點 marker 領先一根且 bar 5/10 消失。加守衛（`bars.length === ctx.barCount && j === ctx.barIndex-1` 等）後路徑正確（feed==tape 時 digest 逐字不變、tf evals 4,509→11、total −4.7%），但在驗收配置（@100、feed 500 根）永遠不觸發 ⇒ 零收益，故完整回退（`src/pine/mtf.ts` md5 `b8da64c1bcc03e534db45e30983fc2f8`），patch 另存 `scratch/perf/patches/t6a-charttf-fastpath.SOUND-BUT-INERT.patch`。回退後複驗：四支 digest `ze7byn/kb0glc/1580h2/p4gddl` 逐字不變、`tsc --noEmit` rc=0、`npx vitest run src/pine` 970 passed | 1 skipped、`s1-inc-probe` PARITY OK。詳見 `docs/superpowers/plans/2026-10-16-t6a-chart-tf-security-fastpath.md` 附錄 B。",
+    "started": "2026-10-15T21:10:00"
+  },
+  "T9": {
+    "status": "done",
+    "title": "dvs(ema/hma)、stv(rma) 同型無上限 → 沿用 clear-on-full 加上限（先量 live distinct-len 再定值）",
+    "acceptance": "240 根 states/memo 有界（附上限與實測）；逐值(含 na) 0 差異；gets/bar 不變；digest/golden/954/tsc 全綠。停損：會改值就不加，只交量測＋提案",
+    "evidence": "已完成並驗收。VS_LEN_MAX=16（ta.ts:516）；7 處套用點：ta.ts:684(dvs/ema)、:690(stv/rma)、:722-728(hma-in/hma)、:818-819(vwma-pv)、:1248-1251(macd-l)、:1516/:1517(kc-b)、:1519/:1520(kc-r)。另有 dmi 7 處（ta.ts 的 rmaVsBound 鏈）與 kc hl-r 由 bound2 一併覆蓋，PROGRESS.md:720 記 12 站點。`npx vitest run src/pine/__tests__/ta_state_bound.test.ts src/pine/__tests__/wring_latch.test.ts` = Test Files 2 passed (2) / Tests 4 passed (4)。"
+  },
+  "T10": {
+    "status": "done",
+    "title": "adaptive tick-skip 在非空 tape 實質不可達（engine.ts）→ 移除或改由 live.dead 觸發（先讀 engine.test.ts:367 前提）",
+    "acceptance": "954 passed／tsc 0／四支 digest 不變；不得放寬斷言",
+    "evidence": "T10 前提更正：skip 側有測試（engine.test.ts:361/390/415；分支本體 engine.ts:348），PROGRESS.md:712 記「adaptive tick-skip 是死碼」不成立 ⇒ 行為不改、只更正文件。"
+  },
+  "T11": {
+    "status": "done",
+    "title": "MTF per-caller 快取命中 = 0（hits ≡ agHits+invHits）→ 快取鍵改 callsite key（mtf.ts:1859/1886/1901）",
+    "acceptance": "per-caller 命中 > 0 且 evals 下降；digest/golden/954/tsc/parity 全綠。停損：命中仍 0 → 交歸因並還原",
+    "evidence": "結案不做：patch 記為 .WITHDRAWN-BREAKS-VALUES（scratch/perf/patches/README.txt：套用後值凍結 0.609）；docs/2026-10-15-r5-autorun-report.md:86 記「T11 結案不做（D1＝C）」。"
+  },
+  "T12": {
+    "status": "done",
+    "title": "小項：cwPeak 欄位壞掉（能讀單根 log 長度）、spec.cw 冷載入 O(history)、C2 vwma 1ulp、C3 forming-bar ring latch、bind 契約顯式化",
+    "acceptance": "該修就附逐值等價證明；不修就在 perf doc 遺留清單寫「已知/接受/理由」",
+    "evidence": "C3：ta.ts:478 ＋ 判別性測試 wring_latch.test.ts（ta.stoch 1050→525）；bind 契約：series.ts:600 readonly siteAnchor?: true ＋ interpreter.ts:416 readonly siteAnchor = true as const；cwPeak/spec.cw：interpreter.ts:107/110/3740/3757 ＋ mtf.ts:2394(mtfCheckpoint)/:2415(mtfTrimCw)/:2422(mtfResetPeak)；C2（vwma 1ulp）已知接受，記於 docs/2026-10-14-pine-perf-align.md。"
+  },
+  "optional": [
+    "dvs(ema/hma) 與 stv(rma) 同型上限（ta.ts，逐值 0 差異 + gets/bar 不變）：T9 已完成（VS_LEN_MAX=16，ta.ts:516；見 T9 evidence）",
+    "adaptive tick-skip 政策：已定案（T10，行為不改；engine.ts:348 分支保留）",
+    "MACD701_v72 剩餘 MTF 每 eval 成本：T6① 已定案（前提否證、結案不做；見 docs/superpowers/plans/2026-10-16-t6a-chart-tf-security-fastpath.md 附錄 B）"
+  ],
+  "_read_me_before_you_start_20261015T2023": {
+    "why": "窗口 A/B 期間樹被回退過一次；T7 根因已由取證定案，修補已套進真樹。跑 T7 的『基線 A/B』會毀掉成果。",
+    "tree_state_now": {
+      "src/pine/series.ts": "md5 e158d372f3a4328f11e2d2f5ccda8c93（已含 T7 修補：IncSnap.len + incRewind 冪等）",
+      "src/pine/mtf.ts": "md5 79d67c66b8e19349b4fdaeeaef5d3d79（凍結優化樹，2411 行、cwPeak×4）",
+      "baseline_check": "954 passed | 1 skipped（62 檔）、tsc --noEmit 0（於 2026-10-15 19:38–19:44 實測）"
+    },
+    "do_not": [
+      "不要 git checkout b9fcd81 -- src/pine / git restore / git stash（會清掉未提交的 R5 成果＋T7 修補）",
+      "不要跑 T7 的『基線 A/B 對照』（T7 根因已定案，見 docs/2026-10-15-r5-forensics-summary.md §1.1）",
+      "不要 npm i",
+      "shell 一律 cd /c/Users/bear9/OpenCharts && <inline>（不要給 cwd: 參數、不要巢狀 bash <file> —— 都會掉進 WSL，npx tsx 會踩 win32-only esbuild）"
+    ],
+    "corrected_root_causes": {
+      "T7": "(d) 上游雙 rewind：tf-frame 序列的 [1] 在 forming bar 讀成當前值；interpreter.ts:3546 先、mtf.ts:2396→2346/2354 後；病灶 series.ts:114-128；(a)(b)(c) 三假說全被推翻。活化律＝forming bar 是新框首根（slotInFrame==0）；最小分歧根數 150、非單調。",
+      "T8": "主導項＝每根 simAt miss 的 ramp（replaySteps=B(B−1)/2：4950/19900/124750）；epoch cache 丟棄貢獻 0 步（epochRebuildSteps 0/0/0）⇒ 別再打 epoch。",
+      "T11": "「per-caller 命中=0」只對 MACD701/K55/final；TRIS390 殘差 7481@500/1692@100 且跨樹逐位元相同。寫鍵＝UDF 內每次新建 callScope（interpreter.ts:1733）⇒ 寫了讀不回；穩定身分＝spec.callerKey。invHits 必須用顯式計數器（counters.mjs snapshot()）。"
+    },
+    "pointers": [
+      "docs/2026-10-15-r5-fix-plan.md（P1–P10 修復清單＋所有權矩陣＋量測時序＋紅線）",
+      "docs/2026-10-15-r5-forensics-summary.md（六探子結論與四處更正）",
+      "docs/2026-10-15-t8-replay-attribution.md、docs/2026-10-15-t11-key-attribution.md、docs/2026-10-15-t12-small-items.md",
+      "scratch/perf/r5-pine-optimized-b9/pine（優化樹複本，131 檔，與 runner 快照逐檔 md5 相同）"
+    ],
+    "note_fixed": "本檔原有多餘的 } 導致 JSON.parse 失敗（13:45 起，windows.B.started 因此為 null）；已於 20:21 修復。"
+  },
+  "ownership_20261015T2033": {
+    "why": "窗 C 20:30 啟動時，omp 正並行修 P2/P7/P8/P9#4/P10。為避免同檔並發 edit（repo 鐵律：同檔不可併發），檔案所有權切開如下。",
+    "omp_owns_files": {
+      "builtins/ta.ts": "P8(T9) 已完成並驗收＋T12#4(C3 forming-bar ring latch) 已完成並驗收。改動：stateFor 新增 opt-in cap（只在使用者指定時才清 leaf-holding map）；新增 VS_LEN_MAX=16 並套用於 emaVs/rmaVs/hmaVs 的 len-keyed 層；winRingReader 只快取 i < ctx.barIndex。驗收（真樹）：npx vitest run src/pine = 954 passed | 1 skipped（62 檔）、tsc --noEmit 0、四支 digest ze7byn/kb0glc/1580h2/p4gddl 逐字不變（scratch/perf/iso/P8-digest-100.json）。",
+      "builtins/strategy.ts": "P2(T8a) — 進行中",
+      "builtins/util.ts + builtins/math.ts": "P7(T6③) — 待做",
+      "engine.ts": "P10(T10) — 待做"
+    },
+    "window_C_owns_files": {
+      "series.ts": "P3(T8b) registry 高水位剪回；T12#5 bind 契約。注意 series.ts 已含 T7 修補（md5 e158d372f3a4328f11e2d2f5ccda8c93），不要覆蓋。",
+      "mtf.ts": "P4(T11) callerKey 鍵、P5(T6②/T12#1#2) spec.cw＋cwPeak、P6(T6①) 圖表tf×標的不進 MTF",
+      "interpreter.ts": "P5 的 hook 表（MtfHooks resetPeak/trimCw）、P9#5"
+    },
+    "do_not": [
+      "不要編輯 builtins/ta.ts／builtins/strategy.ts／builtins/util.ts／builtins/math.ts／engine.ts（omp 正在改，會掉寫入）",
+      "T9／T12#4 已由 omp 完成，不要重做"
+    ],
+    "omp_status": "P1/T7 已完成並在真樹驗收（500x5 parity 0 mismatch、954 passed|1 skipped、tsc 0、四支 digest 逐字不變、golden 0 差異）"
+  }
+,
+  "tier_a_correction_20261016": {
+    "naming_note_20261016": "（無 HHMM 後綴：原區塊未記錄時刻；2026-10-16 追加）",
+    "why": "Tier A 文件與證據收尾：以現行碼與實跑證據更正本狀態檔的錯誤/落後欄位，並修復 T8.evidence 缺結尾引號造成的 JSON 不合法。",
+    "source_of_truth": "PROGRESS.md ＋ src/pine 現行碼 ＋ 受管 JEV",
+    "changed": [
+      "T1 done→partial（evidence 自證 acceptance NOT met）",
+      "T5 cancelled→done（reason 加 'cancelled（作廢）：' 前綴以符合 docs/2026-10-15-r5-remaining-autorun.md:7 值域）",
+      "T6 in_progress→partial（evidence 由 null 改為具體：② 已落地、① 前提已否證、已回退結案）",
+      "T8 JSON 修復（補結尾引號與逗號）＋ evidence 刪除錯誤推論、改為更正版事實",
+      "T9 not_started→done（evidence：ta.ts:516 ＋ 7 處套用點 ＋ 實跑：ta_state_bound.test.ts 3 支 ＋ wring_latch.test.ts 1 支＝4 passed（2 files））",
+      "T10 not_started→done（evidence：前提更正，skip 側有測試）",
+      "T11 not_started→done（evidence：結案不做）",
+      "T12 not_started→done（evidence：C3/bind/cwPeak/spec.cw/C2）"
+    ],
+    "current_tree_note": "現行 src/pine/mtf.ts md5 = b8da64c1bcc03e534db45e30983fc2f8（P5 spec.cw/cwPeak 已落地、T6① 已回退）；_read_me_before_you_start_20261015T2023 內記載的 79d67c66… 為歷史稽核快照，不改動。",
+    "evidence": "npx vitest run src/pine/__tests__/ta_state_bound.test.ts src/pine/__tests__/wring_latch.test.ts: 2 files 4 tests passed；受管 JEV taskwf-verify 5 宣稱 4 通過 1 升級主 LLM 後通過",
+    "p8_review_20261016": "本輪 P8 回修（2026-10-16）：F1 行號越界更正（mtf.ts:2394(mtfCheckpoint)/:2415(mtfTrimCw)/:2422(mtfResetPeak)）；F2 引用更正（docs/2026-10-15-omp-p2-p7-p10-notes.md:124（§P3（T8b）已完成＋反事實證明））；F3 陳舊提案改寫為 P2(T8a) 已實作事實（strategy.ts:299/:308/:352）；F5 自相矛盾更正（T6 changed 項 ① 前提已否證、已回退結案，與 T6.evidence 一致）；F6 標籤更正（:722-728(hma-in/hma)）＋計數補述（另有 dmi 7 處與 kc hl-r 由 bound2 覆蓋，PROGRESS.md:720 記 12 站點）；F7 測試歸屬（實跑 ta_state_bound.test.ts 3 支 ＋ wring_latch.test.ts 1 支＝4 passed（2 files））；F8 命令更正為完整可執行形式（npx vitest run src/pine/__tests__/ta_state_bound.test.ts src/pine/__tests__/wring_latch.test.ts）。受管 JEV taskwf-review 分級：F1-F8/F11 important、F9 minor（不修）。F9 minor、記錄不修（key 命名慣例）；第三輪：perf-align:80（T10 措辭更正）＋ status.json optional 清單同步（T9/T10/T6①）",
+    "advisor_review_20261016": "advisor 複核：6 條驗收逐條實測成立、可宣告完成；本輪另修 T5 evidence（作廢實義＋行號 strategy.ts:1013-1018）、T7 md5 過期（舊值 → 現值 c6cf70d78c8cfbad253292d55bfc1d33；`_read_me_before_you_start_20261015T2023`／`ownership_20261015T2033` 兩區塊為歷史稽核快照，逐字保留舊值，全檔僅此 2 處命中）、perf-align 兩處行號/標籤精度（dmi 7 處：`:1455`/`:1463`/`:1475` 為 `bound2` 直接站點、`:1472`/`:1473`/`:1474`/`:1483` 為 `rmaVsBound` 鏈；`interpreter.ts:3580-3581` 為註解＋逐個 `incRewind` 迴圈）。殘留：F9 key 命名 minor；`docs/2026-10-14-pine-perf-align.md` 段標題「進行中/待裁決」為歷史性未動；三份 docs untracked 未 commit。"
+  }
+}

@@ -33,9 +33,9 @@ Same mechanism: `var x` never re-runs init so it's safe; the hole needs a non-va
 
 Fix direction: keep a separate "shared alias target" marker — e.g. store `v.v` in `declSlots` but have `slotFor`/`bindDeclared` route scalar writes to a *fresh* `BarSeries` when the stored slot isn't one this decl owns (identity tag, or store `{slot, owned}` / a sentinel non-writable wrapper in `declSlots`).
 
-### F3 — `:=` on an alias bound to `SecSeries` loses all history (P2)
+### F3 — ~~`:=` on an alias bound to `SecSeries` loses all history (P2)~~ → **已由 482b776（2026-10-09，writable base seed guard）修復；本段描述的是修復前的舊碼**
 
-`CowSeries.writable` (`interpreter.ts:244-249`; identical in `mtf.ts:1105-1111`) computes `base = src instanceof BarSeries ? src.currentBar : …`. `SecSeries extends BarSeries` but never writes its buffer — `lastBar === -1` — so `base = -1`, the copy loop `for (b=0; b<=-1; …)` produces an **empty** BarSeries, and `setAt(bar, v)` writes only the current bar.
+`CowSeries.writable` (`interpreter.ts:244-249`; identical in `mtf.ts:1105-1111`；行號更正 2026-10-17：現為 `interpreter.ts:342-350` 與 `mtf.ts:1261-1269`（`:1264` 逐字相同），而 `:1105-1111` 現為 `alignToChart` 的 `SecSeries` 包裝) computes `base = src instanceof BarSeries ? src.currentBar : …`. `SecSeries extends BarSeries` but never writes its buffer — `lastBar === -1` — so `base = -1`, the copy loop `for (b=0; b<=-1; …)` produces an **empty** BarSeries, and `setAt(bar, v)` writes only the current bar.
 
 Repro:
 ```pine
@@ -45,7 +45,7 @@ plot(s[1])
 ```
 Expected `s[1]` = previous chart bar's mapped security value (the copy should contain the full mapped history `size() = j+1` entries). Actual: copy is empty; `s[1]` = na. Bounded to aliases of `SecSeries` (and any BarSeries subclass with unwritten `lastBar`), so P2.
 
-Fix direction: `writable` should fall back to `src.size()` when `currentBar < 0`, same as the non-BarSeries branch.
+~~Fix direction: `writable` should fall back to `src.size()` when `currentBar < 0`, same as the non-BarSeries branch.~~ 作廢：見 `docs/superpowers/plans/2026-10-16-tb-pine-debt-three.md` F3（`SecSeries.size()` 是 tf 域值，混進 chart 域 `base` 會 seed 未來 bar，故禁止此修法）；本債已由 482b776 修復。
 
 ### F4 — Tuple destructured series elements bypass the cow entirely; `a[1]` reads live values (P2, pre-existing but same feature surface)
 
@@ -78,4 +78,4 @@ plot(a[1])   // expected close[1]; actual close (current bar)
 
 1. F1: persist cow for all alias decls (`run.declCows` keyed by decl site, rebind inner per execution — the existing `rebind()` already supports it).
 2. F2: in `bindDeclared`/`slotFor`, don't let scalar writes land on a `declSlots` entry that is a foreign/shared series — tag the entry (`declAliases: Set<object>`) and substitute a fresh owned `BarSeries` on kind flip.
-3. F3: `writable`: derive base from `src.size()` when `currentBar < 0` (`SecSeries` reports `j+1`).
+3. ~~F3: `writable`: derive base from `src.size()` when `currentBar < 0` (`SecSeries` reports `j+1`).~~ 作廢：見 `docs/superpowers/plans/2026-10-16-tb-pine-debt-three.md` F3；本債已由 482b776 修復。

@@ -11,7 +11,7 @@ export { Series };
  * Read-anchor hooks. `anchor(s)` = the absolute bar `s.get(0)` resolves to right
  * now; `touch(s)` mirrors the bookkeeping a write performs. Defaults are the
  * plain lastBar semantics; mtf.ts installs tf-aware versions (tfAnchor /
- * tfDirty) so frozen readers see exactly what a live `get(i)` would have.
+ * tfSeries) so frozen readers see exactly what a live `get(i)` would have.
  */
 export const seriesHooks: {
   anchor: (s: BarSeries) => number;
@@ -42,12 +42,20 @@ export interface IncSnap {
   firstBar: number;
   head: number;
   buf: Value[];
+  /** `buf.length` when the snapshot was taken. `buf` is stored by reference, so
+   *  a later rewind cannot recover the length from the array itself — and after
+   *  a sibling rewind has already truncated this series, the array behind the
+   *  snapshot may still be the longer original. */
+  len: number;
   /** Subclass state (virtual fn/memo/lit, CowSeries inner/cow). */
   x?: unknown;
 }
 
 /** LitSeries extra snap fields — the virtual-window flag. */
 export interface LitSnapX { virtual: boolean }
+
+/** CellSeries extra snap fields — the scalar current-value window. */
+export interface CellSnapX { v: Value; n: number; virtual: boolean }
 
 /** LiftedSeries extra snap fields — lazy-kernel state. */
 export interface LiftedSnapX {
@@ -102,12 +110,26 @@ export class BarSeries extends Series {
 
   /** Checkpoint payload for the incremental driver. */
   incSnap(): IncSnap {
-    return { lastBar: this.lastBar, firstBar: this.firstBar, head: this.head, buf: this.buf };
+    return { lastBar: this.lastBar, firstBar: this.firstBar, head: this.head, buf: this.buf, len: this.buf.length };
   }
 
   /** Rewind to a snap taken on this object; a null snap resets to
    *  never-written (series born during the re-evaluated bar). Subclasses
-   *  layer their private state onto `snap.x`. */
+   *  layer their private state onto `snap.x`.
+   *
+   *  `snap.buf` is held by reference and several snapshots can alias one array —
+   *  the interpreter's `seriesSnaps` and the MTF store's per-spec snaps both
+   *  cover tf-frame series. Rewinding in place would therefore destroy the other
+   *  snapshot, and by the time the second one runs, `this.buf` may already have
+   *  been replaced by a shorter slice while the snapshot still points at the
+   *  longer original. On the non-null path below, the target entry count is
+   *  `snap.len` (the length at snapshot time) and nothing else; the length is
+   *  left alone when it already matches, so the append-only case stays
+   *  allocation-free.
+   *
+   *  The `null` path still empties `this.buf` in place, so a snapshot aliasing
+   *  that array loses its data with it — the same loss the old drop arithmetic
+   *  had, kept deliberately to avoid a fresh array per born-this-bar series. */
   incRewind(snap: IncSnap | null): void {
     if (snap === null) {
       this.buf.length = 0;
@@ -117,13 +139,7 @@ export class BarSeries extends Series {
       this.hasContainers = false;
       return;
     }
-    const drop = this.lastBar - snap.lastBar;
-    if (drop > 0) {
-      this.buf = snap.buf.slice(0, snap.buf.length - drop);
-    } else {
-      this.buf = snap.buf;
-      this.buf.length = snap.buf.length;
-    }
+    if (this.buf.length !== snap.len) this.buf = snap.buf.slice(0, snap.len);
     this.head = snap.head;
     this.lastBar = snap.lastBar;
     this.firstBar = snap.firstBar;
@@ -329,7 +345,127 @@ export class LitSeries extends BarSeries {
   }
 }
 
+/** Mutable payloads the incremental driver deep-clones per bar (kinds whose
+ *  Value holds a reference). Mirrors BarSeries.setAt's own check. */
+function isContainerValue(v: Value): boolean {
+  const k = v.kind;
+  return k === 'array' || k === 'map' || k === 'matrix' || k === 'udt';
+}
 
+/**
+ * Current-value slot — the series `new BarSeries(); setAt(bar, v)` produces,
+ * with no buffer to allocate or push through. `get(0)` is `v`, one entry per
+ * elapsed bar is claimed (`size()`), every older offset answers na, and
+ * carry-forward works exactly as the plain series' does. That is precisely the
+ * shape of the two write-only sites the interpreter rebuilds per bar:
+ * `for` variables (a fresh slot per loop iteration — the name is rebound each
+ * iteration, so nothing outlives the bar) and UDF scalar params that are only
+ * `:=`-written (bound fresh per call, never read for history).
+ *
+ * Invariant — virtual state ≡ the BarSeries it replaces: `buf = [v] * n`,
+ * `head = 0`, `firstBar = 0`, `lastBar = writeBar`. Every inherited read
+ * (`get`/`cur`/`peek`/`atOffset`/`size`, plus mtf's tf-anchoring overrides)
+ * derives the same answers from the same two primitives, so only `rAt` (the
+ * storage view) and the write paths need overrides.
+ *
+ * Why a `BarSeries` subclass at all: `evalReassign` requires
+ * `slot instanceof BarSeries` (`x := e` on a loop var / param), `histGetAt`
+ * routes BarSeries through `atOffset` (carry-forward), and `bindDeclared` only
+ * aliases BarSeries slots — a bare `Series` would leak into the model as a
+ * value. It is therefore also whitelisted by `freezeReader`; otherwise every
+ * lazy kernel (`nz`, `math.sum`, …) reading the slot would drop to the eager
+ * O(history) rebuild.
+ *
+ * Deliberate limits — each one a `materialize()` back to plain storage: a write
+ * on a different bar (carry-forward fill / retro-write), a container payload
+ * (the incremental driver deep-clones containers out of `incBuf`), a container
+ * seed. A slot is thus either a scalar current-value cell or an ordinary
+ * BarSeries, never a third thing.
+ */
+export class CellSeries extends BarSeries {
+  /** Current value. `ensureBar` widens the window with copies of it. */
+  private v: Value;
+  /** Visible `v`-valued entries ≡ the replaced series' `buf.length - head`. */
+  private n = 1;
+  /** false once real storage exists — from then on everything is `super`'s. */
+  private virtual = true;
+
+  /** Bind `bar`'s value in one shot: the alloc+setAt pair the callers ran. */
+  constructor(bar: number, v: Value) {
+    super();
+    this.v = v;
+    this.lastBar = bar;
+    seriesHooks.touch(this);
+    // A container payload takes the same materialize path a foreign value
+    // would, and must carry the deep-clone flag the real write sets: the
+    // incremental driver only clones slots whose `hasContainers` is true.
+    if (isContainerValue(v)) { this.materialize(); this.hasContainers = true; }
+  }
+
+  /** Copy the virtual window into real storage, then plain BarSeries rules. */
+  private materialize(): void {
+    const out = new Array<Value>(this.n);
+    out.fill(this.v);
+    this.buf = out;
+    this.head = 0;
+    this.virtual = false;
+  }
+
+  /** Storage view: every visible entry holds the current value. */
+  protected override rAt(k: number): Value | undefined {
+    if (!this.virtual) return super.rAt(k);
+    return k >= 0 && k < this.n ? this.v : undefined;
+  }
+
+  override setAt(bar: number, v: Value): void {
+    if (this.virtual) {
+      // Same-bar overwrite (the loop-var / param hot path) stays a scalar
+      // store — but only while the window is the single newest entry: once
+      // `ensureBar` widened it, the older copies are a *past* value and a
+      // newest-slot write must not rewrite them. `touch` mirrors the
+      // bookkeeping the write would have performed.
+      if (bar === this.lastBar && this.n === 1 && !isContainerValue(v)) {
+        this.v = v;
+        seriesHooks.touch(this);
+        return;
+      }
+      this.materialize();
+    }
+    super.setAt(bar, v);
+  }
+
+  override ensureBar(bar: number): void {
+    if (bar <= this.lastBar) return;
+    if (!this.virtual) { super.ensureBar(bar); return; }
+    // Carry-forward repeats the one value: extend the window in O(1). n === 0
+    // (rewound to never-written) keeps a virtual-na window, like an empty
+    // buffer's — the whole span reads na either way.
+    if (this.n > 0) this.n = Math.min(this.n + (bar - this.lastBar), this.capN);
+    this.lastBar = bar;
+  }
+
+  override incSnap(): IncSnap {
+    const s = super.incSnap();
+    s.x = { v: this.v, n: this.n, virtual: this.virtual };
+    return s;
+  }
+
+  override incRewind(snap: IncSnap | null): void {
+    super.incRewind(snap);
+    if (snap === null) {
+      // Born inside the re-evaluated bar → never-written window (all reads na).
+      // The object is unreachable after the rewind; the state only has to be
+      // safe, not true.
+      this.n = 0;
+      this.virtual = true;
+      return;
+    }
+    const x = snap.x as CellSnapX;
+    this.v = x.v;
+    this.n = x.n;
+    this.virtual = x.virtual;
+  }
+}
 
 /**
  * Lazily-evaluated result of a pointwise series kernel (nz, math.max, …).
@@ -443,22 +579,113 @@ export class LiftedSeries extends BarSeries {
 /**
  * Base for wrappers whose reads forward to another series (copy-on-write UDF
  * params). `readTarget()` is the series `get(i)` currently reads.
+ *
+ * `bind` is the *per-site identity anchor* contract (interpreter's `SiteSeries`,
+ * interpreter.ts:404): an implementation declares it when the wrapper object
+ * itself is created ONCE per call-arg site and merely re-pointed at each bar's
+ * fresh series. Such a wrapper is the stable end of the chain — its
+ * `readTarget()` churns every bar, which is exactly what `stableSeries` must
+ * not follow. Wrappers re-created every bar (`CowSeries`, `input.source`
+ * views) leave it undefined: their *target* is the stable end.
  */
 export abstract class ForwardingSeries extends BarSeries {
   abstract readTarget(): Series;
+  bind?(inner: BarSeries): void;
+  /** Explicit marker for the classes that implement `bind`. `bind` alone is a
+   *  duck test, and a duck test silently adopts any future class that happens to
+   *  carry a `bind` for an unrelated purpose — `stableSeries` would then key a
+   *  cross-bar memo on a churning object. Declaring this flag alongside `bind`
+   *  keeps the pair honest: `SiteSeries` is the only implementor
+   *  (interpreter.ts:404), and `stableSeries` reads this flag, not the method. */
+  readonly siteAnchor?: true;
+}
+
+/** Bounded walk over a forwarding chain. `step` returns the next hop, or its
+ *  own argument to end the walk. The 8-hop cap is the chain's only termination
+ *  guard (a wrapper that forwards to itself, or an absurdly deep chain, stops
+ *  instead of looping) — `freezeReader` and `stableSeries` share it. */
+function walkForwarding(s: Series, step: (t: ForwardingSeries) => Series): Series {
+  let t: Series = s;
+  for (let hop = 0; hop < 8 && t instanceof ForwardingSeries; hop++) {
+    const n = step(t);
+    if (n === t) break;
+    t = n;
+  }
+  return t;
+}
+
+/**
+ * Identity anchor for an identity-keyed cache: **the stable end** of the
+ * forwarding chain. Two wrapper families disagree about which end that is —
+ * a wrapper re-created every bar (`CowSeries`, `input.source` views) must be
+ * skipped in favour of its target, while a wrapper created once per site and
+ * re-bound every bar (`SiteSeries`, via the `bind` contract above) must be
+ * kept. Following `readTarget()` unconditionally gets one of them wrong in
+ * each direction; this picks the end that is the same object across bars,
+ * which is the only property a cross-bar memo may key on.
+ *
+ * Values are unaffected either way: reading through a wrapper is by definition
+ * reading what it currently forwards to (`get`/`cur`/`size`/`atOffset` all
+ * delegate), so both ends answer the same thing this bar. Cross-file contract:
+ * a cache keyed on this result MUST stay stable across bars — that is what
+ * `SiteSeries`/`stableArgSeries` (interpreter.ts:404/522) exist to provide,
+ * and what ta.ts's `wring`/`vs`/`wvs` tables depend on.
+ */
+export function stableSeries(s: Series): Series {
+  return walkForwarding(s, (t) => (t.siteAnchor === true ? t : t.readTarget()));
+}
+
+/** Structural shape of a live-anchor computed series: it carries its own
+ *  BuiltinCtx (`ctx`), so `ctx.barIndex` is the bar its `get` is anchored on. */
+interface LiveAnchor { ctx?: { barIndex?: unknown } }
+
+/**
+ * Live-anchor computed series — the non-`BarSeries` family that recomputes
+ * `get(i)` from bar data instead of storing per-bar slots: ta.ts `FnSeries`
+ * (bare `ta.tr`/`ta.obv`/`ta.wad`…) and time.ts `CalSeries` (bare `hour`…).
+ * `get(i)` there means "i bars before the anchor *its own ctx* is on", which
+ * moves with every bar — the opposite of a BarSeries slot, whose history is
+ * absolute. Identified structurally and self-validating: the series carries
+ * its BuiltinCtx and claims one bar of history per elapsed ctx bar
+ * (`size() === ctx.barIndex + 1`). A hist-backed `Series` carries no ctx, and
+ * any other subclass failing either half is left to the eager path (null).
+ * Returns that ctx — the anchor is `ctx.barIndex` *live*, never a constant.
+ */
+function liveAnchorCtx(s: Series): { barIndex: number } | null {
+  const c = (s as Series & LiveAnchor).ctx;
+  const b = c?.barIndex;
+  if (typeof b !== 'number' || !Number.isInteger(b) || b < 0) return null;
+  return s.size() === b + 1 ? (c as { barIndex: number }) : null;
 }
 
 /**
  * Freeze `s`'s current `get(i)` view: returns a reader that keeps answering
  * what `s.get(i)` answers now, even after `s` (or the eval anchor) moves on.
- * Null when `s` has no absolute storage to replay (computed series) — callers
- * must then evaluate eagerly.
+ * Null when `s` has no replayable view — callers must then evaluate eagerly.
  */
 export function freezeReader(s: Series): ((i: number) => Value) | null {
-  let t: Series = s;
-  for (let hop = 0; hop < 8 && t instanceof ForwardingSeries; hop++) t = t.readTarget();
-  if (!(t instanceof BarSeries)) return null;
-  if (t.constructor !== BarSeries && !(t instanceof LiftedSeries) && !(t instanceof LitSeries)) return null;
+  const t = walkForwarding(s, (w) => w.readTarget());
+  if (!(t instanceof BarSeries)) {
+    // Pin the anchor `a` and re-map every read by how far the anchor has moved
+    // since, so `r(i)` keeps answering bar `a - i`: exactly what `get(i)`
+    // answered when the reader was frozen. `get(n)` is "n bars before the live
+    // anchor" by definition, so the re-mapping is exact for every offset whose
+    // target bar is not ahead of the live anchor — including the out-of-window
+    // offsets a rolling kernel reads past its own length.
+    const c = liveAnchorCtx(t);
+    if (c === null) return null;
+    const a = c.barIndex;
+    // `max(0,…)` mirrors `peek`'s carry-forward: inside a bar loop the anchor
+    // only moves forward (mtf re-anchors nested reads at the tf bar instead of
+    // rewinding the series), so the argument stays ≥ 0; the clamp only keeps a
+    // rewound/foreign anchor from asking a stateful source (ta.obv/ta.wad) for
+    // a bar it has not reached — a negative offset there would memoize garbage.
+    return (i) => { const n = i + c.barIndex - a; return t.get(n > 0 ? n : 0); };
+  }
+  // BarSeries subclasses with REAL per-bar storage are replayable by `peek`;
+  // anything else (a forwarding/foreign wrapper) must be left to the eager path.
+  if (t.constructor !== BarSeries
+      && !(t instanceof LitSeries) && !(t instanceof LiftedSeries) && !(t instanceof CellSeries)) return null;
   const bs = t;
   const a = seriesHooks.anchor(bs);
   return (i) => bs.peek(a, i);

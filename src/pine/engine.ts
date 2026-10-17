@@ -104,6 +104,7 @@ const toBarData = (bars: OHLCV[]): BarData[] =>
   bars.map(b => ({
     openTime: b.time, open: b.open, high: b.high, low: b.low,
     close: b.close, volume: b.volume ?? 0,
+    closeTime: (b as { closeTime?: number }).closeTime,
   }));
 
 /** Vela fetchSeries (with BarRange) → interpreter fetchSeries (sym, tf).
@@ -223,6 +224,36 @@ const markerPosOf = (s: string | undefined): 'aboveBar' | 'belowBar' | 'inBar' =
   if (t === 'abovebar' || t === 'top') return 'aboveBar';
   if (t === 'absolute') return 'inBar';
   return 'belowBar';
+};
+
+/** Map plotshape marker styles to Vela label styles. */
+const shapeToLabelStyle = (shape: string, isChar: boolean): ModelLabel['style'] => {
+  if (isChar) return 'none';
+  const s = shape.toLowerCase().replace(/^shape\./, '').replace(/_/g, '');
+  switch (s) {
+    case 'triangleup': return 'triangleup';
+    case 'triangledown': return 'triangledown';
+    case 'arrowup': return 'arrowup';
+    case 'arrowdown': return 'arrowdown';
+    case 'circle': return 'circle';
+    case 'square': return 'square';
+    case 'diamond': return 'diamond';
+    case 'flag': return 'flag';
+    case 'cross': return 'cross';
+    case 'xcross': return 'xcross';
+    case 'labelup': return 'label_up';
+    case 'labeldown': return 'label_down';
+    default: return 'triangleup';
+  }
+};
+
+const markerLocationToYLoc = (loc: string | undefined): ModelLabel['yloc'] => {
+  const t = (loc ?? '').split('.').pop() ?? '';
+  if (t === 'abovebar') return 'abovebar';
+  if (t === 'top') return 'top';
+  if (t === 'bottom') return 'bottom';
+  if (t === 'absolute') return 'price';
+  return 'belowbar';
 };
 
 export class PineInterpreterEngine implements ScriptingEngine {
@@ -444,7 +475,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
   /** Run in-process on the prepared AST. PineWorkerEngine overrides to run
    *  off-thread. The incremental path: a live session (carried by
    *  opts.incHolder) resumes at its committed checkpoint instead of
-   *  re-evaluating every bar per tick; ineligible/absent → full run. */
+   *  re-evaluating every bar per tick; no resume path → full run. */
   protected async runProgram(
     parsed: ParsedInput,
     barData: BarData[],
@@ -593,10 +624,52 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
             ? opts.text
             : (typeof opts.char === 'string' && opts.char !== '' ? opts.char : undefined),
           size: markerSizeOf(String(opts.size ?? '')),
+          // Shape sink value IS the anchor price (shapeAnchor): bar high/low for
+          // pane regions, the series value for location.absolute. Vela folds a
+          // label's `y` into the pane autoscale when yloc === 'price', so this
+          // must be the real anchor — 0 would stretch the axis down to zero.
+          price: (p.u.kind === 'int' || p.u.kind === 'float') ? p.u.v : undefined,
         }));
       if (markers.length > 0) {
         plotSeriesId.set(plot.index, id);
         series.push({ id, title, paneId: '', kind: 'markers', markers });
+
+        // Vela's renderer does not draw series kind: 'markers', but natively renders
+        // IndicatorModel.labels (supporting triangleup, triangledown, cross, etc.).
+        const lStyle = shapeToLabelStyle(String((opts.marker as string | undefined) ?? 'shape.xcross'), isChar);
+        const yloc = markerLocationToYLoc(String(opts.location ?? ''));
+        const lSize = labelSizeOf(String(opts.size ?? ''));
+        const text = typeof opts.text === 'string' && opts.text !== ''
+          ? opts.text
+          : (typeof opts.char === 'string' && opts.char !== '' ? opts.char : undefined);
+
+        for (const m of markers) {
+          // location.absolute anchors the marker at its sink value; an `na` value has no
+          // anchor, so draw nothing rather than a 0 — Vela folds a price-anchored label's
+          // y into the pane autoscale (see the label.new path above).
+          if (yloc === 'price' && m.price === undefined) continue;
+          labels.push({
+            id: `${id}:m:${m.time}`,
+            paneId: '',
+            xloc: 'bar_time',
+            x: m.time,
+            // Only read by Vela when yloc === 'price' (location.absolute); the
+            // pane-relative ylocs anchor off the bar high/low instead.
+            y: m.price ?? 0,
+            yloc,
+            style: lStyle,
+            color: m.color,
+            textColor: opts.textcolor ? String(opts.textcolor) : undefined,
+            size: lSize,
+            textAlign: 'center',
+            fontFamily: 'default',
+            text,
+            // NOT `true`: forcing every marker onto the price pane would leak a
+            // non-overlay script's (e.g. MACD) absolute-location anchors into
+            // the candle autoscale. Let the script's own pane decide.
+            overlay: opts.overlay === true ? true : undefined,
+          });
+        }
       }
       continue;
     }
@@ -753,12 +826,21 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
       if (x === undefined) continue;
       const ylocRaw = (propStr(p, 'yloc') ?? 'yloc.price').split('.').pop() ?? 'price';
       const yloc = ylocRaw === 'abovebar' ? 'abovebar' : ylocRaw === 'belowbar' ? 'belowbar' : 'price';
+      // A price-anchored label with an `na` y draws NOTHING (TradingView). The old
+      // `?? 0` parked it at price 0 on its own (valid) bar instead, and Vela folds a
+      // VISIBLE label's y into the price-pane autoscale — so the first na label
+      // scrolled into view yanked the axis floor to 0 and squashed every candle
+      // (見高K: smc.ext_bos_lbl is born `label.new(na, na, …)` and later receives
+      // `set_xy(bar_index, <possibly na price>)`, i.e. a valid x with an na y).
+      const y = propNum(p, 'y');
+      if (yloc === 'price' && y === undefined) continue;
       const text = propStr(p, 'text');
       labels.push({
         id: did, paneId: '',
         xloc: xlocOf(propStr(p, 'xloc')),
         x,
-        y: propNum(p, 'y') ?? 0,
+        // abovebar/belowbar y is an OFFSET from the bar's high/low → 0 is its real default.
+        y: y ?? 0,
         yloc,
         text: text !== undefined && text !== '' ? text : undefined,
         style: labelStyleOf(propStr(p, 'style')) as ModelLabel['style'],

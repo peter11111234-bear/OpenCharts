@@ -73,8 +73,8 @@ const withMap = (
 // ── Construction ────────────────────────────────────────────────────────────
 // `map.new<KT, VT>()` / `map.new<KT, VT>(k1, v1, k2, v2, …)`: the parser drops
 // the type args (v1) and the initial pairs are variadic positional args. Every
-// arg is a stash (values keep live-series semantics) — same as array.from.
-// Values are SNAPSHOTs, like array elements: `map.put(m, k, close)` stores the
+// arg is a stash; values are SNAPSHOTs, like array elements (and like
+// `array.from` since its snapshot fix): `map.put(m, k, close)` stores the
 // current close, not a live series handle.
 
 registerBuiltin('map', 'new', (_ctx, args) => {

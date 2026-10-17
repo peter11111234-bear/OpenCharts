@@ -15,7 +15,9 @@
 import { describe, expect, it } from 'vitest';
 import { parse } from '../parser';
 import { runScript } from '../interpreter';
+import { PineInterpreterEngine, buildModel } from '../engine';
 import type { RunResult } from '../contracts';
+import type { OHLCV } from '@luxalgo/vela';
 import '../builtins/index';
 
 const bar = (openTime: number, c = 1) => ({ openTime, open: c, high: c + 1, low: c - 1, close: c, volume: 10 });
@@ -133,12 +135,13 @@ describe('input.int schema dedup via UDF double-call', () => {
 // ── 6. line.new with na coords (Vela UI probe finding) ──────────────────────
 // Browser QA (vela-146.png): 高量1.46's ORB block calls line.new(y1=orb_h) with
 // orb_h=na (ta.valuewhen never matched on TSE stock data — no 08:45 bar). TV
-// draws nothing for na coords; this engine coerces na→0 via numArg(def=0) in
-// builtins/draw.ts, so the model emits 38 lines at y=0 and the price axis
-// stretches to fit them. Pre-existing semantics (475004b), not a Task-5 perf
-// regression — pinned here so the behavior is visible in CI.
-describe('line.new na coordinate coercion (browser-observed)', () => {
-  it('na y-coords are stored as 0 in drawing props (numArg default)', async () => {
+// draws nothing for na coords. This engine used to coerce na→0 via numArg(def=0)
+// in builtins/draw.ts, so the model emitted 38 lines at y=0 and Vela folded that
+// 0 into the price pane's autoscale — the axis collapsed to 0…high and every
+// candle squashed flat. na coords now stay na; buildModel drops such a drawing
+// (and label/marker) instead of parking it at price 0.
+describe('line.new na coordinates stay na (nothing drawn)', () => {
+  it('na y-coords are preserved, not coerced to 0', async () => {
     const src = [
       'indicator("t")',
       'float y = na',
@@ -148,17 +151,148 @@ describe('line.new na coordinate coercion (browser-observed)', () => {
     const r = await runScript(parse(src), [bar(0), bar(60_000)]);
     const line = r.drawings.find(d => d.kind === 'line');
     expect(line).toBeDefined();
-    expect(line!.props.y1).toBe(0);
-    expect(line!.props.y2).toBe(0);
+    expect(line!.props.y1).toBeUndefined();
+    expect(line!.props.y2).toBeUndefined();
   });
 
-  it('na x-coords likewise coerce to 0', async () => {
+  it('na x-coords likewise stay na, real coords untouched', async () => {
     const src = 'indicator("t")\nint x = na\nline.new(x1 = x, y1 = 5, x2 = 2, y2 = 6)\nplot(close)';
     const r = await runScript(parse(src), [bar(0), bar(60_000)]);
     const line = r.drawings.find(d => d.kind === 'line');
-    expect(line!.props.x1).toBe(0);
-    // y-side untouched by na → stays real
+    expect(line!.props.x1).toBeUndefined();
     expect(line!.props.y1).toBe(5);
     expect(line!.props.y2).toBe(6);
+  });
+
+  // The prop-table generated setters (line.set_x1/set_y1/…, label.set_y,
+  // box.set_top/…) are a second door into the same room: they coerced na to 0
+  // long after the constructors were fixed. Cover them explicitly.
+  it('generic prop-table setters keep na for coordinates', async () => {
+    const src = [
+      'indicator("t")',
+      'var line l = line.new(0, 5, 1, 6)',
+      'var label lb = label.new(0, 5)',
+      'var box bx = box.new(0, 5, 1, 6)',
+      'line.set_y1(l, na)',
+      'line.set_x2(l, na)',
+      'label.set_y(lb, na)',
+      'label.set_x(lb, na)',
+      'box.set_top(bx, na)',
+      'box.set_bottom(bx, na)',
+      'plot(close)',
+    ].join('\n');
+    const r = await runScript(parse(src), [bar(0), bar(60_000)]);
+    const line = r.drawings.find(d => d.kind === 'line');
+    const label = r.drawings.find(d => d.kind === 'label');
+    const box = r.drawings.find(d => d.kind === 'box');
+    expect(line!.props.y1).toBeUndefined();
+    expect(line!.props.x2).toBeUndefined();
+    expect(line!.props.x1).toBe(0);
+    expect(label!.props.y).toBeUndefined();
+    expect(label!.props.x).toBeUndefined();
+    expect(box!.props.top).toBeUndefined();
+    expect(box!.props.bottom).toBeUndefined();
+    expect(box!.props.left).toBe(0);
+  });
+
+  it('hand-rolled set_xloc setters keep na too', async () => {
+    const src = [
+      'indicator("t")',
+      'var label lb = label.new(0, 5)',
+      'var box bx = box.new(0, 5, 1, 6)',
+      'label.set_xloc(lb, na, xloc.bar_index)',
+      'box.set_xloc(bx, na, na, xloc.bar_index)',
+      'plot(close)',
+    ].join('\n');
+    const r = await runScript(parse(src), [bar(0), bar(60_000)]);
+    expect(r.drawings.find(d => d.kind === 'label')!.props.x).toBeUndefined();
+    const box = r.drawings.find(d => d.kind === 'box');
+    expect(box!.props.left).toBeUndefined();
+    expect(box!.props.right).toBeUndefined();
+  });
+
+  it('an omitted required coordinate is na, not price 0', async () => {
+    // line.new(x1, y1, x2) — TradingView rejects the call; drawing at 0 instead
+    // is what collapsed the axis, so the missing endpoint must stay na.
+    const src = 'indicator("t")\nline.new(0, 5, 1)\nplot(close)';
+    const r = await runScript(parse(src), [bar(0), bar(60_000)]);
+    const line = r.drawings.find(d => d.kind === 'line');
+    expect(line!.props.y2).toBeUndefined();
+    expect(line!.props.y1).toBe(5);
+  });
+
+  it('a non-numeric coordinate is na too, not price 0', async () => {
+    // `asNum` maps an unparsable string to 0; a coordinate must not inherit that
+    // (TradingView is a compile error, and 0 is a real price).
+    const src = [
+      'indicator("t")',
+      'var line l = line.new(0, 5, 1, 6)',
+      'line.new(0, "abc", 1, 2)',
+      'line.set_y1(l, "abc")',
+      'plot(close)',
+    ].join('\n');
+    const r = await runScript(parse(src), [bar(0), bar(60_000)]);
+    const lines = r.drawings.filter(d => d.kind === 'line');
+    expect(lines[0]!.props.y1).toBeUndefined();
+    expect(lines[0]!.props.x1).toBe(0);
+    expect(lines[0]!.props.y2).toBe(6);
+    expect(lines[1]!.props.y1).toBeUndefined();
+    expect(lines[1]!.props.y2).toBe(2);
+  });
+
+  it('non-coordinate numeric props still coerce na to their 0 default', async () => {
+    const src = [
+      'indicator("t")',
+      'var line l = line.new(0, 5, 1, 6)',
+      'var box bx = box.new(0, 5, 1, 6)',
+      'line.set_width(l, na)',
+      'box.set_border_width(bx, na)',
+      'plot(close)',
+    ].join('\n');
+    const r = await runScript(parse(src), [bar(0), bar(60_000)]);
+    expect(r.drawings.find(d => d.kind === 'line')!.props.width).toBe(0);
+    expect(r.drawings.find(d => d.kind === 'box')!.props.border_width).toBe(0);
+  });
+
+  it('line.get_price extrapolates real coords but returns na for na coords', async () => {
+    const ok = 'indicator("t")\nvar line l = line.new(0, 5, 10, 15)\nplot(line.get_price(l, 5))';
+    const rOk = await runScript(parse(ok), [bar(0), bar(60_000)]);
+    expect(plotVals(rOk)).toEqual([10, 10]);
+
+    const na = 'indicator("t")\nvar line l = line.new(na, na, na, na)\nplot(line.get_price(l, 5))';
+    const rNa = await runScript(parse(na), [bar(0), bar(60_000)]);
+    expect(plotVals(rNa)).toEqual(['na', 'na']);
+
+    const naBar = 'indicator("t")\nvar line l = line.new(0, 5, 10, 15)\nint bx = na\nplot(line.get_price(l, bx))';
+    const rNaBar = await runScript(parse(naBar), [bar(0), bar(60_000)]);
+    expect(plotVals(rNaBar)).toEqual(['na', 'na']);
+  });
+
+  it('buildModel drops the drawing instead of emitting price-0 geometry', async () => {
+    const src = [
+      'indicator("t")',
+      'float orb_h = na',
+      'var line l = line.new(0, 5, 1, 6)',
+      'line.set_y1(l, orb_h)',
+      'plot(close)',
+    ].join('\n');
+    const engine = new PineInterpreterEngine();
+    const prepared = await engine.prepare(src, 'na1');
+    const bars: OHLCV[] = Array.from({ length: 4 }, (_, i) => ({
+      time: i * 60_000, open: 100, high: 101, low: 99, close: 100.5, volume: 10,
+    }));
+    const parsed = parse(src);
+    const r = await runScript(parsed, bars.map(b => ({ openTime: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0 })), { symbol: 'TEST', timeframe: '1' });
+    // The interpreter carries `modelId` on the otherwise opaque prepared token
+    // (same read as engine.test.ts's mkReq).
+    const token = prepared.token as { modelId: string };
+    const model = buildModel(token.modelId,
+      { prepared, market: { symbol: 'TEST', timeframe: '1' }, bars, mode: 'static' },
+      r, bars.map(b => b.time));
+    // The line is still a live object for the script (setters keep working)…
+    expect(r.drawings.find(d => d.kind === 'line')).toBeDefined();
+    // …but nothing reaches the model, so no 0 can reach the pane autoscale
+    // (buildModel omits the key entirely when the list is empty).
+    expect(model.lines ?? []).toHaveLength(0);
   });
 });

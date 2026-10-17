@@ -5,7 +5,7 @@
 import { NA, VFALSE, VTRUE } from '../contracts';
 import type { BuiltinCtx, Value } from '../contracts';
 import { registerBuiltin, registerConstant } from './registry';
-import { asNum, asStr, bindArgs } from './util';
+import { asNum, asStr, bindArgs, unwrapped } from './util';
 import { partsOf, tzOf } from './time';
 
 const strVal = (v: string): Value => ({ kind: 'string', v });
@@ -176,8 +176,11 @@ registerBuiltin('str', 'tonumber', (_ctx, args, named) => {
  *  `{key}`, `{key,spec}` and `{key,date,pattern}` over positional (0-based) or
  *  named arguments. A missing or `na` value renders as `NaN`. */
 export function pineFormat(ctx: BuiltinCtx, template: string, positional: Value[], named: Record<string, Value>): string {
+  // Own properties only: `key` comes from the script's template, so a plain
+  // `named[key]` would resolve `{constructor}`/`{toString}` through the
+  // prototype chain and render a member instead of `NaN`.
   const lookup = (key: string): Value | undefined =>
-    /^\d+$/.test(key) ? positional[Number(key)] : named[key];
+    unwrapped(/^\d+$/.test(key) ? positional[Number(key)] : (Object.hasOwn(named, key) ? named[key] : undefined));
   return template.replace(/\{([^{}]+)\}/g, (_m, body: string) => {
     const parts = body.split(',');
     const v = lookup(parts[0]!.trim());

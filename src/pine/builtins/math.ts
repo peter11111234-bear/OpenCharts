@@ -6,7 +6,7 @@ import { NA } from '../contracts';
 import type { BuiltinCtx, BuiltinFn, Value } from '../contracts';
 import { BarSeries, LiftedSeries, freezeReader } from '../series';
 import { registerBuiltin, registerConstant } from './registry';
-import { asNum, bindArgs, numVal, warnOnce } from './util';
+import { EMPTY_NAMED, asNum, bindArgs, numVal, warnOnce } from './util';
 
 // ── Series lifting ──────────────────────────────────────────────────────────
 // Returns a number or null (= na result for that bar). `kind` decides whether
@@ -75,6 +75,10 @@ function namedValues(
   named: Record<string, Value>,
   params: readonly string[],
 ): Value[] {
+  // Common case: a call with no `name=value` arguments (invokeBuiltin passes
+  // the shared frozen singleton). Return before allocating `out` and the
+  // `Object.entries` pair array the loop below would need.
+  if (named === EMPTY_NAMED) return [];
   const variadic = params.includes('...');
   const out: Value[] = [];
   for (const [k, v] of Object.entries(named)) {
@@ -292,6 +296,9 @@ registerBuiltin('', 'nz', nzFn, true);
 
 registerBuiltin('math', 'tonumber', (_ctx, args, named) => {
   const bound = bindArgs(args, named, ['v']);
+  // `v` is declared value-semantic (builtins/scalarDeclPatch.ts), so it arrives
+  // as a plain value — this `switch` sees the real kind, including for
+  // `tonumber(5)` / `tonumber(x)` / `tonumber(close)`.
   const v = bound.get('v');
   if (!v) return NA;
   switch (v.kind) {

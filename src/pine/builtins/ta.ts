@@ -11,6 +11,7 @@
 
 import type { BuiltinCtx, Value } from '../contracts';
 import { NA, Series } from '../contracts';
+import { stableSeries } from '../series';
 import { registerBuiltin, registerLazyConstant } from './registry';
 import { bindArgs, boolArg, curNum, numArg, truthy, unwrapped, asStr } from './util';
 import type { RtCtx } from './util';
@@ -59,11 +60,17 @@ function constSeriesNum(s: Series, bar: number): number | undefined {
     CONST_SERIES.set(s, m);
   }
   if (m.bad) return undefined;
-  let v = m.v;
+  // Seed from the CURRENT history's newest offset instead of the cross-bar memo
+  // value: a live-current view (frozen readers whose anchor sits ahead of the
+  // series' lastBar, e.g. `math.min(cnt + 1, 10)` under request.security)
+  // answers the same value for EVERY offset, so comparing today's newest
+  // against yesterday's is a false variance. Offsets 0 and 1 are compared
+  // against each other, which is exact for both families.
+  let v: number | undefined;
   const end =
     m.size === 0 || bar < m.bar
       ? size // first scan / rewound bar clock: verify all recorded history
-      : Math.min(size, Math.max(bar - m.bar + 1, size - m.size));
+      : Math.min(size, Math.max(bar - m.bar + 1, size - m.size, 2));
   for (let i = 0; i < end; i++) {
     const h = s.get(i);
     if (h.kind === 'na') continue; // gap, not variance
@@ -110,6 +117,20 @@ interface VS {
 
 const SERIES_IDS = new WeakMap<Series, number>();
 let nextSeriesId = 1;
+/** Identity of a series for every state key in this file (`vs`, `wvs`,
+ *  `wring`, `stv*`, `dvs`, `ema`/`rma`/`cum`/`src` tags).
+ *
+ *  CROSS-BAR CONTRACT — the key argument MUST name the same object on every
+ *  bar, or the state behind it is rebuilt once per bar. For the window tables
+ *  that is one new entry per bar, i.e. Θ(bars²) memory (`winRingReader`); for
+ *  the VS tables it is a full O(L) rescan per bar. The stability comes from
+ *  upstream: `evalArg`/`jitArgFinish` hand each call-arg site a per-site
+ *  `SiteSeries` (interpreter.ts:404, `stableArgSeries` :522) precisely so
+ *  identity-keyed memos survive an arg expression that re-creates its series
+ *  every bar (`math.min(cnt + 1, 10)` → a fresh LiftedSeries per call), and
+ *  `stableSeries` (series.ts) is the other half — it stops at that wrapper
+ *  instead of following its per-bar `readTarget()`. Changing either side
+ *  silently reintroduces the per-bar rescan/rebuild. */
 const seriesId = (s: Series): number => {
   let id = SERIES_IDS.get(s);
   if (id === undefined) { id = nextSeriesId++; SERIES_IDS.set(s, id); }
@@ -138,7 +159,7 @@ function stateMap(ctx: BuiltinCtx): Map<unknown, unknown> {
 // Zero string allocation per lookup (was a `a|b|c` template per call site
 // per bar). First-level parts live on rt.state beside strategy.*'s flat
 // 'strategy|*' keys — no part here may equal a 'strategy|*' literal.
-function stateFor<T>(ctx: BuiltinCtx, parts: readonly KPart[], make: () => T): T {
+function stateFor<T>(ctx: BuiltinCtx, parts: readonly KPart[], make: () => T, cap?: number): T {
   let m = stateMap(ctx);
   for (let i = 0; i < parts.length - 1; i++) {
     const k = parts[i]!;
@@ -148,21 +169,32 @@ function stateFor<T>(ctx: BuiltinCtx, parts: readonly KPart[], make: () => T): T
   }
   const leaf = parts[parts.length - 1]!;
   let s = m.get(leaf) as T | undefined;
-  if (s === undefined) { s = make(); m.set(leaf, s); }
+  if (s === undefined) {
+    // `cap` bounds the map that holds the leaf key — used for the window-length
+    // level of `dvs`/`stv` state, where an unbounded length argument
+    // (`ta.ema(close, cnt + 1)`) would otherwise mint one entry per bar.
+    // Clearing is safe: the entry is rebuilt on the next lookup.
+    if (cap !== undefined && m.size >= cap) m.clear();
+    s = make(); m.set(leaf, s);
+  }
   return s;
 }
 
-/** Wrap a Value (series ref or scalar) into a VS keyed by `sig` at `callsite`. */
+/** Wrap a Value (series ref or scalar) into a VS keyed by `sig` at `callsite`.
+ *  The series key is `seriesId(stableSeries(arg))` — the arg's stable end, so
+ *  one bar's churn does not mint a new VS (see `seriesId` above); the read
+ *  still goes through that same object, which forwards to whatever series the
+ *  site produced this bar. */
 function vsOf(ctx: BuiltinCtx, v: Value | undefined, sig: string): VS {
   const rt = ctx as RtCtx;
   const site = rt.callsite ?? 'g';
   if (v !== undefined && v.kind === 'series') {
-    const s = v.v;
-    return stateFor<VS>(ctx, ['vs', site, 'series', seriesId(s)], () => ({
+    const t = stableSeries(v.v);
+    return stateFor<VS>(ctx, ['vs', site, 'series', seriesId(t)], () => ({
       last: -1,
       get(b: number): number | undefined {
         if (b > this.last) this.last = b;
-        return num(s.get(ctx.barIndex - b));
+        return num(t.get(ctx.barIndex - b));
       },
     }));
   }
@@ -176,42 +208,108 @@ function vsOf(ctx: BuiltinCtx, v: Value | undefined, sig: string): VS {
   }));
 }
 
+/** A `VS` that memoizes `fn` per bar (`vseries`'s closure). Factored out so the
+ *  same shape can also live in a two-level bounded table (`bound2`) instead of
+ *  `stateFor`'s tree. */
+function memoVs(fn: (b: number) => number | undefined): VS {
+  const memo = new Map<number, number | undefined>();
+  const self: VS = {
+    last: -1,
+    memo,
+    get(b: number): number | undefined {
+      if (b > self.last) self.last = b;
+      if (memo.has(b)) return memo.get(b);
+      const v = fn(b);
+      memo.set(b, v);
+      return v;
+    },
+  };
+  return self;
+}
+
+/** A `VS` that runs `step` once per bar in ascending order, replaying any gap
+ *  (`vstate`'s closure). */
+function stateVs(step: (b: number) => number | undefined): VS {
+  const memo = new Map<number, number | undefined>();
+  const self: VS = {
+    last: -1,
+    memo,
+    get(b: number): number | undefined {
+      if (b <= self.last) return memo.get(b);
+      for (let i = self.last + 1; i <= b; i++) memo.set(i, step(i));
+      self.last = b;
+      return memo.get(b);
+    },
+  };
+  return self;
+}
+
+/** `emaVs`'s closure: iterative EMA against its own memo. `a` is the smoothing
+ *  factor, so the caller owns the `2 / (len + 1)` rounding. */
+function emaSelf(src: VS, a: number): VS {
+  const memo = new Map<number, number | undefined>();
+  const self: VS = {
+    last: -1,
+    memo,
+    get(b: number): number | undefined {
+      if (b > self.last) self.last = b;
+      if (memo.has(b)) return memo.get(b);
+      let k = b;
+      while (k >= 0 && !memo.has(k)) k--;
+      let p = k >= 0 ? memo.get(k) : undefined;
+      for (let i = k + 1; i <= b; i++) {
+        const x = src.get(i);
+        const v = x === undefined ? undefined : p === undefined || i === 0 ? x : a * x + (1 - a) * p;
+        memo.set(i, v);
+        p = v;
+      }
+      return memo.get(b);
+    },
+  };
+  return self;
+}
+
+/** The Wilder RMA recurrence. `self` re-resolves this same VS — `rmaVs` passes
+ *  its tag lookup, a bounded caller passes its two-level lookup. */
+function rmaStep(ctx: BuiltinCtx, src: VS, len: number, a: number, self: () => VS): (b: number) => number | undefined {
+  return (b) => {
+    const x = src.get(b);
+    if (x === undefined) return undefined;
+    if (b < len - 1) return undefined;
+    if (b === len - 1) return meanWin(ctx, src, b, len);
+    const p = self().get(b - 1);
+    if (p === undefined) return meanWin(ctx, src, b, len); // defensive reseed
+    return a * x + (1 - a) * p;
+  };
+}
+
+/** Two-level bounded table. `parts`'s last element is the OUTER key — capped by
+ *  `stateFor` — and the map it holds is keyed by `innerKey` and capped here.
+ *  `cap` alone bounds only the map holding the leaf, so a key that varies in
+ *  TWO dimensions (`dmi`'s diLength × adxSmoothing, `kc`'s length × mult) still
+ *  minted one nested map per distinct value, and the subtree total grew with
+ *  the bar count. Clearing is safe for the same reason `cap` is: the entry is
+ *  rebuilt on the next lookup. */
+function bound2<T>(ctx: BuiltinCtx, parts: readonly KPart[], innerKey: number | string, make: () => T): T {
+  const byInner = stateFor<Map<number | string, T>>(ctx, parts, () => new Map(), VS_LEN_MAX);
+  let st = byInner.get(innerKey);
+  if (st === undefined) {
+    if (byInner.size >= VS_LEN_MAX) byInner.clear();
+    st = make();
+    byInner.set(innerKey, st);
+  }
+  return st;
+}
+
 /** Memoized derived series. fn(b) may recurse via other VS (bar args ≤ b). */
-function vseries(ctx: BuiltinCtx, key: Key, fn: (b: number) => number | undefined): VS {
-  return stateFor<VS>(ctx, ['dvs', ...kparts(key)], () => {
-    const memo = new Map<number, number | undefined>();
-    const self: VS = {
-      last: -1,
-      memo,
-      get(b: number): number | undefined {
-        if (b > this.last) this.last = b;
-        if (memo.has(b)) return memo.get(b);
-        const v = fn(b);
-        memo.set(b, v);
-        return v;
-      },
-    };
-    return self;
-  });
+function vseries(ctx: BuiltinCtx, key: Key, fn: (b: number) => number | undefined, cap?: number): VS {
+  return stateFor<VS>(ctx, ['dvs', ...kparts(key)], () => memoVs(fn), cap);
 }
 
 /** Stateful per-bar machine: step(b) runs once per bar in ascending order,
  *  replaying any gap. Result memoized per bar. */
-function vstate(ctx: BuiltinCtx, key: Key, step: (b: number) => number | undefined): VS {
-  return stateFor<VS>(ctx, ['stv', ...kparts(key)], () => {
-    const memo = new Map<number, number | undefined>();
-    const self: VS = {
-      last: -1,
-      memo,
-      get(b: number): number | undefined {
-        if (b <= self.last) return memo.get(b);
-        for (let i = self.last + 1; i <= b; i++) memo.set(i, step(i));
-        self.last = b;
-        return memo.get(b);
-      },
-    };
-    return self;
-  });
+function vstate(ctx: BuiltinCtx, key: Key, step: (b: number) => number | undefined, cap?: number): VS {
+  return stateFor<VS>(ctx, ['stv', ...kparts(key)], () => stateVs(step), cap);
 }
 
 // length arg → int (Pine floors floats; ≤0/na → undefined).
@@ -254,6 +352,18 @@ function meanScan(vs: VS, b: number, L: number): number | undefined {
 function sumScan(vs: VS, b: number, L: number): number {
   let s = 0;
   for (let i = 0; i < L; i++) s += vs.get(b - i) ?? 0;
+  return s;
+}
+
+/** Strict window sum: na anywhere in [b-L+1, b] → undefined — the window
+ *  semantics ta.vwma's numerator/denominator scan had before it went sliding. */
+function ssumScan(vs: VS, b: number, L: number): number | undefined {
+  let s = 0;
+  for (let i = 0; i < L; i++) {
+    const v = vs.get(b - i);
+    if (v === undefined) return undefined;
+    s += v;
+  }
   return s;
 }
 
@@ -300,7 +410,7 @@ function stdevScan(vs: VS, b: number, L: number, biased: boolean): number | unde
   return Math.sqrt(s / (biased ? L : L - 1));
 }
 
-type WinKind = 'mean' | 'sum' | 'wma' | 'max' | 'min' | 'sd_b' | 'sd_u';
+type WinKind = 'mean' | 'sum' | 'ssum' | 'wma' | 'max' | 'min' | 'sd_b' | 'sd_u';
 
 // Identity for VS objects — the window aggregate is keyed by the source VS
 // (which already embeds callsite+series for vsOf / a unique key for derived
@@ -313,10 +423,111 @@ const vsId = (v: VS): number => {
   if (id === undefined) { id = nextVsId++; VS_IDS.set(v, id); }
   return id;
 };
+
+/** Cap on the number of `wring` tables (one per source VS). The table's key is
+ *  a VS identity, and a source whose identity churns every bar (a wrapper the
+ *  `bind` contract does not cover, or one whose reads the arg expression
+ *  rebuilds) mints a new — permanently empty afterwards — ring per bar while
+ *  its length grows: Θ(bars²) entries for a shape as ordinary as
+ *  `ta.sma(math.max(close, open), cnt + 1)`. Same policy and shape as
+ *  `TF_MEMO_MAX` (mtf.ts:57): clear-on-full. Dropping the tables only drops
+ *  sharing — each reader holds its own Map reference and every dropped entry
+ *  is a pure `vs.get(i)` memo, so the next read recomputes the same value. */
+const WIN_RING_MAX = 512;
+
+/** winAgg's source-value ring: at most one `vs.get(i)` per source bar per run,
+ *  shared by every window over that VS (any kind, any L) and by the O(L) scans
+ *  that read one window value at a time (`ta.stoch`'s hi/lo ranges). A window
+ *  re-reads the same bars constantly: steady state reads `b` and `b-L` per bar,
+ *  a new L re-seeds its window, and an L that moves per bar re-slides the whole
+ *  gap once per length (K55's `math.min(tab_abc_bar_count+1,10)`), each read
+ *  going through `Series.get` — a buffer index + Value unwrap, and for a
+ *  LiftedSeries / derived source a lazy re-evaluation. With the cache each
+ *  source bar costs at most one `vs.get` per run, whatever L sequence asks for
+ *  it; the arithmetic is untouched, so the results are the same values.
+ *
+ *  Past the forming bar the source is not in history yet: a live read (usually
+ *  undefined) must not be frozen into the ring. Same for an na read: a slot can
+ *  still be filled later (bar-end carry-forward), and a frozen na would poison
+ *  every strict window downstream — today's code re-reads it, so na reads stay
+ *  live.
+ *
+ *  Rewind safety rides the generic `snapCtxState`/`restoreCtxState` rollback:
+ *  an all-scalar numeric-keyed Map in `ctx.state` is classified as a bar memo
+ *  and pruned above the last trusted bar, exactly like every VS `memo`. Bars ≤
+ *  that bound are immutable in the incremental driver (an earlier tape rewrite
+ *  falls back to a full fresh run, i.e. an empty `ctx.state`). The table count
+ *  is capped at `WIN_RING_MAX` for the reason given there. */
+function winRingReader(ctx: BuiltinCtx, vs: VS): (i: number) => number | undefined {
+  const rings = stateFor<Map<number, Map<number, number>>>(ctx, ['wring'], () => new Map());
+  const id = vsId(vs);
+  let ring = rings.get(id);
+  if (ring === undefined) {
+    if (rings.size >= WIN_RING_MAX) rings.clear();
+    ring = new Map();
+    rings.set(id, ring);
+  }
+  return (i: number): number | undefined => {
+    if (i < 0 || i > ctx.barIndex) return vs.get(i);
+    const c = ring.get(i);
+    if (c !== undefined) return c;
+    const v = vs.get(i);
+    // Only committed bars are cached: the forming bar's value still changes
+    // within the bar, so latching it would serve a stale read on a later
+    // `get(formingBar)` in the same run.
+    if (i < ctx.barIndex && v !== undefined) ring.set(i, v);
+    return v;
+  };
+}
 /** Serialized winAgg payload — every closure variable the slide mutates. */
 interface WinAggSnap {
   dqJ: number[]; dqV: number[]; qh: number; bad: number; wnum: number;
   ax: number; ac: number; sx: number; sc: number;
+}
+
+/** Cap on the number of `wvs` states held per (kind, source-VS) group — that
+ *  table's leaf is keyed by the window length `L`, so a length that grows
+ *  without bound (`ta.sma(close, cnt + 1)`, L = bar + 1) mints one state per
+ *  bar — Θ(bars) states, each with its own memo and (for max/min) its own
+ *  retained deque: `scratch/perf/r5-wvs-bound.mjs` measures 240 states /
+ *  240 memo entries / 4,483 deque slots on 240 bars, i.e. tracking the bar
+ *  count (and a length that oscillates instead pays Θ(bars) memo per live
+ *  state). Same policy and shape as `WIN_RING_MAX` (above) and
+ *  `TF_MEMO_MAX` (mtf.ts:57): clear-on-full.
+ *  Dropping a state only drops its memo and accumulators: a window queried
+ *  again afterwards re-seeds from the shared `wring` source ring (or the O(L)
+ *  scan) and recomputes the identical values — see `winAgg`'s seeding path,
+ *  which is the same one a first-ever L takes. The cost is that O(L) re-seed,
+ *  paid once per L the script actually revisits.
+ *  `64` is ≥7× the largest live distinct-L count per group measured on every
+ *  script this repo benchmarks (`scratch/perf/r5-wvs-len-stats.mjs`: K55 9 —
+ *  its saturated `math.min(tab_abc_bar_count+1, 10)`; varlen-cycle 7; all other
+ *  groups ≤4), so no script that reuses a length pays a rebuild, while the
+ *  unbounded-L shape plateaus at 64 instead of tracking the bar count. */
+const WIN_LEN_MAX = 64;
+
+/** Cap on the distinct window lengths a `dvs`/`stv` group may accumulate
+ *  (`ta.ema(close, cnt + 1)` mints one per bar when `cnt` grows with the bar).
+ *  `16` is ≥1.7× the largest live distinct-length count measured on every
+ *  script this repo benchmarks (`scratch/perf/t9-distinct-len.json`: TRIS390
+ *  `dvs/ema` 1, `stv/rma` 2; the widest saturated form 9), so no real script
+ *  ever pays a rebuild, while the unbounded form plateaus at 16 instead of
+ *  tracking the bar count (measured 240 on the 240-bar grow form). */
+const VS_LEN_MAX = 16;
+
+/** `stateFor` for a flat L-keyed state table: same tree shape stateFor builds
+ *  (the parts walk to the group map, whose keys are the window lengths), with
+ *  the L keys capped as `WIN_LEN_MAX` describes. The requested L is created
+ *  only after a full table is dropped, so a lookup of a live L never clears. */
+function winStateFor(ctx: BuiltinCtx, parts: readonly KPart[], L: number, make: () => VS): VS {
+  const byLen = stateFor<Map<number, VS>>(ctx, parts, () => new Map());
+  let st = byLen.get(L);
+  if (st === undefined) {
+    if (byLen.size >= WIN_LEN_MAX) byLen.clear();
+    st = make();
+    byLen.set(L, st);
+  }
+  return st;
 }
 
 /** Incremental window aggregate. Forward bars slide the [b-L+1, b] window in
@@ -325,8 +536,11 @@ interface WinAggSnap {
  *  the first query or non-monotonic lookups fall back to the O(L) scan — the
  *  incremental bookkeeping can't walk backward. */
 function winAgg(ctx: BuiltinCtx, kind: WinKind, vs: VS, L: number): VS {
-  return stateFor<VS>(ctx, ['wvs', kind, vsId(vs), L], () => {
+  return winStateFor(ctx, ['wvs', kind, vsId(vs)], L, () => {
     const memo = new Map<number, number | undefined>();
+    // Source-value cache shared with every other window over this VS — see
+    // `winRingReader` for why it exists and why it is rewind-safe.
+    const rd = winRingReader(ctx, vs);
     const useDq = kind === 'max' || kind === 'min';
     // dq: index-stamped monotonic deque (parallel arrays + head index, so the
     // per-step exit pop is O(1) — Array.shift would reintroduce O(L)).
@@ -366,6 +580,7 @@ function winAgg(ctx: BuiltinCtx, kind: WinKind, vs: VS, L: number): VS {
     const result = (): number | undefined => {
       switch (kind) {
         case 'sum': return sum();
+        case 'ssum': return bad > 0 ? undefined : sum();
         case 'max': case 'min':
           return bad > 0 ? undefined : dqV[qh];
         case 'wma': return bad > 0 ? undefined : wnum / (L * (L + 1) / 2);
@@ -379,14 +594,16 @@ function winAgg(ctx: BuiltinCtx, kind: WinKind, vs: VS, L: number): VS {
       }
     };
     const direct = (b: number): number | undefined => {
+      const rvs: VS = { last: -1, get: rd };
       switch (kind) {
-        case 'mean': return meanScan(vs, b, L);
-        case 'sum': return sumScan(vs, b, L);
-        case 'wma': return wmaScan(vs, b, L);
-        case 'max': return highestScan(vs, b, L);
-        case 'min': return lowestScan(vs, b, L);
-        case 'sd_b': return stdevScan(vs, b, L, true);
-        default: return stdevScan(vs, b, L, false);
+        case 'mean': return meanScan(rvs, b, L);
+        case 'sum': return sumScan(rvs, b, L);
+        case 'ssum': return ssumScan(rvs, b, L);
+        case 'wma': return wmaScan(rvs, b, L);
+        case 'max': return highestScan(rvs, b, L);
+        case 'min': return lowestScan(rvs, b, L);
+        case 'sd_b': return stdevScan(rvs, b, L, true);
+        default: return stdevScan(rvs, b, L, false);
       }
     };
     const self: VS = {
@@ -417,10 +634,10 @@ function winAgg(ctx: BuiltinCtx, kind: WinKind, vs: VS, L: number): VS {
         }
         if (self.last === -1) {
           const lo = b - L + 1;
-          for (let j = lo; j <= b; j++) add(j, vs.get(j), j - lo + 1);
+          for (let j = lo; j <= b; j++) add(j, rd(j), j - lo + 1);
         } else {
           for (let i = self.last + 1; i <= b; i++) {
-            const vIn = vs.get(i), vOut = vs.get(i - L);
+            const vIn = rd(i), vOut = rd(i - L);
             del(i - L, vOut);
             add(i, vIn);
             if (kind === 'wma')
@@ -444,6 +661,10 @@ const meanWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number | undefi
   winAgg(ctx, 'mean', vs, L).get(b);
 const sumLoose = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number =>
   winAgg(ctx, 'sum', vs, L).get(b) ?? 0;
+/** Strict sliding window sum — undefined unless every bar in [b-L+1, b] has a
+ *  value (ta.vwma's semantics: one na anywhere in the window → na result). */
+const ssumWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number | undefined =>
+  winAgg(ctx, 'ssum', vs, L).get(b);
 const wmaWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number | undefined =>
   winAgg(ctx, 'wma', vs, L).get(b);
 const highestWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number): number | undefined =>
@@ -456,50 +677,30 @@ const stdevWin = (ctx: BuiltinCtx, vs: VS, b: number, L: number, biased: boolean
 // ── ta.* building blocks shared by several builtins ──────────────────────────
 
 function emaVs(ctx: BuiltinCtx, src: VS, len: number, tag: Key): VS {
-  const a = 2 / (len + 1);
   // Same recurrence as before (ema(b) seeds from ema(b-1), na source → na),
   // but resolved iteratively against this VS's own memo: the recursive form
   // re-built the state key and re-walked the state map for every historical
   // bar, so a fresh source series made each bar O(bar) map lookups.
-  return stateFor<VS>(ctx, ['dvs', 'ema', ...kparts(tag), len], () => {
-    const memo = new Map<number, number | undefined>();
-    const self: VS = {
-      last: -1,
-      memo,
-      get(b: number): number | undefined {
-        if (b > self.last) self.last = b;
-        if (memo.has(b)) return memo.get(b);
-        let k = b;
-        while (k >= 0 && !memo.has(k)) k--;
-        let p = k >= 0 ? memo.get(k) : undefined;
-        for (let i = k + 1; i <= b; i++) {
-          const x = src.get(i);
-          const v = x === undefined ? undefined : p === undefined || i === 0 ? x : a * x + (1 - a) * p;
-          memo.set(i, v);
-          p = v;
-        }
-        return memo.get(b);
-      },
-    };
-    return self;
-  });
+  return stateFor<VS>(ctx, ['dvs', 'ema', ...kparts(tag), len], () => emaSelf(src, 2 / (len + 1)), VS_LEN_MAX);
 }
 
 /** Wilder RMA: seeded with SMA of the first `len` bars → na until bar len-1. */
 function rmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: Key): VS {
-  const a = 1 / len;
-  return vstate(ctx, ['rma', ...kparts(tag), len], (b) => {
-    const x = src.get(b);
-    if (x === undefined) return undefined;
-    if (b < len - 1) return undefined;
-    if (b === len - 1) return meanWin(ctx, src, b, len);
-    const p = rmaVsGet(ctx, src, len, tag, b - 1);
-    if (p === undefined) return meanWin(ctx, src, b, len); // defensive reseed
-    return a * x + (1 - a) * p;
-  });
+  return vstate(ctx, ['rma', ...kparts(tag), len],
+    rmaStep(ctx, src, len, 1 / len, () => rmaVs(ctx, src, len, tag)), VS_LEN_MAX);
 }
-function rmaVsGet(ctx: BuiltinCtx, src: VS, len: number, tag: Key, b: number): number | undefined {
-  return rmaVs(ctx, src, len, tag).get(b);
+/** `rmaVs` for a key that varies in TWO dimensions: `tail` is the state path
+ *  (`stateFor` caps its last element) and `inner` keys the map it holds, itself
+ *  capped by `bound2`. Identity is (tail…, inner) — the same tuple `rmaVs`
+ *  builds from `[...tag, len]`. */
+function rmaVsBound(ctx: BuiltinCtx, src: VS, len: number, tail: readonly KPart[], inner: number | string): VS {
+  return bound2(ctx, tail, inner,
+    () => stateVs(rmaStep(ctx, src, len, 1 / len, () => rmaVsBound(ctx, src, len, tail, inner))));
+}
+
+/** `emaVs` for a key that varies in two dimensions — see `rmaVsBound`. */
+function emaVsBound(ctx: BuiltinCtx, src: VS, len: number, tail: readonly KPart[], inner: number | string): VS {
+  return bound2(ctx, tail, inner, () => emaSelf(src, 2 / (len + 1)));
 }
 
 function trVs(ctx: BuiltinCtx): VS {
@@ -523,8 +724,8 @@ function hmaVs(ctx: BuiltinCtx, src: VS, len: number, tag: Key): VS {
     const s = wmaWin(ctx, src, b, len);
     if (f === undefined || s === undefined) return undefined;
     return 2 * f - s;
-  });
-  return vseries(ctx, ['hma', ...kparts(tag), len], (b) => wmaWin(ctx, inner, b, root));
+  }, VS_LEN_MAX);
+  return vseries(ctx, ['hma', ...kparts(tag), len], (b) => wmaWin(ctx, inner, b, root), VS_LEN_MAX);
 }
 
 // ── arg plumbing ─────────────────────────────────────────────────────────────
@@ -576,7 +777,7 @@ reg('ema', (ctx, args, named) => {
 function emaTag(ctx: BuiltinCtx, bound: Map<string, Value>): string {
   const rt = ctx as RtCtx;
   const sv = bound.get('source');
-  const id = sv !== undefined && sv.kind === 'series' ? `s${seriesId(sv.v)}` : `c${num(sv)}`;
+  const id = sv !== undefined && sv.kind === 'series' ? `s${seriesId(stableSeries(sv.v))}` : `c${num(sv)}`;
   return `${rt.callsite ?? 'g'}|${id}`;
 }
 
@@ -606,14 +807,19 @@ reg('vwma', (ctx, args, named) => {
   const src = srcOf(ctx, b); const L = lenOf(b);
   if (!src || L === undefined) return NA;
   const bar = ctx.barIndex;
-  let num_ = 0, den = 0;
-  for (let i = 0; i < L; i++) {
-    const s = src.get(bar - i);
-    const vol = num(ctx.volume.get(i));
-    if (s === undefined || vol === undefined) return NA;
-    num_ += s * vol;
-    den += vol;
-  }
+  // Σ(src·vol)/Σvol over [bar-L+1, bar], na in the window → na (strict).
+  // Was a per-bar O(L) double scan; both sums now slide (winAgg 'ssum'), with
+  // the per-bar product folded into one derived series so the aggregates read
+  // one value per bar each. The product series is undefined wherever either
+  // input is, so its strict sum already covers both na conditions.
+  const vol = vsOf(ctx, { kind: 'series', v: ctx.volume }, 'volume');
+  const pv = vseries(ctx, ['vwma-pv', emaTag(ctx, b), L], (bb) => {
+    const s = src.get(bb), v = vol.get(bb);
+    return s === undefined || v === undefined ? undefined : s * v;
+  }, VS_LEN_MAX);
+  const num_ = ssumWin(ctx, pv, bar, L);
+  const den = ssumWin(ctx, vol, bar, L);
+  if (num_ === undefined || den === undefined) return NA;
   return fl(den === 0 ? undefined : num_ / den);
 });
 
@@ -745,9 +951,15 @@ reg('highestbars', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length']);
   const { src, len } = srcLen(ctx, b, ctx.high, 'high');
   if (len === undefined) return NA;
-  const m = highestWin(ctx, src, ctx.barIndex, len);
+  const bar = ctx.barIndex;
+  const m = highestWin(ctx, src, bar, len);
   if (m === undefined) return NA;
-  for (let i = 0; i < len; i++) if (src.get(ctx.barIndex - i) === m) return { kind: 'int', v: i === 0 ? 0 : -i };
+  // Same newest→oldest `== m` scan as before — same order, same `===`, same
+  // na/NaN handling — but the window reads come from winAgg's shared source
+  // ring, i.e. the bars the extremum window already fetched, instead of L
+  // fresh `Series.get` chains per bar.
+  const rd = winRingReader(ctx, src);
+  for (let i = 0; i < len; i++) if (rd(bar - i) === m) return { kind: 'int', v: i === 0 ? 0 : -i };
   return NA;
 });
 
@@ -755,9 +967,11 @@ reg('lowestbars', (ctx, args, named) => {
   const b = bindArgs(args, named, ['source', 'length']);
   const { src, len } = srcLen(ctx, b, ctx.low, 'low');
   if (len === undefined) return NA;
-  const m = lowestWin(ctx, src, ctx.barIndex, len);
+  const bar = ctx.barIndex;
+  const m = lowestWin(ctx, src, bar, len);
   if (m === undefined) return NA;
-  for (let i = 0; i < len; i++) if (src.get(ctx.barIndex - i) === m) return { kind: 'int', v: i === 0 ? 0 : -i };
+  const rd = winRingReader(ctx, src);
+  for (let i = 0; i < len; i++) if (rd(bar - i) === m) return { kind: 'int', v: i === 0 ? 0 : -i };
   return NA;
 });
 
@@ -814,7 +1028,7 @@ reg('cum', (ctx, args, named) => {
   if (!src) return NA;
   const rt = ctx as RtCtx;
   const sv = b.get('source');
-  const srcParts: readonly KPart[] = sv !== undefined && sv.kind === 'series' ? ['s', seriesId(sv.v)] : ['c', num(sv)];
+  const srcParts: readonly KPart[] = sv !== undefined && sv.kind === 'series' ? ['s', seriesId(stableSeries(sv.v))] : ['c', num(sv)];
   const cum = vstate(ctx, ['cum', rt.callsite ?? 'g', ...srcParts], (bb) => {
     const x = src.get(bb);
     if (x === undefined) return undefined;
@@ -978,9 +1192,10 @@ reg('supertrend', (ctx, args, named) => {
   const rt = ctx as RtCtx;
   const key = ['st', rt.callsite ?? 'g', factor, L] as const;
   const atr = rmaVs(ctx, trVs(ctx), L, ['st-atr', ...key]);
-  const st = stateFor<StState>(ctx, ['stv-x', ...key], () => ({}));
-  const lastBar = stateFor<{ n: number }>(ctx, ['stv-b', ...key], () => ({ n: -1 }));
-  const memo = stateFor<Map<number, [number, number] | undefined>>(ctx, ['stv-m', ...key], () => new Map());
+  const site = rt.callsite ?? 'g';
+  const st = bound2<StState>(ctx, ['stv-x', 'st', site, L], String(factor), () => ({}));
+  const lastBar = bound2<{ n: number }>(ctx, ['stv-b', 'st', site, L], String(factor), () => ({ n: -1 }));
+  const memo = bound2<Map<number, [number, number] | undefined>>(ctx, ['stv-m', 'st', site, L], String(factor), () => new Map());
   const bar = ctx.barIndex;
   if (memo.has(bar)) {
     const m = memo.get(bar);
@@ -1033,7 +1248,7 @@ reg('macd', (ctx, args, named) => {
   const macdL = vseries(ctx, ['macd-l', tag, fast, slow], (bb) => {
     const f = fastE.get(bb), s = slowE.get(bb);
     return f === undefined || s === undefined ? undefined : f - s;
-  });
+  }, VS_LEN_MAX);
   const sigL = emaVs(ctx, macdL, sig, ['macd-g', tag]);
   const bar = ctx.barIndex;
   const m = macdL.get(bar), s = sigL.get(bar);
@@ -1235,35 +1450,37 @@ reg('dmi', (ctx, args, named) => {
   if (diL === undefined || adxL === undefined) return arr(NA, NA, NA);
   const rt = ctx as RtCtx;
   const tag = [rt.callsite ?? 'g', diL, adxL] as const;
-  const plusDM = vseries(ctx, ['dmi+p', ...tag], (bb) => {
+  // diL and adxL both vary, so bound BOTH levels: `stateFor`'s cap bounds the
+  // map holding `diL`, `bound2` bounds the `adxL` map inside it.
+  const plusDM = bound2(ctx, ['dvs', 'dmi+p', tag[0], tag[1]], tag[2], () => memoVs((bb) => {
     const off = ctx.barIndex - bb;
     const h = num(ctx.high.get(off)), hp = num(ctx.high.get(off + 1));
     const l = num(ctx.low.get(off)), lp = num(ctx.low.get(off + 1));
     if (h === undefined || hp === undefined || l === undefined || lp === undefined) return undefined;
     const up = h - hp, dn = lp - l;
     return up > dn && up > 0 ? up : 0;
-  });
-  const minusDM = vseries(ctx, ['dmi-m', ...tag], (bb) => {
+  }));
+  const minusDM = bound2(ctx, ['dvs', 'dmi-m', tag[0], tag[1]], tag[2], () => memoVs((bb) => {
     const off = ctx.barIndex - bb;
     const h = num(ctx.high.get(off)), hp = num(ctx.high.get(off + 1));
     const l = num(ctx.low.get(off)), lp = num(ctx.low.get(off + 1));
     if (h === undefined || hp === undefined || l === undefined || lp === undefined) return undefined;
     const up = h - hp, dn = lp - l;
     return dn > up && dn > 0 ? dn : 0;
-  });
+  }));
   const tr = trVs(ctx);
-  const trS = rmaVs(ctx, tr, diL, ['dmi-tr', ...tag]);
-  const pS = rmaVs(ctx, plusDM, diL, ['dmi-pr', ...tag]);
-  const mS = rmaVs(ctx, minusDM, diL, ['dmi-mr', ...tag]);
-  const dx = vseries(ctx, ['dmi-dx', ...tag], (bb) => {
+  const trS = rmaVsBound(ctx, tr, diL, ['stv', 'rma', 'dmi-tr', tag[0], tag[1]], tag[2]);
+  const pS = rmaVsBound(ctx, plusDM, diL, ['stv', 'rma', 'dmi-pr', tag[0], tag[1]], tag[2]);
+  const mS = rmaVsBound(ctx, minusDM, diL, ['stv', 'rma', 'dmi-mr', tag[0], tag[1]], tag[2]);
+  const dx = bound2(ctx, ['dvs', 'dmi-dx', tag[0], tag[1]], tag[2], () => memoVs((bb) => {
     const t = trS.get(bb), p = pS.get(bb), m = mS.get(bb);
     if (t === undefined || p === undefined || m === undefined) return undefined;
     // TV fixnan(): 0/na tr smooth → +di/-di read as 0, not na.
     const pdi = t === 0 ? 0 : 100 * p / t, mdi = t === 0 ? 0 : 100 * m / t;
     const s = pdi + mdi;
     return s === 0 ? 0 : 100 * Math.abs(pdi - mdi) / s;
-  });
-  const adx = rmaVs(ctx, dx, adxL, ['dmi-adx', ...tag]);
+  }));
+  const adx = rmaVsBound(ctx, dx, adxL, ['stv', 'rma', 'dmi-adx', tag[0], tag[2]], tag[1]);
   const bar = ctx.barIndex;
   const t = trS.get(bar);
   const p = t === undefined ? undefined : (pS.get(bar) === undefined ? undefined : (t === 0 ? 0 : 100 * pS.get(bar)! / t));
@@ -1285,18 +1502,22 @@ function kcParts(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>, u
   const useTr = boolArg(b, 'useTrueRange', true);
   const rt = ctx as RtCtx;
   const tag = [rt.callsite ?? 'g', useWma ? 'w' : 'e', L, mult, useTr] as const;
+  // L and mult both vary, so bound BOTH levels: `stateFor`'s cap bounds the map
+  // holding `L`, `bound2` bounds the map keyed by `mult|useTr` inside it. The
+  // `w`/`e` class stays in the path so the EMA and WMA branches cannot share.
+  const inner = `${tag[3]}|${tag[4]}`;
   const rngSrc = useTr
     ? trVs(ctx)
-    : vseries(ctx, ['hl-r', ...tag], (bb) => {
+    : bound2(ctx, ['dvs', 'hl-r', tag[0], tag[1], tag[2]], inner, () => memoVs((bb) => {
         const h = num(ctx.high.get(ctx.barIndex - bb)), l = num(ctx.low.get(ctx.barIndex - bb));
         return h === undefined || l === undefined ? undefined : h - l;
-      });
+      }));
   const basis = useWma
-    ? vseries(ctx, ['kc-b', ...tag], (bb) => wmaWin(ctx, src, bb, L))
-    : emaVs(ctx, src, L, ['kc-b', ...tag]);
+    ? bound2(ctx, ['dvs', 'kc-b', tag[0], tag[1], tag[2]], inner, () => memoVs((bb) => wmaWin(ctx, src, bb, L)))
+    : emaVsBound(ctx, src, L, ['dvs', 'ema', 'kc-b', tag[0], tag[1], tag[2]], inner);
   const rng = useWma
-    ? vseries(ctx, ['kc-r', ...tag], (bb) => wmaWin(ctx, rngSrc, bb, L))
-    : emaVs(ctx, rngSrc, L, ['kc-r', ...tag]);
+    ? bound2(ctx, ['dvs', 'kc-r', tag[0], tag[1], tag[2]], inner, () => memoVs((bb) => wmaWin(ctx, rngSrc, bb, L)))
+    : emaVsBound(ctx, rngSrc, L, ['dvs', 'ema', 'kc-r', tag[0], tag[1], tag[2]], inner);
   return { basis, rng, mult };
 }
 function kcImpl(ctx: BuiltinCtx, args: Value[], named: Record<string, Value>, useWma: boolean): Value {
@@ -1327,10 +1548,10 @@ reg('fisher', (ctx, args, named) => {
   const src = srcOf(ctx, b) ?? vsOf(ctx, { kind: 'series', v: ctx.hlc3 }, 'hlc3');
   const L = lenOf(b) ?? 9;
   const rt = ctx as RtCtx;
-  const key = ['fisher', rt.callsite ?? 'g', emaTag(ctx, b), L] as const;
-  const st = stateFor<FisherState>(ctx, ['stv-x', ...key], () => ({}));
-  const lastBar = stateFor<{ n: number }>(ctx, ['stv-b', ...key], () => ({ n: -1 }));
-  const memo = stateFor<Map<number, [number, number] | undefined>>(ctx, ['stv-m', ...key], () => new Map());
+  const site = rt.callsite ?? 'g';
+  const st = bound2<FisherState>(ctx, ['stv-x', 'fisher', site, L], emaTag(ctx, b), () => ({}));
+  const lastBar = bound2<{ n: number }>(ctx, ['stv-b', 'fisher', site, L], emaTag(ctx, b), () => ({ n: -1 }));
+  const memo = bound2<Map<number, [number, number] | undefined>>(ctx, ['stv-m', 'fisher', site, L], emaTag(ctx, b), () => new Map());
   const bar = ctx.barIndex;
   if (memo.has(bar)) {
     const m = memo.get(bar);
@@ -1400,10 +1621,11 @@ reg('sar', (ctx, args, named) => {
   const inc = numArg(b, 'inc', 0.02);
   const max = numArg(b, 'max', 0.2);
   const rt = ctx as RtCtx;
-  const key = ['sar', rt.callsite ?? 'g', start, inc, max] as const;
-  const st = stateFor<SarState>(ctx, ['stv-x', ...key], () => ({}));
-  const lastBar = stateFor<{ n: number }>(ctx, ['stv-b', ...key], () => ({ n: -1 }));
-  const memo = stateFor<Map<number, number | undefined>>(ctx, ['stv-m', ...key], () => new Map());
+  const site = rt.callsite ?? 'g';
+  const sarInner = `${start}|${inc}`;
+  const st = bound2<SarState>(ctx, ['stv-x', 'sar', site, max], sarInner, () => ({}));
+  const lastBar = bound2<{ n: number }>(ctx, ['stv-b', 'sar', site, max], sarInner, () => ({ n: -1 }));
+  const memo = bound2<Map<number, number | undefined>>(ctx, ['stv-m', 'sar', site, max], sarInner, () => new Map());
   const bar = ctx.barIndex;
   if (memo.has(bar)) return fl(memo.get(bar));
   let out: number | undefined;
@@ -1489,12 +1711,13 @@ reg('vwap', (ctx, args, named) => {
   const rt = ctx as RtCtx;
   const anchorUnw0 = anchorV !== undefined ? unwrapped(anchorV) : undefined;
   const aTag = anchorV === undefined ? 'none'
-    : anchorV.kind === 'series' && anchorUnw0?.kind !== 'string' ? `s${seriesId(anchorV.v)}`
+    : anchorV.kind === 'series' && anchorUnw0?.kind !== 'string' ? `s${seriesId(stableSeries(anchorV.v))}`
     : `v${anchorUnw0 !== undefined && anchorUnw0.kind === 'string' ? anchorUnw0.v : anchorV.kind}`;
-  const key = ['vwap', rt.callsite ?? 'g', emaTag(ctx, b), aTag, hasSd ? sdMult : ''] as const;
-  const st = stateFor<{ sv?: number; spv?: number; svv?: number }>(ctx, ['stv-x', ...key], () => ({}));
-  const lastBar = stateFor<{ n: number }>(ctx, ['stv-b', ...key], () => ({ n: -1 }));
-  const memo = stateFor<Map<number, [number | undefined, number | undefined] | undefined>>(ctx, ['stv-m', ...key], () => new Map());
+  const site = rt.callsite ?? 'g';
+  const vwapInner = `${emaTag(ctx, b)}|${hasSd ? sdMult : ''}`;
+  const st = bound2<{ sv?: number; spv?: number; svv?: number }>(ctx, ['stv-x', 'vwap', site, aTag], vwapInner, () => ({}));
+  const lastBar = bound2<{ n: number }>(ctx, ['stv-b', 'vwap', site, aTag], vwapInner, () => ({ n: -1 }));
+  const memo = bound2<Map<number, [number | undefined, number | undefined] | undefined>>(ctx, ['stv-m', 'vwap', site, aTag], vwapInner, () => new Map());
 
   // Anchor test at absolute bar bb: bool-series truthy, tf-string boundary,
   // or a truthy scalar (reset every bar — degenerate but consistent).
@@ -1572,9 +1795,15 @@ reg('stoch', (ctx, args, named) => {
   const L = lenOf(b);
   if (!src || !hi || !lo || L === undefined) return NA;
   const bar = ctx.barIndex;
+  // Same scan as before — same order, same comparisons, same na handling —
+  // but the 2·L window reads per bar go through winAgg's shared source ring
+  // (one `Series.get` per source bar per run), so the hi/lo ranges stop
+  // re-fetching every bar of the window on every bar.
+  const hrd = winRingReader(ctx, hi);
+  const lrd = winRingReader(ctx, lo);
   let h = -Infinity, l = Infinity;
   for (let i = 0; i < L; i++) {
-    const hv = hi.get(bar - i), lv = lo.get(bar - i);
+    const hv = hrd(bar - i), lv = lrd(bar - i);
     if (hv === undefined || lv === undefined) return NA;
     if (hv > h) h = hv;
     if (lv < l) l = lv;
@@ -1682,7 +1911,7 @@ function condAt(ctx: BuiltinCtx, v: Value | undefined, b: number): boolean {
  *  keep separate accumulators, exactly like the other stateful ta.* builtins. */
 function srcKey(ctx: BuiltinCtx, v: Value | undefined): string {
   const rt = ctx as RtCtx;
-  const id = v !== undefined && v.kind === 'series' ? `s${seriesId(v.v)}` : `c${num(v)}`;
+  const id = v !== undefined && v.kind === 'series' ? `s${seriesId(stableSeries(v.v))}` : `c${num(v)}`;
   return `${rt.callsite ?? 'g'}|${id}`;
 }
 

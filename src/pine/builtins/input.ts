@@ -14,7 +14,7 @@ import {
   RtCtx, bindArgs, strArg, asNum, asStr, slugify,
 } from './util';
 
-const INPUT_ORDER = [
+export const INPUT_ORDER = [
   'defval', 'title', 'minval', 'maxval', 'step', 'options',
   'group', 'inline', 'tooltip', 'confirm', 'display',
 ] as const;
@@ -78,7 +78,7 @@ function rawDefval(v: Value): unknown {
 //
 // Cache lifetime: WeakMap<RtCtx> so each run's memo is dropped with the ctx.
 // Cache key: ctx.callsite — already stable `#N` per Call node, and already
-// composes with siteStack inside UDFs.
+// composes with siteCtx inside UDFs.
 interface InputMemo {
   id: string;
   title: string;
@@ -179,7 +179,7 @@ registerBuiltin('input', 'price', scalarInput('float', 'price', { kind: 'float',
 // enum signature puts `options` third (input.int's minval/maxval/step slots do
 // not exist here), so it binds its own positional order; the schema/override
 // machinery below is the shared one.
-const ENUM_ORDER = [
+export const ENUM_ORDER = [
   'defval', 'title', 'options', 'tooltip', 'inline', 'group', 'confirm', 'display', 'active',
 ] as const;
 registerBuiltin('input', 'enum', scalarInput('string', 'enum', { kind: 'string', v: '' }, ENUM_ORDER));

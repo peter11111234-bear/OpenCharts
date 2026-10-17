@@ -68,16 +68,20 @@ const newArray = (ctx: BuiltinCtx, args: Value[], named: Record<string, Value>) 
     if (!ctx.warnings.includes(msg)) ctx.warnings.push(msg);
   }
   const size = Number.isFinite(raw) ? Math.max(0, raw) : 0;
-  const init = bound.get('initial_value');
-  return arrVal(new Array<Value>(size).fill(init === undefined ? NA : init));
+  // `initial_value` is declared value-semantic (builtins/scalarDeclPatch.ts), so
+  // it arrives as a plain value — store it as-is, never a live handle (see the
+  // SNAPSHOT header). `?? NA` covers the omitted arg.
+  const init = bound.get('initial_value') ?? NA;
+  return arrVal(new Array<Value>(size).fill(init));
 };
 registerBuiltin('array', 'new', newArray, { idx: [1], names: ['initial_value'] });
 for (const name of ['new_bool', 'new_color', 'new_float', 'new_int', 'new_line', 'new_label', 'new_box', 'new_linefill', 'new_table', 'new_string', 'new_type']) {
   registerBuiltin('array', name, newArray, { idx: [1], names: ['initial_value'] });
 }
 
-// Every arg is an element — stash keeps live-series semantics.
-registerBuiltin('array', 'from', (_ctx, args) => arrVal(args.slice()), true);
+// Every arg is an element, snapshotted at call time (TV semantics — same
+// `snap` path as push/set/insert, so a stashed series does not stay live).
+registerBuiltin('array', 'from', (_ctx, args) => arrVal(args.map((v) => snap(v))), true);
 
 // array.copy(id) — TV: "creates a copy of an existing array". Shallow: element
 // Values are shared, so a nested array/map/drawing stays aliased to the same
@@ -226,8 +230,11 @@ export function valueEq(a: Value, b: Value): boolean {
 registerBuiltin('array', 'includes', (_ctx, args, named) => {
   const bound = bind(args, named, ['id', 'value']);
   const a = asArr(bound.get('id'));
-  const v = bound.get('value');
-  if (a === null || v === undefined) return NA;
+  const raw = bound.get('value');
+  if (a === null || raw === undefined) return NA;
+  // The `value` arg is declared value-semantic (builtins/scalarDeclPatch.ts), so
+  // it arrives as a plain scalar — compare it directly.
+  const v = raw;
   return { kind: 'bool', v: a.some((e) => valueEq(e, v)) };
 }, { idx: [1], names: ['value'] });
 const indexOfFn =
@@ -235,8 +242,11 @@ const indexOfFn =
   (_ctx, args, named) => {
     const bound = bind(args, named, ['id', 'value']);
     const a = asArr(bound.get('id'));
-    const v = bound.get('value');
-    if (a === null || v === undefined) return NA;
+    const raw = bound.get('value');
+    if (a === null || raw === undefined) return NA;
+    // Declared value-semantic ⇒ plain scalar here; the search compares the
+    // current-bar value, not a series handle.
+    const v = raw;
     let found = -1;
     if (fromEnd) {
       for (let i = a.length - 1; i >= 0; i--) {
@@ -289,8 +299,11 @@ const binSearch =
   (_ctx, args, named) => {
     const bound = bind(args, named, ['id', 'value']);
     const a = asArr(bound.get('id'));
-    const v = bound.get('value');
-    if (a === null || v === undefined) return NA;
+    const raw = bound.get('value');
+    if (a === null || raw === undefined) return NA;
+    // Declared value-semantic ⇒ plain scalar; cmp/valueEq need a plain value or
+    // the negative insertion hint is meaningless.
+    const v = raw;
     // TV: returns index if found, else negative insertion hint.
     let lo = 0;
     let hi = a.length;
@@ -427,8 +440,11 @@ registerBuiltin('array', 'abs', (_ctx, args, named) => {
 registerBuiltin('array', 'percentrank', (_ctx, args, named) => {
   const bound = bind(args, named, ['id', 'value']);
   const a = asArr(bound.get('id'));
-  const v = bound.get('value');
-  if (a === null || v === undefined || v.kind === 'na') return NA;
+  const raw = bound.get('value');
+  if (a === null || raw === undefined) return NA;
+  // Declared value-semantic ⇒ plain scalar; otherwise the kind check below
+  // never passes and every call returns na.
+  const v = raw;
   const n = numsOf(a);
   if (n.length === 0 || (v.kind !== 'int' && v.kind !== 'float')) return NA;
   const below = n.filter((x) => x <= v.v).length;

@@ -44,6 +44,10 @@ function shifted(ctx: BuiltinCtx, b: number): BuiltinCtx {
     high: s(ctx.high),
     low: s(ctx.low),
     close: s(ctx.close),
+    // `time` too: simulate() derives its day boundaries (`risk.*` daily rules)
+    // and leg exit times from it, and an unshifted series would make every bar
+    // read the CURRENT bar's time — contradicting this wrapper's contract.
+    time: s(ctx.time),
   } as BuiltinCtx;
 }
 

@@ -24,3 +24,9 @@ import './log';
 import './strategy';
 import './strategyEquity';
 import './util';
+// The ScalarSpec declaration table (builtins/scalarDeclPatch.ts) resolves its
+// entries against BUILTINS, so it MUST be imported after every module that
+// registers a builtin — keep this line last. Appending a new `import` above it
+// is correct; appending below it silently drops that module's declarations
+// (asserted by __tests__/scalar_spec_integrity.test.ts).
+import './scalarDeclPatch';
