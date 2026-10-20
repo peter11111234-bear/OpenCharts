@@ -1,0 +1,969 @@
+﻿//@version=6
+// ===== MACD雙週期 V7.0 (A主動結束+B被動失效 標準版) =====
+//
+indicator(title = "雙週期MACD V7.0", shorttitle = "MACD V7.0", overlay = false, precision = 2, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ==========================================
+// 0. 核心結構體定義
+// ==========================================
+type FractalPoint
+    int    idx
+    float  price
+    float  hist_val
+
+// ============================== Ⅰ. 用戶設定 ==============================
+var string g_base = "基本設置"
+string symbolType = input.string(title = "選擇設定模式", defval = "自定義", options = ["BTC", "ETH", "自定義"], group = g_base)
+
+var string g_macd = "MACD參數設置"
+int fastLength       = input.int(title = "快週期MACD-快線長度", defval = 5, minval = 1, group = g_macd)
+int slowLength       = input.int(title = "快週期MACD-慢線長度", defval = 10, minval = 1, group = g_macd)
+int signalSmoothing  = input.int(title = "快週期MACD-信號線平滑", defval = 4, minval = 1, group = g_macd)
+
+int slowFastLength   = input.int(title = "慢週期MACD-快線長度", defval = 12, minval = 1, group = g_macd)
+int slowSlowLength   = input.int(title = "慢週期MACD-慢線長度", defval = 26, minval = 1, group = g_macd)
+int slowSignalLength = input.int(title = "慢週期MACD-信號線長度", defval = 9, minval = 1, group = g_macd)
+
+var string g_div = "FRACTAL_DIV_PROTOCOL_V6 (慢週期核心)"
+bool useFractalDivergence = input.bool(title = "啟用結構化分形背離", defval = true, group = g_div)
+bool requireZeroCross     = input.bool(title = "啟用過零軸確認", defval = true, group = g_div)
+int  fractalLeftBars      = input.int(title = "分形左Bars", defval = 5, minval = 2, group = g_div)
+int  fractalRightBars     = input.int(title = "分形右Bars", defval = 5, minval = 2, group = g_div)
+
+bool  showSlowDiv     = input.bool(title = "顯示慢週期背離", defval = true, group = g_div, inline = "slow_div")
+color slowBearDivColor = input.color(title = "頂(深紅)", defval = color.maroon, group = g_div, inline = "slow_div")
+color slowBullDivColor = input.color(title = "底(深綠)", defval = color.teal, group = g_div, inline = "slow_div")
+int   divLineWidth     = input.int(title = "線條寬度", defval = 2, minval = 1, group = g_div)
+
+var string g_filter = "過濾器與防禦機制"
+bool  useATRFilter      = input.bool(title = "啟用 ATR 自適應波動過濾", defval = true, group = g_filter)
+float atrRelThreshold   = input.float(title = "ATR 相對波動閾值(倍數)", defval = 1.0, step = 0.1, minval = 0.1, group = g_filter)
+bool  useVolumeFilter   = input.bool(title = "啟用成交量過濾", defval = true, group = g_filter, tooltip = "用於信號、動能衰減等所有需要成交量判斷的場合")
+float volumeThreshold   = input.float(title = "成交量閾值(倍數)", defval = 1.5, step = 0.1, minval = 1.0, group = g_filter)
+bool  usePriceFilter    = input.bool(title = "啟用「價格未反應」過濾器", defval = true, group = g_filter)
+float priceFilterAtrMult = input.float(title = "價格反應ATR容忍度", defval = 0.3, minval = 0.1, step = 0.1, group = g_filter)
+float in_minHistLevel      = input.float(title = "動能衰減的最小柱體值(絕對值)", defval = 3.0, minval = 0, step = 0.1, group = g_filter)
+float heapDarkTolerance = input.float(title = "暗柱容忍度(+快柱)", defval = 3.0, minval = 0, step = 0.5, group = g_filter, tooltip = "超跌/超漲判定中，慢柱超過快柱+此值即視為暗柱、條件不成立")
+
+var string g_market = "市場狀態過濾 (Kill Zones)"
+bool  showAtlasZone     = input.bool(title = "顯示壓縮區 (Atlas)", defval = true, group = g_market)
+float chopLevel         = input.float(title = "Choppiness 觸發閾值", defval = 60.0, step = 0.1, group = g_market)
+float squeezeSensitivity = input.float(title = "壓縮(S)觸發靈敏度(%)", defval = 80.0, minval = 50.0, maxval = 100.0, step = 1.0, group = g_market)
+bool  showChopZone      = input.bool(title = "顯示低波動區 (Choppiness)", defval = true, group = g_market)
+
+var string g_squeeze = "擠壓監測設置"
+bool  enableSqueezeMonitor = input.bool(title = "啟用擠壓監測", defval = true, group = g_squeeze)
+float squeezeThreshold     = input.float(title = "擠壓閾值 (Threshold)", defval = 0.75, minval = 0.1, maxval = 5.0, step = 0.05, group = g_squeeze)
+bool  useAdaptiveFactor   = input.bool(title = "Factor自動75分位(100根)", defval = true, group = g_squeeze, tooltip = "開啟後閾值=近100根Factor的75分位(EMA20平滑)，且封頂不超過固定閾值——安靜盤自動放鬆，趨勢中防止閾值被墊高誤鎖")
+float in_slowStrength = input.float(title = "慢柱強度閾值(|Slow|)", defval = 10.0, minval = 1.0, step = 1.0, group = g_squeeze)
+float in_earlyHistLimit        = input.float(title = "提早啟動快柱弱動能上限(|Fast|)", defval = 20.0, minval = 1.0, step = 1.0, group = g_squeeze, tooltip = "只看快柱(leader)：前根快柱弱於此值才算壓縮完成；慢柱只驗方向不限大小")
+float in_fvgMinPoints     = input.float(title = "提早啟動FVG缺口最小點數", defval = 10.0, minval = 0, step = 1.0, group = g_squeeze, tooltip = "不用ATR，直接用點數：bullish低-high[2]>=點數才算")
+bool  showEarlyDebug        = input.bool(title = "顯示提早觸發除錯標籤", defval = false, group = g_squeeze, tooltip = "FVG缺口bar印缺口點數+前根快慢柱值，對圖除錯用，抓完數就關")
+bool  showSqueezeFactor    = input.bool(title = "顯示擠壓係數線圖", defval = true, group = g_squeeze)
+bool  showSqueezeShapes    = input.bool(title = "顯示擠壓信號標記", defval = true, group = g_squeeze)
+color squeezeLongColor     = input.color(title = "嘎空啟動箭頭顏色", defval = color.new(#00FF00, 0), group = g_squeeze)
+color squeezeShortColor    = input.color(title = "嘎多啟動箭頭顏色", defval = color.new(#FF0000, 0), group = g_squeeze)
+
+var string g_squeeze_end = "擠壓結束信號設置 (高量整合)"
+bool  enableSqueezeEndSignal = input.bool(title = "啟用擠壓結束信號", defval = true, group = g_squeeze_end)
+int   endSignal_leftBars     = input.int(title = "結束信號 Pivot 左側 K 棒", defval = 2, minval = 1, maxval = 15, group = g_squeeze_end)
+int   endSignal_rightBars    = input.int(title = "結束信號 Pivot 右側 K 棒", defval = 2, minval = 1, maxval = 15, group = g_squeeze_end)
+float endSignal_volFilter    = input.float(title = "結束信號成交量過濾閾值", defval = 2.0, step = 0.1, minval = 0.5, maxval = 6.0, group = g_squeeze_end)
+int   endPivotWindowBars   = input.int(title = "高量Pivot確認有效窗(根)", defval = 10, minval = 1, maxval = 50, group = g_squeeze_end, tooltip = "高量樞軸確認後，等待收盤破/站回EMA10的最長K棒數；1=僅當根(舊行為)")
+bool  showEndSignalMarker    = input.bool(title = "顯示結束信號標記", defval = true, group = g_squeeze_end)
+color endSignalShortColor    = input.color(title = "嘎空結束(高量)標記顏色", defval = color.new(#00FF00, 0), group = g_squeeze_end)
+color endSignalLongColor     = input.color(title = "嘎多結束(高量)標記顏色", defval = color.new(#FF0000, 0), group = g_squeeze_end)
+
+// ===== V7：主動結束-動能衰竭設置 (A) =====
+var string g_squeeze_end_momentum = "嘎空嘎多結束偵測 (動能)"
+bool  enableMomentumEndSignal = input.bool(title = "啟用動能結束偵測", defval = true, group = g_squeeze_end_momentum, tooltip = "綠柱連2縮且腰斬 OR 跨零(需>門檻) 才算結束")
+bool  showMomentumEndMarker   = input.bool(title = "顯示動能結束標記", defval = true, group = g_squeeze_end_momentum)
+float momentumShrinkRatio     = input.float(title = "動能腰斬比例", defval = 0.5, minval = 0.1, maxval = 1.0, step = 0.1, group = g_squeeze_end_momentum, tooltip = "histFast < histFast[2]*比例 才算衰竭")
+float in_momentumMinHist         = input.float(title = "跨零最小柱體(過濾雜訊)", defval = 1.0, minval = 0, step = 0.5, group = g_squeeze_end_momentum)
+float in_longEndFastLimit      = input.float(title = "嘎多結束快線絕對值上限(|Fast|)", defval = 20.0, minval = 0, step = 1.0, group = g_squeeze_end_momentum, tooltip = "台指期觀察：|macdLineFast|<上限才算嘎多真結束")
+color momentumEndShortColor   = input.color(title = "嘎空結束(動能)標記顏色", defval = color.new(#00FF00, 0), group = g_squeeze_end_momentum)
+color momentumEndLongColor    = input.color(title = "嘎多結束(動能)標記顏色", defval = color.new(#FF0000, 0), group = g_squeeze_end_momentum)
+
+// ===== V7：被動失效設置 (B) - FVG地板 + EMA20三振 =====
+var string g_squeeze_fail = "擠壓失效設置 (被動下架-灰色)"
+bool  enableSqueezeFail     = input.bool(title = "啟用失效自動下架", defval = true, group = g_squeeze_fail, tooltip = "FVG地板跌破 或 EMA20三振(1假2看量3真死) → 灰色失效")
+float ema20SecondVolMult  = input.float(title = "第二次破EMA20需爆量幾倍(20MA)", defval = 1.5, minval = 1.0, maxval = 3.0, step = 0.1, group = g_squeeze_fail)
+int   squeezeTimeoutBars    = input.int(title = "超時幾根判失效(有FVG會自動續命歸零)", defval = 50, minval = 10, maxval = 200, group = g_squeeze_fail)
+bool  showFailMarker        = input.bool(title = "顯示失效標記(灰X)", defval = true, group = g_squeeze_fail)
+color failShortColor        = input.color(title = "嘎空失效顏色", defval = color.new(color.gray, 0), group = g_squeeze_fail)
+color failLongColor         = input.color(title = "嘎多失效顏色", defval = color.new(color.gray, 0), group = g_squeeze_fail)
+
+var string g_oversold = "超跌反彈預警設置 (嘎空預警)"
+bool  enableOversoldDetection = input.bool(title = "啟用超跌嘎空區塊標註", defval = true, group = g_oversold)
+float in_majorDump      = input.float(title = "前波大跌暗紅柱(Slow)最深需達", defval = 70.0, minval = 1.0, step = 10.0, group = g_oversold)
+float in_oversold       = input.float(title = "本波鮮紅柱絕對值閾值", defval = 30.0, minval = 1.0, step = 5.0, group = g_oversold)
+int   minHeapBars             = input.int(title = "紅柱堆成立的最少K棒數", defval = 2, minval = 1, step = 1, group = g_oversold)
+color oversoldBoxColor        = input.color(title = "預警區塊顏色", defval = color.new(color.white, 85), group = g_oversold)
+
+var string g_overbought = "超漲回跌預警設置 (殺多預警)"
+bool  enableOverboughtDetection = input.bool(title = "啟用超漲殺多區塊標註", defval = true, group = g_overbought)
+float in_majorPump        = input.float(title = "前波大漲暗綠柱(Slow)最高需達", defval = 70.0, minval = 1.0, step = 10.0, group = g_overbought)
+float in_overbought       = input.float(title = "本波鮮綠柱絕對值閾值", defval = 30.0, minval = 1.0, step = 5.0, group = g_overbought)
+int   minBullHeapBars           = input.int(title = "綠柱堆成立的最少K棒數", defval = 2, minval = 1, step = 1, group = g_overbought)
+color overboughtBoxColor        = input.color(title = "預警區塊顏色", defval = color.new(color.yellow, 85), group = g_overbought)
+
+var string g_visual = "視覺設置"
+bool  showSlowMACD       = input.bool(title = "顯示慢週期MACD", defval = true, group = g_visual)
+bool  showSlowMACDLines  = input.bool(title = "顯示慢週期MACD線", defval = false, group = g_visual)
+color slowSignalLineColor = input.color(title = "慢信號線顏色", defval = color.new(color.purple, 0), group = g_visual, inline = "slowline")
+bool  showFastMACD       = input.bool(title = "顯示快週期MACD", defval = true, group = g_visual)
+float momentumThreshold  = input.float(title = "動能衰減預警閾值(%)", defval = 40.0, minval = 1.0, maxval = 99.0, step = 1.0, group = g_visual)
+bool  showInfoPanel      = input.bool(title = "顯示資訊面板", defval = true, group = g_visual)
+bool  showFastMACDLines  = input.bool(title = "顯示快週期MACD線", defval = true, group = g_visual)
+color fastSignalLineColor = input.color(title = "信號線顏色", defval = color.new(color.orange, 0), group = g_visual, inline = "fastline")
+
+// ===== V6.8：短線強化過濾 =====
+var string g_filter_st = "短線強化過濾 (5m/15m)"
+bool useSlowTrendConfirm = input.bool(title = "慢線方向確認", defval = true, group = g_filter_st, tooltip = "做多時慢線柱體需>0且趨勢向上；做空反之")
+int  minSignalCooldown   = input.int(title = "信號冷卻K棒數", defval = 3, minval = 0, maxval = 10, group = g_filter_st, tooltip = "兩次信號間最少間隔K棒數，避免反覆翻單")
+int  dssMaxGapBars       = input.int(title = "雙重嘎空狀態有效窗(根)", defval = 30, minval = 5, maxval = 200, group = g_filter_st, tooltip = "雙重嘎空任一非零狀態的最長等待根數：state1等結束、state2等第二次啟動、state3等死叉，全部受此限；自進入起算最長存活 N 根（含進入根），第 N+1 根歸零")
+
+// ===== 短週期MACD綠柱首次減少偵測 =====
+var string g_30m = "短週期MACD首減偵測"
+bool showFirstDecrease   = input.bool(title = "顯示綠柱首減標記", defval = true, group = g_30m, tooltip = "15/20/25/30分圖上，綠柱由增轉減的第一次收盤標記")
+int  firstTurnMinBars = input.int(title = "首減/首增最少連續根數", defval = 3, minval = 2, maxval = 6, group = g_30m)
+
+// ===== 短週期MACD紅柱首增偵測（可能+） =====
+var string g_30m_plus = "短週期MACD可能+偵測"
+bool showRedFirstIncrease = input.bool(title = "顯示紅柱首增標記", defval = true, group = g_30m_plus, tooltip = "15/20/25/30分圖上，紅柱由減轉增的第一次收盤標記")
+
+// ===== V6.9.1：吞噬確認最佳空點（動能衰減+紅K吞噬 → 次根綠柱續縮） =====
+var string g_engulf = "吞噬確認最佳空點"
+bool  enableEngulfShort = input.bool(title = "啟用吞噬空點偵測", defval = true, group = g_engulf)
+int   engulfConfirmBars = input.int(title = "吞噬確認有效窗(根)", defval = 2, minval = 1, maxval = 5, group = g_engulf, tooltip = "吞噬武裝後等待次根確認的最長K棒數；1=僅下一根(舊行為)")
+color bestShortColor    = input.color(title = "空點箭頭顏色", defval = color.new(color.red, 0), group = g_engulf)
+
+// ===== V7.1：15分短週期MACD動能停滯反轉 =====
+var string g_stall = "15分短週期MACD動能停滯"
+bool  enableStallSignal = input.bool(title = "啟用該漲不漲／該跌不跌偵測", defval = true, group = g_stall)
+float in_stallHistLimit    = input.float(title = "柱體弱動能範圍(絕對值)", defval = 15.0, minval = 0.1, step = 0.5, group = g_stall)
+int   stallBars         = input.int(title = "持續K棒數", defval = 4, minval = 4, maxval = 6, group = g_stall)
+color stallBearColor    = input.color(title = "該漲不漲標記顏色", defval = color.new(color.red, 0), group = g_stall)
+color stallBullColor    = input.color(title = "該跌不跌標記顏色", defval = color.new(color.lime, 0), group = g_stall)
+
+// ============================== Ⅱ. 參數配置 ==============================
+[e_fast, e_slow, e_sig, e_sFast, e_sSlow, e_sSig] = switch symbolType
+    "BTC" => [5, 10, 4, 12, 26, 9]
+    "ETH" => [4, 8, 3, 10, 20, 6]
+    => [fastLength, slowLength, signalSmoothing, slowFastLength, slowSlowLength, slowSignalLength]
+
+// A8修正：預設模式連動絕對點數閾值（原缺陷：切 BTC/ETH 只換 MACD 長度，點數閾值仍是台指期尺規）
+// 倍率基準：MACD 柱體≈價格尺度；台指期 ~22,000 / BTC ~110,000(×5) / ETH ~3,500(×0.16)——啟始估值，上圖後再校準
+[earlyHistLimit, stallHistLimit, minHistLevel, momentumMinHist, majorDumpThreshold, oversoldThreshold, majorPumpThreshold, overboughtThreshold, earlyFvgMinPoints, longEndFastLineLimit, slowStrengthThreshold] = switch symbolType
+    "BTC" => [100.0, 75.0, 15.0, 5.0, 350.0, 150.0, 350.0, 150.0, 50.0, 100.0, 50.0]
+    "ETH" => [3.0, 2.5, 0.5, 0.2, 11.0, 5.0, 11.0, 5.0, 1.6, 3.0, 1.6]
+    => [in_earlyHistLimit, in_stallHistLimit, in_minHistLevel, in_momentumMinHist, in_majorDump, in_oversold, in_majorPump, in_overbought, in_fvgMinPoints, in_longEndFastLimit, in_slowStrength]
+
+// ============================== Ⅲ. 核心計算 ==============================
+[macdLineFast, signalLineFast, histFast] = ta.macd(source = close, fastlen = e_fast, slowlen = e_slow, siglen = e_sig)
+[macdLineSlow, signalLineSlow, histSlow] = ta.macd(source = close, fastlen = e_sFast, slowlen = e_sSlow, siglen = e_sSig)
+
+// ===== 短週期綠柱首次減少偵測 =====
+bool is30m_chart       = timeframe.period == "30" or timeframe.period == "15" or timeframe.period == "20" or timeframe.period == "25"
+var bool is30m_rising  = false
+var int  rise_count    = 0
+bool is30m_green       = histFast > 0
+bool is30m_first_drop  = false
+
+if is30m_chart and is30m_green
+    if not is30m_rising
+        is30m_rising := true
+        rise_count   := 1
+    else
+        if histFast > histFast[1]
+            rise_count += 1
+        else if histFast < histFast[1]
+            if rise_count >= firstTurnMinBars
+                is30m_first_drop := true
+            rise_count   := 0
+            is30m_rising := false
+else
+    is30m_rising     := false
+    rise_count       := 0
+    is30m_first_drop := false
+
+// ===== 短週期紅柱首增偵測（可能+） =====
+var bool is30m_falling = false
+var int  fall_count    = 0
+bool is30m_red         = histFast < 0
+bool is30m_first_rise  = false
+
+if is30m_chart and is30m_red
+    if not is30m_falling
+        is30m_falling := true
+        fall_count    := 1
+    else
+        // 紅柱負值變大 → 柱體增加（趨勢延續）
+        if histFast < histFast[1]
+            fall_count += 1
+        // 紅柱負值變小 → 柱體減少（首次回升）
+        else if histFast > histFast[1]
+            if fall_count >= firstTurnMinBars
+                is30m_first_rise := true
+            fall_count    := 0
+            is30m_falling := false
+else
+    is30m_falling    := false
+    fall_count       := 0
+    is30m_first_rise := false
+
+// 可能+：紅柱首增
+bool is30m_plus_signal = showRedFirstIncrease and is30m_chart and is30m_first_rise and barstate.isconfirmed
+
+// ===== V7.1：15分短週期MACD弱動能停滯（連續達標僅提示一次） =====
+bool is15mChart = timeframe.period == "15"
+bool isWeakGreen = is15mChart and histFast > 0 and histFast <= stallHistLimit
+bool isWeakRed   = is15mChart and histFast < 0 and histFast >= -stallHistLimit
+bool wasWeakGreen = is15mChart and histFast[1] > 0 and histFast[1] <= stallHistLimit
+bool wasWeakRed   = is15mChart and histFast[1] < 0 and histFast[1] >= -stallHistLimit
+var int weakGreenBars = 0
+var int weakRedBars   = 0
+var bool weakGreenSignaled = false
+var bool weakRedSignaled   = false
+
+if isWeakGreen
+    if wasWeakGreen and histFast > histFast[1]
+        weakGreenBars := 0
+        weakGreenSignaled := false
+    else
+        weakGreenBars += 1
+else
+    weakGreenBars := 0
+    weakGreenSignaled := false
+
+if isWeakRed
+    if wasWeakRed and histFast < histFast[1]
+        weakRedBars := 0
+        weakRedSignaled := false
+    else
+        weakRedBars += 1
+else
+    weakRedBars := 0
+    weakRedSignaled := false
+
+bool stallBearSignal = enableStallSignal and weakGreenBars == stallBars and not weakGreenSignaled and barstate.isconfirmed
+bool stallBullSignal = enableStallSignal and weakRedBars == stallBars and not weakRedSignaled and barstate.isconfirmed
+
+if stallBearSignal
+    weakGreenSignaled := true
+if stallBullSignal
+    weakRedSignaled := true
+
+float atrCurrent  = ta.atr(length = 14)
+float atrBaseline = ta.sma(atrCurrent, length = 100)
+float atrRatio    = not na(atrBaseline) and atrBaseline != 0 ? atrCurrent / atrBaseline : 0.0
+bool  isVolatilityPass = not useATRFilter or (atrRatio >= atrRelThreshold)
+
+float volumeMA     = ta.sma(volume, length = 20)
+bool  isVolumePass = not useVolumeFilter or (volume >= volumeMA * volumeThreshold)
+
+float slowTrendLine = ta.linreg(histSlow, length = 3, offset = 0)
+
+// Atlas & Choppiness
+int   atlas_len = 20
+float atlas_basis = ta.sma(close, length = atlas_len)
+float atlas_dev   = 2.0 * ta.stdev(close, length = atlas_len)
+float atlas_upper = atlas_basis + atlas_dev
+float atlas_lower = atlas_basis - atlas_dev
+float atlas_dbb   = not na(atlas_upper) and atlas_upper != 0 ? nz(math.sqrt((atlas_upper - atlas_lower) / atlas_upper) * 20) : 0.0
+float atlas_dbbmed = ta.ema(atlas_dbb, length = 120)
+float atlas_factor = not na(atlas_dbbmed) ? atlas_dbbmed * (squeezeSensitivity / 100.0) : 0.0
+float atlas_val    = atlas_dbb - atlas_factor
+bool  isAtlasSqueeze = atlas_val <= 0
+
+int   chop_len    = 14
+float chop_sum_tr = math.sum(ta.tr, chop_len)
+float chop_low    = ta.lowest(low, length = chop_len)
+float chop_high   = ta.highest(high, length = chop_len)
+float chop_height = chop_high - chop_low
+float chopValue   = chop_height != 0 ? 100 * (math.log10(chop_sum_tr / chop_height) / math.log10(chop_len)) : 0.0
+bool  isChoppy    = chopValue >= chopLevel
+bool  isNoTradeZone = isAtlasSqueeze or isChoppy
+
+// 動能衰減
+float decreaseMultiplier = (100 - momentumThreshold) / 100.0
+bool isBullishMomentumDecreasing = histFast > 0 and histFast[1] > 0 and histFast < (histFast[1] * decreaseMultiplier) and math.abs(histFast[1]) >= minHistLevel
+bool isBearishMomentumDecreasing = histFast < 0 and histFast[1] < 0 and histFast > (histFast[1] * decreaseMultiplier) and math.abs(histFast[1]) >= minHistLevel
+bool priceHasNotReacted_Bullish  = low > (low[1] - atrCurrent * priceFilterAtrMult)
+bool priceHasNotReacted_Bearish  = high < (high[1] + atrCurrent * priceFilterAtrMult)
+bool showWhiteTriangleRaw = isBullishMomentumDecreasing and (not usePriceFilter or priceHasNotReacted_Bullish) and not isNoTradeZone
+bool showYellowTriangleRaw = isBearishMomentumDecreasing and (not usePriceFilter or priceHasNotReacted_Bearish) and not isNoTradeZone
+
+// ===== V6.9.1：吞噬確認最佳空點 =====
+// 第一段：動能衰減(綠柱縮>閾值) + 當根紅K實體完全吞噬前一根綠K實體 → 在該根histFast上標註並武裝
+float redBodyTop        = math.max(open, close)
+float redBodyBottom     = math.min(open, close)
+bool  prevWasGreenBar   = close[1] > open[1]
+bool  bearishEngulfBody = close < open and prevWasGreenBar and redBodyTop >= math.max(open[1], close[1]) and redBodyBottom <= math.min(open[1], close[1])
+bool  engulfArmSignal   = enableEngulfShort and showWhiteTriangleRaw and bearishEngulfBody and barstate.isconfirmed
+
+var int engulfArmIdx = na
+bool  bestShortSignal = false
+if engulfArmSignal
+    engulfArmIdx := bar_index
+else if not na(engulfArmIdx) and (bar_index - engulfArmIdx) <= engulfConfirmBars
+    // 第二段：武裝後 engulfConfirmBars 根內 histFast 仍為綠柱且持續變短 + K棒收綠 → 最佳空點(紅色向下箭頭)
+    bestShortSignal := enableEngulfShort and histFast > 0 and histFast < histFast[1] and close > open and barstate.isconfirmed
+    if bestShortSignal or (bar_index - engulfArmIdx) == engulfConfirmBars
+        engulfArmIdx := na
+else
+    engulfArmIdx := na
+
+// ============================== 擠壓監測 ==============================
+// V6.10→V7.1 優化：自適應+EMA平滑，避免閾值跳動與histFast≈0爆衝
+const float MIN_HIST_DENOM = 1.0  // Factor 分母護欄：|histFast| 低於此值時 Factor 歸零，防微小分母吹爆 histSlow/histFast 比值
+float FactorRaw = math.abs(histFast) >= MIN_HIST_DENOM ? math.min(math.max((histSlow / histFast) - 1, -10), 10) : 0
+float Factor = ta.ema(FactorRaw, 3)
+float factorThresholdAdaptive = ta.percentile_nearest_rank(Factor, 100, 75)
+float factorThresholdRaw = useAdaptiveFactor ? nz(factorThresholdAdaptive, squeezeThreshold) : squeezeThreshold
+// A1修正：自適應閾值封頂在固定閾值——趨勢中 Factor 長期偏大會把 P75 墊高造成誤鎖，封頂後自適應只能放鬆不能加嚴
+float factorThreshold = useAdaptiveFactor ? math.min(ta.ema(factorThresholdRaw, 20), squeezeThreshold) : squeezeThreshold
+
+float ema10 = ta.ema(close, length = 10)
+float ema20 = ta.ema(close, length = 20)
+float ema50 = ta.ema(close, length = 50)
+float ema60 = ta.ema(close, length = 60)
+bool  is_bullish_alignment = ema10 > ema20 and ema20 > ema50
+bool  is_bearish_alignment = ema10 < ema20 and ema20 < ema50
+bool  is_hist_slow_strong  = math.abs(histSlow) >= slowStrengthThreshold
+
+bool short_squeeze_trigger_base = enableSqueezeMonitor and histFast > 0 and histSlow > histFast and close > ema60 and is_hist_slow_strong and is_bullish_alignment and Factor > factorThreshold
+bool long_squeeze_trigger_base  = enableSqueezeMonitor and histFast < 0 and math.abs(histSlow) > math.abs(histFast) and close < ema60 and is_hist_slow_strong and is_bearish_alignment and Factor > factorThreshold
+// V7.2提早啟動：V反轉第一時間捕捉。兩腿允許錯開一根——快柱兩根內有過弱壓縮 + 缺口這根或上一根出生(皆需>=點數) + 慢線還沒翻(證明漲勢剛起步) + 本根收紅轉綠。
+//  舊寫法要求缺口與壓縮同根，在V底結構上無解：大陽線T的 low 永遠壓不過下跌中T-2的 high(缺口要T+1才出生)，而T+1時快柱已翻綠(壓縮腿死亡)。兩腿永遠錯過彼此。
+bool early_short_fvg_gap = (low - high[2]) >= earlyFvgMinPoints
+bool early_long_fvg_gap  = (low[2] - high) >= earlyFvgMinPoints
+bool early_short_gap1 = (low[1] - high[3]) >= earlyFvgMinPoints
+bool early_long_gap1  = (low[3] - high[1]) >= earlyFvgMinPoints
+bool early_short_weak = (histFast[1] < 0 and math.abs(histFast[1]) < earlyHistLimit) or (histFast[2] < 0 and math.abs(histFast[2]) < earlyHistLimit)
+bool early_long_weak  = (histFast[1] > 0 and math.abs(histFast[1]) < earlyHistLimit) or (histFast[2] > 0 and math.abs(histFast[2]) < earlyHistLimit)
+bool early_short_trigger = enableSqueezeMonitor and histSlow[1] < 0 and early_short_weak and close > open and (early_short_fvg_gap or early_short_gap1) and barstate.isconfirmed
+bool early_long_trigger  = enableSqueezeMonitor and histSlow[1] > 0 and early_long_weak and close < open and (early_long_fvg_gap or early_long_gap1)  and barstate.isconfirmed
+bool short_squeeze_trigger = (short_squeeze_trigger_base or early_short_trigger) and barstate.isconfirmed
+bool long_squeeze_trigger  = (long_squeeze_trigger_base  or early_long_trigger)  and barstate.isconfirmed
+
+// V7.2整體狀態機：單一方向變數，同一時間最多一邊active，從根消除雙開
+//  0=無狀態(白線) +1=嘎空(綠線) -1=嘎多(紅線)
+//  is_*_active=更新前狀態(轉移輸入用)；is_*_now=更新後狀態(start/線色/面板用)——Pine單遍由上而下執行，不可混用
+var int squeezeDir = 0
+bool is_short_squeeze_active = squeezeDir == 1
+bool is_long_squeeze_active  = squeezeDir == -1
+// V7：失效追蹤 // TODO: ponytail debt — 最簡追蹤，僅保留 FVG 地板 + EMA20 三振
+var int short_squeeze_start_idx = na
+var int long_squeeze_start_idx  = na
+var float shortFvgFloor = na
+var float longFvgFloor  = na
+var int shortEma20Count = 0
+var int longEma20Count  = 0
+
+// ============================== 高量樞軸點 ==============================
+float end_pivot_high = ta.pivothigh(high, leftbars = endSignal_leftBars, rightbars = endSignal_rightBars)
+float end_pivot_low  = ta.pivotlow(low, leftbars = endSignal_leftBars, rightbars = endSignal_rightBars)
+
+// V6.9.2 修正：爆量定義改為「樞軸那根成交量 > N倍的20期均量」(預設2倍)，取代原本 20根量總和 vs 歷史p95 的繞口算法
+float end_vol_ratio = nz(volumeMA[endSignal_rightBars]) != 0 ? volume[endSignal_rightBars] / volumeMA[endSignal_rightBars] : 0.0
+float cur_vol_ratio  = nz(volumeMA) != 0 ? volume / volumeMA : 0.0
+bool  is_end_high_volume = end_vol_ratio > endSignal_volFilter
+
+// 分形背離與結束物件共用 GC — 宣告必須在使用點之前，Pine 不 hoist
+const int MAX_SHARED_LINES = 380
+const int MAX_SHARED_LABELS = 380
+var array<line> sharedLines = array.new<line>()
+var array<label> sharedLabels = array.new<label>()
+f_push_line(line l) =>
+    if not na(l)
+        array.push(sharedLines, l)
+        if array.size(sharedLines) > MAX_SHARED_LINES
+            line.delete(array.shift(sharedLines))
+f_push_label(label lb) =>
+    if not na(lb)
+        array.push(sharedLabels, lb)
+        if array.size(sharedLabels) > MAX_SHARED_LABELS
+            label.delete(array.shift(sharedLabels))
+
+// ============================== 慢週期分形背離 ==============================
+float ph_slow = ta.pivothigh(histSlow, leftbars = fractalLeftBars, rightbars = fractalRightBars)
+float pl_slow = ta.pivotlow(histSlow, leftbars = fractalLeftBars, rightbars = fractalRightBars)
+
+var FractalPoint last_bear_peak_slow = na
+var FractalPoint last_bull_valley_slow = na
+var bool bear_valley_conf_slow = false
+var bool bull_valley_conf_slow = false
+
+if histSlow < 0
+    bear_valley_conf_slow := true
+if histSlow > 0
+    bull_valley_conf_slow := true
+
+if not na(ph_slow) and useFractalDivergence
+    int    idx   = bar_index - fractalRightBars
+    float  price = high[fractalRightBars]
+    FractalPoint curr = FractalPoint.new(idx = idx, price = price, hist_val = ph_slow)
+    if not na(last_bear_peak_slow) and curr.price > last_bear_peak_slow.price and curr.hist_val < last_bear_peak_slow.hist_val and (not requireZeroCross or bear_valley_conf_slow)
+        if showSlowDiv
+            line new_l = line.new(x1 = last_bear_peak_slow.idx, y1 = last_bear_peak_slow.hist_val, x2 = curr.idx, y2 = curr.hist_val, color = slowBearDivColor, width = divLineWidth, style = line.style_dashed)
+            label new_lb = label.new(x = math.floor((last_bear_peak_slow.idx + curr.idx) / 2), y = math.max(curr.hist_val, last_bear_peak_slow.hist_val), text = "頂(慢)", color = color.new(color.red, 100), textcolor = slowBearDivColor, style = label.style_none, size = size.small)
+            f_push_line(new_l)
+            f_push_label(new_lb)
+    last_bear_peak_slow := curr
+    bear_valley_conf_slow := false
+
+if not na(pl_slow) and useFractalDivergence
+    int    idx   = bar_index - fractalRightBars
+    float  price = low[fractalRightBars]
+    FractalPoint curr = FractalPoint.new(idx = idx, price = price, hist_val = pl_slow)
+    if not na(last_bull_valley_slow) and curr.price < last_bull_valley_slow.price and curr.hist_val > last_bull_valley_slow.hist_val and (not requireZeroCross or bull_valley_conf_slow)
+        if showSlowDiv
+            line new_l = line.new(x1 = last_bull_valley_slow.idx, y1 = last_bull_valley_slow.hist_val, x2 = curr.idx, y2 = curr.hist_val, color = slowBullDivColor, width = divLineWidth, style = line.style_dashed)
+            label new_lb = label.new(x = math.floor((last_bull_valley_slow.idx + curr.idx) / 2), y = math.min(curr.hist_val, last_bull_valley_slow.hist_val), text = "底(慢)", color = color.new(color.green, 100), textcolor = slowBullDivColor, style = label.style_none, size = size.small)
+            f_push_line(new_l)
+            f_push_label(new_lb)
+    last_bull_valley_slow := curr
+    bull_valley_conf_slow := false
+
+// ============================== Ⅳ. 信號判定 ==============================
+bool goldenCross = ta.crossover(macdLineFast, signalLineFast)
+bool deadCross   = ta.crossunder(macdLineFast, signalLineFast)
+
+// ============================== V7 擠壓狀態管理 (A主動結束 + B被動失效) ==============================
+// A2修正：高量樞軸事件鎖存——確認當根收盤未破/站回EMA10時，保留事件等後續K棒在有效窗內補確認
+var int shortPivotArmIdx = na
+var int longPivotArmIdx  = na
+if is_short_squeeze_active and not na(end_pivot_high) and is_end_high_volume and barstate.isconfirmed
+    shortPivotArmIdx := bar_index
+if is_long_squeeze_active and not na(end_pivot_low) and is_end_high_volume and barstate.isconfirmed
+    longPivotArmIdx := bar_index
+if not is_short_squeeze_active
+    shortPivotArmIdx := na
+if not is_long_squeeze_active
+    longPivotArmIdx := na
+
+// A1: 高量樞軸
+bool shortPivotValid = not na(shortPivotArmIdx) and (bar_index - shortPivotArmIdx) < endPivotWindowBars
+bool longPivotValid  = not na(longPivotArmIdx)  and (bar_index - longPivotArmIdx)  < endPivotWindowBars
+bool squeeze_end_short_condition = enableSqueezeEndSignal and is_short_squeeze_active and shortPivotValid and close < ema10
+bool squeeze_end_long_condition  = enableSqueezeEndSignal and is_long_squeeze_active  and longPivotValid  and close > ema10 and math.abs(macdLineFast) < longEndFastLineLimit
+
+// A2: 動能衰竭 — V7強化：需同時破MA10才算真結束
+bool squeeze_end_short_momentum = false
+if is_short_squeeze_active and enableMomentumEndSignal and close < ema10
+    bool cross_down = histFast[1] > 0 and histFast <= 0 and math.abs(histFast[1]) >= momentumMinHist and histSlow < 0 and math.abs(histSlow) > 1.3 * math.abs(histFast == 0 ? 0.01 : histFast)
+    bool shrink_2   = histFast > 0 and histFast[1] > 0 and histFast[2] > 0 and histFast < histFast[1] and histFast[1] < histFast[2] and histFast < histFast[2] * momentumShrinkRatio
+    squeeze_end_short_momentum := cross_down or shrink_2
+
+bool squeeze_end_long_momentum = false
+if is_long_squeeze_active and enableMomentumEndSignal and close > ema10 and math.abs(macdLineFast) < longEndFastLineLimit
+    bool cross_up  = histFast[1] < 0 and histFast >= 0 and math.abs(histFast[1]) >= momentumMinHist and histSlow > 0 and math.abs(histSlow) > 1.3 * math.abs(histFast == 0 ? 0.01 : histFast)
+    bool shrink_2l = histFast < 0 and histFast[1] < 0 and histFast[2] < 0 and histFast > histFast[1] and histFast[1] > histFast[2] and math.abs(histFast) < math.abs(histFast[2]) * momentumShrinkRatio
+    squeeze_end_long_momentum := cross_up or shrink_2l
+
+bool is_short_active_end = (squeeze_end_short_condition or squeeze_end_short_momentum) and barstate.isconfirmed
+bool is_long_active_end  = (squeeze_end_long_condition  or squeeze_end_long_momentum)  and barstate.isconfirmed
+
+// ===== V7 B: FVG地板 + EMA20三振 (Factor只看有沒有力，不用來判死) =====
+// 純結構：只要有洞就算FVG，不看洞多大/實體多大 (不卡% / 不卡ATR)
+bool bullishFVG = low > high[2]
+bool bearishFVG = high < low[2]
+bool shortCrossUnder = ta.crossunder(close, ema20)
+bool longCrossOver   = ta.crossover(close, ema20)
+bool shortSecondVolBreak = false
+bool longSecondVolBreak  = false
+if is_short_squeeze_active
+    if shortCrossUnder
+        shortEma20Count += 1
+        if shortEma20Count == 2 and volume > volumeMA * ema20SecondVolMult
+            shortSecondVolBreak := true
+    if bullishFVG
+        shortFvgFloor := na(shortFvgFloor) ? high[2] : math.max(shortFvgFloor, high[2])
+        short_squeeze_start_idx := bar_index
+        shortEma20Count := 0
+else
+    shortEma20Count := 0
+if is_long_squeeze_active
+    if longCrossOver
+        longEma20Count += 1
+        if longEma20Count == 2 and volume > volumeMA * ema20SecondVolMult
+            longSecondVolBreak := true
+    if bearishFVG
+        longFvgFloor := na(longFvgFloor) ? low[2] : math.min(longFvgFloor, low[2])
+        long_squeeze_start_idx := bar_index
+        longEma20Count := 0
+else
+    longEma20Count := 0
+bool shortFvgBroken = enableSqueezeFail and is_short_squeeze_active and not na(shortFvgFloor) and close < shortFvgFloor
+bool longFvgBroken  = enableSqueezeFail and is_long_squeeze_active  and not na(longFvgFloor)  and close > longFvgFloor
+bool shortEma3Strike = enableSqueezeFail and is_short_squeeze_active and shortEma20Count >= 3
+bool longEma3Strike  = enableSqueezeFail and is_long_squeeze_active  and longEma20Count  >= 3
+bool shortEma2StrikeVol = enableSqueezeFail and is_short_squeeze_active and shortSecondVolBreak
+bool longEma2StrikeVol  = enableSqueezeFail and is_long_squeeze_active  and longSecondVolBreak
+bool short_timeout_failed = enableSqueezeFail and is_short_squeeze_active and not na(short_squeeze_start_idx) and (bar_index - short_squeeze_start_idx) > squeezeTimeoutBars
+bool long_timeout_failed  = enableSqueezeFail and is_long_squeeze_active  and not na(long_squeeze_start_idx)  and (bar_index - long_squeeze_start_idx)  > squeezeTimeoutBars
+bool is_short_passive_fail = (shortFvgBroken or shortEma3Strike or shortEma2StrikeVol or short_timeout_failed) and barstate.isconfirmed
+bool is_long_passive_fail  = (longFvgBroken  or longEma3Strike  or longEma2StrikeVol  or long_timeout_failed)  and barstate.isconfirmed
+
+// 狀態更新(單一寫入點)：快慢分工——慢(base)訊號只能從中立開倉，快(early FVG)訊號才能翻轉；同根失效不立刻重開
+//  雙觸發→+1(短優先)；抱倉遇反向early→翻轉；本邊結束/失效→0；否則續抱(不碰start_idx)
+int nextDir = squeezeDir
+if short_squeeze_trigger and long_squeeze_trigger
+    // A6修正：雙觸發只可能為 early+base 混觸（early雙向互斥於收紅/收綠；base雙向互斥於histFast正負），讓early(新鮮V反轉證據)優先於base(舊排列)
+    nextDir := early_short_trigger ? 1 : early_long_trigger ? -1 : 1
+else if squeezeDir == 1
+    if early_long_trigger
+        nextDir := -1
+    else if is_short_active_end or is_short_passive_fail
+        nextDir := 0
+else if squeezeDir == -1
+    if early_short_trigger
+        nextDir := 1
+    else if is_long_active_end or is_long_passive_fail
+        nextDir := 0
+else
+    if short_squeeze_trigger
+        nextDir := 1
+    else if long_squeeze_trigger
+        nextDir := -1
+
+if nextDir != squeezeDir
+    // 邊緣動作：兩邊追蹤全清(舊邊FVG地板/EMA計數作廢)，新邊重設start_idx
+    short_squeeze_start_idx := na
+    shortFvgFloor := na
+    shortEma20Count := 0
+    long_squeeze_start_idx := na
+    longFvgFloor := na
+    longEma20Count := 0
+    if nextDir == 1
+        short_squeeze_start_idx := bar_index
+    else if nextDir == -1
+        long_squeeze_start_idx := bar_index
+    squeezeDir := nextDir
+
+// 更新後新鮮狀態：start/線色/抑制/面板一律讀這組，消除一根滯後
+bool is_short_now = squeezeDir == 1
+bool is_long_now  = squeezeDir == -1
+
+bool short_squeeze_start = is_short_now and not (squeezeDir[1] == 1)
+bool long_squeeze_start  = is_long_now  and not (squeezeDir[1] == -1)
+
+bool show_squeeze_end_short = squeeze_end_short_condition and barstate.isconfirmed
+bool show_squeeze_end_long  = squeeze_end_long_condition  and barstate.isconfirmed
+bool show_momentum_end_short = showMomentumEndMarker and squeeze_end_short_momentum and barstate.isconfirmed
+bool show_momentum_end_long  = showMomentumEndMarker and squeeze_end_long_momentum  and barstate.isconfirmed
+bool show_short_failed = showFailMarker and is_short_passive_fail
+bool show_long_failed  = showFailMarker and is_long_passive_fail
+
+// V7: 嘎空/嘎多期間抑制白/黃三角假訊號（定義必須在擠壓狀態之後，避免前向引用）
+bool showWhiteTriangle = showWhiteTriangleRaw and not is_short_now and barstate.isconfirmed
+bool showYellowTriangle = showYellowTriangleRaw and not is_long_now and barstate.isconfirmed
+
+// === V6.8 雙重嘎空做空訊號 (純單週期高穩定度架構) ===
+var int shortSqueezeState = 0
+var int dssChangeIdx = na
+if is_short_passive_fail or long_squeeze_start
+    shortSqueezeState := 0
+else if shortSqueezeState > 0 and not na(dssChangeIdx) and (bar_index - dssChangeIdx) >= dssMaxGapBars
+    shortSqueezeState := 0
+else if shortSqueezeState == 0 and short_squeeze_start
+    shortSqueezeState := 1
+    dssChangeIdx := bar_index
+else if shortSqueezeState == 1 and is_short_active_end
+    shortSqueezeState := 2
+    dssChangeIdx := bar_index
+else if shortSqueezeState == 2 and short_squeeze_start
+    shortSqueezeState := 3
+    dssChangeIdx := bar_index
+
+bool is_macd_slope_negative = (macdLineFast < macdLineFast[1]) and (signalLineFast < signalLineFast[1])
+bool finalMTFShortSignal = (shortSqueezeState == 3) and deadCross and is_macd_slope_negative and not isNoTradeZone and barstate.isconfirmed
+
+if finalMTFShortSignal
+    shortSqueezeState := 0
+
+// === 基礎信號判定與冷卻 ===
+bool baseLong  = goldenCross and isVolatilityPass and not isNoTradeZone
+bool baseShort = deadCross  and isVolatilityPass and not isNoTradeZone
+
+bool slowTrendUp   = not useSlowTrendConfirm or (histSlow > 0 and slowTrendLine > slowTrendLine[1])
+bool slowTrendDown = not useSlowTrendConfirm or (histSlow < 0 and slowTrendLine < slowTrendLine[1])
+
+var int barsSinceLastSignal = 999
+bool okCooldown = barsSinceLastSignal >= minSignalCooldown
+
+bool finalLongSignal  = baseLong  and isVolumePass and slowTrendUp   and okCooldown and barstate.isconfirmed
+bool finalShortSignal = baseShort and isVolumePass and slowTrendDown and okCooldown and barstate.isconfirmed
+
+if finalLongSignal or finalShortSignal
+    barsSinceLastSignal := 0
+else
+    barsSinceLastSignal += 1
+
+// ============================== Ⅴ. 超跌/超漲 偵測 ==============================
+type HeapState
+    float prev_fast_extreme
+    float prev_slow_extreme
+    float curr_fast_extreme
+    float curr_slow_extreme
+    int   start_idx
+    bool  in_heap
+    box   active_box
+    label active_label
+
+f_analyze_heap(bool enable, bool is_bull_heap, float histFast, float histSlow, int min_bars,
+               float major_threshold, float minor_threshold,
+               color box_bg_color, color box_border_color, color box_text_color,
+               string box_text, bool ema_slope_up, float y_label) =>
+    var HeapState state = HeapState.new(na, na, na, na, na, false, na, na)
+    bool condition_met = false
+
+    if not enable
+        if not na(state.active_box)
+            box.delete(state.active_box)
+            state.active_box := na
+        if not na(state.active_label)
+            label.delete(state.active_label)
+            state.active_label := na
+        state.in_heap          := false
+        state.prev_fast_extreme := na
+        state.prev_slow_extreme := na
+    else
+        bool current_in_heap = is_bull_heap ? (histFast > 0) : (histFast < 0)
+        if current_in_heap
+            if not state.in_heap
+                state.in_heap := true
+                state.curr_fast_extreme := histFast
+                state.curr_slow_extreme := histSlow
+                state.start_idx := bar_index
+                state.active_box := na
+                state.active_label := na
+            else
+                if is_bull_heap
+                    state.curr_fast_extreme := math.max(state.curr_fast_extreme, histFast)
+                    state.curr_slow_extreme := math.max(state.curr_slow_extreme, histSlow)
+                else
+                    state.curr_fast_extreme := math.min(state.curr_fast_extreme, histFast)
+                    state.curr_slow_extreme := math.min(state.curr_slow_extreme, histSlow)
+        else
+            if state.in_heap
+                int heap_bars = bar_index - state.start_idx
+                if heap_bars >= min_bars
+                    state.prev_fast_extreme := state.curr_fast_extreme
+                    state.prev_slow_extreme := state.curr_slow_extreme
+                state.in_heap := false
+                if not na(state.active_box)
+                    box.delete(state.active_box)
+                    state.active_box := na
+                if not na(state.active_label)
+                    label.delete(state.active_label)
+                    state.active_label := na
+
+        if state.in_heap and not na(state.prev_fast_extreme)
+            int bars_in_heap = bar_index - state.start_idx + 1
+            bool cond_major     = is_bull_heap ? (state.prev_slow_extreme >= major_threshold) : (math.abs(state.prev_slow_extreme) >= major_threshold)
+            bool cond_min_bars  = bars_in_heap >= min_bars
+            bool cond_fast_limit = is_bull_heap ? (histFast <= minor_threshold) : (math.abs(histFast) <= minor_threshold)
+            bool cond_divergence = is_bull_heap ? (state.curr_fast_extreme < state.prev_fast_extreme) : (math.abs(state.curr_fast_extreme) < math.abs(state.prev_fast_extreme))
+            bool cond_no_dark   = is_bull_heap ? ((histSlow <= 0) or (histSlow <= histFast + heapDarkTolerance)) : ((histSlow >= 0) or (math.abs(histSlow) <= math.abs(histFast) + heapDarkTolerance))
+            bool cond_ema_slope = is_bull_heap ? ema_slope_up : not ema_slope_up
+
+            if cond_major and cond_min_bars and cond_fast_limit and cond_divergence and cond_no_dark and cond_ema_slope
+                condition_met := true
+                if na(state.active_box)
+                    if is_bull_heap
+                        state.active_box := box.new(left = state.start_idx, top = state.curr_fast_extreme, right = bar_index, bottom = 0,
+                                                     border_color = box_border_color, border_width = 2, border_style = line.style_solid,
+                                                     bgcolor = box_bg_color)
+                        state.active_label := label.new(x = math.floor((state.start_idx + bar_index) / 2), y = -y_label, text = box_text,
+                                                         color = color.new(color.white, 100), textcolor = box_text_color,
+                                                         style = label.style_none, size = size.normal)
+                    else
+                        state.active_box := box.new(left = state.start_idx, top = 0, right = bar_index, bottom = state.curr_fast_extreme,
+                                                     border_color = box_border_color, border_width = 2, border_style = line.style_solid,
+                                                     bgcolor = box_bg_color)
+                        state.active_label := label.new(x = math.floor((state.start_idx + bar_index) / 2), y = y_label, text = box_text,
+                                                         color = color.new(color.white, 100), textcolor = box_text_color,
+                                                         style = label.style_none, size = size.normal)
+                else
+                    box.set_right(state.active_box, bar_index)
+                    if is_bull_heap
+                        box.set_top(state.active_box, state.curr_fast_extreme)
+                    else
+                        box.set_bottom(state.active_box, state.curr_fast_extreme)
+                    label.set_x(state.active_label, math.floor((state.start_idx + bar_index) / 2))
+    [condition_met, state]
+
+bool ema20_rising = ema20 > ema20[1]
+
+float highest_abs_hist_for_label = ta.highest(math.abs(histFast), length = 50)
+float y_label_pos = highest_abs_hist_for_label * 1.5
+
+[is_oversold_condition, _] = f_analyze_heap(enableOversoldDetection, false, histFast, histSlow, minHeapBars,
+                                            majorDumpThreshold, oversoldThreshold,
+                                            oversoldBoxColor, color.white, color.white, "超跌反彈", ema20_rising, y_label_pos)
+
+[is_overbought_condition, _] = f_analyze_heap(enableOverboughtDetection, true, histFast, histSlow, minBullHeapBars,
+                                              majorPumpThreshold, overboughtThreshold,
+                                              overboughtBoxColor, color.yellow, color.yellow, "超漲回跌", ema20_rising, y_label_pos)
+
+// ============================== Ⅵ. 繪圖 ==============================
+var array<label> S_labels = array.new<label>()
+var array<label> L_labels = array.new<label>()
+var array<label> B_labels = array.new<label>()
+
+color fastBullColorVis   = color.new(#00FF00, 0)
+color fastBearColorVis   = color.new(#FF0000, 0)
+color slowBullColorVis   = color.new(#4CAF50, 70)
+color slowBearColorVis   = color.new(#F44336, 70)
+color atlasColor         = color.new(color.white, 85)
+color chopColor          = color.new(color.red, 85)
+color s_color            = color.new(color.blue, 0)
+color l_color            = color.new(color.red, 0)
+color b_color            = color.new(color.yellow, 0)
+color whiteWarningColor  = color.new(color.white, 0)
+color yellowWarningColor = color.new(color.yellow, 0)
+color _bgColor = is_oversold_condition ? color.new(color.white, 85) : is_overbought_condition ? color.new(color.yellow, 85) : showAtlasZone and isAtlasSqueeze ? atlasColor : showChopZone and isChoppy ? chopColor : na
+bgcolor(color = _bgColor, title = "背景(超跌/超漲/壓縮/低波動)")
+
+// MACD 快線動態顏色
+bool  isEma20Neg  = ema20 < ema20[1]
+bool  isDarkDashed = (macdLineFast < signalLineFast) and isEma20Neg
+color fastMColor   = (macdLineFast >= signalLineFast) ? color.lime : (isDarkDashed ? color.maroon : color.red)
+
+plot(series = showSlowMACD ? histSlow : na, title = "慢週期MACD柱狀圖", style = plot.style_columns, color = histSlow >= 0 ? slowBullColorVis : slowBearColorVis, linewidth = 2)
+plot(series = showSlowMACDLines ? macdLineSlow : na, title = "慢週期MACD線", color = slowBullColorVis, linewidth = 2)
+plot(series = showSlowMACDLines ? signalLineSlow : na, title = "慢週期信號線", color = slowSignalLineColor, linewidth = 2)
+plot(series = showFastMACD ? histFast : na, title = "快週期MACD柱狀圖", style = plot.style_columns, color = histFast >= 0 ? fastBullColorVis : fastBearColorVis, linewidth = 4)
+plot(series = showFastMACDLines ? macdLineFast : na, title = "快週期MACD線", color = fastMColor, linewidth = 2)
+plot(series = showFastMACDLines ? signalLineFast : na, title = "快週期信號線", color = fastSignalLineColor, linewidth = 2)
+hline(price = 0, title = "零線", color = color.gray, linestyle = hline.style_solid)
+
+float y_level_for_marker = highest_abs_hist_for_label * 1.2
+bool  s_zone = showAtlasZone and isAtlasSqueeze and not isChoppy
+bool  l_zone = showChopZone and isChoppy and not isAtlasSqueeze
+bool  b_zone = showAtlasZone and showChopZone and isAtlasSqueeze and isChoppy
+bool  showS_marker = s_zone and (bar_index == 0 or not s_zone[1])
+bool  showL_marker = l_zone and (bar_index == 0 or not l_zone[1])
+bool  showB_marker = b_zone and (bar_index == 0 or not b_zone[1])
+
+f_manage_labels(bool show, string txt, color col, array<label> arr, float y) =>
+    if show
+        label new_lbl = label.new(x = bar_index, y = y, text = txt, color = color.new(col, 100), textcolor = col, style = label.style_none, size = size.small)
+        array.push(arr, new_lbl)
+    if array.size(arr) > 0
+        if bar_index - label.get_x(array.get(arr, 0)) >= 100
+            label.delete(array.shift(arr))
+f_manage_labels(showS_marker, "S", s_color, S_labels, y_level_for_marker)
+f_manage_labels(showL_marker, "L", l_color, L_labels, y_level_for_marker)
+f_manage_labels(showB_marker, "B", b_color, B_labels, y_level_for_marker)
+
+// 交易信號
+plotshape(title = "做多信號", series = finalLongSignal, text = "BUY", style = shape.labelup, location = location.bottom, color = fastBullColorVis, textcolor = color.black, size = size.small)
+plotshape(title = "做空信號", series = finalShortSignal, text = "SELL", style = shape.labeldown, location = location.top, color = fastBearColorVis, textcolor = color.white, size = size.small)
+plotshape(title = "多頭動能減弱", series = showWhiteTriangle, style = shape.triangledown, location = location.top, color = whiteWarningColor, size = size.tiny)
+plotshape(title = "空頭動能減弱", series = showYellowTriangle, style = shape.triangleup, location = location.bottom, color = yellowWarningColor, size = size.tiny)
+
+// V6.9.1 吞噬確認最佳空點
+plotshape(title = "紅K吞噬動能衰減標註", series = engulfArmSignal ? histFast * 1.15 : na, style = shape.triangledown, location = location.absolute, color = color.new(color.orange, 0), size = size.tiny)
+plotshape(title = "吞噬確認最佳空點", series = bestShortSignal ? histFast * 1.5 : na, style = shape.arrowdown, location = location.absolute, color = bestShortColor, size = size.normal)
+
+// 雙重嘎空做空訊號標記
+plotshape(title = "雙重嘎空做空訊號", series = finalMTFShortSignal, text = "MTF SELL", style = shape.labeldown, location = location.top, color = color.new(#8E44AD, 0), textcolor = color.white, size = size.small)
+
+// 擠壓係數 - 單線連續：待機白 / 嘎空綠 / 嘎多紅（同根bar只一種顏色，避免雙線誤會） // TODO: ponytail debt — linewidth 需 input int，無法每根切粗細，改用固定 2 + 顏色區分
+color squeezeColor = is_short_now ? color.new(#00FF00, 0) : is_long_now ? color.new(#FF0000, 0) : color.new(color.white, 0)
+plot(series = showSqueezeFactor and enableSqueezeMonitor ? Factor : na, title = "擠壓係數", color = squeezeColor, linewidth = 2, style = plot.style_line)
+plot(series = showSqueezeFactor and enableSqueezeMonitor ? factorThreshold : na, title = "實際擠壓閾值", color = color.new(#27AE60, 50), linewidth = 1, style = plot.style_line)
+
+// 擠壓啟動信號
+plotshape(title = "嘎空啟動", series = showSqueezeShapes and short_squeeze_start ? -y_level_for_marker : na, text = "嘎空", style = shape.arrowup, location = location.absolute, color = squeezeLongColor, textcolor = squeezeLongColor, size = size.normal)
+plotshape(title = "嘎多啟動", series = showSqueezeShapes and long_squeeze_start ? y_level_for_marker : na, text = "嘎多", style = shape.arrowdown, location = location.absolute, color = squeezeShortColor, textcolor = squeezeShortColor, size = size.normal)
+
+// V7.2除錯：缺口新生(這根/上一根)bar印缺口點數+前兩根快慢柱值，對圖抓數不再用猜的 (關掉 showEarlyDebug 即零成本)
+if showEarlyDebug and (bullishFVG or bearishFVG or early_short_gap1 or early_long_gap1)
+    string gapTxt = "G=" + str.tostring(bullishFVG ? low - high[2] : bearishFVG ? low[2] - high : early_short_gap1 ? low[1] - high[3] : low[3] - high[1], "#.#")
+    string dbgTxt = gapTxt + " F1=" + str.tostring(histFast[1], "#.#") + " F2=" + str.tostring(histFast[2], "#.#") + " S1=" + str.tostring(histSlow[1], "#.#") + (early_short_trigger ? " ES✓" : "") + (early_long_trigger ? " EL✓" : "")
+    bool dbgBull = bullishFVG or (early_short_gap1 and not bearishFVG)
+    float dbgY = dbgBull ? -y_level_for_marker * 0.5 : y_level_for_marker * 0.5
+    label dbgLb = label.new(x = bar_index, y = dbgY, text = dbgTxt, color = color.new(color.white, 100), textcolor = early_short_trigger or early_long_trigger ? color.new(#00FF00, 0) : color.new(color.gray, 0), style = label.style_none, size = size.small)
+    f_push_label(dbgLb)
+
+// 短週期綠柱首次減少
+plotshape(title = "短週期綠柱首減", series = showFirstDecrease and is30m_chart and is30m_first_drop and barstate.isconfirmed ? y_level_for_marker * 1.5 : na, text = "可能-", style = shape.labeldown, location = location.absolute, color = color.new(#2196F3, 0), textcolor = color.white, size = size.normal)
+
+// 短週期紅柱首增（可能+）
+plotshape(title = "短週期紅柱首增", series = is30m_plus_signal ? -y_level_for_marker * 1.5 : na, text = "可能+", style = shape.labelup, location = location.absolute, color = color.new(#FF9800, 0), textcolor = color.white, size = size.normal)
+
+// V7.1：15分該漲不漲／該跌不跌
+plotshape(title = "15分該漲不漲", series = stallBearSignal ? histFast * 1.3 : na, style = shape.diamond, location = location.absolute, color = stallBearColor, size = size.tiny)
+plotshape(title = "15分該跌不跌", series = stallBullSignal ? histFast * 1.3 : na, style = shape.diamond, location = location.absolute, color = stallBullColor, size = size.tiny)
+
+// 擠壓結束信號 - 菱形標記 (A1高量) 已併入垂直線標記，此處移除以節省 plot count
+if showEndSignalMarker
+    if show_squeeze_end_short
+        line new_el = line.new(x1 = bar_index, y1 = 0, x2 = bar_index, y2 = 1, color = endSignalShortColor, style = line.style_dashed, width = 1, extend = extend.both)
+        f_push_line(new_el)
+    if show_squeeze_end_long
+        line new_el2 = line.new(x1 = bar_index, y1 = 0, x2 = bar_index, y2 = 1, color = endSignalLongColor, style = line.style_dashed, width = 1, extend = extend.both)
+        f_push_line(new_el2)
+
+// ===== V7：嘎空嘎多結束標記（A2動能衰竭） =====
+if show_momentum_end_short
+    label new_ml = label.new(x = bar_index, y = -y_level_for_marker, text = "嘎空結束", color = color.new(color.white, 100), textcolor = momentumEndShortColor, style = label.style_none, size = size.normal)
+    f_push_label(new_ml)
+if show_momentum_end_long
+    label new_ml2 = label.new(x = bar_index, y = y_level_for_marker, text = "嘎多結束", color = color.new(color.white, 100), textcolor = momentumEndLongColor, style = label.style_none, size = size.normal)
+    f_push_label(new_ml2)
+
+// ===== V7：失效標記 (B被動 - 灰色，以 label 文字標記呈現以節省 plot count) =====
+if show_short_failed
+    label new_fl = label.new(x = bar_index, y = -y_level_for_marker * 0.8, text = "失效", color = color.new(color.white, 100), textcolor = failShortColor, style = label.style_none, size = size.small)
+    f_push_label(new_fl)
+if show_long_failed
+    label new_fl2 = label.new(x = bar_index, y = y_level_for_marker * 0.8, text = "失效", color = color.new(color.white, 100), textcolor = failLongColor, style = label.style_none, size = size.small)
+    f_push_label(new_fl2)
+
+// ============================== Ⅶ. 警報 ==============================
+alertcondition(condition = finalLongSignal, title = "V6 策略做多", message = "策略多單進場")
+alertcondition(condition = finalShortSignal, title = "V6 策略做空", message = "策略空單進場")
+alertcondition(condition = finalMTFShortSignal, title = "雙重嘎空做空訊號 (MTF SELL)", message = "雙重嘎空空頭策略訊號觸發：符合雙重嘎空+死叉且快慢線皆為負斜率！")
+alertcondition(condition = short_squeeze_start, title = "擠壓監測-嘎空啟動", message = "嘎空狀態啟動！")
+alertcondition(condition = long_squeeze_start, title = "擠壓監測-嘎多啟動", message = "嘎多狀態啟動！")
+alertcondition(condition = show_squeeze_end_short, title = "擠壓監測-嘎空結束", message = "嘎空結束信號：高量 Pivot High + MA10 跌破確認！")
+alertcondition(condition = show_squeeze_end_long, title = "擠壓監測-嘎多結束", message = "嘎多結束信號：高量 Pivot Low + MA10 突破確認！")
+alertcondition(condition = is_oversold_condition and not is_oversold_condition[1] and barstate.isconfirmed, title = "MACD-超跌反彈(嘎空預警)", message = "超跌反彈預警：紅柱動能減弱 + 無暗紅柱 + 鮮紅柱絕對值小於閾值！")
+alertcondition(condition = is_overbought_condition and not is_overbought_condition[1] and barstate.isconfirmed, title = "MACD-超漲回跌(殺多預警)", message = "超漲回跌預警：綠柱動能減弱 + 無暗綠柱 + 鮮綠柱小於閾值！")
+alertcondition(condition = showFirstDecrease and is30m_chart and is30m_first_drop and barstate.isconfirmed, title = "短週期綠柱首減", message = "短週期MACD綠柱由增轉減，短期可能回檔！")
+alertcondition(condition = is30m_plus_signal, title = "短週期紅柱首增(可能+)", message = "短週期MACD紅柱由減轉增，短期可能反彈！")
+alertcondition(condition = stallBearSignal, title = "15分該漲不漲", message = "15分鐘短週期MACD綠柱在弱動能區達設定持續根數且無法擴大，留意後續回跌！")
+alertcondition(condition = stallBullSignal, title = "15分該跌不跌", message = "15分鐘短週期MACD紅柱在弱動能區達設定持續根數且無法擴大，留意後續嘎空上漲！")
+alertcondition(condition = squeeze_end_short_momentum and barstate.isconfirmed, title = "嘎空結束(動能)", message = "嘎空結束：連2縮腰斬或跨零，並通過慢柱同向強度與MA10確認！")
+alertcondition(condition = squeeze_end_long_momentum and barstate.isconfirmed, title = "嘎多結束(動能)", message = "嘎多結束：連2縮腰斬或跨零，並通過慢柱同向強度與MA10確認！")
+alertcondition(condition = is_short_passive_fail, title = "嘎空失效(被動)", message = "嘎空失效：FVG地板破/EMA20三振/超時")
+alertcondition(condition = is_long_passive_fail, title = "嘎多失效(被動)", message = "嘎多失效：FVG地板破/EMA20三振/超時")
+alertcondition(condition = bullishFVG and is_short_squeeze_active and nz(shortFvgFloor) != nz(shortFvgFloor[1]) and barstate.isconfirmed, title = "嘎空-FVG續命", message = "嘎空續命：純結構向上缺口，地板上墊，計時歸零")
+alertcondition(condition = bearishFVG and is_long_squeeze_active and nz(longFvgFloor) != nz(longFvgFloor[1]) and barstate.isconfirmed, title = "嘎多-FVG續命", message = "嘎多續命：純結構向下缺口，失效界線下移，計時歸零")
+alertcondition(condition = showWhiteTriangle, title = "白三角(動能衰減-已過濾)", message = "快週期多頭動能衰減，已通過價格與市場狀態過濾，且目前不在嘎空狀態")
+alertcondition(condition = showYellowTriangle, title = "黃三角(動能衰減-已過濾)", message = "快週期空頭動能衰減，已通過價格與市場狀態過濾，且目前不在嘎多狀態")
+
+// ============================== Ⅷ. 資訊面板 ==============================
+var table infoTable = table.new(position = position.top_right, columns = 3, rows = 7, border_width = 1)
+f_fillCell(table tbl, int col, int row, string txt, color bgColor, color txtColor) =>
+    table.cell(table_id = tbl, column = col, row = row, text = txt, bgcolor = bgColor, text_color = txtColor, text_size = size.small)
+
+if showInfoPanel and barstate.islast
+    color c_title = color.new(#2980B9, 10)
+    color c_head  = color.new(#34495E, 10)
+    color c_red   = color.new(#E74C3C, 20)
+    color c_grey  = color.new(#7F8C8D, 20)
+    color c_blue  = color.new(#3498DB, 20)
+    color c_white = color.white
+    color c_black = color.black
+    color c_yellow = color.new(#F1C40F, 20)
+
+    string statusText = "─ 監控中"
+    color  statusBgColor = c_grey
+    color  statusTextColor = c_white
+    if isAtlasSqueeze and isChoppy
+        statusText    := "B: 禁止交易"
+        statusBgColor := c_yellow
+        statusTextColor := c_black
+    else if isAtlasSqueeze
+        statusText    := "S: 壓縮中"
+        statusBgColor := c_white
+        statusTextColor := c_black
+    else if isChoppy
+        statusText    := "L: 低波動"
+        statusBgColor := c_red
+        statusTextColor := c_black
+
+    f_fillCell(infoTable, 0, 0, "MACD Pro+ V7.0", c_title, c_white)
+    f_fillCell(infoTable, 1, 0, symbolType, c_head, c_white)
+    f_fillCell(infoTable, 2, 0, statusText, statusBgColor, statusTextColor)
+    
+    string squeezePanelText = "─ 待機"
+    color  squeezePanelBg = c_grey
+    color  squeezePanelTextColor = c_white
+    if is_short_now
+        squeezePanelText := "🔥 持續嘎空"
+        squeezePanelBg := color.new(#00FF00, 0)
+        squeezePanelTextColor := c_black
+    else if is_long_now
+        squeezePanelText := "🔴 持續嘎多"
+        squeezePanelBg := color.new(#FF0000, 0)
+        squeezePanelTextColor := c_black
+    else if is_short_passive_fail
+        squeezePanelText := "⚠ 嘎空失效"
+        squeezePanelBg := color.new(color.gray, 0)
+        squeezePanelTextColor := c_white
+    else if is_long_passive_fail
+        squeezePanelText := "⚠ 嘎多失效"
+        squeezePanelBg := color.new(color.gray, 0)
+        squeezePanelTextColor := c_white
+
+    f_fillCell(infoTable, 0, 1, "擠壓狀態", c_head, c_white)
+    f_fillCell(infoTable, 1, 1, enableSqueezeMonitor ? "啟用" : "停用", c_blue, c_white)
+    f_fillCell(infoTable, 2, 1, squeezePanelText, squeezePanelBg, squeezePanelTextColor)
+    
+    color factorColor = is_short_now ? color.new(#00FF00, 0) : is_long_now ? color.new(#FF0000, 0) : c_grey
+    color factorTextColor = is_short_now or is_long_now ? c_black : c_white
+    f_fillCell(infoTable, 0, 2, "擠壓係數", c_head, c_white)
+    f_fillCell(infoTable, 1, 2, str.tostring(Factor, "#.##"), factorColor, factorTextColor)
+    f_fillCell(infoTable, 2, 2, str.tostring(factorThreshold, "#.##"), c_grey, c_white)
+    
+    string endSignalStatus = "無擠壓"
+    color  endSignalBg = c_grey
+    color  endSignalTextColor = c_white
+    if is_short_now or is_long_now
+        endSignalStatus := "擠壓進行中"
+        endSignalBg := c_blue
+    if show_squeeze_end_short
+        endSignalStatus := "高量:嘎空結束!"
+        endSignalBg     := endSignalShortColor
+        endSignalTextColor := c_black
+    else if show_squeeze_end_long
+        endSignalStatus := "高量:嘎多結束!"
+        endSignalBg     := endSignalLongColor
+        endSignalTextColor := c_black
+    else if cur_vol_ratio >= endSignal_volFilter and (is_short_now or is_long_now)
+        endSignalStatus := "爆量中"
+        endSignalBg     := c_yellow
+        endSignalTextColor := c_black
+    
+    f_fillCell(infoTable, 0, 3, "結束信號(高量)", c_head, c_white)
+    f_fillCell(infoTable, 1, 3, enableSqueezeEndSignal ? "啟用" : "停用", c_blue, c_white)
+    f_fillCell(infoTable, 2, 3, endSignalStatus, endSignalBg, endSignalTextColor)
+    
+    f_fillCell(infoTable, 0, 4, "當根量/MA20", c_head, c_white)
+    f_fillCell(infoTable, 1, 4, str.tostring(cur_vol_ratio, "#.##"), cur_vol_ratio >= volumeThreshold ? c_yellow : c_grey, c_white)
+    f_fillCell(infoTable, 2, 4, "閾值:" + str.tostring(volumeThreshold, "#.#"), c_grey, c_white)
+    
+    string momentumEndStatus = "無擠壓"
+    color  momentumEndBg = c_grey
+    color  momentumEndTextColor = c_white
+    if is_short_now
+        momentumEndStatus := "嘎空進行中"
+        momentumEndBg := color.new(#00FF00, 0)
+        momentumEndTextColor := c_black
+    else if is_long_now
+        momentumEndStatus := "嘎多進行中"
+        momentumEndBg := color.new(#FF0000, 0)
+        momentumEndTextColor := c_black
+    if squeeze_end_short_momentum
+        momentumEndStatus := "動能:嘎空結束!"
+        momentumEndBg     := momentumEndShortColor
+        momentumEndTextColor := c_black
+    else if squeeze_end_long_momentum
+        momentumEndStatus := "動能:嘎多結束!"
+        momentumEndBg     := momentumEndLongColor
+        momentumEndTextColor := c_black
+    
+    f_fillCell(infoTable, 0, 5, "動能結束", c_head, c_white)
+    f_fillCell(infoTable, 1, 5, enableMomentumEndSignal ? "啟用" : "停用", c_blue, c_white)
+    f_fillCell(infoTable, 2, 5, momentumEndStatus, momentumEndBg, momentumEndTextColor)
+    
+    f_fillCell(infoTable, 0, 6, "高量結束=綠菱/紅菱 · 動能結束=綠字/紅字", color.new(#7F8C8D, 20), c_white)
+    table.merge_cells(infoTable, 1, 6, 2, 6)
+    f_fillCell(infoTable, 1, 6, "失效=灰X · 啟動=綠↑/紅↓", color.new(#34495E, 20), c_white)

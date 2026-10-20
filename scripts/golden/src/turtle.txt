@@ -1,0 +1,55 @@
+//@version=6
+strategy("Turtle System", overlay=true, initial_capital=100000)
+
+// --- 參數設定 ---
+n_entry = input.int(55, "進場週期 (System 2)")
+e_exit  = input.int(10, "出場週期 (MA 10)")
+atr_len = input.int(20, "ATR 週期 (N)")
+risk_per_trade = input.float(1.0, "每筆交易風險 %") / 100
+
+// --- 指標計算 ---
+atr = ta.rma(ta.tr(false), atr_len)
+
+hi_entry = ta.highest(high, n_entry)[1]
+lo_entry = ta.lowest(low, n_entry)[1]
+hi_exit  = ta.highest(high, e_exit)[1]
+lo_exit  = ta.lowest(low, e_exit)[1]
+
+// --- 狀態變數 ---
+var float entry_price = 0.0
+var float unit        = 0.0
+
+// 重置
+if strategy.position_size == 0
+    entry_price := 0.0
+    unit        := 0.0
+
+// 計算單位
+if strategy.position_size == 0
+    unit := math.max(1, math.round((strategy.equity * risk_per_trade) / (2 * atr)))
+
+// --- 進場 ---
+if strategy.position_size == 0
+    if close > hi_entry
+        entry_price := close
+        strategy.entry("Long", strategy.long, qty=unit)
+
+    if close < lo_entry
+        entry_price := close
+        strategy.entry("Short", strategy.short, qty=unit)
+
+// --- 出場 ---
+float long_stop  = entry_price - (2 * atr)
+float short_stop = entry_price + (2 * atr)
+
+if strategy.position_size > 0 and (low < lo_exit or low < long_stop)
+    strategy.close_all(comment="Exit Long")
+
+if strategy.position_size < 0 and (high > hi_exit or high > short_stop)
+    strategy.close_all(comment="Exit Short")
+
+// --- 繪圖 ---
+plot(hi_entry, color=color.new(color.lime, 50), title="Long Entry")
+plot(lo_entry, color=color.new(color.red, 50), title="Short Entry")
+plot(strategy.position_size > 0 ? lo_exit : na, color=color.orange, style=plot.style_line, title="Long Exit Line")
+plot(strategy.position_size < 0 ? hi_exit : na, color=color.orange, style=plot.style_line, title="Short Exit Line")

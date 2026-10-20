@@ -1,0 +1,233 @@
+//@version=6
+// @description TD Sequential (Setup 9 / Countdown 13) + Bollinger Bands Pro
+// @author Antigravity
+indicator(title="TD Setup & Bollinger Bands Pro", shorttitle="TD+BB Pro v2.3", overlay=true, max_bars_back=500, max_lines_count=500)
+
+// ==========================================
+// 1. 布林通道 (Bollinger Bands)
+// ==========================================
+string grp_bb   = "布林通道設定"
+float  bb_src   = input.source(defval=close, title="數據源", group=grp_bb)
+int    bb_len   = input.int(defval=20, title="長度", minval=1, group=grp_bb)
+float  bb_mult  = input.float(defval=2.5, title="標準差倍數", minval=0.001, maxval=50.0, group=grp_bb)
+
+[bb_basis, bb_upper, bb_lower] = ta.bb(series=bb_src, length=bb_len, mult=bb_mult)
+
+p_upper = plot(series=bb_upper, title="Upper", color=color.new(#F23645, 20))
+p_lower = plot(series=bb_lower, title="Lower", color=color.new(#089981, 20))
+fill(plot1=p_upper, plot2=p_lower, color=color.new(#2196F3, 85), title="BB Fill")
+
+bool is_basis_up   = not na(bb_basis) and not na(bb_basis[1]) and bb_basis > bb_basis[1]
+bool is_basis_down = not na(bb_basis) and not na(bb_basis[1]) and bb_basis < bb_basis[1]
+color bb_dir       = is_basis_up ? color.blue : (is_basis_down ? color.red : color.gray)
+plot(series=bb_basis, title="Basis", color=bb_dir, linewidth=2)
+
+// ==========================================
+// 1.5 MA 斜率過濾 (MA5 / MA10 / MA20)
+// ==========================================
+string grp_ma    = "MA 斜率過濾設定"
+bool   ma_filter = input.bool(defval=true, title="MA5/10/20 斜率過濾 (全負抑制Buy / 全正抑制Sell)", group=grp_ma)
+string ma_type   = input.string(defval="SMA", title="均線類型", options=["SMA", "EMA"], group=grp_ma)
+
+calc_ma(float src, int len) =>
+    ma_type == "SMA" ? ta.sma(src, len) : ta.ema(src, len)
+
+float ma5  = calc_ma(close, 5)
+float ma10 = calc_ma(close, 10)
+float ma20 = calc_ma(close, 20)
+
+plot(series=ma5,  title="MA5",  color=color.new(color.orange, 40), linewidth=1)
+plot(series=ma10, title="MA10", color=color.new(color.teal, 40),    linewidth=1)
+plot(series=ma20, title="MA20", color=color.new(color.fuchsia, 40), linewidth=1)
+
+// SMA 斜率 = 本根 SMA − 前一根 SMA（< 0 = 負斜率 / > 0 = 正斜率）
+float ma5_slope  = ma5  - ma5[1]
+float ma10_slope = ma10 - ma10[1]
+float ma20_slope = ma20 - ma20[1]
+
+bool ma5_down  = not na(ma5_slope)  and ma5_slope  < 0
+bool ma10_down = not na(ma10_slope) and ma10_slope < 0
+bool ma20_down = not na(ma20_slope) and ma20_slope < 0
+
+bool ma5_up  = not na(ma5_slope)  and ma5_slope  > 0
+bool ma10_up = not na(ma10_slope) and ma10_slope > 0
+bool ma20_up = not na(ma20_slope) and ma20_slope > 0
+
+bool ma_all_down = ma5_down and ma10_down and ma20_down
+bool ma_all_up   = ma5_up   and ma10_up   and ma20_up
+
+// 統一的 MA 買賣許可（所有 Buy/Sell 訊號共用）
+bool ma_buy_allowed  = not (ma_filter and ma_all_down)
+bool ma_sell_allowed = not (ma_filter and ma_all_up)
+
+// 診斷：三線全負斜率背景微紅、全正微綠
+bgcolor(color=ma_all_down ? color.new(color.red, 88) : ma_all_up ? color.new(color.green, 88) : na, title="MA 斜率過濾背景診斷")
+
+// ==========================================
+// 2. TD Setup 狀態機 (9 轉)
+// ==========================================
+string grp_td        = "TD 序列設定"
+int    td_max        = input.int(defval=20, title="TD 計數上限", minval=9, maxval=100, group=grp_td)
+bool   show_cd       = input.bool(defval=true, title="顯示 Countdown 13", group=grp_td)
+bool   show_risk_lvl = input.bool(defval=true, title="顯示風控止損線", group=grp_td)
+string filter_mode   = input.string(defval="標註共振", title="布林過濾模式",
+                         options=["全顯示", "僅共振", "標註共振", "順勢回踩"], group=grp_td)
+
+// DeMark 定義：
+//   Sell Setup = 連漲 9 根 (close > close[4]) → 多頭力竭，看跌
+//   Buy  Setup = 連跌 9 根 (close < close[4]) → 空頭力竭，看漲
+bool is_sell_setup_bar = not na(close) and not na(close[4]) and close > close[4]
+bool is_buy_setup_bar  = not na(close) and not na(close[4]) and close < close[4]
+
+var int  sell_setup_cnt   = 0
+var int  buy_setup_cnt    = 0
+var bool sell_perf_locked = false
+var bool buy_perf_locked  = false
+
+if is_sell_setup_bar
+    sell_setup_cnt   := math.min(sell_setup_cnt + 1, td_max)
+    buy_setup_cnt    := 0
+    buy_perf_locked  := false
+    // Perfection：第 8 或第 9 根 high ≥ 第 6、7 根 high（第 9 根一次性鎖定）
+    if sell_setup_cnt == 9 and not na(high[3]) and not na(high[1])
+        sell_perf_locked := (high[0] >= high[3] and high[0] >= high[2]) or (high[1] >= high[3] and high[1] >= high[2])
+else if is_buy_setup_bar
+    buy_setup_cnt    := math.min(buy_setup_cnt + 1, td_max)
+    sell_setup_cnt   := 0
+    sell_perf_locked := false
+    if buy_setup_cnt == 9 and not na(low[3]) and not na(low[1])
+        buy_perf_locked := (low[0] <= low[3] and low[0] <= low[2]) or (low[1] <= low[3] and low[1] <= low[2])
+else
+    sell_setup_cnt   := 0
+    buy_setup_cnt    := 0
+    sell_perf_locked := false
+    buy_perf_locked  := false
+
+// ==========================================
+// 3. TD Countdown 13（獨立、非連續狀態機）
+// ==========================================
+var bool sell_cd_active = false
+var int  sell_cd_count  = 0
+var bool buy_cd_active  = false
+var int  buy_cd_count   = 0
+
+bool sell_setup_9 = sell_setup_cnt == 9
+bool buy_setup_9  = buy_setup_cnt  == 9
+
+if sell_setup_9
+    sell_cd_active := true
+    sell_cd_count  := 0
+    buy_cd_active  := false
+    buy_cd_count   := 0
+
+if buy_setup_9
+    buy_cd_active  := true
+    buy_cd_count   := 0
+    sell_cd_active := false
+    sell_cd_count  := 0
+
+bool sell_cd_done = false
+bool buy_cd_done  = false
+
+// Sell Countdown：close >= high[2]（續創高）非連續累計到 13
+if sell_cd_active and not sell_setup_9 and not na(high[2]) and close >= high[2]
+    sell_cd_count += 1
+    if sell_cd_count == 13
+        sell_cd_done   := true
+        sell_cd_active := false
+
+// Buy Countdown：close <= low[2]（續創低）非連續累計到 13
+if buy_cd_active and not buy_setup_9 and not na(low[2]) and close <= low[2]
+    buy_cd_count += 1
+    if buy_cd_count == 13
+        buy_cd_done   := true
+        buy_cd_active := false
+
+// ==========================================
+// 4. 布林通道共振過濾 (BB Confluence)
+// ==========================================
+bool sell_bb_touch = not na(bb_upper) and (high >= bb_upper or close >= bb_upper)
+bool buy_bb_touch  = not na(bb_lower) and (low  <= bb_lower or close <= bb_lower)
+
+bool is_trend_up   = not na(bb_basis) and is_basis_up   and close > bb_basis
+bool is_trend_down = not na(bb_basis) and is_basis_down and close < bb_basis
+
+// 基礎門控：先通過 MA 斜率過濾，再依 filter_mode 疊加 BB 條件
+bool sell_pass = ma_sell_allowed
+bool buy_pass  = ma_buy_allowed
+
+if filter_mode == "僅共振"
+    sell_pass := sell_pass and sell_bb_touch
+    buy_pass  := buy_pass  and buy_bb_touch
+else if filter_mode == "順勢回踩"
+    sell_pass := sell_pass and is_trend_down
+    buy_pass  := buy_pass  and is_trend_up
+
+// ==========================================
+// 5. TD 止損風控線 (Risk Line)
+// ==========================================
+var float sell_risk_lvl = na
+var float buy_risk_lvl  = na
+
+float hi9 = ta.highest(high, 9)
+float lo9 = ta.lowest(low, 9)
+
+if sell_setup_9
+    sell_risk_lvl := hi9 + ta.tr
+if buy_setup_9
+    buy_risk_lvl  := lo9 - ta.tr
+
+plot(series=show_risk_lvl ? sell_risk_lvl : na, title="Sell Risk Line", color=color.new(color.red, 30), style=plot.style_circles)
+plot(series=show_risk_lvl ? buy_risk_lvl  : na, title="Buy Risk Line",  color=color.new(color.green, 30), style=plot.style_circles)
+
+// ==========================================
+// 6. 繪圖 (Shapes)
+// ==========================================
+
+// --- Sell Setup (看跌, 上方紅色) ---
+bool show_sell_9      = sell_setup_9 and sell_pass and not sell_perf_locked
+bool show_sell_9_perf = sell_setup_9 and sell_pass and sell_perf_locked
+plotshape(series=show_sell_9,      title="Sell 9",  style=shape.triangledown, location=location.abovebar, color=color.red, textcolor=color.red, text="9",  size=size.tiny)
+plotshape(series=show_sell_9_perf, title="Sell 9+", style=shape.triangledown, location=location.abovebar, color=color.red, textcolor=color.red, text="9+", size=size.tiny)
+plotshape(series=sell_setup_cnt == 13 and sell_pass, title="Sell 13", style=shape.triangledown, location=location.abovebar, color=color.red, textcolor=color.red, text="13", size=size.tiny)
+plotshape(series=sell_setup_cnt == 15 and sell_pass, title="Sell 15", style=shape.triangledown, location=location.abovebar, color=color.red, textcolor=color.red, text="15", size=size.tiny)
+plotshape(series=sell_setup_cnt == td_max and sell_pass, title="Sell Max", style=shape.triangledown, location=location.abovebar, color=color.red, textcolor=color.red, text="●", size=size.tiny)
+
+// --- Buy Setup (看漲, 下方綠色) ---
+bool show_buy_9      = buy_setup_9 and buy_pass and not buy_perf_locked
+bool show_buy_9_perf = buy_setup_9 and buy_pass and buy_perf_locked
+plotshape(series=show_buy_9,      title="Buy 9",  style=shape.triangleup, location=location.belowbar, color=color.green, textcolor=color.green, text="9",  size=size.tiny)
+plotshape(series=show_buy_9_perf, title="Buy 9+", style=shape.triangleup, location=location.belowbar, color=color.green, textcolor=color.green, text="9+", size=size.tiny)
+plotshape(series=buy_setup_cnt == 13 and buy_pass, title="Buy 13", style=shape.triangleup, location=location.belowbar, color=color.green, textcolor=color.green, text="13", size=size.tiny)
+plotshape(series=buy_setup_cnt == 15 and buy_pass, title="Buy 15", style=shape.triangleup, location=location.belowbar, color=color.green, textcolor=color.green, text="15", size=size.tiny)
+plotshape(series=buy_setup_cnt == td_max and buy_pass, title="Buy Max", style=shape.triangleup, location=location.belowbar, color=color.green, textcolor=color.green, text="●", size=size.tiny)
+
+// --- BB 共振標記 (★) ---
+plotchar(series=filter_mode == "標註共振" and sell_setup_9 and sell_bb_touch and ma_sell_allowed, title="Sell 9 + BB Upper", char="★", location=location.abovebar, color=color.yellow, size=size.small)
+plotchar(series=filter_mode == "標註共振" and buy_setup_9  and buy_bb_touch  and ma_buy_allowed,  title="Buy 9 + BB Lower",  char="★", location=location.belowbar, color=color.yellow, size=size.small)
+
+// --- CD13 完成 ---
+bool show_sell_cd13 = show_cd and sell_cd_done and ma_sell_allowed
+bool show_buy_cd13  = show_cd and buy_cd_done  and ma_buy_allowed
+
+plotchar(series=show_sell_cd13, title="Sell CD13", char="★", location=location.abovebar, color=color.red, size=size.small)
+plotchar(series=show_buy_cd13,  title="Buy CD13",  char="★", location=location.belowbar, color=color.green, size=size.small)
+
+// 綠色星垂直虛線（對應 K 棒下緣）
+if show_buy_cd13
+    line.new(x1=bar_index, y1=low, x2=bar_index, y2=low - (high - low), color=color.white, style=line.style_dotted, width=1)
+
+// --- K 線著色 ---
+barcolor(color=sell_setup_cnt >= 9 and ma_sell_allowed ? color.new(color.red, 60) : buy_setup_cnt >= 9 and ma_buy_allowed ? color.new(color.green, 60) : na)
+
+// ==========================================
+// 7. 警報 (Alerts)
+// ==========================================
+alertcondition(condition=buy_setup_9 and buy_pass,  title="TD Buy Setup 9 觸發",  message="[TD 9] {{ticker}} 觸發 TD Buy Setup 9，空頭力竭看漲！價格 {{close}}")
+alertcondition(condition=sell_setup_9 and sell_pass, title="TD Sell Setup 9 觸發", message="[TD 9] {{ticker}} 觸發 TD Sell Setup 9，多頭力竭看跌！價格 {{close}}")
+alertcondition(condition=buy_setup_9 and buy_perf_locked and buy_pass,   title="TD Perfect Buy 9+",  message="[TD 9+] {{ticker}} 完美 Buy 9+！價格 {{close}}")
+alertcondition(condition=sell_setup_9 and sell_perf_locked and sell_pass, title="TD Perfect Sell 9+", message="[TD 9+] {{ticker}} 完美 Sell 9+！價格 {{close}}")
+alertcondition(condition=show_buy_cd13,  title="TD Buy Countdown 13 完成",  message="[TD CD13] {{ticker}} Buy Countdown 13 完成！")
+alertcondition(condition=show_sell_cd13, title="TD Sell Countdown 13 完成", message="[TD CD13] {{ticker}} Sell Countdown 13 完成！")
+alertcondition(condition=buy_setup_9 and buy_bb_touch and ma_buy_allowed,   title="TD Buy 9 + BB 下軌共振",  message="[TD+BB] {{ticker}} Buy 9 觸及布林下軌，高勝率反彈！價格 {{close}}")
+alertcondition(condition=sell_setup_9 and sell_bb_touch and ma_sell_allowed, title="TD Sell 9 + BB 上軌共振", message="[TD+BB] {{ticker}} Sell 9 觸及布林上軌，高勝率回調！價格 {{close}}")

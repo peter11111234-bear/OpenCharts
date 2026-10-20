@@ -1,0 +1,1773 @@
+//@version=6
+indicator("見高KV4.54", overlay = true, max_bars_back = 5000, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ==========================================================================
+// [AI Ledger] Pine Script v6: NO getter functions exist (label.get_style, etc.)
+// Must use LabelData UDT to track state. Never use non-existent getters.
+// ==========================================================================
+
+// ==========================================
+// 1. 見高K 參數設定 (Inputs)
+// ==========================================
+string group_zz  = "ZigZag 與 標籤"
+float devPerc     = input.float(50,  "ZigZag 轉折門檻 (% ATR)", step = 5, group = group_zz, tooltip = "以 ATR 的百分比為門檻，避免價格波動造成不對稱轉折")
+bool showZigZag   = input.bool(true,  "顯示波浪折線", group = group_zz)
+color zzColor     = input.color(color.white, "波浪折線顏色", group = group_zz)
+int zzWidth       = input.int(1, "波浪折線寬度", minval=1, maxval=5, group = group_zz)
+string zzStyleStr = input.string("Dotted", "波浪折線樣式", options=["Solid", "Dotted", "Dashed"], group = group_zz)
+string zzStyle    = zzStyleStr == "Solid" ? line.style_solid : zzStyleStr == "Dotted" ? line.style_dotted : line.style_dashed
+bool showLiveLine = input.bool(true,  "顯示最新走勢(虛線)", group = group_zz)
+float offset_mult = input.float(1.5,  "N字標籤偏移倍數", step = 0.1, group = group_zz)
+color nBullColor  = input.color(color.new(color.orange, 20), "正N 背景", group = group_zz)
+color nBearColor  = input.color(color.new(color.purple, 20), "倒N 背景", group = group_zz)
+bool showTable    = input.bool(true,  "顯示右上強弱表", group = group_zz)
+
+string group_limit = "數量設定"
+int kHighLimit    = input.int(5, "見高K 數目", group = group_limit, minval = 1)
+int kLowLimit     = input.int(5, "落底K 數目", group = group_limit, minval = 1)
+int bullNLimit    = input.int(5, "正N 最大數目", group = group_limit, minval = 1)
+int bearNLimit    = input.int(5, "倒N 最大數目", group = group_limit, minval = 1)
+
+// ==========================================
+// 2. Market Structure (SMC) 參數設定
+// ==========================================
+int   ms_len        = input.int(15, 'CHoCH Detection Period', minval = 1, group = "=== Market Structure (SMC) ===")
+int   ms_shortLen   = input.int(3, 'IDM Detection Period', minval = 1, group = "=== Market Structure (SMC) ===")
+
+bool  ms_showFvg    = input.bool(true, "Show FVG", group = "=== Market Structure (SMC) ===")
+int   ms_fvgLength  = input.int(5, "FVG Fixed Length (Bars)", minval = 1, group = "=== Market Structure (SMC) ===")
+
+bool  ms_filterTrend  = input.bool(false, "Filter by Trend Only", group = "=== Market Structure (SMC) ===", tooltip = "開啟後：只顯示順勢 FVG")
+bool  ms_useAtrFilter = input.bool(false, "Use ATR to Filter Noise", group = "=== Market Structure (SMC) ===", tooltip = "開啟後：過濾掉太小的 FVG")
+float ms_atrMult      = input.float(0.5, "ATR Threshold Multiplier", step = 0.1, group = "=== Market Structure (SMC) ===")
+
+color ms_fvgBullCss = input.color(color.new(#2962ff, 50), "Bullish FVG", group = "=== Market Structure (SMC) ===") 
+color ms_fvgBearCss = input.color(color.new(#f50057, 50), "Bearish FVG", group = "=== Market Structure (SMC) ===")
+
+bool  ms_showOb     = input.bool(true, "Show Order Blocks", group = "=== Market Structure (SMC) ===")
+color ms_obBullCss  = input.color(color.new(color.green, 40), "Bullish OB", group = "=== Market Structure (SMC) ===")
+color ms_obBearCss  = input.color(color.new(color.red, 40), "Bearish OB", group = "=== Market Structure (SMC) ===")
+
+color ms_bullCss    = input.color(#089981, 'Bullish Structure', group = "=== Market Structure (SMC) ===")
+color ms_bearCss    = input.color(#ff5252, 'Bearish Structure', group = "=== Market Structure (SMC) ===")
+bool  ms_showChoch  = input.bool(true, "Show CHoCH", group = "=== Market Structure (SMC) ===")
+bool  ms_showBos    = input.bool(true, "Show BOS", group = "=== Market Structure (SMC) ===")
+bool  ms_showIdm    = input.bool(true, "Show Inducements", inline = 'ms_idm', group = "=== Market Structure (SMC) ===")
+color ms_idmCss     = input.color(color.gray, "", inline = 'ms_idm', group = "=== Market Structure (SMC) ===")
+bool  ms_showSweeps = input.bool(true, "Show Sweeps", inline = 'ms_sweeps', group = "=== Market Structure (SMC) ===")
+color ms_sweepsCss  = input.color(color.gray, "", inline = 'ms_sweeps', group = "=== Market Structure (SMC) ===")
+bool  ms_showCircles= input.bool(true, "Show Swings", group = "=== Market Structure (SMC) ===")
+
+// ==========================================
+// 3. TradingABC 參數設定
+// ==========================================
+int tab_prd       = input.int(8, "ZigZag Period", minval = 2, maxval = 50, group = "=== TradingABC ===")
+float tab_fiboup    = input.float(0.618, "Fibonacci Max", group = "=== TradingABC ===")
+float tab_fibodn    = input.float(0.382, "Fibonacci Min", group = "=== TradingABC ===")
+float tab_errorrate = input.float(5.0, "Error Rate", minval = 0, maxval = 30, group = "=== TradingABC ===") / 100
+bool tab_showabc   = input.bool(true, "Show ABC", group = "=== TradingABC ===")
+bool tab_keepabc   = input.bool(true, "Keep Old ABCs", group = "=== TradingABC ===")
+
+bool tab_showcloud = input.bool(true, "Show Cloud", group = "=== TradingABC ===", inline = "cloud")
+color tab_c_upcol   = input.color(color.new(color.lime, 75), "", group = "=== TradingABC ===", inline = "cloud")
+color tab_c_dncol   = input.color(color.new(color.red, 75), "", group = "=== TradingABC ===", inline = "cloud")
+bool tab_showzigzag = input.bool(true, "Show Zig Zag & Fibo", group = "=== TradingABC ===", inline = "zigzag")
+color tab_upcol     = input.color(color.lime, "", group = "=== TradingABC ===", inline = "zigzag")
+color tab_dncol     = input.color(color.red, "", group = "=== TradingABC ===", inline = "zigzag")
+
+float tab_srcma     = input.source(close, "Source for Moving Averages", group = "=== TradingABC ===")
+int tab_malen1    = input.int(50, "SMA 1 Length", minval = 1, group = "=== TradingABC ===")
+int tab_malen2    = input.int(100, "SMA 2 Length", minval = 1, group = "=== TradingABC ===")
+int tab_malen3    = input.int(150, "SMA 3 Length", minval = 1, group = "=== TradingABC ===")
+int tab_malen4    = input.int(200, "SMA 4 Length", minval = 1, group = "=== TradingABC ===")
+int tab_malen5    = input.int(20, "EMA 1 Length", minval = 1, group = "=== TradingABC ===")
+int tab_malen6    = input.int(40, "EMA 2 Length", minval = 1, group = "=== TradingABC ===")
+
+// ==========================================
+// 3.1 諧波型態參數設定
+// ==========================================
+bool harmonic_showHarmonic = input.bool(true, title='顯示諧波型態', group='=== 諧波型態 ===')
+int harmonic_max_pivot_size = input.int(100, title='最大樞軸點數量', group='=== 諧波型態 ===', minval = 10)
+
+int harmonic_cnt_harmonic_show = input.int(10, '諧波標籤顯示數量', minval=1, maxval=100, group='=== 諧波型態 ===', tooltip='保留最近100個，但圖表上只顯示最近N個')
+
+bool harmonic_showZigZag1 = input.bool(true, title='顯示 ZigZag 1', group='=== 諧波型態 ===')
+int harmonic_zigzag1Length = input.int(5, minval=2, title='ZigZag 1 長度', group='=== 諧波型態 ===')
+color harmonic_zigzag1Color = input.color(color.teal, title='ZigZag 1 顏色', group='=== 諧波型態 ===')
+
+bool harmonic_showZigZag2 = input.bool(true, title='顯示 ZigZag 2', group='=== 諧波型態 ===')
+int harmonic_zigzag2Length = input.int(10, minval=2, title='ZigZag 2 長度', group='=== 諧波型態 ===')
+color harmonic_zigzag2Color = input.color(color.olive, title='ZigZag 2 顏色', group='=== 諧波型態 ===')
+
+bool harmonic_showZigZag3 = input.bool(true, title='顯示 ZigZag 3', group='=== 諧波型態 ===')
+int harmonic_zigzag3Length = input.int(15, minval=2, title='ZigZag 3 長度', group='=== 諧波型態 ===')
+color harmonic_zigzag3Color = input.color(color.lime, title='ZigZag 3 顏色', group='=== 諧波型態 ===')
+
+bool harmonic_showZigZag4 = input.bool(true, title='顯示 ZigZag 4', group='=== 諧波型態 ===')
+int harmonic_zigzag4Length = input.int(20, minval=2, title='ZigZag 4 長度', group='=== 諧波型態 ===')
+color harmonic_zigzag4Color = input.color(color.fuchsia, title='ZigZag 4 顏色', group='=== 諧波型態 ===')
+
+bool harmonic_abcdClassic = input.bool(true, title='經典 ABCD', group='=== 諧波型態 ===')
+bool harmonic_abEQcd = input.bool(true, title='AB=CD', group='=== 諧波型態 ===')
+bool harmonic_abcdExt = input.bool(true, title='ABCD 延伸', group='=== 諧波型態 ===')
+bool harmonic_gartley = input.bool(true, title='Gartley 加特利', group='=== 諧波型態 ===')
+bool harmonic_crab = input.bool(true, title='Crab 螃蟹', group='=== 諧波型態 ===')
+bool harmonic_deepCrab = input.bool(true, title='Deep Crab 深螃', group='=== 諧波型態 ===')
+bool harmonic_bat = input.bool(true, title='Bat 蝙蝠', group='=== 諧波型態 ===')
+bool harmonic_butterfly = input.bool(true, title='Butterfly 蝴蝶', group='=== 諧波型態 ===')
+bool harmonic_shark = input.bool(true, title='Shark 鯊魚', group='=== 諧波型態 ===')
+bool harmonic_cypher = input.bool(true, title='Cypher 賽福', group='=== 諧波型態 ===')
+bool harmonic_threeDrives = input.bool(true, title='Three Drives 三驅動', group='=== 諧波型態 ===')
+bool harmonic_fiveZero = input.bool(true, title='Five-O 五 - 零', group='=== 諧波型態 ===')
+bool harmonic_doubleBottomTop = input.bool(true, title='Double Top/Bottom 雙頂/雙底', group='=== 諧波型態 ===')
+
+int harmonic_errorPercent = input.int(10, minval=5, maxval=20, title='容許誤差百分比', group='=== 諧波型態 ===')
+int harmonic_maxRiskPerReward = input.int(30, title='最大風險報酬比 (雙頂/雙底)', minval=0, group='=== 諧波型態 ===')
+bool harmonic_waitForConfirmation = input.bool(true, title='等待確認', group='=== 諧波型態 ===')
+color harmonic_bullishColor = input.color(color.green, title='看漲顏色', group='=== 諧波型態 ===')
+color harmonic_bearishColor = input.color(color.red, title='看跌顏色', group='=== 諧波型態 ===')
+
+// ==========================================
+// 3.2 背離指標參數設定
+// ==========================================
+bool div_showDivergence = input.bool(true, title='顯示背離指標', group='=== 背離指標 ===')
+int div_prd            = input.int(defval = 5, title = "樞軸點週期", minval = 1, maxval = 50, group='=== 背離指標 ===')
+string div_source         = input.string(defval = "Close", title = "樞軸點來源", options = ["Close", "High/Low"], group='=== 背離指標 ===')
+string div_searchdiv      = input.string(defval = "Regular", title = "背離類型", options = ["Regular", "Hidden", "Regular/Hidden"], group='=== 背離指標 ===')
+string div_showindis      = input.string(defval = "Full", title = "指標名稱顯示", options = ["Full", "First Letter", "Don't Show"], group='=== 背離指標 ===')
+int div_showlimit      = input.int(1, title = "最少背離數量", minval = 1, maxval = 11, group='=== 背離指標 ===')
+int div_maxpp          = input.int(defval = 10, title = "最大樞軸點檢查數", minval = 1, maxval = 20, group='=== 背離指標 ===')
+int div_maxbars        = input.int(defval = 100, title = "最大K棒檢查範圍", minval = 30, maxval = 200, group='=== 背離指標 ===')
+bool div_shownum        = input.bool(defval = true, title = "顯示背離數量", group='=== 背離指標 ===')
+bool div_showlast       = input.bool(defval = false, title = "僅顯示最新背離", group='=== 背離指標 ===')
+bool div_dontconfirm    = input.bool(defval = false, title = "不等待確認（即時計算）", group='=== 背離指標 ===')
+bool div_showlines      = input.bool(defval = true, title = "顯示背離連接線", group='=== 背離指標 ===')
+bool div_showpivot      = input.bool(defval = false, title = "顯示 H/L 樞軸點標籤", group='=== 背離指標 ===')
+
+bool div_calcmacd   = input.bool(true, 'MACD', group='=== 背離指標 ===')
+bool div_calcmacda  = input.bool(true, 'MACD 柱狀圖', group='=== 背離指標 ===')
+bool div_calcrsi    = input.bool(true, 'RSI', group='=== 背離指標 ===')
+bool div_calcstoc   = input.bool(true, 'KD 指標', group='=== 背離指標 ===')
+bool div_calccci    = input.bool(true, 'CCI', group='=== 背離指標 ===')
+bool div_calcmom    = input.bool(true, 'Momentum', group='=== 背離指標 ===')
+bool div_calcobv    = input.bool(true, 'OBV', group='=== 背離指標 ===')
+bool div_calcvwmacd = input.bool(true, 'VWmacd', group='=== 背離指標 ===')
+bool div_calccmf    = input.bool(true, 'Chaikin 資金流', group='=== 背離指標 ===')
+bool div_calcmfi    = input.bool(true, 'MFI 資金指數', group='=== 背離指標 ===')
+
+color div_pos_reg_col  = input.color(defval = color.yellow, title = "正向常規背離", group='=== 背離指標 ===')
+color div_neg_reg_col  = input.color(defval = color.navy, title = "負向常規背離", group='=== 背離指標 ===')
+color div_pos_hid_col  = input.color(defval = color.lime, title = "正向隱藏背離", group='=== 背離指標 ===')
+color div_neg_hid_col  = input.color(defval = color.red, title = "負向隱藏背離", group='=== 背離指標 ===')
+color div_pos_text_col = input.color(defval = color.black, title = "正向文字顏色", group='=== 背離指標 ===')
+color div_neg_text_col = input.color(defval = color.white, title = "負向文字顏色", group='=== 背離指標 ===')
+
+// ==========================================
+// 4. 見高K 核心變數與全域計算
+// ==========================================
+// 4. 見高K 核心變數與全域計算
+// ==========================================
+
+// [第一階段] 定義循環緩衝區的 UDT
+type CircularBuffer
+    float[] values = na
+    int[]   bars   = na
+    int[]   dirs   = na
+    int     head   = -1
+    int     count  = 0
+    int     capacity = 0
+
+method initBuffer(CircularBuffer self, int cap) =>
+    if cap <= 0
+        runtime.error("CircularBuffer capacity must be > 0")
+    if self.capacity != cap
+        self.capacity := cap
+        self.values := array.new_float(cap, na)
+        self.bars   := array.new_int(cap, na)
+        self.dirs   := array.new_int(cap, na)
+        self.head   := -1
+        self.count  := 0
+
+method push(CircularBuffer self, float val, int bar, int dir) =>
+    if self.capacity > 0
+        self.head := (self.head + 1) % self.capacity
+        array.set(self.values, self.head, val)
+        array.set(self.bars, self.head, bar)
+        array.set(self.dirs, self.head, dir)
+        if self.count < self.capacity
+            self.count += 1
+
+method get(CircularBuffer self, int n) =>
+    if n < 0 or n >= self.count
+        na
+    else
+        int idx = (self.head - n + self.capacity) % self.capacity
+        array.get(self.values, idx)
+
+method getBar(CircularBuffer self, int n) =>
+    if n < 0 or n >= self.count
+        na
+    else
+        int idx = (self.head - n + self.capacity) % self.capacity
+        array.get(self.bars, idx)
+
+method getDir(CircularBuffer self, int n) =>
+    if n < 0 or n >= self.count
+        na
+    else
+        int idx = (self.head - n + self.capacity) % self.capacity
+        array.get(self.dirs, idx)
+
+method pop(CircularBuffer self) =>
+    if self.count > 0
+        self.head := (self.head - 1 + self.capacity) % self.capacity
+        self.count -= 1
+
+method updateTop(CircularBuffer self, float val, int bar, int dir) =>
+    if self.count > 0
+        array.set(self.values, self.head, val)
+        array.set(self.bars, self.head, bar)
+        array.set(self.dirs, self.head, dir)
+
+// [第二階段] 繪圖物件生命週期集中管理
+type DrawObj
+    line   ln = na
+    label  lbl = na
+    box    bx = na
+    int    barCreated
+
+type DrawManager
+    DrawObj[] objects
+    int maxObjects
+    int maxBarsKeep
+    int headIndex = 0  // O(1) Ring Buffer 寫入指標，取代 array.shift()
+
+method addLine(DrawManager dm, line l) =>
+    if array.size(dm.objects) < dm.maxObjects
+        array.push(dm.objects, DrawObj.new(ln = l, barCreated = bar_index))
+    else
+        DrawObj old = array.get(dm.objects, dm.headIndex)
+        if not na(old.ln)
+            line.delete(old.ln)
+        if not na(old.lbl)
+            label.delete(old.lbl)
+        if not na(old.bx)
+            box.delete(old.bx)
+        array.set(dm.objects, dm.headIndex, DrawObj.new(ln = l, barCreated = bar_index))
+        dm.headIndex := (dm.headIndex + 1) % dm.maxObjects
+    l
+
+method addLabel(DrawManager dm, label lbl) =>
+    if array.size(dm.objects) < dm.maxObjects
+        array.push(dm.objects, DrawObj.new(lbl = lbl, barCreated = bar_index))
+    else
+        DrawObj old = array.get(dm.objects, dm.headIndex)
+        if not na(old.ln)
+            line.delete(old.ln)
+        if not na(old.lbl)
+            label.delete(old.lbl)
+        if not na(old.bx)
+            box.delete(old.bx)
+        array.set(dm.objects, dm.headIndex, DrawObj.new(lbl = lbl, barCreated = bar_index))
+        dm.headIndex := (dm.headIndex + 1) % dm.maxObjects
+    lbl
+
+method addBox(DrawManager dm, box bx) =>
+    if array.size(dm.objects) < dm.maxObjects
+        array.push(dm.objects, DrawObj.new(bx = bx, barCreated = bar_index))
+    else
+        DrawObj old = array.get(dm.objects, dm.headIndex)
+        if not na(old.ln)
+            line.delete(old.ln)
+        if not na(old.lbl)
+            label.delete(old.lbl)
+        if not na(old.bx)
+            box.delete(old.bx)
+        array.set(dm.objects, dm.headIndex, DrawObj.new(bx = bx, barCreated = bar_index))
+        dm.headIndex := (dm.headIndex + 1) % dm.maxObjects
+    bx
+
+method cleanup(DrawManager dm) =>
+    if array.size(dm.objects) > 0
+        for i = 0 to array.size(dm.objects) - 1
+            DrawObj obj = array.get(dm.objects, i)
+            bool has_content = not na(obj.ln) or not na(obj.lbl) or not na(obj.bx)
+            if has_content and bar_index - obj.barCreated > dm.maxBarsKeep
+                if not na(obj.ln)
+                    line.delete(obj.ln)
+                if not na(obj.lbl)
+                    label.delete(obj.lbl)
+                if not na(obj.bx)
+                    box.delete(obj.bx)
+                // O(1) 原址清空：刪除繪圖物件但保留陣列槽位，維持 Ring Buffer 固定長度
+                array.set(dm.objects, i, DrawObj.new(barCreated = bar_index))
+
+var DrawManager globalDrawMgr = DrawManager.new(array.new<DrawObj>(), 300, 1000, 0)
+// [效能] 節流：每 50 根掃一次即足夠（maxBarsKeep=1000 精度要求低，晚刪 ≤49 根視覺無感）
+if bar_index % 50 == 0
+    globalDrawMgr.cleanup()
+
+type LabelData
+    label id
+    color bgCol
+    color txtCol
+    string style
+
+// [項目6] UDT：封裝每組 ZigZag 的所有陣列
+type HarmonicZZ
+    CircularBuffer cb
+    array<line>  wmLines
+    array<int>   wmType
+    array<bool>  wmLabels
+    array<label> wmLabel
+
+// [項目7] 形態索引常數（取代 magic number）
+int IDX_GARTLEY     = 0
+int IDX_CRAB        = 1
+int IDX_DEEPCRAB    = 2
+int IDX_BAT         = 3
+int IDX_BUTTERFLY   = 4
+int IDX_SHARK       = 5
+int IDX_CYPHER      = 6
+int IDX_3DRIVES     = 7
+int IDX_FIVEZERO    = 8
+int IDX_ABCD        = 9
+int IDX_ABEQCD      = 10
+int IDX_ABCDEXT     = 11
+int IDX_DOUBLETOPBTM = 12
+
+// [項目8] 形態中文名稱陣列（搭配迴圈使用）
+var PATTERN_NAMES = array.from('加特利','螃蟹','深螃','蝙蝠','蝴蝶','鯊魚','賽福','三驅動','五-零','經典ABCD','AB=CD','ABCD延','雙頂/底')
+
+var array<LabelData> grp_harmonic_labels = array.new<LabelData>(0)
+int KEEP_MAX = 100
+float atrVal    = ta.atr(14)
+float label_off = nz(atrVal * offset_mult, 0)
+
+var float pA = na, var float pB = na, var float pC = na
+var int idxA = na, var int idxB = na, var int idxC = na
+var float zMax = high, var int zMaxIdx = bar_index, var float topK_l = low
+var float zMin = low, var int zMinIdx = bar_index, var float botK_h = high
+var int zDir = 0
+
+// MTF 守衛：當前圖表週期大於目標週期時，自動降級使用當前圖表資料
+// 避免穿透 TradingView 歷史資料限制導致 na 傳染
+float tf_sec = timeframe.in_seconds()
+// [效能] 本地 sma 每根照算維持歷史一致（稀疏呼叫會讓 ta.* 歷史錯位，CW10003 紅線）；
+// 只有 request.security 被 dash_needed 閘住——v6 dynamic requests 官方支援條件呼叫
+float dash_sma300 = ta.sma(close[1], 300)
+float dash_sma20  = ta.sma(close[1], 20)
+float dash_sma5   = ta.sma(close[1], 5)
+bool  dash_needed = showTable and barstate.islast
+float vA = tf_sec < 60   ? (dash_needed ? request.security(syminfo.tickerid, "1",  dash_sma300, gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off) : na) : dash_sma300
+float vB = tf_sec < 900  ? (dash_needed ? request.security(syminfo.tickerid, "15", dash_sma20,  gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off) : na) : dash_sma20
+float vC = tf_sec < 3600 ? (dash_needed ? request.security(syminfo.tickerid, "60", dash_sma5,   gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off) : na) : dash_sma5
+
+var array<label> bullNLabs = array.new<label>(0)
+var array<float> bullNT_N = array.new<float>(0), var array<float> bullNT_E = array.new<float>(0), var array<float> bullNT_V = array.new<float>(0)
+var array<bool>  bullND_N = array.new<bool>(0),  var array<bool>  bullND_E = array.new<bool>(0),  var array<bool>  bullND_V = array.new<bool>(0)
+var array<bool>  bullNDone = array.new<bool>(0)
+
+var array<label> bearNLabs = array.new<label>(0)
+var array<float> bearNT_N = array.new<float>(0), var array<float> bearNT_E = array.new<float>(0), var array<float> bearNT_V = array.new<float>(0)
+var array<bool>  bearND_N = array.new<bool>(0),  var array<bool>  bearND_E = array.new<bool>(0),  var array<bool>  bearND_V = array.new<bool>(0)
+var array<bool>  bearNDone = array.new<bool>(0)
+
+var array<label> kHighLabs = array.new<label>(0), var array<float> kHighTP = array.new<float>(0), var array<bool> kHighDone = array.new<bool>(0)
+var array<label> kLowLabs  = array.new<label>(0), var array<float> kLowTP  = array.new<float>(0), var array<bool> kLowDone  = array.new<bool>(0)
+
+var array<float> kHighPrice = array.new<float>(0)
+var array<int>   kHighIdx   = array.new<int>(0)
+
+var array<float> kLowPrice  = array.new<float>(0)
+var array<int>   kLowIdx    = array.new<int>(0)
+
+get_sorted_text(string title, float valN, bool dN, float valE, bool dE, float valV, bool dV) =>
+    array<string> names = array.from("N: ", "E: ", "V: ")
+    array<float> vals = array.from(valN, valE, valV)
+    array<bool> dones = array.from(dN, dE, dV)
+    for i = 0 to 1
+        for j = i + 1 to 2
+            if array.get(vals, j) > array.get(vals, i)
+                float tmpV = array.get(vals, i)
+                array.set(vals, i, array.get(vals, j))
+                array.set(vals, j, tmpV)
+                string tmpN = array.get(names, i)
+                array.set(names, i, array.get(names, j))
+                array.set(names, j, tmpN)
+                bool tmpD = array.get(dones, i)
+                array.set(dones, i, array.get(dones, j))
+                array.set(dones, j, tmpD)
+    string res = title + "\n"
+    for i = 0 to 2
+        res += array.get(names, i) + str.tostring(array.get(vals, i), "#.0") + (array.get(dones, i) ? " ✓" : "") + (i < 2 ? "\n" : "")
+    res
+
+delete_old_k_high(float newPrice) =>
+    if array.size(kHighPrice) > 0
+        for i = array.size(kHighPrice) - 1 to 0
+            if array.get(kHighPrice, i) < newPrice
+                label.delete(array.get(kHighLabs, i))
+                array.remove(kHighLabs, i)
+                array.remove(kHighTP, i)
+                array.remove(kHighDone, i)
+                array.remove(kHighPrice, i)
+                array.remove(kHighIdx, i)
+
+delete_old_k_low(float newPrice) =>
+    if array.size(kLowPrice) > 0
+        for i = array.size(kLowPrice) - 1 to 0
+            if array.get(kLowPrice, i) > newPrice
+                label.delete(array.get(kLowLabs, i))
+                array.remove(kLowLabs, i)
+                array.remove(kLowTP, i)
+                array.remove(kLowDone, i)
+                array.remove(kLowPrice, i)
+                array.remove(kLowIdx, i)
+
+f_manage_label_display(array<LabelData> q, int show_limit, int keep_limit) =>
+    while array.size(q) > keep_limit
+        removed_obj = array.shift(q)
+        label.delete(removed_obj.id)
+    int size = array.size(q)
+    int start_visible_idx = size - show_limit
+    if size > 0
+        for i = 0 to size - 1
+            obj = array.get(q, i)
+            bool is_visible = i >= start_visible_idx
+            color c_bg = is_visible ? obj.bgCol : color.new(color.white, 100)
+            color c_tx = is_visible ? obj.txtCol : color.new(color.white, 100)
+            label.set_color(obj.id, c_bg)
+            label.set_textcolor(obj.id, c_tx)
+            label.set_style(obj.id, is_visible ? obj.style : label.style_none)
+
+// ==========================================
+// 5. Market Structure (SMC) 函數與變數
+// ==========================================
+type SMC_Engine
+    int   os           = 0
+    bool  top_crossed  = false
+    bool  btm_crossed  = false
+    float max_price    = na
+    float min_price    = na
+    int   max_x1       = na
+    int   min_x1       = na
+    float topy         = na
+    float btmy         = na
+    bool  stop_crossed = false
+    bool  sbtm_crossed = false    
+    float saved_top_high = na
+    float saved_top_low  = na
+    float saved_btm_high = na
+    float saved_btm_low  = na
+
+    box[]  ob_boxes   = na
+    bool[] ob_is_bull = na
+    box[]  fvg_boxes  = na
+    bool[] fvg_is_bull = na
+
+    line  ext_choch     = na
+    line  ext_bos       = na
+    line  ext_idm       = na
+    label ext_choch_lbl = na
+    label ext_bos_lbl   = na
+    label ext_idm_lbl   = na
+
+method init(SMC_Engine self, color idmCss) =>
+    self.ob_boxes   := array.new_box(0)
+    self.ob_is_bull := array.new_bool(0)
+    self.fvg_boxes   := array.new_box(0)
+    self.fvg_is_bull := array.new_bool(0)
+    self.ext_choch   := line.new(na, na, na, na, style = line.style_dashed)
+    self.ext_bos    := line.new(na, na, na, na)
+    self.ext_idm    := line.new(na, na, na, na, style = line.style_dotted, color = idmCss)
+    self.ext_choch_lbl := label.new(na, na, '反轉', color = na, size = size.normal, textcolor = color.white)
+    self.ext_bos_lbl   := label.new(na, na, 'BOS'  , color = na, size = size.tiny)
+    self.ext_idm_lbl   := label.new(na, na, '多 IDM', color = na, size = size.normal, textcolor = color.white)
+
+var SMC_Engine smc = SMC_Engine.new()
+if barstate.isfirst
+    smc.init(ms_idmCss)
+
+
+// ==========================================
+// 5.1 諧波型態核心變數與函數
+// ==========================================
+harmonic_err_min = (100 - harmonic_errorPercent) / 100
+harmonic_err_max = (100 + harmonic_errorPercent) / 100
+
+// [項目6] 4 組 ZigZag 使用 UDT 實例（僅在啟用時懶載入緩衝區，減少記憶體浪費）
+var HarmonicZZ zz1 = HarmonicZZ.new(CircularBuffer.new(), array.new_line(8), array.new_int(2, 1), array.new_bool(13, false), array.new_label(1))
+var HarmonicZZ zz2 = HarmonicZZ.new(CircularBuffer.new(), array.new_line(8), array.new_int(2, 1), array.new_bool(13, false), array.new_label(1))
+var HarmonicZZ zz3 = HarmonicZZ.new(CircularBuffer.new(), array.new_line(8), array.new_int(2, 1), array.new_bool(13, false), array.new_label(1))
+var HarmonicZZ zz4 = HarmonicZZ.new(CircularBuffer.new(), array.new_line(8), array.new_int(2, 1), array.new_bool(13, false), array.new_label(1))
+
+// 懶載入：僅在對應 ZigZag 啟用時才分配緩衝區記憶體
+if harmonic_showHarmonic
+    if harmonic_showZigZag1
+        zz1.cb.initBuffer(harmonic_max_pivot_size)
+    if harmonic_showZigZag2
+        zz2.cb.initBuffer(harmonic_max_pivot_size)
+    if harmonic_showZigZag3
+        zz3.cb.initBuffer(harmonic_max_pivot_size)
+    if harmonic_showZigZag4
+        zz4.cb.initBuffer(harmonic_max_pivot_size)
+
+harmonic_pivots(length) =>
+    float phigh = ta.highestbars(high, length) == 0 ? high : na
+    float plow = ta.lowestbars(low, length) == 0 ? low : na
+    dir = 0
+    dir := not na(plow) and na(phigh) ? -1 : dir[1]
+    dir := not na(phigh) and na(plow) ? 1 : dir
+    [dir, phigh, plow]
+
+harmonic_zigzag(length, CircularBuffer cb) =>
+    [dir, phigh, plow] = harmonic_pivots(length)
+    dirchanged = ta.change(dir)
+    if not na(phigh) or not na(plow)
+        value = dir == 1 ? phigh : plow
+        bar = bar_index
+        newDir = dir
+        if dirchanged == 0 and cb.count >= 1
+            pivot = cb.get(0)
+            pivotbar = cb.getBar(0)
+            pivotdir = cb.getDir(0)
+            cb.pop()
+            useNewValues = value * pivotdir < pivot * pivotdir
+            value := useNewValues ? pivot : value
+            bar := useNewValues ? pivotbar : bar
+        if cb.count >= 2
+            lastPoint = cb.get(1)
+            newDir := dir * value > dir * lastPoint ? dir * 2 : dir
+        cb.push(value, bar, newDir)
+
+// [項目8] 重構：迴圈建立標籤文字（取代 13 行手動拼接）
+harmonic_get_harmonic_label(wmLabels, dir, price, bar, q_labels, show_cnt, keep_cnt) =>
+    string labelText = ''
+    for i = 0 to 11
+        if array.get(wmLabels, i)
+            labelText += (labelText == '' ? '' : '\n') + array.get(PATTERN_NAMES, i)
+    // 雙頂/雙底需要根據方向區分
+    if array.get(wmLabels, IDX_DOUBLETOPBTM)
+        string dtName = dir < 0 ? '雙頂' : '雙底'
+        labelText += (labelText == '' ? '' : '\n') + dtName
+    trendColor = dir > 0 ? harmonic_bullishColor : harmonic_bearishColor
+    string myStyle = dir < 1 ? label.style_label_down : label.style_label_up
+    baseLabel = label.new(x=bar, y=price, text=labelText, yloc=yloc.price, color=trendColor, style=myStyle, textcolor=color.black, size=size.small)
+    LabelData new_entry = LabelData.new(baseLabel, trendColor, color.black, myStyle)
+    array.push(q_labels, new_entry)
+    f_manage_label_display(q_labels, show_cnt, keep_cnt)
+    baseLabel
+
+// [修復1] 重構後的 harmonic_detect_harmonic_pattern：統一線條清理，防止孤兒線條
+harmonic_detect_harmonic_pattern(CircularBuffer cb, wmlines, wmlabel, wmtype, wmLabels, zigzagColor, zigzagWidth, zigzagStyle, showZigZag) =>
+    for i = 0 to 12
+        array.set(wmLabels, i, false)
+    start = harmonic_waitForConfirmation ? 1 : 0
+    wm_pattern = false
+    abcd_pattern = false
+    double_pattern = false
+    if cb.count >= 6 + start and showZigZag
+        d = cb.get(start + 0)
+        dBar = cb.getBar(start + 0)
+        dDir = cb.getDir(start + 0)
+        c = cb.get(start + 1)
+        cBar = cb.getBar(start + 1)
+        cDir = cb.getDir(start + 1)
+        b = cb.get(start + 2)
+        bBar = cb.getBar(start + 2)
+        bDir = cb.getDir(start + 2)
+        a = cb.get(start + 3)
+        aBar = cb.getBar(start + 3)
+        aDir = cb.getDir(start + 3)
+        x = cb.get(start + 4)
+        xBar = cb.getBar(start + 4)
+        xDir = cb.getDir(start + 4)
+        y = cb.get(start + 5)
+        yBar = cb.getBar(start + 5)
+        yDir = cb.getDir(start + 5)
+        highPoint = math.max(x, a, b, c, d)
+        lowPoint = math.min(x, a, b, c, d)
+        dir = c > d ? 1 : -1
+        xabRatio = math.abs(x - a) > 0 ? math.abs(b - a) / math.abs(x - a) : na
+        abcRatio = math.abs(a - b) > 0 ? math.abs(c - b) / math.abs(a - b) : na
+        bcdRatio = math.abs(b - c) > 0 ? math.abs(d - c) / math.abs(b - c) : na
+        xadRatio = math.abs(x - a) > 0 ? math.abs(d - a) / math.abs(x - a) : na
+        yxaRatio = math.abs(y - x) > 0 ? math.abs(a - x) / math.abs(y - x) : na
+        abTime = math.abs(aBar - bBar)
+        cdTime = math.abs(cBar - dBar)
+        abPrice = math.abs(a - b)
+        cdPrice = math.abs(c - d)
+        time_ratio = abTime > 0 ? cdTime / abTime : na
+        price_ratio = abPrice > 0 ? cdPrice / abPrice : na
+        abcdDirection = a < b and a < c and c < b and c < d and a < d and b < d ? 1 :
+             a > b and a > c and c > b and c > d and a > d and b > d ? -1 :
+             0
+        risk = math.abs(b - d)
+        reward = math.abs(c - d)
+        riskPerReward = risk * 100 / (risk + reward)
+        if b < highPoint and b > lowPoint
+            if harmonic_gartley and xabRatio >= 0.618 * harmonic_err_min and xabRatio <= 0.618 * harmonic_err_max and abcRatio >= 0.382 * harmonic_err_min and abcRatio <= 0.886 * harmonic_err_max and (bcdRatio >= 1.272 * harmonic_err_min and bcdRatio <= 1.618 * harmonic_err_max or xadRatio >= 0.786 * harmonic_err_min and xadRatio <= 0.786 * harmonic_err_max)
+                wm_pattern := true
+                array.set(wmLabels, IDX_GARTLEY, true)
+            if harmonic_crab and xabRatio >= 0.382 * harmonic_err_min and xabRatio <= 0.618 * harmonic_err_max and abcRatio >= 0.382 * harmonic_err_min and abcRatio <= 0.886 * harmonic_err_max and (bcdRatio >= 2.24 * harmonic_err_min and bcdRatio <= 3.618 * harmonic_err_max or xadRatio >= 1.618 * harmonic_err_min and xadRatio <= 1.618 * harmonic_err_max)
+                wm_pattern := true
+                array.set(wmLabels, IDX_CRAB, true)
+            if harmonic_deepCrab and xabRatio >= 0.886 * harmonic_err_min and xabRatio <= 0.886 * harmonic_err_max and abcRatio >= 0.382 * harmonic_err_min and abcRatio <= 0.886 * harmonic_err_max and (bcdRatio >= 2.00 * harmonic_err_min and bcdRatio <= 3.618 * harmonic_err_max or xadRatio >= 1.618 * harmonic_err_min and xadRatio <= 1.618 * harmonic_err_max)
+                wm_pattern := true
+                array.set(wmLabels, IDX_DEEPCRAB, true)
+            if harmonic_bat and xabRatio >= 0.382 * harmonic_err_min and xabRatio <= 0.50 * harmonic_err_max and abcRatio >= 0.382 * harmonic_err_min and abcRatio <= 0.886 * harmonic_err_max and (bcdRatio >= 1.618 * harmonic_err_min and bcdRatio <= 2.618 * harmonic_err_max or xadRatio >= 0.886 * harmonic_err_min and xadRatio <= 0.886 * harmonic_err_max)
+                wm_pattern := true
+                array.set(wmLabels, IDX_BAT, true)
+            if harmonic_butterfly and xabRatio >= 0.786 * harmonic_err_min and xabRatio <= 0.786 * harmonic_err_max and abcRatio >= 0.382 * harmonic_err_min and abcRatio <= 0.886 * harmonic_err_max and (bcdRatio >= 1.618 * harmonic_err_min and bcdRatio <= 2.618 * harmonic_err_max or xadRatio >= 1.272 * harmonic_err_min and xadRatio <= 1.618 * harmonic_err_max)
+                wm_pattern := true
+                array.set(wmLabels, IDX_BUTTERFLY, true)
+        if harmonic_shark and abcRatio >= 1.13 * harmonic_err_min and abcRatio <= 1.618 * harmonic_err_max and bcdRatio >= 1.618 * harmonic_err_min and bcdRatio <= 2.24 * harmonic_err_max and xadRatio >= 0.886 * harmonic_err_min and xadRatio <= 1.13 * harmonic_err_max
+            wm_pattern := true
+            array.set(wmLabels, IDX_SHARK, true)
+        if harmonic_cypher and xabRatio >= 0.382 * harmonic_err_min and xabRatio <= 0.618 * harmonic_err_max and abcRatio >= 1.13 * harmonic_err_min and abcRatio <= 1.414 * harmonic_err_max and (bcdRatio >= 1.272 * harmonic_err_min and bcdRatio <= 2.00 * harmonic_err_max or xadRatio >= 0.786 * harmonic_err_min and xadRatio <= 0.786 * harmonic_err_max)
+            wm_pattern := true
+            array.set(wmLabels, IDX_CYPHER, true)
+        if harmonic_threeDrives and yxaRatio >= 0.618 * harmonic_err_min and yxaRatio <= 0.618 * harmonic_err_max and xabRatio >= 1.27 * harmonic_err_min and xabRatio <= 1.618 * harmonic_err_max and abcRatio >= 0.618 * harmonic_err_min and abcRatio <= 0.618 * harmonic_err_max and bcdRatio >= 1.27 * harmonic_err_min and bcdRatio <= 1.618 * harmonic_err_max
+            wm_pattern := true
+            array.set(wmLabels, IDX_3DRIVES, true)
+        if harmonic_fiveZero and xabRatio >= 1.13 * harmonic_err_min and xabRatio <= 1.618 * harmonic_err_max and abcRatio >= 1.618 * harmonic_err_min and abcRatio <= 2.24 * harmonic_err_max and bcdRatio >= 0.5 * harmonic_err_min and bcdRatio <= 0.5 * harmonic_err_max
+            wm_pattern := true
+            array.set(wmLabels, IDX_FIVEZERO, true)
+        if harmonic_abcdClassic and abcRatio >= 0.618 * harmonic_err_min and abcRatio <= 0.786 * harmonic_err_max and bcdRatio >= 1.272 * harmonic_err_min and bcdRatio <= 1.618 * harmonic_err_max and abcdDirection != 0
+            abcd_pattern := true
+            array.set(wmLabels, IDX_ABCD, true)
+        if harmonic_abEQcd and time_ratio >= harmonic_err_min and time_ratio <= harmonic_err_max and price_ratio >= harmonic_err_min and price_ratio <= harmonic_err_max and abcdDirection != 0
+            abcd_pattern := true
+            array.set(wmLabels, IDX_ABEQCD, true)
+        if harmonic_abcdExt and price_ratio >= 1.272 * harmonic_err_min and price_ratio <= 1.618 * harmonic_err_max and abcRatio >= 0.618 * harmonic_err_min and abcRatio <= 0.786 * harmonic_err_max and abcdDirection != 0
+            abcd_pattern := true
+            array.set(wmLabels, IDX_ABCDEXT, true)
+        if harmonic_doubleBottomTop and (dDir == 1 and bDir == 2 and cDir == -1 or dDir == -1 and bDir == -2 and cDir == 1) and riskPerReward < harmonic_maxRiskPerReward
+            double_pattern := true
+            array.set(wmLabels, IDX_DOUBLETOPBTM, true)
+        // [修復1] 統一清理：只要有新型態就先刪除所有舊線條與標籤，防止孤兒線條
+        if wm_pattern or abcd_pattern or double_pattern
+            for i = 0 to 7
+                line.delete(array.get(wmlines, i))
+            label old_lbl = array.get(wmlabel, 0)
+            label.delete(old_lbl)
+            // [A3] 同步從顯示佇列移除已刪標籤，避免死物件占用 keep/show 名額
+            if not na(old_lbl) and array.size(grp_harmonic_labels) > 0
+                for i = array.size(grp_harmonic_labels) - 1 to 0
+                    LabelData e = array.get(grp_harmonic_labels, i)
+                    if e.id == old_lbl
+                        array.remove(grp_harmonic_labels, i)
+        if wm_pattern
+            xa = line.new(y1=x, y2=a, x1=xBar, x2=aBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            ab = line.new(y1=a, y2=b, x1=aBar, x2=bBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            bc = line.new(y1=b, y2=c, x1=bBar, x2=cBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            cd = line.new(y1=c, y2=d, x1=cBar, x2=dBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            xb = line.new(y1=x, y2=b, x1=xBar, x2=bBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            bd = line.new(y1=b, y2=d, x1=bBar, x2=dBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            xd = line.new(y1=x, y2=d, x1=xBar, x2=dBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            ac = line.new(y1=a, y2=c, x1=aBar, x2=cBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            array.set(wmlines, 0, xa)
+            array.set(wmlines, 1, ab)
+            array.set(wmlines, 2, bc)
+            array.set(wmlines, 3, cd)
+            array.set(wmlines, 4, xb)
+            array.set(wmlines, 5, bd)
+            array.set(wmlines, 6, xd)
+            array.set(wmlines, 7, ac)
+            array.set(wmtype, 0, dir)
+        if abcd_pattern and not wm_pattern
+            ab = line.new(y1=a, y2=b, x1=aBar, x2=bBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            bc = line.new(y1=b, y2=c, x1=bBar, x2=cBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            cd = line.new(y1=c, y2=d, x1=cBar, x2=dBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            array.set(wmlines, 1, ab)
+            array.set(wmlines, 2, bc)
+            array.set(wmlines, 3, cd)
+            array.set(wmtype, 0, dir)
+        if double_pattern and not wm_pattern
+            bd = line.new(y1=b, y2=d, x1=bBar, x2=dBar, color=zigzagColor, width=zigzagWidth, style=zigzagStyle)
+            array.set(wmlines, 5, bd)
+            array.set(wmtype, 0, dir)
+        if wm_pattern or abcd_pattern or double_pattern
+            array.set(wmlabel, 0, harmonic_get_harmonic_label(wmLabels, dir, d, dBar, grp_harmonic_labels, harmonic_cnt_harmonic_show, KEEP_MAX))
+    pattern = wm_pattern and not wm_pattern[1] or abcd_pattern and not abcd_pattern[1] or double_pattern and not double_pattern[1]
+    pattern
+// 核心 Swing 計算函數 — 使用 ta.pivothigh/pivotlow 正確偵測擺動點
+ms_swings(int length) =>
+    ph_val = ta.pivothigh(high, length, length)
+    pl_val = ta.pivotlow(low, length, length)
+    top_val  = not na(ph_val) ? ph_val : na
+    topx_val = not na(ph_val) ? bar_index - length : na
+    btm_val  = not na(pl_val) ? pl_val : na
+    btmx_val = not na(pl_val) ? bar_index - length : na
+    [top_val, topx_val, btm_val, btmx_val]
+
+// 通用回收函數：推入新物件並 cap 上限
+ms_push_line(line l) =>
+    globalDrawMgr.addLine(l)
+
+ms_push_label(label lb) =>
+    globalDrawMgr.addLabel(lb)
+
+method draw_ob(SMC_Engine self, float p_high, float p_low, int index, bool is_bull, bool showOb, color obBullCss, color obBearCss) =>
+    if not na(index) and showOb and not na(p_high) and not na(p_low)
+        color ob_col = is_bull ? obBullCss : obBearCss
+        box ob = box.new(left = index, top = p_high, right = bar_index + 5, bottom = p_low, 
+             border_color = color(na), bgcolor = ob_col, 
+             text = is_bull ? "+OB" : "-OB", 
+             text_color = color.new(color.white, 20), text_size = size.tiny)
+        array.push(self.ob_boxes, ob)
+        array.push(self.ob_is_bull, is_bull)
+        while array.size(self.ob_boxes) > 30
+            box.delete(array.shift(self.ob_boxes))
+            array.shift(self.ob_is_bull)
+
+// [效能] SMC 全關時跳過 4 個 ta.pivot* 呼叫/根；開啟任一項即完整計算
+bool ms_any = ms_showFvg or ms_showOb or ms_showChoch or ms_showBos or ms_showIdm or ms_showSweeps or ms_showCircles
+[ms_top, ms_topx, ms_btm, ms_btmx] = switch ms_any
+    true  => ms_swings(ms_len)
+    false => [na, int(na), na, int(na)]
+[ms_stop, ms_stopx, ms_sbtm, ms_sbtmx] = switch ms_any
+    true  => ms_swings(ms_shortLen)
+    false => [na, int(na), na, int(na)]
+
+// ==========================================
+// 5.2 背離指標核心變數與函數
+// ==========================================
+// 計算各技術指標
+div_rsi = div_showDivergence and div_calcrsi ? ta.rsi(close, 14) : na
+[div_macd, _, div_deltamacd] = switch div_showDivergence and (div_calcmacd or div_calcmacda)
+    true  => ta.macd(close, 12, 26, 9)
+    false => [na, na, na]
+div_moment = div_showDivergence and div_calcmom ? ta.mom(close, 10) : na
+div_cci = div_showDivergence and div_calccci ? ta.cci(close, 10) : na
+div_obv = div_showDivergence and div_calcobv ? ta.obv : na
+div_stk = div_showDivergence and div_calcstoc ? ta.sma(ta.stoch(close, high, low, 14), 3) : na
+div_vwmacd = div_showDivergence and div_calcvwmacd ? ta.vwma(close, 12) - ta.vwma(close, 26) : na
+div_cmfm = ((close - low) - (high - close)) / (high - low)
+div_cmfv = div_cmfm * volume
+div_cmf = div_showDivergence and div_calccmf ? ta.sma(div_cmfv, 21) / ta.sma(volume, 21) : na
+div_mfi = div_showDivergence and div_calcmfi ? ta.mfi(close, 14) : na
+
+// 指標名稱與顏色陣列
+var div_ind_names = array.new_string(10)
+var div_colors = array.new_color(4)
+if barstate.isfirst
+    array.set(div_ind_names, 0, div_showindis == "Full" ? "MACD" : "M")
+    array.set(div_ind_names, 1, div_showindis == "Full" ? "Hist" : "H")
+    array.set(div_ind_names, 2, div_showindis == "Full" ? "RSI" : "R")
+    array.set(div_ind_names, 3, div_showindis == "Full" ? "Stoch" : "S")
+    array.set(div_ind_names, 4, div_showindis == "Full" ? "CCI" : "C")
+    array.set(div_ind_names, 5, div_showindis == "Full" ? "MOM" : "M")
+    array.set(div_ind_names, 6, div_showindis == "Full" ? "OBV" : "O")
+    array.set(div_ind_names, 7, div_showindis == "Full" ? "VWMACD" : "V")
+    array.set(div_ind_names, 8, div_showindis == "Full" ? "CMF" : "C")
+    array.set(div_ind_names, 9, div_showindis == "Full" ? "MFI" : "M")
+    array.set(div_colors, 0, div_pos_reg_col)
+    array.set(div_colors, 1, div_neg_reg_col)
+    array.set(div_colors, 2, div_pos_hid_col)
+    array.set(div_colors, 3, div_neg_hid_col)
+
+// 樞軸點偵測（背離專用）
+float div_ph = div_showDivergence ? ta.pivothigh((div_source == "Close" ? close : high), div_prd, div_prd) : na
+float div_pl = div_showDivergence ? ta.pivotlow((div_source == "Close" ? close : low), div_prd, div_prd) : na
+
+// 樞軸點位置與數值陣列
+var int div_maxarraysize = 20
+var CircularBuffer div_ph_cb = CircularBuffer.new()
+var CircularBuffer div_pl_cb = CircularBuffer.new()
+
+div_ph_cb.initBuffer(div_maxarraysize)
+div_pl_cb.initBuffer(div_maxarraysize)
+
+if not na(div_ph)
+    div_ph_cb.push(div_ph, bar_index, 0)
+
+if not na(div_pl)
+    div_pl_cb.push(div_pl, bar_index, 0)
+
+// [效能優化] 僅在有新樞軸點或手動強制確認時才計算（減少 90% 運算）
+bool div_trigger = not na(div_ph) or not na(div_pl) or div_dontconfirm
+
+// 正向常規/隱藏背離檢測 — 中點抽樣降維 O(P×L) → O(P)
+div_pos_reg_hid(src, cond) =>
+    divlen = 0
+    prsc = div_source == "Close" ? close : low
+    if div_trigger and (div_dontconfirm or src > src[1] or close > close[1])
+        sp = div_dontconfirm ? 0 : 1
+        for x = 0 to div_maxpp - 1
+            int barAtX = div_pl_cb.getBar(x)
+            _detectLen = bar_index - barAtX + div_prd
+            if na(barAtX) or barAtX == 0 or _detectLen > div_maxbars
+                break
+            if _detectLen > 5 and
+               ((cond == 1 and src[sp] > src[_detectLen] and prsc[sp] < nz(div_pl_cb.get(x))) or
+               (cond == 2 and src[sp] < src[_detectLen] and prsc[sp] > nz(div_pl_cb.get(x))))
+                slope1 = (src[sp] - src[_detectLen]) / (_detectLen - sp)
+                slope2 = (close[sp] - close[_detectLen]) / (_detectLen - sp)
+                // 中點抽樣：僅校驗 25%/50%/75% 三個關鍵點，取代逐根掃描
+                rangeLen = _detectLen - sp
+                int mid1 = sp + math.max(1, math.round(rangeLen * 0.25))
+                int mid2 = sp + math.max(1, math.round(rangeLen * 0.50))
+                int mid3 = sp + math.max(1, math.round(rangeLen * 0.75))
+                float line_src_m1 = src[sp] - slope1 * (mid1 - sp)
+                float line_cls_m1 = close[sp] - slope2 * (mid1 - sp)
+                float line_src_m2 = src[sp] - slope1 * (mid2 - sp)
+                float line_cls_m2 = close[sp] - slope2 * (mid2 - sp)
+                float line_src_m3 = src[sp] - slope1 * (mid3 - sp)
+                float line_cls_m3 = close[sp] - slope2 * (mid3 - sp)
+                arrived = true
+                if src[mid1] < line_src_m1 or nz(close[mid1]) < line_cls_m1
+                    arrived := false
+                if arrived and (src[mid2] < line_src_m2 or nz(close[mid2]) < line_cls_m2)
+                    arrived := false
+                if arrived and (src[mid3] < line_src_m3 or nz(close[mid3]) < line_cls_m3)
+                    arrived := false
+                if arrived
+                    divlen := _detectLen
+                    break
+    divlen
+
+// 負向常規/隱藏背離檢測 — 中點抽樣降維 O(P×L) → O(P)
+div_neg_reg_hid(src, cond) =>
+    divlen = 0
+    prsc = div_source == "Close" ? close : high
+    if div_trigger and (div_dontconfirm or src < src[1] or close < close[1])
+        sp = div_dontconfirm ? 0 : 1
+        for x = 0 to div_maxpp - 1
+            int barAtX = div_ph_cb.getBar(x)
+            _detectLen = bar_index - barAtX + div_prd
+            if na(barAtX) or barAtX == 0 or _detectLen > div_maxbars
+                break
+            if _detectLen > 5 and
+               ((cond == 1 and src[sp] < src[_detectLen] and prsc[sp] > nz(div_ph_cb.get(x))) or
+               (cond == 2 and src[sp] > src[_detectLen] and prsc[sp] < nz(div_ph_cb.get(x))))
+                slope1 = (src[sp] - src[_detectLen]) / (_detectLen - sp)
+                slope2 = (close[sp] - nz(close[_detectLen])) / (_detectLen - sp)
+                // 中點抽樣：僅校驗 25%/50%/75% 三個關鍵點，取代逐根掃描
+                rangeLen = _detectLen - sp
+                int mid1 = sp + math.max(1, math.round(rangeLen * 0.25))
+                int mid2 = sp + math.max(1, math.round(rangeLen * 0.50))
+                int mid3 = sp + math.max(1, math.round(rangeLen * 0.75))
+                float line_src_m1 = src[sp] - slope1 * (mid1 - sp)
+                float line_cls_m1 = close[sp] - slope2 * (mid1 - sp)
+                float line_src_m2 = src[sp] - slope1 * (mid2 - sp)
+                float line_cls_m2 = close[sp] - slope2 * (mid2 - sp)
+                float line_src_m3 = src[sp] - slope1 * (mid3 - sp)
+                float line_cls_m3 = close[sp] - slope2 * (mid3 - sp)
+                arrived = true
+                if src[mid1] > line_src_m1 or nz(close[mid1]) > line_cls_m1
+                    arrived := false
+                if arrived and (src[mid2] > line_src_m2 or nz(close[mid2]) > line_cls_m2)
+                    arrived := false
+                if arrived and (src[mid3] > line_src_m3 or nz(close[mid3]) > line_cls_m3)
+                    arrived := false
+                if arrived
+                    divlen := _detectLen
+                    break
+    divlen
+
+// 計算四種背離並回傳陣列
+div_calculate(cond, indicator) =>
+    int d0 = cond and (div_searchdiv == "Regular" or div_searchdiv == "Regular/Hidden") ? div_pos_reg_hid(indicator, 1) : 0
+    int d1 = cond and (div_searchdiv == "Regular" or div_searchdiv == "Regular/Hidden") ? div_neg_reg_hid(indicator, 1) : 0
+    int d2 = cond and (div_searchdiv == "Hidden" or div_searchdiv == "Regular/Hidden")  ? div_pos_reg_hid(indicator, 2) : 0
+    int d3 = cond and (div_searchdiv == "Hidden" or div_searchdiv == "Regular/Hidden")  ? div_neg_reg_hid(indicator, 2) : 0
+    [d0, d1, d2, d3]
+
+// 背離結果陣列（10 個指標 × 4 種背離 = 40 個元素）
+var div_all = array.new_int(40)
+
+div_array_set(int d0, int d1, int d2, int d3, int index) =>
+    array.set(div_all, index * 4 + 0, d0)
+    array.set(div_all, index * 4 + 1, d1)
+    array.set(div_all, index * 4 + 2, d2)
+    array.set(div_all, index * 4 + 3, d3)
+
+// 線條與標籤管理陣列
+var div_pos_lines  = array.new_line(0)
+var div_neg_lines  = array.new_line(0)
+var div_pos_labels = array.new_label(0)
+var div_neg_labels = array.new_label(0)
+
+div_del_old_pos_lines() =>
+    if array.size(div_pos_lines) > 0
+        for j = 0 to array.size(div_pos_lines) - 1
+            line.delete(array.get(div_pos_lines, j))
+        array.clear(div_pos_lines)
+
+div_del_old_neg_lines() =>
+    if array.size(div_neg_lines) > 0
+        for j = 0 to array.size(div_neg_lines) - 1
+            line.delete(array.get(div_neg_lines, j))
+        array.clear(div_neg_lines)
+
+div_del_old_pos_labels() =>
+    if array.size(div_pos_labels) > 0
+        for j = 0 to array.size(div_pos_labels) - 1
+            label.delete(array.get(div_pos_labels, j))
+        array.clear(div_pos_labels)
+
+div_del_old_neg_labels() =>
+    if array.size(div_neg_labels) > 0
+        for j = 0 to array.size(div_neg_labels) - 1
+            label.delete(array.get(div_neg_labels, j))
+        array.clear(div_neg_labels)
+
+div_del_last_pos(n) =>
+    _n = math.min(n, array.size(div_pos_lines))
+    if _n > 0
+        asz = array.size(div_pos_lines)
+        for j = 1 to _n
+            line.delete(array.get(div_pos_lines, asz - j))
+            array.pop(div_pos_lines)
+        if array.size(div_pos_labels) > 0
+            label.delete(array.get(div_pos_labels, array.size(div_pos_labels) - 1))
+            array.pop(div_pos_labels)
+
+div_del_last_neg(n) =>
+    _n = math.min(n, array.size(div_neg_lines))
+    if _n > 0
+        asz = array.size(div_neg_lines)
+        for j = 1 to _n
+            line.delete(array.get(div_neg_lines, asz - j))
+            array.pop(div_neg_lines)
+        if array.size(div_neg_labels) > 0
+            label.delete(array.get(div_neg_labels, array.size(div_neg_labels) - 1))
+            array.pop(div_neg_labels)
+
+// ==========================================
+// 6. TradingABC 變數初始化
+// ==========================================
+var float[] tab_ma_array = array.new_float(6)
+array.set(tab_ma_array, 0, ta.sma(tab_srcma, tab_malen1))
+array.set(tab_ma_array, 1, ta.sma(tab_srcma, tab_malen2))
+array.set(tab_ma_array, 2, ta.sma(tab_srcma, tab_malen3))
+array.set(tab_ma_array, 3, ta.sma(tab_srcma, tab_malen4))
+array.set(tab_ma_array, 4, ta.ema(tab_srcma, tab_malen5))
+array.set(tab_ma_array, 5, ta.ema(tab_srcma, tab_malen6))
+
+float tab_umax = na
+float tab_umin = na
+float tab_lmax = na
+float tab_lmin = na
+int tab_upper = 0
+int tab_lower = 0
+// LICM：將迴圈不變式外提，每根 K 棒節省 10 次 math.max/min 呼叫
+float max_oc = math.max(open, close)
+float min_oc = math.min(open, close)
+for x = 1 to 6
+    float tab_ma = array.get(tab_ma_array, x - 1)
+    if tab_ma >= max_oc
+        tab_upper := tab_upper + 1
+        if na(tab_umax)
+            tab_umax := tab_ma
+            tab_umin := tab_ma
+        else
+            tab_umax := math.max(tab_umax, tab_ma)
+            tab_umin := math.min(tab_umin, tab_ma)
+    else if tab_ma <= min_oc
+        tab_lower := tab_lower + 1
+        if na(tab_lmax)
+            tab_lmax := tab_ma
+            tab_lmin := tab_ma
+        else
+            tab_lmax := math.max(tab_lmax, tab_ma)
+            tab_lmin := math.min(tab_lmin, tab_ma)
+
+// 狀態機啟動守衛：確保最長的那根均線 (SMA 200) 擺脫 na 值，狀態機才啟動
+bool tab_engine_ready = not na(array.get(tab_ma_array, 3))
+
+var int tab_trend = 0
+tab_trend := not tab_engine_ready ? 0 : 
+              (tab_lower > 0 and tab_upper == 0 and tab_lower[1] > 0 and tab_upper[1] == 0 ? 1 :
+              tab_lower == 0 and tab_upper > 0 and tab_lower[1] == 0 and tab_upper[1] > 0 ? -1 :
+              tab_trend)
+
+color tab_tucolor = tab_trend == 1 ? tab_c_upcol : na
+color tab_tdcolor = tab_trend == -1 ? tab_c_dncol : na
+
+// ==========================================
+// 7. 見高K ZigZag 引擎與實時繪圖
+// ==========================================
+float dev = atrVal * (devPerc / 100)
+bool nH_Trig = false
+bool nL_Trig = false
+
+var line tempZzLine = na
+if barstate.islast
+    line.delete(tempZzLine)
+    tempZzLine := na
+
+if zDir == 0
+    zDir := (na(high[1]) or high >= high[1]) ? 1 : -1
+
+if zDir == 1
+    if high > zMax
+        zMax := high, zMaxIdx := bar_index
+    else
+        topK_l := math.min(nz(topK_l, low), low)
+        if (zMax - low) > dev
+            pA := pB, pB := pC, pC := zMax
+            idxA := idxB, idxB := idxC, idxC := zMaxIdx
+            zDir := -1, nH_Trig := true
+            if showZigZag and not na(idxB)
+                if barstate.isconfirmed
+                    globalDrawMgr.addLine(line.new(x1 = idxB, y1 = pB, x2 = idxC, y2 = pC, color = zzColor, width = zzWidth, style = zzStyle))
+                else
+                    tempZzLine := line.new(x1 = idxB, y1 = pB, x2 = idxC, y2 = pC, color = zzColor, width = zzWidth, style = zzStyle)
+            zMin := low, zMinIdx := bar_index, botK_h := high
+else
+    if low < zMin
+        zMin := low, zMinIdx := bar_index
+    else
+        botK_h := math.max(nz(botK_h, high), high)
+        if (high - zMin) > dev
+            pA := pB, pB := pC, pC := zMin
+            idxA := idxB, idxB := idxC, idxC := zMinIdx
+            zDir := 1, nL_Trig := true
+            if showZigZag and not na(idxB)
+                if barstate.isconfirmed
+                    globalDrawMgr.addLine(line.new(x1 = idxB, y1 = pB, x2 = idxC, y2 = pC, color = zzColor, width = zzWidth, style = zzStyle))
+                else
+                    tempZzLine := line.new(x1 = idxB, y1 = pB, x2 = idxC, y2 = pC, color = zzColor, width = zzWidth, style = zzStyle)
+            zMax := high, zMaxIdx := bar_index, topK_l := low
+
+var line liveLine = na
+if barstate.islast and showLiveLine
+    line.delete(liveLine)
+    liveLine := line.new(x1 = idxC, y1 = pC, x2 = (zDir == 1 ? zMaxIdx : zMinIdx), y2 = (zDir == 1 ? zMax : zMin), color = color.white, style = line.style_dotted, width = 2)
+
+// ==========================================
+// 7.1 諧波型態 ZigZag 執行
+// ==========================================
+// [修復5] ZigZag 關閉時跳過對應計算
+if harmonic_showHarmonic
+    if harmonic_showZigZag1
+        harmonic_zigzag(harmonic_zigzag1Length, zz1.cb)
+    if harmonic_showZigZag2
+        harmonic_zigzag(harmonic_zigzag2Length, zz2.cb)
+    if harmonic_showZigZag3
+        harmonic_zigzag(harmonic_zigzag3Length, zz3.cb)
+    if harmonic_showZigZag4
+        harmonic_zigzag(harmonic_zigzag4Length, zz4.cb)
+
+// ==========================================
+// 8. TradingABC ZigZag 引擎
+// ==========================================
+tab_get_ph_pl_dir(int _periodLen) =>
+    float tab_ph = ta.highestbars(high, _periodLen) == 0 ? high : na
+    float tab_pl = ta.lowestbars(low, _periodLen) == 0 ? low : na
+    var int tab_dir = 0
+    tab_dir := not na(tab_ph) and na(tab_pl) ? 1 : (not na(tab_pl) and na(tab_ph) ? -1 : tab_dir)
+    [tab_ph, tab_pl, tab_dir]
+
+[tab_ph, tab_pl, tab_dir] = tab_get_ph_pl_dir(tab_prd)
+
+var int tab_max_array_size = 10
+var CircularBuffer tab_cb = CircularBuffer.new()
+
+tab_cb.initBuffer(tab_max_array_size)
+
+tab_add_to_zigzag(float value, int bindex) =>
+    tab_cb.push(value, bindex, 0)
+
+tab_update_zigzag(float value, int bindex) =>
+    if tab_cb.count == 0
+        tab_add_to_zigzag(value, bindex)
+    else
+        float old_val = tab_cb.get(0)
+        if (tab_dir == 1 and value > old_val) or (tab_dir == -1 and value < old_val)
+            tab_cb.updateTop(value, bindex, 0)
+    0.
+
+float tab_dir_changed = ta.change(tab_dir)
+if not na(tab_ph) or not na(tab_pl)
+    if tab_dir_changed != 0
+        tab_add_to_zigzag(tab_dir == 1 ? tab_ph : tab_pl, bar_index)
+    else
+        tab_update_zigzag(tab_dir == 1 ? tab_ph : tab_pl, bar_index)
+
+// ==========================================
+// 9. 見高K 目標價計算與標籤生成
+// ==========================================
+
+if nL_Trig and not na(pA) and pC > pA and pB > pC
+    float tN = pC + (pB - pA), float tE = pB + (pB - pA), float tV = pB + (pB - pC)
+    if array.size(bullNLabs) >= bullNLimit
+        label.delete(array.shift(bullNLabs))
+        array.shift(bullNT_N), array.shift(bullNT_E), array.shift(bullNT_V)
+        array.shift(bullND_N), array.shift(bullND_E), array.shift(bullND_V), array.shift(bullNDone)
+    string txt = get_sorted_text("正N 目標", tN, false, tE, false, tV, false)
+    label lb = label.new(x = idxC, y = high + label_off, text = "正N", tooltip = txt, color = nBullColor, textcolor = color.white, style = label.style_label_down, size = size.small)
+    array.push(bullNLabs, lb), array.push(bullNT_N, tN), array.push(bullNT_E, tE), array.push(bullNT_V, tV)
+    array.push(bullND_N, false), array.push(bullND_E, false), array.push(bullND_V, false), array.push(bullNDone, false)
+
+if nH_Trig and not na(pA) and pC < pA and pB < pC
+    float tN = pC - (pA - pB), float tE = pB - (pA - pB), float tV = pB - (pC - pB)
+    if array.size(bearNLabs) >= bearNLimit
+        label.delete(array.shift(bearNLabs))
+        array.shift(bearNT_N), array.shift(bearNT_E), array.shift(bearNT_V)
+        array.shift(bearND_N), array.shift(bearND_E), array.shift(bearND_V), array.shift(bearNDone)
+    string txt = get_sorted_text("倒N 目標", tN, false, tE, false, tV, false)
+    label lb = label.new(x = idxC, y = low - label_off, text = "倒N", tooltip = txt, color = nBearColor, textcolor = color.white, style = label.style_label_up, size = size.small)
+    array.push(bearNLabs, lb), array.push(bearNT_N, tN), array.push(bearNT_E, tE), array.push(bearNT_V, tV)
+    array.push(bearND_N, false), array.push(bearND_E, false), array.push(bearND_V, false), array.push(bearNDone, false)
+
+bool isHH = nH_Trig and not na(pB) and pC > pB
+if isHH
+    delete_old_k_high(pC)
+    float tp = (2 * topK_l) - pC
+    if array.size(kHighLabs) >= kHighLimit
+        label.delete(array.shift(kHighLabs))
+        array.shift(kHighTP), array.shift(kHighDone)
+        array.shift(kHighPrice), array.shift(kHighIdx)
+    label lb = label.new(x = idxC, y = pC, text = "見高K", tooltip = "TP: " + str.tostring(tp, "#.0"), color = color.red, style = label.style_label_down, textcolor = color.white, size = size.small)
+    array.push(kHighLabs, lb), array.push(kHighTP, tp), array.push(kHighDone, false)
+    array.push(kHighPrice, pC), array.push(kHighIdx, idxC)
+
+bool isLL = nL_Trig and not na(pB) and pC < pB
+if isLL
+    delete_old_k_low(pC)
+    float tp = (2 * botK_h) - pC
+    if array.size(kLowLabs) >= kLowLimit
+        label.delete(array.shift(kLowLabs))
+        array.shift(kLowTP), array.shift(kLowDone)
+        array.shift(kLowPrice), array.shift(kLowIdx)
+    label lb = label.new(x = idxC, y = pC, text = "落底K", tooltip = "TP: " + str.tostring(tp, "#.0"), color = color.green, style = label.style_label_up, textcolor = color.white, size = size.small)
+    array.push(kLowLabs, lb), array.push(kLowTP, tp), array.push(kLowDone, false)
+    array.push(kLowPrice, pC), array.push(kLowIdx, idxC)
+
+// ==========================================
+// 10. TradingABC ABC 模式識別
+// ==========================================
+
+// ==========================================
+// 9.1 諧波型態識別執行
+// ==========================================
+var bool harmonic_alert_condition = false
+var int last_zz1_count = 0
+var int last_zz2_count = 0
+var int last_zz3_count = 0
+var int last_zz4_count = 0
+// [A2] 追蹤各組最新樞軸的價格與位置：同向延續 pop+push 不改 count，需靠這兩個值偵測原位更新
+var float last_zz1_val = na
+var float last_zz2_val = na
+var float last_zz3_val = na
+var float last_zz4_val = na
+var int last_zz1_bar = na
+var int last_zz2_bar = na
+var int last_zz3_bar = na
+var int last_zz4_bar = na
+
+// [效能優化] 僅在有新樞軸點或樞軸原位更新時才偵測型態
+if harmonic_showHarmonic
+    bool h_new_pattern = false
+    if harmonic_showZigZag1 and zz1.cb.count > 0 and (zz1.cb.count != last_zz1_count or zz1.cb.get(0) != last_zz1_val or zz1.cb.getBar(0) != last_zz1_bar)
+        h_new_pattern := harmonic_detect_harmonic_pattern(zz1.cb, zz1.wmLines, zz1.wmLabel, zz1.wmType, zz1.wmLabels, harmonic_zigzag1Color, 1, line.style_solid, harmonic_showZigZag1) or h_new_pattern
+        last_zz1_count := zz1.cb.count
+        last_zz1_val := zz1.cb.get(0)
+        last_zz1_bar := zz1.cb.getBar(0)
+    if harmonic_showZigZag2 and zz2.cb.count > 0 and (zz2.cb.count != last_zz2_count or zz2.cb.get(0) != last_zz2_val or zz2.cb.getBar(0) != last_zz2_bar)
+        h_new_pattern := harmonic_detect_harmonic_pattern(zz2.cb, zz2.wmLines, zz2.wmLabel, zz2.wmType, zz2.wmLabels, harmonic_zigzag2Color, 1, line.style_solid, harmonic_showZigZag2) or h_new_pattern
+        last_zz2_count := zz2.cb.count
+        last_zz2_val := zz2.cb.get(0)
+        last_zz2_bar := zz2.cb.getBar(0)
+    if harmonic_showZigZag3 and zz3.cb.count > 0 and (zz3.cb.count != last_zz3_count or zz3.cb.get(0) != last_zz3_val or zz3.cb.getBar(0) != last_zz3_bar)
+        h_new_pattern := harmonic_detect_harmonic_pattern(zz3.cb, zz3.wmLines, zz3.wmLabel, zz3.wmType, zz3.wmLabels, harmonic_zigzag3Color, 1, line.style_solid, harmonic_showZigZag3) or h_new_pattern
+        last_zz3_count := zz3.cb.count
+        last_zz3_val := zz3.cb.get(0)
+        last_zz3_bar := zz3.cb.getBar(0)
+    if harmonic_showZigZag4 and zz4.cb.count > 0 and (zz4.cb.count != last_zz4_count or zz4.cb.get(0) != last_zz4_val or zz4.cb.getBar(0) != last_zz4_bar)
+        h_new_pattern := harmonic_detect_harmonic_pattern(zz4.cb, zz4.wmLines, zz4.wmLabel, zz4.wmType, zz4.wmLabels, harmonic_zigzag4Color, 1, line.style_solid, harmonic_showZigZag4) or h_new_pattern
+        last_zz4_count := zz4.cb.count
+        last_zz4_val := zz4.cb.get(0)
+        last_zz4_bar := zz4.cb.getBar(0)
+
+    harmonic_alert_condition := h_new_pattern
+
+// ==========================================
+// 9.2 背離指標偵測與繪圖
+// ==========================================
+bool div_new_this_bar = false
+
+// 計算各指標背離（每根皆呼叫以維持 series 一致性；昂貴掃描由函數內 div_trigger 把關）
+if div_showDivergence
+    array.fill(div_all, 0)
+    [d0_0, d1_0, d2_0, d3_0] = div_calculate(div_calcmacd, div_macd)
+    div_array_set(d0_0, d1_0, d2_0, d3_0, 0)
+    [d0_1, d1_1, d2_1, d3_1] = div_calculate(div_calcmacda, div_deltamacd)
+    div_array_set(d0_1, d1_1, d2_1, d3_1, 1)
+    [d0_2, d1_2, d2_2, d3_2] = div_calculate(div_calcrsi, div_rsi)
+    div_array_set(d0_2, d1_2, d2_2, d3_2, 2)
+    [d0_3, d1_3, d2_3, d3_3] = div_calculate(div_calcstoc, div_stk)
+    div_array_set(d0_3, d1_3, d2_3, d3_3, 3)
+    [d0_4, d1_4, d2_4, d3_4] = div_calculate(div_calccci, div_cci)
+    div_array_set(d0_4, d1_4, d2_4, d3_4, 4)
+    [d0_5, d1_5, d2_5, d3_5] = div_calculate(div_calcmom, div_moment)
+    div_array_set(d0_5, d1_5, d2_5, d3_5, 5)
+    [d0_6, d1_6, d2_6, d3_6] = div_calculate(div_calcobv, div_obv)
+    div_array_set(d0_6, d1_6, d2_6, d3_6, 6)
+    [d0_7, d1_7, d2_7, d3_7] = div_calculate(div_calcvwmacd, div_vwmacd)
+    div_array_set(d0_7, d1_7, d2_7, d3_7, 7)
+    [d0_8, d1_8, d2_8, d3_8] = div_calculate(div_calccmf, div_cmf)
+    div_array_set(d0_8, d1_8, d2_8, d3_8, 8)
+    [d0_9, d1_9, d2_9, d3_9] = div_calculate(div_calcmfi, div_mfi)
+    div_array_set(d0_9, d1_9, d2_9, d3_9, 9)
+
+    if div_trigger
+        // 檢查背離總數門檻
+        div_total = 0
+        for x = 0 to array.size(div_all) - 1
+            div_total := div_total + math.round(math.sign(array.get(div_all, x)))
+        bool meets_div_limit = div_total >= div_showlimit
+
+        // 追蹤線條管理狀態
+        var int div_last_pos_n = 0
+        var int div_last_neg_n = 0
+        var bool div_rm_last_pos = false
+        var bool div_rm_last_neg = false
+        if not na(div_pl)
+            div_rm_last_pos := false
+            div_last_pos_n := 0
+        if not na(div_ph)
+            div_rm_last_neg := false
+            div_last_neg_n := 0
+
+        // 繪製背離線條與標籤
+        div_txt_top = ""
+        div_txt_btm = ""
+        div_distances = array.new_int(0)
+        div_num_top = 0
+        div_num_btm = 0
+        div_top_col = color.white
+        div_btm_col = color.white
+        div_old_pos_ok = true
+        div_old_neg_ok = true
+        div_sp = div_dontconfirm ? 0 : 1
+
+        for x = 0 to 9
+            div_type = -1
+            for y = 0 to 3
+                if array.get(div_all, x * 4 + y) > 0 and meets_div_limit
+                    div_type := y
+                    if (y % 2) == 1
+                        div_num_top := div_num_top + 1
+                        div_top_col := array.get(div_colors, y)
+                    if (y % 2) == 0
+                        div_num_btm := div_num_btm + 1
+                        div_btm_col := array.get(div_colors, y)
+                    if not array.includes(div_distances, array.get(div_all, x * 4 + y))
+                        array.push(div_distances, array.get(div_all, x * 4 + y))
+                        new_line = div_showlines ? line.new(
+                                  x1 = bar_index - array.get(div_all, x * 4 + y),
+                                  y1 = (div_source == "Close" ? close[array.get(div_all, x * 4 + y)] :
+                                                   (y % 2) == 0 ? low[array.get(div_all, x * 4 + y)] :
+                                                                  high[array.get(div_all, x * 4 + y)]),
+                                  x2 = bar_index - div_sp,
+                                  y2 = (div_source == "Close" ? close[div_sp] :
+                                                   (y % 2) == 0 ? low[div_sp] : high[div_sp]),
+                                  color = array.get(div_colors, y),
+                                  style = y < 2 ? line.style_solid : line.style_dashed,
+                                  width = y < 2 ? 2 : 1)
+                                  : na
+                        if (y % 2) == 0
+                            if div_old_pos_ok
+                                div_old_pos_ok := false
+                                if not div_showlast and div_rm_last_pos
+                                    div_del_last_pos(div_last_pos_n)
+                                    div_last_pos_n := 0
+                                if div_showlast
+                                    div_del_old_pos_lines()
+                            array.push(div_pos_lines, new_line)
+                            div_last_pos_n := div_last_pos_n + 1
+                            div_rm_last_pos := true
+                        if (y % 2) == 1
+                            if div_old_neg_ok
+                                div_old_neg_ok := false
+                                if not div_showlast and div_rm_last_neg
+                                    div_del_last_neg(div_last_neg_n)
+                                    div_last_neg_n := 0
+                                if div_showlast
+                                    div_del_old_neg_lines()
+                            array.push(div_neg_lines, new_line)
+                            div_last_neg_n := div_last_neg_n + 1
+                            div_rm_last_neg := true
+            if div_type >= 0
+                div_txt_top := div_txt_top + ((div_type % 2) == 1 ? (div_showindis != "Don't Show" ? array.get(div_ind_names, x) + "\n" : "") : "")
+                div_txt_btm := div_txt_btm + ((div_type % 2) == 0 ? (div_showindis != "Don't Show" ? array.get(div_ind_names, x) + "\n" : "") : "")
+
+        // 繪製背離標籤（小字 size.tiny）
+        if div_showindis != "Don't Show" or div_shownum
+            if div_shownum and div_num_top > 0
+                div_txt_top := div_txt_top + str.tostring(div_num_top)
+            if div_shownum and div_num_btm > 0
+                div_txt_btm := div_txt_btm + str.tostring(div_num_btm)
+            if div_txt_top != ""
+                if div_showlast
+                    div_del_old_neg_labels()
+                array.push(div_neg_labels, label.new(x = bar_index, y = math.max(high, high[1]), text = div_txt_top, color = div_top_col, textcolor = div_neg_text_col, style = label.style_label_down, size = size.tiny))
+                div_new_this_bar := true
+            if div_txt_btm != ""
+                if div_showlast
+                    div_del_old_pos_labels()
+                array.push(div_pos_labels, label.new(x = bar_index, y = math.min(low, low[1]), text = div_txt_btm, color = div_btm_col, textcolor = div_pos_text_col, style = label.style_label_up, size = size.tiny))
+                div_new_this_bar := true
+
+        // 背離繪圖物件上限保護
+        while array.size(div_pos_lines) > 50
+            line.delete(array.shift(div_pos_lines))
+        while array.size(div_neg_lines) > 50
+            line.delete(array.shift(div_neg_lines))
+        while array.size(div_pos_labels) > 30
+            label.delete(array.shift(div_pos_labels))
+        while array.size(div_neg_labels) > 30
+            label.delete(array.shift(div_neg_labels))
+
+if tab_showzigzag and tab_cb.count > 2
+    var line tab_zzline1 = line.new(na, na, na, na, width = 2, style = line.style_dashed)
+    var line tab_zzline2 = line.new(na, na, na, na, width = 2, style = line.style_dashed)
+    tab_zzline1.set_xy1(math.round(tab_cb.getBar(0)), tab_cb.get(0))
+    tab_zzline1.set_xy2(math.round(tab_cb.getBar(1)), tab_cb.get(1))
+    tab_zzline1.set_color(tab_dir == 1 ? tab_upcol : tab_dncol)
+    
+    tab_zzline2.set_xy1(math.round(tab_cb.getBar(1)), tab_cb.get(1))
+    tab_zzline2.set_xy2(math.round(tab_cb.getBar(2)), tab_cb.get(2))
+    tab_zzline2.set_color(tab_dir == -1 ? tab_upcol : tab_dncol)
+    
+    float tab_zzlen = math.abs(tab_cb.get(1) - tab_cb.get(2))
+    float tab_fmin = tab_dir == 1 ? tab_cb.get(1) + tab_zzlen * (tab_fibodn - tab_errorrate) : tab_cb.get(2) + tab_zzlen * ((1 - tab_fibodn) + tab_errorrate)
+    float tab_fmax = tab_dir == 1 ? tab_cb.get(1) + tab_zzlen * (tab_fiboup + tab_errorrate) : tab_cb.get(2) + tab_zzlen * ((1 - tab_fiboup) - tab_errorrate)
+    var line tab_fibo1 = line.new(na, na, na, na, color = color.blue, style = line.style_dashed, extend = extend.right)
+    var line tab_fibo2 = line.new(na, na, na, na, color = color.blue, style = line.style_dashed, extend = extend.right)
+    
+    tab_fibo1.set_xy1(math.round(tab_cb.getBar(1)), tab_fmin)
+    tab_fibo1.set_xy2(math.round(tab_cb.getBar(1)) + 1, tab_fmin)
+    
+    tab_fibo2.set_xy1(math.round(tab_cb.getBar(1)), tab_fmax)
+    tab_fibo2.set_xy2(math.round(tab_cb.getBar(1)) + 1, tab_fmax)
+
+float tab_zchange = tab_cb.count > 0 ? tab_cb.get(0) : 0.0
+array<float> tab_abc = array.new<float>(0)
+if ta.change(tab_zchange) != 0 and tab_cb.count > 2 and ((not na(tab_pl) and tab_trend == 1 and tab_dir == -1 and low < array.max(tab_ma_array)) or (not na(tab_ph) and tab_trend == -1 and tab_dir == 1 and high > array.min(tab_ma_array)))
+    float tab_a = tab_cb.get(0)
+    float tab_b = tab_cb.get(1)
+    int tab_b_loc = tab_cb.getBar(1)
+    float tab_c = tab_cb.get(2)
+    int tab_c_loc = tab_cb.getBar(2)
+    float tab_rate = (tab_a - tab_b) / (tab_c - tab_b)
+    if tab_rate >= (tab_fibodn - tab_fibodn * tab_errorrate) and tab_rate <= (tab_fiboup + tab_fiboup * tab_errorrate)
+        array.push(tab_abc, tab_b)
+        array.push(tab_abc, time[bar_index - tab_b_loc])
+        array.push(tab_abc, tab_c)
+        array.push(tab_abc, time[bar_index - tab_c_loc])
+
+tab_draw_line(int dir, int t1, float y1_, int t2, float y2_, int t3, float y3_) =>
+    line tab_l1 = line.new(x1 = t1, y1 = y1_, x2 = t2, y2 = y2_, color = dir == 1 ? tab_upcol : tab_dncol, width = 2, xloc = xloc.bar_time)
+    line tab_l2 = line.new(x1 = t2, y1 = y2_, x2 = t3, y2 = y3_, color = dir == 1 ? tab_dncol : tab_upcol, width = 2, xloc = xloc.bar_time)
+    [tab_l1, tab_l2]
+
+tab_draw_label(int dir, int t1, float y1_, int t2, float y2_, int t3, float y3_) =>
+    label tab_alabel = label.new(x = t1, y = y1_, text = "C", style = dir == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.white, 100), textcolor = color.blue, xloc = xloc.bar_time)
+    label tab_blabel = label.new(x = t2, y = y2_, text = "B", style = dir == -1 ? label.style_label_down : label.style_label_up, color = color.new(color.white, 100), textcolor = color.blue, xloc = xloc.bar_time)
+    label tab_clabel = label.new(x = t3, y = y3_, text = "A", style = dir == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.white, 100), textcolor = color.blue, xloc = xloc.bar_time)
+    [tab_alabel, tab_blabel, tab_clabel]
+
+var line[] tab_abclines = array.new_line(0)
+var label[] tab_abclabels = array.new_label(0)
+
+if tab_showabc and array.size(tab_abc) >= 4
+    if not tab_keepabc
+        while array.size(tab_abclines) > 0
+            line.delete(array.shift(tab_abclines))
+        while array.size(tab_abclabels) > 0
+            label.delete(array.shift(tab_abclabels))
+    
+    [tab_l1_, tab_l2_] = tab_draw_line(tab_dir, time, tab_cb.get(0), int(array.get(tab_abc, 1)), array.get(tab_abc, 0), int(array.get(tab_abc, 3)), array.get(tab_abc, 2))
+    array.push(tab_abclines, tab_l1_)
+    array.push(tab_abclines, tab_l2_)
+
+    [tab_la1_, tab_la2_, tab_la3_] = tab_draw_label(tab_dir, time, tab_cb.get(0), int(array.get(tab_abc, 1)), array.get(tab_abc, 0), int(array.get(tab_abc, 3)), array.get(tab_abc, 2))
+    array.push(tab_abclabels, tab_la1_)
+    array.push(tab_abclabels, tab_la2_)
+    array.push(tab_abclabels, tab_la3_)
+
+    while array.size(tab_abclines) > 20
+        line.delete(array.shift(tab_abclines))
+    while array.size(tab_abclabels) > 30
+        label.delete(array.shift(tab_abclabels))
+
+// ==========================================
+// 11. 見高K 達標追蹤與動態更新
+// ==========================================
+
+if barstate.isconfirmed and array.size(bullNLabs) > 0 and array.includes(bullNDone, false)
+    for i = 0 to array.size(bullNLabs) - 1
+        if not array.get(bullNDone, i)
+            float vN = array.get(bullNT_N, i), vE = array.get(bullNT_E, i), vV = array.get(bullNT_V, i)
+            bool changed = false
+            if high >= vN and not array.get(bullND_N, i)
+                array.set(bullND_N, i, true)
+                changed := true
+            if high >= vE and not array.get(bullND_E, i)
+                array.set(bullND_E, i, true)
+                changed := true
+            if high >= vV and not array.get(bullND_V, i)
+                array.set(bullND_V, i, true)
+                changed := true
+            if changed
+                label.set_tooltip(array.get(bullNLabs, i), get_sorted_text("正N 目標", vN, array.get(bullND_N, i), vE, array.get(bullND_E, i), vV, array.get(bullND_V, i)))
+            if array.get(bullND_N, i) and array.get(bullND_E, i) and array.get(bullND_V, i)
+                label.set_textcolor(array.get(bullNLabs, i), color.black)
+                array.set(bullNDone, i, true)
+
+if barstate.isconfirmed and array.size(bearNLabs) > 0 and array.includes(bearNDone, false)
+    for i = 0 to array.size(bearNLabs) - 1
+        if not array.get(bearNDone, i)
+            float vN = array.get(bearNT_N, i), vE = array.get(bearNT_E, i), vV = array.get(bearNT_V, i)
+            bool changed = false
+            if low <= vN and not array.get(bearND_N, i)
+                array.set(bearND_N, i, true)
+                changed := true
+            if low <= vE and not array.get(bearND_E, i)
+                array.set(bearND_E, i, true)
+                changed := true
+            if low <= vV and not array.get(bearND_V, i)
+                array.set(bearND_V, i, true)
+                changed := true
+            if changed
+                label.set_tooltip(array.get(bearNLabs, i), get_sorted_text("倒N 目標", vN, array.get(bearND_N, i), vE, array.get(bearND_E, i), vV, array.get(bearND_V, i)))
+            if array.get(bearND_N, i) and array.get(bearND_E, i) and array.get(bearND_V, i)
+                label.set_textcolor(array.get(bearNLabs, i), color.black)
+                array.set(bearNDone, i, true)
+
+if barstate.isconfirmed and array.size(kHighLabs) > 0 and array.includes(kHighDone, false)
+    for i = 0 to array.size(kHighLabs) - 1
+        if not array.get(kHighDone, i) and low <= array.get(kHighTP, i)
+            label.set_textcolor(array.get(kHighLabs, i), color.black)
+            array.set(kHighDone, i, true)
+
+if barstate.isconfirmed and array.size(kLowLabs) > 0 and array.includes(kLowDone, false)
+    for i = 0 to array.size(kLowLabs) - 1
+        if not array.get(kLowDone, i) and high >= array.get(kLowTP, i)
+            label.set_textcolor(array.get(kLowLabs, i), color.black)
+            array.set(kLowDone, i, true)
+
+// ==========================================
+// 12. TradingABC Stochastic 與進場信號
+// ==========================================
+bool tab_lbounced = false
+bool tab_sbounced = false
+for i = 0 to 5
+    if math.min(low, low[1]) <= array.get(tab_ma_array, i) and close > array.get(tab_ma_array, i) and close > open
+        tab_lbounced := true
+    if math.max(high, high[1]) >= array.get(tab_ma_array, i) and close < array.get(tab_ma_array, i) and close < open
+        tab_sbounced := true
+
+float tab_sto = ta.sma(ta.stoch(close, high, low, 5), 3)
+float tab_sto_sig = ta.sma(tab_sto, 3)
+bool tab_lstoch = tab_sto[1] <= tab_sto_sig[1] and tab_sto > tab_sto_sig and tab_sto[1] < 50
+bool tab_sstoch = tab_sto[1] >= tab_sto_sig[1] and tab_sto < tab_sto_sig and tab_sto[1] > 50
+
+bool tab_there_is_abc = array.size(tab_abc) != 0
+var float tab_last_zz_point = 0.0
+tab_last_zz_point := tab_cb.count > 1 and tab_there_is_abc ? tab_cb.get(0) : tab_last_zz_point
+var int tab_abc_bar_count = 0
+var int tab_abc_prev_size = 0
+if array.size(tab_abc) > tab_abc_prev_size
+    tab_abc_bar_count := 0
+tab_abc_prev_size := array.size(tab_abc)
+tab_abc_bar_count := tab_abc_bar_count + 1
+float tab_hhh_ = ta.highest(math.min(tab_abc_bar_count + 1, 10))
+float tab_lll_ = ta.lowest(math.min(tab_abc_bar_count + 1, 10))
+
+bool tab_long = tab_trend == 1 and tab_abc_bar_count <= 6 and tab_lbounced and tab_lll_ >= tab_last_zz_point
+bool tab_short = tab_trend == -1 and tab_abc_bar_count <= 6 and tab_sbounced and tab_hhh_ <= tab_last_zz_point
+
+// ==========================================
+// 13a. SMC CHoCH 狀態搶先更新（防止盤中即時橫跳漂移）
+// ==========================================
+var float smc_os_prev = na
+var float smc_max_price_prev = na
+var float smc_min_price_prev = na
+// [A5] BOS 延遲確認快照：記錄檢查點位階與起點（max/min_price 會被突破根自身 high/low 更新，不能直接回看）
+var float ms_bos_top_ref = na
+var int   ms_bos_top_x1  = na
+var float ms_bos_btm_ref = na
+var int   ms_bos_btm_x1  = na
+
+if not na(ms_top)
+    smc.topy := ms_top
+    smc.saved_top_high := high[ms_len]
+    smc.saved_top_low  := low[ms_len]
+
+if not na(ms_btm)
+    smc.btmy := ms_btm
+    smc.saved_btm_high := high[ms_len]
+    smc.saved_btm_low  := low[ms_len]
+
+// 核心改動：改用已確認的前一根收盤價 close[1] 來判斷突破
+bool ms_bull_choch_early = close[1] > smc.topy and not smc.top_crossed and not na(smc.topy)
+bool ms_bear_choch_early = close[1] < smc.btmy and not smc.btm_crossed and not na(smc.btmy)
+
+if ms_bull_choch_early
+    smc.os := 1
+
+if ms_bear_choch_early
+    smc.os := 0
+
+// ==========================================
+// 13b. SMC FVG Logic
+// ==========================================
+if ms_showFvg
+    float ms_min_gap_size = ms_useAtrFilter ? (atrVal * ms_atrMult) : 0.0
+
+    float ms_bull_gap_top = low
+    float ms_bull_gap_btm = high[2]
+    float ms_bull_size    = ms_bull_gap_top - ms_bull_gap_btm
+    bool ms_pass_bull_trend = ms_filterTrend ? (smc.os == 1) : true
+
+    if ms_bull_gap_top > ms_bull_gap_btm and ms_bull_size >= ms_min_gap_size and ms_pass_bull_trend
+        box fvg_b = box.new(left = bar_index - 2, top = ms_bull_gap_top, right = bar_index - 2 + ms_fvgLength, bottom = ms_bull_gap_btm, 
+             border_color = ms_fvgBullCss, bgcolor = ms_fvgBullCss, extend = extend.none, xloc = xloc.bar_index, 
+             text = "FVG", text_size = size.small, text_color = color.new(color.white, 20), 
+             text_halign = text.align_right, text_valign = text.align_center)
+        array.push(smc.fvg_boxes, fvg_b)
+        array.push(smc.fvg_is_bull, true)
+        while array.size(smc.fvg_boxes) > 40
+            box.delete(array.shift(smc.fvg_boxes))
+            array.shift(smc.fvg_is_bull)
+
+    float ms_bear_gap_top = low[2]
+    float ms_bear_gap_btm = high
+    float ms_bear_size    = ms_bear_gap_top - ms_bear_gap_btm
+    bool ms_pass_bear_trend = ms_filterTrend ? (smc.os == 0) : true
+    
+    if ms_bear_gap_btm < ms_bear_gap_top and ms_bear_size >= ms_min_gap_size and ms_pass_bear_trend
+        box fvg_s = box.new(left = bar_index - 2, top = ms_bear_gap_top, right = bar_index - 2 + ms_fvgLength, bottom = ms_bear_gap_btm, 
+             border_color = ms_fvgBearCss, bgcolor = ms_fvgBearCss, extend = extend.none, xloc = xloc.bar_index, 
+             text = "FVG", text_size = size.small, text_color = color.new(color.white, 20), 
+             text_halign = text.align_right, text_valign = text.align_center)
+        array.push(smc.fvg_boxes, fvg_s)
+        array.push(smc.fvg_is_bull, false)
+        while array.size(smc.fvg_boxes) > 40
+            box.delete(array.shift(smc.fvg_boxes))
+            array.shift(smc.fvg_is_bull)
+
+    // FVG 填補消除：當蠟燭收盤價完全穿過 FVG 時刪除
+    if barstate.isconfirmed and array.size(smc.fvg_boxes) > 0
+        for i = array.size(smc.fvg_boxes) - 1 to 0
+            box fvg_box = array.get(smc.fvg_boxes, i)
+            float fvg_top = box.get_top(fvg_box)
+            float fvg_btm = box.get_bottom(fvg_box)
+            // Bullish FVG 被空方穿越（收盤跌破底部）→ 消除
+            // Bearish FVG 被多方穿越（收盤突破頂部）→ 消除
+            bool fvg_is_bull_val = array.get(smc.fvg_is_bull, i)
+            bool is_mitigated = fvg_is_bull_val ? (close < fvg_btm) : (close > fvg_top)
+            if is_mitigated
+                box.delete(fvg_box)
+                array.remove(smc.fvg_boxes, i)
+                array.remove(smc.fvg_is_bull, i)
+
+// ==========================================
+// 14. 見高K SMC Structure Logic（CHoCH 繪圖 + BOS/IDM/Sweep）
+// ==========================================
+// 注意：smc.os 已由 Section 13a 搶先更新；此處負責 top_crossed/btm_crossed 與繪圖
+
+if not na(ms_top)
+    smc.top_crossed := false
+
+if not na(ms_btm)
+    smc.btm_crossed := false
+
+bool ms_bull_choch = close[1] > smc.topy and not smc.top_crossed and not na(smc.topy)
+bool ms_bear_choch = close[1] < smc.btmy and not smc.btm_crossed and not na(smc.btmy)
+
+if ms_bull_choch
+    smc.os := 1
+    smc.top_crossed := true
+    smc.draw_ob(smc.saved_btm_high, smc.saved_btm_low, ms_btmx, true, ms_showOb, ms_obBullCss, ms_obBearCss)
+
+if ms_bear_choch
+    smc.os := 0
+    smc.btm_crossed := true
+    smc.draw_ob(smc.saved_top_high, smc.saved_top_low, ms_topx, false, ms_showOb, ms_obBullCss, ms_obBearCss)
+
+if smc.os != smc_os_prev
+    smc.max_price := high
+    smc.min_price := low
+    smc.max_x1    := bar_index
+    smc.min_x1    := bar_index
+    smc.stop_crossed := false
+    smc.sbtm_crossed := false
+
+    if smc.os == 1 and ms_showChoch
+        ms_push_line(line.new(ms_topx, smc.topy, bar_index, smc.topy, color = ms_bullCss, style = line.style_dashed))
+        ms_push_label(label.new(int(math.avg(bar_index, ms_topx)), smc.topy, '反轉', color = na, style = label.style_label_down, textcolor = color.white, size = size.normal))
+    else if ms_showChoch
+        ms_push_line(line.new(ms_btmx, smc.btmy, bar_index, smc.btmy, color = ms_bearCss, style = line.style_dashed))
+        ms_push_label(label.new(int(math.avg(bar_index, ms_btmx)), smc.btmy, '反轉', color = na, style = label.style_label_up, textcolor = color.white, size = size.normal))
+
+float ms_stopy = fixnan(ms_stop)
+float ms_sbtmy = fixnan(ms_sbtm)
+
+if low < ms_sbtmy and not smc.sbtm_crossed and smc.os == 1 and ms_sbtmy != smc.btmy and not na(ms_sbtmy)
+    if ms_showIdm
+        ms_push_line(line.new(ms_sbtmx, ms_sbtmy, bar_index, ms_sbtmy, color = ms_idmCss, style = line.style_dotted))
+        ms_push_label(label.new(ms_sbtmx, ms_sbtmy, '多 IDM', color = na, style = label.style_label_up, textcolor = color.white, size = size.normal))
+    smc.sbtm_crossed := true
+
+bool ms_bos_bull_condition = smc.sbtm_crossed and smc.os == 1 and not na(ms_bos_top_ref)
+if close[1] > ms_bos_top_ref and ms_bos_bull_condition
+    if ms_showBos
+        ms_push_line(line.new(ms_bos_top_x1, ms_bos_top_ref, bar_index, ms_bos_top_ref, color = ms_bullCss))
+        ms_push_label(label.new(int(math.avg(bar_index, ms_bos_top_x1)), ms_bos_top_ref, 'BOS', color = color(na), style = label.style_label_down, textcolor = ms_bullCss, size = size.tiny))
+        smc.draw_ob(smc.saved_btm_high, smc.saved_btm_low, ms_btmx, true, ms_showOb, ms_obBullCss, ms_obBearCss)
+    smc.sbtm_crossed := false
+
+if high > ms_stopy and not smc.stop_crossed and smc.os == 0 and ms_stopy != smc.topy and not na(ms_stopy)
+    if ms_showIdm
+        ms_push_line(line.new(ms_stopx, ms_stopy, bar_index, ms_stopy, color = ms_idmCss, style = line.style_dotted))
+        ms_push_label(label.new(ms_stopx, ms_stopy, '空 IDM', color = na, style = label.style_label_down, textcolor = color.white, size = size.normal))
+    smc.stop_crossed := true
+
+bool ms_bos_bear_condition = smc.stop_crossed and smc.os == 0 and not na(ms_bos_btm_ref)
+if close[1] < ms_bos_btm_ref and ms_bos_bear_condition
+    if ms_showBos
+        ms_push_line(line.new(ms_bos_btm_x1, ms_bos_btm_ref, bar_index, ms_bos_btm_ref, color = ms_bearCss))
+        ms_push_label(label.new(int(math.avg(bar_index, ms_bos_btm_x1)), ms_bos_btm_ref, 'BOS', color = na, style = label.style_label_up, textcolor = ms_bearCss, size = size.tiny))
+        smc.draw_ob(smc.saved_top_high, smc.saved_top_low, ms_topx, false, ms_showOb, ms_obBullCss, ms_obBearCss)
+    smc.stop_crossed := false
+
+if high > smc.max_price and close < smc.max_price and smc.os == 1 and bar_index - smc.max_x1 > 1 and ms_showSweeps and not na(smc.max_price)
+    int target_bar = int(math.avg(bar_index, smc.max_x1))
+    ms_push_line(line.new(smc.max_x1, smc.max_price, bar_index, smc.max_price, color = ms_sweepsCss, style = line.style_dotted))
+    ms_push_label(label.new(target_bar, smc.max_price, 'x', color = na, style = label.style_label_down, textcolor = color.white))
+    float dot_y_high = high[bar_index - target_bar] + (atrVal * 0.5)
+    ms_push_label(label.new(target_bar, dot_y_high, text="●", yloc=yloc.price, color=na, style=label.style_none, textcolor=color.white, size=size.large))
+    ms_push_line(line.new(target_bar, smc.max_price, target_bar, dot_y_high, color=color.white, style=line.style_dotted, width=1))
+
+if low < smc.min_price and close > smc.min_price and smc.os == 0 and bar_index - smc.min_x1 > 1 and ms_showSweeps and not na(smc.min_price)
+    int target_bar = int(math.avg(bar_index, smc.min_x1))
+    ms_push_line(line.new(smc.min_x1, smc.min_price, bar_index, smc.min_price, color = ms_sweepsCss, style = line.style_dotted))
+    ms_push_label(label.new(target_bar, smc.min_price, 'x', color = na, style = label.style_label_up, textcolor = color.white))
+    float dot_y_low = low[bar_index - target_bar] - (atrVal * 0.5)
+    ms_push_label(label.new(target_bar, dot_y_low, text="●", yloc=yloc.price, color=na, style=label.style_none, textcolor=color.white, size=size.large))
+    ms_push_line(line.new(target_bar, smc.min_price, target_bar, dot_y_low, color=color.white, style=line.style_dotted, width=1))
+
+// [A5] 先快照本根檢查點位階（＝截至上根的 max/min_price），供下一根的 close[1] 回測
+ms_bos_top_ref := smc.max_price
+ms_bos_top_x1  := smc.max_x1
+ms_bos_btm_ref := smc.min_price
+ms_bos_btm_x1  := smc.min_x1
+smc.max_price := not na(smc.max_price) ? math.max(high, smc.max_price) : high
+smc.min_price := not na(smc.min_price) ? math.min(low, smc.min_price) : low
+
+if smc.max_price > smc_max_price_prev and not na(smc_max_price_prev)
+    smc.max_x1 := bar_index
+if smc.min_price < smc_min_price_prev and not na(smc_min_price_prev)
+    smc.min_x1 := bar_index
+
+smc_os_prev := smc.os
+smc_max_price_prev := smc.max_price
+smc_min_price_prev := smc.min_price
+
+// ==========================================
+// 15. 見高K SMC Extensions (Real-time updates)
+// ==========================================
+// OB Mitigation：被價格穿透的 OB 自動消除
+if barstate.isconfirmed and array.size(smc.ob_boxes) > 0
+    for i = array.size(smc.ob_boxes) - 1 to 0
+        box ob_box = array.get(smc.ob_boxes, i)
+        bool ob_bull = array.get(smc.ob_is_bull, i)
+        // 多頭 OB（需求區）：收盤跌破底部 → 失效
+        // 空頭 OB（供給區）：收盤突破頂部 → 失效
+        bool ob_mitigated = ob_bull ? (close < box.get_bottom(ob_box)) : (close > box.get_top(ob_box))
+        if ob_mitigated
+            box.delete(ob_box)
+            array.remove(smc.ob_boxes, i)
+            array.remove(smc.ob_is_bull, i)
+
+if barstate.islast
+    // 存活的 OB 方塊延伸到當前 Bar
+    if array.size(smc.ob_boxes) > 0
+        for i = 0 to array.size(smc.ob_boxes) - 1
+            box.set_right(array.get(smc.ob_boxes, i), bar_index + 5)
+
+    if smc.os == 1
+        if ms_showChoch and not na(smc.topy)
+            smc.ext_choch.set_xy1(ms_btmx, smc.btmy), smc.ext_choch.set_xy2(bar_index, smc.btmy), smc.ext_choch.set_color(ms_bullCss)    
+            smc.ext_choch_lbl.set_xy(bar_index, smc.btmy), smc.ext_choch_lbl.set_style(label.style_label_up), smc.ext_choch_lbl.set_textcolor(color.white)
+        if ms_showBos and not na(smc.max_price)
+            smc.ext_bos.set_xy1(smc.max_x1, smc.max_price), smc.ext_bos.set_xy2(bar_index, smc.max_price), smc.ext_bos.set_color(ms_bullCss)    
+            smc.ext_bos_lbl.set_xy(bar_index, smc.max_price), smc.ext_bos_lbl.set_style(label.style_label_down), smc.ext_bos_lbl.set_textcolor(ms_bullCss)
+        if not smc.sbtm_crossed and ms_showIdm and not na(ms_sbtmy)
+            smc.ext_idm.set_xy1(ms_sbtmx, ms_sbtmy), smc.ext_idm.set_xy2(bar_index + 15, ms_sbtmy)
+            smc.ext_idm_lbl.set_xy(bar_index + 15, ms_sbtmy), smc.ext_idm_lbl.set_style(label.style_label_up)
+            smc.ext_idm_lbl.set_text('多 IDM')
+            smc.ext_idm.set_color(ms_idmCss), smc.ext_idm_lbl.set_textcolor(color.white)
+        else
+            smc.ext_idm.set_color(na)
+            smc.ext_idm_lbl.set_textcolor(na)
+    else
+        if ms_showChoch and not na(smc.topy)
+            smc.ext_choch.set_xy1(ms_topx, smc.topy), smc.ext_choch.set_xy2(bar_index, smc.topy), smc.ext_choch.set_color(ms_bearCss)    
+            smc.ext_choch_lbl.set_xy(bar_index, smc.topy), smc.ext_choch_lbl.set_style(label.style_label_down), smc.ext_choch_lbl.set_textcolor(color.white)
+        if ms_showBos and not na(smc.min_price)
+            smc.ext_bos.set_xy1(smc.min_x1, smc.min_price), smc.ext_bos.set_xy2(bar_index, smc.min_price), smc.ext_bos.set_color(ms_bearCss)    
+            smc.ext_bos_lbl.set_xy(bar_index, smc.min_price), smc.ext_bos_lbl.set_style(label.style_label_up), smc.ext_bos_lbl.set_textcolor(ms_bearCss)
+        if not smc.stop_crossed and ms_showIdm and not na(ms_stopy)
+            smc.ext_idm.set_xy1(ms_stopx, ms_stopy), smc.ext_idm.set_xy2(bar_index + 15, ms_stopy)
+            smc.ext_idm_lbl.set_xy(bar_index + 15, ms_stopy), smc.ext_idm_lbl.set_style(label.style_label_down)
+            smc.ext_idm_lbl.set_text('空 IDM')
+            smc.ext_idm.set_color(ms_idmCss), smc.ext_idm_lbl.set_textcolor(color.white)
+        else
+            smc.ext_idm.set_color(na)
+            smc.ext_idm_lbl.set_textcolor(na)
+
+// ==========================================
+// 16. 見高K 右上角強弱面板 (Table)
+// ==========================================
+var table dash = table.new(position = position.top_right, columns = 1, rows = 4, frame_color = color.gray, frame_width = 1)
+if showTable and barstate.islast
+    bool bull = (vC > vB) and (vB > vA)
+    bool bear = (vA > vB) and (vB > vC)
+    table.cell(table_id = dash, column = 0, row = 0, text = bull ? "多頭強" : (bear ? "空頭強" : "盤整"), bgcolor = bull ? color.new(color.green, 30) : (bear ? color.new(color.red, 30) : color.new(color.gray, 50)), text_color = color.white)
+    table.cell(table_id = dash, column = 0, row = 1, text = "A(1m 300): "  + str.tostring(vA, "#.0"), text_color = color.white, text_size = size.small)
+    table.cell(table_id = dash, column = 0, row = 2, text = "B(15m 20): " + str.tostring(vB, "#.0"), text_color = color.white, text_size = size.small)
+    table.cell(table_id = dash, column = 0, row = 3, text = "C(60m 5): "  + str.tostring(vC, "#.0"), text_color = color.white, text_size = size.small)
+
+// ==========================================
+// 17. TradingABC Trend Cloud 繪製
+// ==========================================
+fill(plot(tab_umax, color = na), plot(tab_umin, color = na), color = tab_showcloud ? tab_tdcolor : na)
+fill(plot(tab_lmax, color = na), plot(tab_lmin, color = na), color = tab_showcloud ? tab_tucolor : na)
+
+// ==========================================
+// 18. TradingABC 進場信號標記
+// ==========================================
+plotshape(tab_long,  style = shape.triangleup, color = tab_upcol, location = location.belowbar, size = size.small)
+plotshape(tab_short, style = shape.triangledown, color = tab_dncol, location = location.abovebar, size = size.small)
+
+// ==========================================
+// 19. TradingABC Alert 條件
+// ==========================================
+alertcondition(tab_long, title = "ABC Long", message = "ABC Long")
+alertcondition(tab_short, title = "ABC Short", message = "ABC Short")
+
+
+// ==========================================
+// 19.4 諧波 Alert 條件
+// ==========================================
+alertcondition(harmonic_alert_condition, title='新的和諧形態警報', message='在 {{ticker}} 上偵測到新的和諧形態')
+alertcondition(div_new_this_bar, title='偵測到背離', message='在 {{ticker}} 上偵測到背離')
+
+// 背離 H/L 樞軸點標記
+plotshape(not na(div_ph) and div_showpivot and div_showDivergence, text = "H", style = shape.labeldown, color = color.new(color.white, 100), textcolor = color.red, location = location.abovebar, offset = -div_prd, size = size.tiny)
+plotshape(not na(div_pl) and div_showpivot and div_showDivergence, text = "L", style = shape.labelup, color = color.new(color.white, 100), textcolor = color.lime, location = location.belowbar, offset = -div_prd, size = size.tiny)
+
+// ==========================================
+// 20. 見高K Swing High/Low Plot
+// ==========================================
+plot(ms_showCircles ? ms_top : na, 'MS Swing High', color.new(ms_bearCss, 50), 5, plot.style_circles, offset = -ms_len)
+plot(ms_showCircles ? ms_btm : na, 'MS Swing Low', color.new(ms_bullCss, 50), 5, plot.style_circles, offset = -ms_len)

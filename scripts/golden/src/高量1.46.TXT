@@ -1,0 +1,441 @@
+// =====================================================================================================================
+// FVG高量V1.41 + VWAP — 修復版
+// 修復: 11 個問題 (P1-P11) + 5 項優化 (OA-OE)
+// =====================================================================================================================
+//@version=6
+indicator('FVG高量V1.41 + VWAP', overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_polylines_count = 100, max_bars_back = 1000)
+
+// =====================================================================================================================}
+// 📌 1. FVG Volume Profile 參數設定
+// ====================================================================================================================={
+group_fvg = "=== FVG Volume Profile 設定 ==="
+bool autoTf = input.bool(true, "自動時間週期", inline = "1", group = group_fvg)
+string tf1 = input.timeframe("10", "", inline = "1", group = group_fvg, tooltip = "關閉 '自動' 時，選擇用於檢測 FVG 成交量的自定義時間週期。")
+bool showVP = input.bool(true, "顯示 VP 柱狀圖", group = group_fvg)  // [Bug #8 修復] hideVP → showVP (語意反轉)
+int fvg_extend = input.int(25, "FVG 延伸長度 (K 棒)", minval = 1, group = group_fvg, tooltip = "FVG box 向右延伸的 K 棒數")  // [Bug #11 修復] 25 改為可配置
+int bins = input.int(15, "VP 解析度 (Bins)", group = group_fvg)
+float gap_filter = input.float(0.5, '缺口過濾閾值', step = 0.01, group = group_fvg)
+color bull_color = input.color(#1da370, '看漲 FVG 顏色', group = group_fvg)
+color bear_color = input.color(#bc25d6, '看跌 FVG 顏色', group = group_fvg)
+
+// =====================================================================================================================}
+// 📌 2. 高量警示 & 趨勢線 參數設定
+// ====================================================================================================================={
+group_vol = "=== 高量警示與趨勢線 設定 ==="
+float filter_vol = input.float(2, '依成交量過濾點', step = 0.1, group = group_vol, minval = 0, maxval = 6)
+int leftBars = input(15, "樞軸點 左側 K 棒", group = group_vol)
+int rightBars = input(15, "樞軸點 右側 K 棒", group = group_vol)
+bool show_lvl = input.bool(true, '顯示支撐壓力級別', group = group_vol)
+
+// 趨勢線設定
+bool trendline_enabled = input.bool(true, '啟用趨勢線', group = group_vol)
+int trendline_length = input.int(14, '趨勢線回看週期', group = group_vol)
+float trendline_mult = input.float(0, '趨勢線斜率', minval = 0, step = .1, group = group_vol)
+string trendline_calcMethod = input.string('Atr', '斜率計算方法', options = ['Atr','Stdev','Linreg'], group = group_vol)
+bool trendline_backpaint = input(true, '趨勢線回溯繪製', tooltip = '禁用回溯繪製以查看實時信息。', group = group_vol)
+
+color trendline_upColor = input.color(#2962FF, '上升趨勢線顏色', group = group_vol)
+color trendline_dnColor = input.color(#FF6D00, '下降趨勢線顏色', group = group_vol)
+bool trendline_showExt = input(true, '顯示延伸線', group = group_vol)
+
+color upper_col = input.color(#fda05e, "高點顏色", inline = "lvl_col", group = group_vol)
+color lower_col = input.color(#2fd68e, "低點顏色", inline = "lvl_col", group = group_vol)
+
+// [Bug #13 修復] 即時 alert 模式 (1m scalper 可關閉 isconfirmed 提早觸發)
+bool realtime_alert = input.bool(false, "即時 alert 模式 (1m scalper)", group = group_vol, tooltip = "啟用時 alert 不等收盤，K 棒形成中即觸發；停用則等收盤才觸發")
+
+// =====================================================================================================================}
+// 📌 3. [ORB設定] 台指期 08:45 開盤區間
+// ====================================================================================================================={
+group_orb    = "=== 台指期 08:45 開盤設定 ==="
+bool show_orb   = input.bool(true, "啟用 08:45 高低點標示", group = group_orb, tooltip = "使用 ta.valuewhen 強制鎖定 08:45 的 5分K 數值，並回溯繪製")
+color orb_color = input.color(color.white, "線條顏色", group = group_orb)
+int orb_width   = input.int(2, "線條寬度", minval = 1, group = group_orb)
+int orb_length  = input.int(15, "線條延伸長度 (根)", minval = 1, group = group_orb)
+
+// =====================================================================================================================}
+// 📌 4. VWAP 設定
+// ====================================================================================================================={
+group_vwap  = "=== VWAP 設定 ==="
+bool show_vwap = input.bool(true, "顯示 VWAP 線", group = group_vwap)
+color vwap_col = input.color(color.rgb(255, 0, 255), "VWAP 顏色 (粉紅)", group = group_vwap)
+int vwap_wid   = input.int(2, "VWAP 線寬", minval = 1, group = group_vwap)
+
+// 計算 VWAP
+my_vwap = ta.vwap(hlc3)
+plot(show_vwap ? my_vwap : na, "VWAP", color = vwap_col, linewidth = vwap_wid)
+
+// =====================================================================================================================}
+// 📌 FVG 型別定義與基礎計算
+// ====================================================================================================================={
+type fvg
+    box FVG
+    bool isBull
+    array<float> volumeProfile
+    array<box> volumeBoxes
+    line poc
+    label pocLbl
+
+// --- [P2 修復] 時間週期邏輯：使用 simple 型別鎖定 ---
+// --- [Bug #2 修正] 改用標準時間週期表，避免 6/12/24/144 等非標準週期 ---
+float currentMins = timeframe.in_seconds("") / 60
+simple string targetTf = autoTf ? (
+    currentMins <= 20    ? "1"  :
+    currentMins <= 45    ? "5"  :
+    currentMins <= 60    ? "10" :
+    currentMins <= 120   ? "15" :
+    currentMins <= 240   ? "30" :
+    currentMins <= 1440  ? "60" :
+    "D"
+) : tf1
+bool hasLowerData = timeframe.in_seconds(targetTf) < timeframe.in_seconds("")
+
+// --- [P1 修復] request.security_lower_tf 必須全域呼叫 ---
+array<float> request_c_lower = request.security_lower_tf('', targetTf, close)
+array<float> request_v_lower = request.security_lower_tf('', targetTf, volume)
+
+array<float> c_lower = array.new<float>()
+array<float> v_lower = array.new<float>()
+
+if hasLowerData
+    c_lower := request_c_lower
+    v_lower := request_v_lower
+else
+    c_lower := array.from(close)
+    v_lower := array.from(volume)
+
+// --- [P9 修復] ta.stdev 除零保護 ---
+float bearish_std = math.max(ta.stdev(low[2] - high, 200), syminfo.mintick)
+float bullish_std = math.max(ta.stdev(low - high[2], 200), syminfo.mintick)
+float bearish_gap_size = (low[2] - high) / bearish_std
+float bullish_gap_size = (low - high[2]) / bullish_std
+
+// =====================================================================================================================}
+// 📌 高量警示與趨勢線 核心邏輯
+// ====================================================================================================================={
+ph = ta.pivothigh(leftBars, rightBars)
+pl = ta.pivotlow(leftBars, rightBars)
+volume_ = math.sum(volume, leftBars * 2)
+
+float vol = volume_
+// [P10 修復] 移除未使用的 min_vol / max_vol
+// [New#E 修復] 使用 volume_[1] 排除當前 K 棒，避免 self-referential 偏差
+reference_vol = ta.percentile_nearest_rank(volume_[1], 1000, 95)
+norm_vol = volume_ / reference_vol * 5
+
+int width1 = 0
+int width2 = 0
+var levels = array.new<line>()
+// [Bug #4 + New#D 修復] 樞紐點 labels 改為單一合併 label，並追蹤供清理
+var pivot_labels = array.new<label>()
+int maxLevelLines = 450  // [Bug #5 修復] levels 陣列上限 (max_lines_count=500 - 50 緩衝)
+
+var float trendline_upper = 0.
+var float trendline_lower = 0.
+var float trendline_slope_ph = 0.
+var float trendline_slope_pl = 0.
+var trendline_offset = trendline_backpaint ? trendline_length : 0
+
+trendline_ph = ta.pivothigh(trendline_length, trendline_length)
+trendline_pl = ta.pivotlow(trendline_length, trendline_length)
+bool trendline_ph_cond = not na(trendline_ph)
+bool trendline_pl_cond = not na(trendline_pl)
+
+trendline_slope = switch trendline_calcMethod
+    'Atr'    => ta.atr(trendline_length) / trendline_length * trendline_mult
+    'Stdev'  => ta.stdev(close, trendline_length) / trendline_length * trendline_mult
+    'Linreg' => math.abs(ta.sma(close * bar_index, trendline_length) - ta.sma(close, trendline_length) * ta.sma(bar_index, trendline_length)) / ta.variance(bar_index, trendline_length) / 2 * trendline_mult
+
+// --- [Bug #1 修正] slope 帶方向：正斜率=樞紐上升，負斜率=樞紐下降 ---
+trendline_slope_ph := trendline_ph_cond ? (trendline_ph >= nz(trendline_ph[1], trendline_ph) ? trendline_slope : -trendline_slope) : trendline_slope_ph
+trendline_slope_pl := trendline_pl_cond ? (trendline_pl >= nz(trendline_pl[1], trendline_pl) ? trendline_slope : -trendline_slope) : trendline_slope_pl
+// 上線更新：signed slope 使用 + 號（上升趨勢時為正，線往上；下降時為負，線往下）
+trendline_upper := trendline_ph_cond ? trendline_ph : trendline_upper + trendline_slope_ph
+// 下線更新：原本就是 + 號，signed slope 沿用即可
+trendline_lower := trendline_pl_cond ? trendline_pl : trendline_lower + trendline_slope_pl
+
+var int trendline_upos = 0
+var int trendline_dnos = 0
+// --- [Bug #1 修正] 突破條件：上線從 - 改為 + 以對應 signed slope ---
+trendline_upos := trendline_ph_cond ? 0 : close > trendline_upper + trendline_slope_ph * trendline_length ? 1 : trendline_upos
+trendline_dnos := trendline_pl_cond ? 0 : close < trendline_lower + trendline_slope_pl * trendline_length ? 1 : trendline_dnos
+
+var line uptl = line.new(na, na, na, na, color = trendline_upColor, style = line.style_dashed, extend = extend.right)
+var line dntl = line.new(na, na, na, na, color = trendline_dnColor, style = line.style_dashed, extend = extend.right)
+
+if trendline_ph_cond and trendline_showExt and trendline_enabled
+    uptl.set_xy1(bar_index - trendline_offset, trendline_backpaint ? trendline_ph : trendline_upper + trendline_slope_ph * trendline_length)
+    uptl.set_xy2(bar_index - trendline_offset + 1, trendline_backpaint ? trendline_ph + trendline_slope : trendline_upper + trendline_slope_ph * (trendline_length + 1))
+
+if trendline_pl_cond and trendline_showExt and trendline_enabled
+    dntl.set_xy1(bar_index - trendline_offset, trendline_backpaint ? trendline_pl : trendline_lower + trendline_slope_pl * trendline_length)
+    dntl.set_xy2(bar_index - trendline_offset + 1, trendline_backpaint ? trendline_pl + trendline_slope : trendline_lower + trendline_slope_pl * (trendline_length + 1))
+
+upper_trendline_value = trendline_enabled ? (trendline_backpaint ? trendline_upper : trendline_upper + trendline_slope_ph * trendline_length) : na
+lower_trendline_value = trendline_enabled ? (trendline_backpaint ? trendline_lower : trendline_lower + trendline_slope_pl * trendline_length) : na
+
+// [Bug #10 修復] 拿掉 ph_cond 條件，樞紐點時 plot 不再隱形，避免視覺斷裂
+plot(upper_trendline_value, 'Upper Trendline', color = trendline_enabled ? trendline_upColor : na, offset = -trendline_offset)
+plot(lower_trendline_value, 'Lower Trendline', color = trendline_enabled ? trendline_dnColor : na, offset = -trendline_offset)
+
+upper_break_condition = trendline_enabled and (trendline_upos > trendline_upos[1])
+lower_break_condition = trendline_enabled and (trendline_dnos > trendline_dnos[1])
+
+plotshape(upper_break_condition ? hl2 : na, "Upper Break", shape.circle, location.absolute, color = color(na), text = "BR", textcolor = trendline_upColor, size = size.normal)
+plotshape(lower_break_condition ? hl2 : na, "Lower Break", shape.circle, location.absolute, color = color(na), text = "BR", textcolor = trendline_dnColor, size = size.normal)
+
+// =====================================================================================================================}
+// 📌 [OA+OB+OC+OD 優化] FVG 偵測核心邏輯
+// ====================================================================================================================={
+
+// --- [OB 優化] 共用 FVG 建立函數，消除多空重複代碼 ---
+createFvgEntry(bool isBull, float fvg_upper, float fvg_lower, array<float> cls_arr, array<float> vol_arr, color fvg_color) =>
+    fvg_box = box.new(bar_index - 1, fvg_upper, bar_index + 3, fvg_lower, border_color = na, border_width = 0, bgcolor = color.new(fvg_color, 70), tooltip = "FVG (Fair Value Gap)\nVP 為 FVG 形成當下的成交量分佈快照，非即時更新。\n顏色：粉紫=空方 FVG | 綠=多方 FVG")  // [Bug #12 修復] tooltip 註明 VP 為快照
+    binSize = (fvg_upper - fvg_lower) / bins
+
+    // [OD 優化] 只在 FVG 觸發時分配陣列
+    volumeP     = array.new<float>(bins, 0.)
+    volumeBoxes = array.new<box>(bins, box(na))
+    poc_line    = line(na)
+    poc_lbl     = label(na)
+
+    // [OA 優化] VP 計算迴圈反轉：先遍歷 K 棒一次 O(candles)，取代原本 O(bins × candles)
+    // [Bug #3 修正] 1m 圖 (hasLowerData=false) 跳過 VP 計算；[New#C] showVP=false 也跳過 (節省 box 配額)
+    if hasLowerData and showVP and cls_arr.size() > 1
+        for i = 0 to cls_arr.size() - 1
+            cls = cls_arr.get(i)
+            v_val = vol_arr.get(i)
+            if cls >= fvg_lower and cls <= fvg_upper
+                binIdx = math.floor((cls - fvg_lower) / binSize)
+                binIdx := math.max(0, math.min(binIdx, bins - 1))
+                volumeP.set(binIdx, volumeP.get(binIdx) + v_val)
+
+    // 繪製 VP Boxes + 找 POC
+    // [Bug #3 修正] 1m 圖完全跳過；[New#C] showVP=false 也不創建 box
+    if hasLowerData and showVP
+        float maxVol = volumeP.max()
+        bool pocFound = false
+        for k = 0 to bins - 1
+            lower = fvg_lower + binSize * k
+            upper = lower + binSize
+            mid   = lower + binSize / 2
+            volumeBoxes.set(k, box.new(bar_index - 1, upper, bar_index - 1, lower, border_width = 0))
+            v_val_bin = volumeP.get(k)
+            if maxVol != 0 and v_val_bin == maxVol and not pocFound
+                poc_line := line.new(bar_index - 1, mid, bar_index - 1, mid, color = fvg_color)
+                // [P11 修復] 成交量一律正值，多空用前綴區分
+                string volText = isBull ? str.tostring(maxVol, format.volume) : "▼ " + str.tostring(maxVol, format.volume)
+                poc_lbl  := label.new(bar_index - 1, mid, volText, style = label.style_label_left, color = fvg_color, textcolor = chart.fg_color, size = size.tiny)
+                pocFound := true
+
+    fvg.new(fvg_box, isBull, volumeP, volumeBoxes, poc_line, poc_lbl)
+
+detectFairValueGap() =>
+    var fvgs = array.new<fvg>()
+
+    bool bullish_gap_condition = low > high[2] and high[1] > high[2] and bullish_gap_size > gap_filter
+    bool bearish_gap_condition = high < low[2] and low[1] < low[2] and bearish_gap_size > gap_filter
+
+    if c_lower.size() == 0 or v_lower.size() == 0
+        bullish_gap_condition := false
+        bearish_gap_condition := false
+
+    cls_array = c_lower[1]
+    vol_array = v_lower[1]
+
+    // --- 建立新 FVG ---
+    if bullish_gap_condition
+        fvgs.push(createFvgEntry(true, low, high[2], cls_array, vol_array, bull_color))
+
+    if bearish_gap_condition
+        fvgs.push(createFvgEntry(false, low[2], high, cls_array, vol_array, bear_color))
+
+    // --- 超過上限時清理最舊 ---
+    if fvgs.size() > 10
+        f = fvgs.shift()
+        f.FVG.delete()
+        f.poc.delete()
+        f.pocLbl.delete()
+        if hasLowerData and showVP
+            for b in f.volumeBoxes
+                b.delete()
+
+    // --- [P3 修復] 反向迭代安全刪除 + 更新繪圖 ---
+    if fvgs.size() > 0
+        for i = fvgs.size() - 1 to 0 by 1
+            f = fvgs.get(i)
+            f_left = f.FVG.get_left()
+
+            // 超齡清理
+            if (bar_index - f_left) > 950
+                f.FVG.delete()
+                if hasLowerData and showVP
+                    for b in f.volumeBoxes
+                        b.delete()
+                f.poc.delete()
+                f.pocLbl.delete()
+                fvgs.remove(i)
+                continue
+
+            f.FVG.set_right(bar_index + fvg_extend)  // [Bug #11 修復] 25 改為可配置
+            top   = f.FVG.get_top()
+            bot   = f.FVG.get_bottom()
+            left  = f.FVG.get_left()
+            right = f.FVG.get_right()
+            binSize = (top - bot) / bins
+            boxes   = f.volumeBoxes
+            f.poc.set_x2(right)
+            f.pocLbl.set_x(right)
+            // [Bug #3 修正] 1m 圖資料樣本少（單根 K），加 ⚠️ 警告標示，避免誤判 POC
+            float vpSum = f.volumeProfile.sum()
+            string vpText = str.tostring(vpSum, format.volume)
+            f.FVG.set_text(not hasLowerData ? "⚠ 1m " + vpText : vpText)
+            f.FVG.set_text_halign(text.align_right)
+            f.FVG.set_text_valign(f.isBull ? text.align_bottom : text.align_top)
+            f.FVG.set_text_size(size.tiny)
+            f.FVG.set_text_color(chart.fg_color)
+
+            // 價格穿越 FVG 時刪除
+            bool shouldRemove = f.isBull ? (low < f.FVG.get_bottom()) : (high > f.FVG.get_top())
+            if shouldRemove
+                f.FVG.delete()
+                if hasLowerData and showVP  // [New#C 修復] VP box 未創建時不迭代刪除
+                    for b in boxes
+                        b.delete()
+                f.poc.delete()
+                f.pocLbl.delete()
+                fvgs.remove(i)
+                continue
+
+            // [OC 優化] VP Box 寬度統一公式
+            // [New#C 修復] showVP=false 或 1m 圖跳過整個 VP box 更新 (避免 na.set_right 報錯)
+            if hasLowerData and showVP
+                float volSum = f.volumeProfile.max()
+                if volSum != 0
+                    for k = 0 to bins - 1
+                        lower = bot + binSize * k
+                        volRatio = f.volumeProfile.get(k) / volSum
+                        boxWidth = math.round(volRatio * (right - left) / 2)
+                        box_id   = boxes.get(k)
+                        fvg_color = f.isBull ? bull_color : bear_color
+                        bgColor  = color.from_gradient(f.volumeProfile.get(k), 0, volSum, color.new(fvg_color, 100), fvg_color)
+                        if boxWidth != 0
+                            box_id.set_right(left + boxWidth)
+                            box_id.set_bgcolor(bgColor)
+
+detectFairValueGap()
+
+// =====================================================================================================================}
+// 📌 [P8 修復] draw_level 參數型別補齊
+// ====================================================================================================================={
+method draw_level(float src, int n, int w, color col) =>
+    line.new(x1 = n, y1 = src, x2 = n, y2 = src, style = line.style_solid, width = math.round(w / 3), color = col)
+
+// --- [P6 修復] check_cross_levels 反向迭代版 ---
+// --- [Bug #4 修復] 同步刪除對應 label；[Bug #7 修復] age > 300 也清理 ---
+check_cross_levels(arrayOfLines) =>
+    if array.size(arrayOfLines) > 0
+        for lineNo = array.size(arrayOfLines) - 1 to 0 by 1
+            line currentLine = array.get(arrayOfLines, lineNo)
+            float lineLevel = line.get_price(currentLine, bar_index)
+            bool lineWasCrossed = math.sign(close[1] - lineLevel) != math.sign(close - lineLevel)
+            // [Bug #7 修復] 樞紐點年齡 (current_bar - pivot_bar) > 300 則清理
+            bool isOld = bar_index - line.get_x1(currentLine) > 300
+            if lineWasCrossed or isOld
+                line.set_style(currentLine, line.style_dotted)
+                if array.size(pivot_labels) > lineNo
+                    label.delete(array.get(pivot_labels, lineNo))
+                    array.remove(pivot_labels, lineNo)
+                array.remove(arrayOfLines, lineNo)
+                int(na)
+            else
+                line.set_x2(currentLine, bar_index)
+                int(na)
+
+// =====================================================================================================================}
+// 📌 [P4 修復] 高量樞軸點繪製邏輯
+// ====================================================================================================================={
+// [Bug #7 修復] 移除 last_bar_index - bar_index < 300 限制，改為在 check_cross_levels 中以樞紐點年齡判斷
+// 高點 — 以 math.ceil 取代迴圈（Bug #9 修正）
+width1 := (not na(ph) and norm_vol > filter_vol and barstate.isconfirmed) ? math.min(11, math.ceil(norm_vol)) : 0
+if not na(ph) and norm_vol > filter_vol and barstate.isconfirmed
+    int n = bar_index - rightBars
+    float src = high[rightBars]
+    chart.point cp = chart.point.from_index(n, src)
+    if levels.size() >= maxLevelLines  // [Bug #5 修復] 上限保護：刪除最舊的 line + label 再加入
+        line.delete(array.shift(levels))
+        if array.size(pivot_labels) > 0
+            label.delete(array.shift(pivot_labels))
+    levels.push(src.draw_level(n, width1, upper_col))
+    // [Bug #4 + New#D 修復] 合併 circle + text 為單一 label（● 為視覺錨點 + 成交量）
+    label newLbl = label.new(cp, text = "● " + str.tostring(vol, format.volume), textcolor = chart.fg_color, color = color.new(upper_col, 30), style = label.style_label_down, size = size.tiny)
+    pivot_labels.push(newLbl)
+
+// [P4 修復] 低點 — 以 math.ceil 取代迴圈（Bug #9 修正，清除重複的 filter_vol 檢查）
+width2 := (not na(pl) and norm_vol > filter_vol and barstate.isconfirmed) ? math.min(11, math.ceil(norm_vol)) : 0
+if not na(pl) and norm_vol > filter_vol and barstate.isconfirmed
+    int n = bar_index - rightBars
+    float src = low[rightBars]
+    chart.point cp = chart.point.from_index(n, src)
+    if levels.size() >= maxLevelLines  // [Bug #5 修復] 上限保護
+        line.delete(array.shift(levels))
+        if array.size(pivot_labels) > 0
+            label.delete(array.shift(pivot_labels))
+    levels.push(src.draw_level(n, width2, lower_col))
+    // [Bug #4 + New#D 修復] 合併為單一 label
+    label newLbl = label.new(cp, text = "● " + str.tostring(vol, format.volume), textcolor = chart.fg_color, color = color.new(lower_col, 30), style = label.style_label_up, size = size.tiny)
+    pivot_labels.push(newLbl)
+
+check_cross_levels(levels)
+
+// --- [P7 修復] 只清理 levels 陣列，不使用 line.all 暴力全刪 ---
+if not show_lvl
+    for l in levels
+        line.delete(l)
+    for lbl in pivot_labels  // [Bug #4 修復] 同步清理 labels
+        label.delete(lbl)
+    levels.clear()
+    pivot_labels.clear()
+
+// =====================================================================================================================}
+// 📌 [P5 修復] 台指期 08:45 ORB — 鎖定 Asia/Taipei 時區
+// ====================================================================================================================={
+bool is_0845 = hour(time, "Asia/Taipei") == 8 and minute(time, "Asia/Taipei") == 45
+[orb_h, orb_l] = request.security(syminfo.tickerid, "5", [ta.valuewhen(is_0845, high, 0), ta.valuewhen(is_0845, low, 0)], lookahead = barmerge.lookahead_off)
+
+// [Bug #6 修復] 每日 ORB 觸發旗標 + 動態 x1 計算 (適用所有時間週期)
+var bool orb_fired_today = false
+if dayofmonth != dayofmonth[1]  // 換日重置
+    orb_fired_today := false
+
+// 觸發條件：今天 08:50 後第一根 K 棒 (用 timestamp 比較，適用 1m/3m/5m/15m/30m/1H/4H/1D)
+int today_0850_ts = timestamp("Asia/Taipei", year, month, dayofmonth, 8, 50)
+bool is_orb_first_bar = (time >= today_0850_ts) and (time[1] < today_0850_ts or na(time[1]))
+if show_orb and is_orb_first_bar and not orb_fired_today
+    orb_fired_today := true
+    // 動態 x1：當前 K 棒到 08:45 的時間差 / K 棒週期
+    int current_minute_of_day = hour(time, "Asia/Taipei") * 60 + minute(time, "Asia/Taipei")
+    int minutes_to_0845 = current_minute_of_day - (8 * 60 + 45)
+    int bars_back = math.max(1, math.ceil(minutes_to_0845 * 60 / timeframe.in_seconds()))
+    line.new(x1 = bar_index - bars_back, y1 = orb_h,
+             x2 = bar_index + orb_length, y2 = orb_h,
+             color = orb_color, width = orb_width)
+    line.new(x1 = bar_index - bars_back, y1 = orb_l,
+             x2 = bar_index + orb_length, y2 = orb_l,
+             color = orb_color, width = orb_width)
+
+// =====================================================================================================================}
+// 📌 警報邏輯
+// ====================================================================================================================={
+// [Bug #13 修復] 即時模式時跳過 barstate.isconfirmed，否則等收盤
+bool alert_confirmed = realtime_alert or barstate.isconfirmed
+alert_freq = realtime_alert ? alert.freq_once_per_bar : alert.freq_once_per_bar_close
+if not na(ph) and norm_vol > filter_vol and alert_confirmed
+    alert("高量樞軸高點出現：可能發生看跌反轉 🟠", freq = alert_freq)
+if not na(pl) and norm_vol > filter_vol and alert_confirmed
+    alert("高量樞軸低點出現：可能發生看漲反轉 🟢", freq = alert_freq)
+if trendline_enabled
+    if trendline_upos > trendline_upos[1] and alert_confirmed
+        alert("向上突破下降趨勢線 ↗️", freq = alert_freq)
+    if trendline_dnos > trendline_dnos[1] and alert_confirmed
+        alert("向下突破上升趨勢線 ↘️", freq = alert_freq)

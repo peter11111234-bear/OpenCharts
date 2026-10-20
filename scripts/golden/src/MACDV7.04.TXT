@@ -1,0 +1,436 @@
+// @version=6
+indicator(title = "MACD_V7.04", shorttitle = "MACD_V7.04", overlay = false, format = format.price, precision = 3, max_bars_back = 1000, max_labels_count = 500, max_lines_count = 500)
+
+// ==========================================
+// Ⅰ. INPUTS 參數區
+// ==========================================
+source = close
+
+// --- 時框設定 ---
+useCurrentRes = input.bool(defval = true,  title = "使用當前圖表解析度？",       group = "時框設定")
+resCustom     = input.string(defval = "60", title = "使用自定義時間框架？",        group = "時框設定")
+res           = useCurrentRes ? timeframe.period : resCustom
+mtfSmooth     = input.bool(defval = true,  title = "平滑MTF數據（消除階梯）？",   group = "時框設定")
+mtfSmoothLen  = input.int(defval = 8, minval = 1, title = "MTF平滑長度",           group = "時框設定")
+
+// --- MACD顯示控制 ---
+smd              = input.bool(defval = true, title = "顯示MACD線和信號線？",     group = "MACD顯示控制")
+sd               = input.bool(defval = true, title = "顯示交叉點標記？",         group = "MACD顯示控制")
+sh               = input.bool(defval = true, title = "顯示直方圖？",             group = "MACD顯示控制")
+macd_colorChange = input.bool(defval = true, title = "變更MACD線顏色？",         group = "MACD顯示控制")
+hist_colorChange = input.bool(defval = true, title = "直方圖顏色變化？",         group = "MACD顯示控制")
+showZoneBg       = input.bool(defval = true, title = "顯示多空區域底色？",       group = "MACD顯示控制")  // E1
+
+// --- MACD參數 ---
+preset       = input.string(defval = "自訂", title = "參數預設模式", options = ["保守", "積極", "自訂"], group = "MACD參數")
+fastLength   = input.int(defval = 12, minval = 1, title = "快速EMA長度（自訂模式）",  group = "MACD參數")
+slowLength   = input.int(defval = 26, minval = 1, title = "慢速EMA長度（自訂模式）",  group = "MACD參數")
+signalLength = input.int(defval = 9,  minval = 1, title = "信號線長度（自訂模式）",   group = "MACD參數")
+max_labels   = input.int(defval = 150, title = "最大標籤數量",                     group = "MACD參數")
+
+// E4: 套用 Preset
+int _fast   = preset == "保守" ? 21 : preset == "積極" ? 8  : fastLength
+int _slow   = preset == "保守" ? 55 : preset == "積極" ? 21 : slowLength
+int _signal = preset == "保守" ? 13 : preset == "積極" ? 5  : signalLength
+
+// A5: 標籤配額分配
+maxDivLabels      = math.max(10, math.round(max_labels / 3))
+maxZeroCrossLines = math.max(10, math.round(max_labels / 3))
+
+// --- 基準線 ---
+showBaseLines      = input.bool(defval = true,  title = "顯示基準線?",    group = "基準線")
+upperBaseLineValue = input.float(defval = 25.0, title = "上方基準線值",   group = "基準線")
+lowerBaseLineValue = input.float(defval = 25.0, title = "下方基準線值",   group = "基準線")
+
+// --- 背離參數 ---
+showDivergence       = input.bool(defval = true,  title = "顯示標準背離標籤？",          group = "背離參數")
+showHiddenDivergence = input.bool(defval = false, title = "顯示隱藏背離？",              group = "背離參數")  // O1
+useConfirmation      = input.bool(defval = false, title = "等待價格確認後才顯示背離？",  group = "背離參數")  // O4
+confirmBars          = input.int(defval = 2, minval = 1, maxval = 5, title = "確認K線數",   group = "背離參數")  // O4
+pivotStrength        = input.int(defval = 3, minval = 1, maxval = 10, title = "波峰強度（左右確認K線數）", group = "背離參數")
+
+// E2: 多時框背離確認
+useMtfDivFilter = input.bool(defval = false, title = "啟用多時框背離強弱過濾？", group = "背離參數")
+autoMtf         = input.bool(defval = true,  title = "自動對應確認大週期？",      group = "背離參數")
+divHigherTF     = input.string(defval = "D",  title = "手動確認大週期（表外覆寫）",  group = "背離參數")
+
+// --- 零軸穿越 ---
+showSignalZeroCross = input.bool(defval = true, title = "顯示信號線零軸穿越標記？", group = "零軸穿越")
+showMacdZeroCross   = input.bool(defval = true, title = "顯示MACD零軸穿越標記？",  group = "零軸穿越")
+
+// --- 自適應 ---
+useAdaptivePeriod  = input.bool(defval = true,  title = "使用自適應回顧周期？", group = "自適應")
+baseLookbackPeriod = input.int(defval = 14,     title = "基礎回顧周期",         group = "自適應")
+cooldownPeriod     = input.int(defval = 5,      title = "背離信號冷卻周期",     group = "自適應")
+showVolatilityInfo = input.bool(defval = true,  title = "顯示波動性信息？",     group = "自適應")
+volatilityLength   = input.int(defval = 14,     title = "波動性計算周期",       group = "自適應")
+baseCalcPeriod     = input.int(defval = 10,     title = "基準計算天數 (保留)",         group = "自適應")
+useTradingDays     = input.bool(defval = true,  title = "使用交易日計算？ (保留)",     group = "自適應")
+labelOffset        = input.int(defval = 3,      title = "標籤偏移(柱數)",       group = "自適應")
+
+
+// ==========================================
+// Ⅱ. MACD & MTF 計算
+// ==========================================
+fastMA    = ta.ema(source, _fast)
+slowMA    = ta.ema(source, _slow)
+macd_raw  = fastMA - slowMA
+signal_raw = ta.sma(macd_raw, _signal)
+hist_raw  = macd_raw - signal_raw
+
+// MTF: [1] + lookahead_on = 不重繪（官方標準模式）
+[_macd_mtf, _signal_mtf, _hist_mtf] = request.security(syminfo.tickerid, res, [macd_raw[1], signal_raw[1], hist_raw[1]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool isMTF    = not useCurrentRes
+
+// P1-C 修復: 防止自定義時框低於圖表時框（官方建議防護）
+if isMTF and timeframe.in_seconds(res) < timeframe.in_seconds(timeframe.period)
+    runtime.error("自定義時間框架 (" + res + ") 低於圖表時框，請選擇更高的時間框架")
+outMacD_raw   = isMTF ? _macd_mtf : macd_raw
+outSignal_raw = isMTF ? _signal_mtf : signal_raw
+outHist_raw   = isMTF ? _hist_mtf : hist_raw
+outMacD   = isMTF and mtfSmooth ? ta.ema(outMacD_raw,   mtfSmoothLen) : outMacD_raw
+outSignal = isMTF and mtfSmooth ? ta.ema(outSignal_raw, mtfSmoothLen) : outSignal_raw
+outHist   = isMTF and mtfSmooth ? ta.ema(outHist_raw,   mtfSmoothLen) : outHist_raw
+
+// B3 修復: 統一使用內建函數
+zeroCrossUp         = ta.crossover(outMacD, 0)
+zeroCrossDown       = ta.crossunder(outMacD, 0)
+signalZeroCrossUp   = ta.crossover(outSignal, 0)
+signalZeroCrossDown = ta.crossunder(outSignal, 0)
+
+
+// ==========================================
+// Ⅲ. 自適應波動率邏輯
+// ==========================================
+currentTfVolatility = ta.atr(volatilityLength)
+// B1 修復: ta.sma 使用常數長度 200，na 時降級為累積平均 (防冷啟動崩潰)
+float smaVol = ta.sma(currentTfVolatility, 200)
+// G5 修復: ta.cum 移出三元運算（避免 CW10004 一致性警告）
+float cumVol = ta.cum(nz(currentTfVolatility))
+// G3 修復: 以有效 ATR 根數為分母，避免冷啟動期間基準被低估（原 bar13~212 釘在上限）
+var int validAtrCount = 0
+if not na(currentTfVolatility)
+    validAtrCount += 1
+float baseVolatility = na(smaVol) ? cumVol / math.max(validAtrCount, 1) : smaVol
+get_adaptive_period(base_len, cur_atr, base_atr) =>
+    // G4 修復: periodLen 更名避免遮蔽全域 res（CW10013）
+    float periodLen = na(cur_atr) or na(base_atr) ? base_len : base_len * (1 + (cur_atr - base_atr) / math.max(base_atr, 0.0001))
+    int( math.round(math.max(math.min(periodLen, base_len * 2), math.max(5, base_len / 2))) )
+
+lookbackPeriod = useAdaptivePeriod ? get_adaptive_period(baseLookbackPeriod, currentTfVolatility, baseVolatility) : baseLookbackPeriod
+
+// #1 修正：volColor 移至全域宣告，避免在 if barstate.islast 內觸發 CE10013
+color volColor = currentTfVolatility > baseVolatility * 1.2 ? color.orange : currentTfVolatility < baseVolatility * 0.8 ? color.aqua : color.white
+string volState = currentTfVolatility > baseVolatility * 1.2 ? "⚡ 高波動" : currentTfVolatility < baseVolatility * 0.8 ? "😴 低波動" : "〰 正常"
+
+
+// ==========================================
+// Ⅳ. 交叉系統
+// ==========================================
+deathCross  = ta.crossunder(outMacD, outSignal)
+goldenCross = ta.crossover(outMacD, outSignal)
+
+
+// ==========================================
+// Ⅴ. 背離偵測系統
+// ==========================================
+pHigh = ta.pivothigh(source, pivotStrength, pivotStrength)
+pLow  = ta.pivotlow(source,  pivotStrength, pivotStrength)
+mHigh = ta.pivothigh(outMacD, pivotStrength, pivotStrength)
+mLow  = ta.pivotlow(outMacD,  pivotStrength, pivotStrength)
+
+isPriceHigh = not na(pHigh)
+isPriceLow  = not na(pLow)
+isMacdHigh  = not na(mHigh)
+isMacdLow   = not na(mLow)
+
+var float lastPriceHigh  = high,  var float lastPriceLow  = low
+var float lastMacdHigh   = 0.0,   var float lastMacdLow   = 0.0
+var int   lastPriceHighBar = -99999, var int   lastPriceLowBar  = -99999
+var int   lastMacdHighBar  = -99999, var int   lastMacdLowBar   = -99999
+
+var float prevPriceHigh = high,   var float prevPriceLow = low
+var float prevMacdHigh  = 0.0,    var float prevMacdLow  = 0.0
+
+// B2 修復: 計數器旗標（需累積 >= 2 次 pivot 才啟用，避免初始值誤判）
+var int  priceHighCount  = 0
+var int  priceLowCount   = 0
+var int  macdHighCount   = 0
+var int  macdLowCount    = 0
+var bool hasTwoPriceHighs = false
+var bool hasTwoPriceLows  = false
+var bool hasTwoMacdHighs  = false
+var bool hasTwoMacdLows   = false
+
+if isPriceHigh and bar_index - lastPriceHighBar > lookbackPeriod / 4
+    prevPriceHigh    := lastPriceHigh
+    lastPriceHigh    := pHigh
+    lastPriceHighBar := bar_index - pivotStrength
+    priceHighCount   += 1
+    hasTwoPriceHighs := priceHighCount >= 2
+
+if isPriceLow and bar_index - lastPriceLowBar > lookbackPeriod / 4
+    prevPriceLow    := lastPriceLow
+    lastPriceLow    := pLow
+    lastPriceLowBar := bar_index - pivotStrength
+    priceLowCount   += 1
+    hasTwoPriceLows := priceLowCount >= 2
+
+if isMacdHigh and bar_index - lastMacdHighBar > lookbackPeriod / 4
+    prevMacdHigh    := lastMacdHigh
+    lastMacdHigh    := mHigh
+    lastMacdHighBar := bar_index - pivotStrength
+    macdHighCount   += 1
+    hasTwoMacdHighs := macdHighCount >= 2
+
+if isMacdLow and bar_index - lastMacdLowBar > lookbackPeriod / 4
+    prevMacdLow    := lastMacdLow
+    lastMacdLow    := mLow
+    lastMacdLowBar := bar_index - pivotStrength
+    macdLowCount   += 1
+    hasTwoMacdLows := macdLowCount >= 2
+
+var int lastBullishDivBar  = 0
+var int lastBearishDivBar  = 0
+
+// B2: 加入旗標前置條件
+bool bearishDivergence = hasTwoPriceHighs and hasTwoMacdHighs
+     and lastPriceHigh > prevPriceHigh and lastMacdHigh < prevMacdHigh
+     and bar_index - lastBearishDivBar > cooldownPeriod
+
+bool bullishDivergence = hasTwoPriceLows and hasTwoMacdLows
+     and lastPriceLow < prevPriceLow and lastMacdLow > prevMacdLow
+     and bar_index - lastBullishDivBar > cooldownPeriod
+
+// O1: 隱藏背離
+bool hiddenBearish = hasTwoPriceHighs and hasTwoMacdHighs
+     and lastPriceHigh < prevPriceHigh and lastMacdHigh > prevMacdHigh
+     and bar_index - lastBearishDivBar > cooldownPeriod
+
+bool hiddenBullish = hasTwoPriceLows and hasTwoMacdLows
+     and lastPriceLow > prevPriceLow and lastMacdLow < prevMacdLow
+     and bar_index - lastBullishDivBar > cooldownPeriod
+
+// F1: 主週期 → 確認大週期 自動對應（秒數檔位跳級；G1 補 1M→3M、3M→12M；G8 中位數門檻；G7 超大時框降級）
+f_autoDivTF(string tf) =>
+    int secs = timeframe.in_seconds(tf)
+    string out = na(secs) ? "" : secs <= 180 ? "15" : secs <= 600 ? "60" : secs <= 1800 ? "240" : secs <= 7200 ? "1D" : secs <= 86400 ? "1W" : secs <= 1000000 ? "1M" : secs <= 4000000 ? "3M" : secs <= 15000000 ? "12M" : ""
+    out
+
+string mainTf   = isMTF ? res : timeframe.period
+string autoDiv  = f_autoDivTF(mainTf)
+string effDivTF = autoMtf ? (autoDiv != "" ? autoDiv : mainTf) : divHigherTF
+
+// P1-C 修復: 防止確認大週期低於圖表時框（官方建議防護；G7 降級後自動模式不會誤觸發）
+if useMtfDivFilter and timeframe.in_seconds(effDivTF) < timeframe.in_seconds(timeframe.period)
+    runtime.error("多時框確認大週期 (" + effDivTF + ") 低於圖表時框，請選擇更高的時間框架")
+
+// E2: 多時框過濾（套用與主 MACD 相同的平滑處理）
+// G2 修復: HTF 方向在 request 內部以 HTF 前後根比較，避免階梯資料造成 92% 時間平盤假象
+[htfBearish, htfBullish] = request.security(syminfo.tickerid, effDivTF, [macd_raw[1] < macd_raw[2], macd_raw[1] > macd_raw[2]], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool strongBearish = bearishDivergence and (not useMtfDivFilter or htfBearish)
+bool weakBearish   = bearishDivergence and useMtfDivFilter and htfBullish
+bool strongBullish = bullishDivergence and (not useMtfDivFilter or htfBullish)
+bool weakBullish   = bullishDivergence and useMtfDivFilter and htfBearish
+
+// O4: 價格確認延遲（上升緣觸發，避免背離持續時重置計時）
+var bool bearDivPending    = false
+var int  bearDivTriggerBar = 0
+var bool bullDivPending    = false
+var int  bullDivTriggerBar = 0
+
+if bearishDivergence and not bearDivPending
+    bearDivTriggerBar := bar_index
+    bearDivPending    := true
+else if not bearishDivergence
+    bearDivPending := false
+
+if bullishDivergence and not bullDivPending
+    bullDivTriggerBar := bar_index
+    bullDivPending    := true
+else if not bullishDivergence
+    bullDivPending := false
+
+bool bearishReady = useConfirmation ? (bearDivPending and bar_index - bearDivTriggerBar == confirmBars) : bearishDivergence
+bool bullishReady = useConfirmation ? (bullDivPending and bar_index - bullDivTriggerBar == confirmBars) : bullishDivergence
+
+if (isPriceHigh or isMacdHigh) and bearishDivergence
+    lastBearishDivBar := bar_index
+if (isPriceLow  or isMacdLow)  and bullishDivergence
+    lastBullishDivBar := bar_index
+
+
+// ==========================================
+// Ⅵ. 標籤管理與渲染
+// ==========================================
+var label[] div_labels = array.new_label()
+
+if showDivergence
+    // 標準看跌（強/弱分級 + labelOffset 位移）
+    if (isPriceHigh or isMacdHigh) and bearishReady
+        string bearLblText  = weakBearish ? "看跌⚠" : (strongBearish and useMtfDivFilter ? "看跌★" : "看跌")
+        color  bearLblColor = strongBearish and useMtfDivFilter ? color.green : weakBearish ? color.new(color.green, 60) : color.green
+        string bearLblSize  = useMtfDivFilter and weakBearish ? size.tiny : useMtfDivFilter and strongBearish ? size.normal : size.small
+        lbl = label.new(x = math.min(bar_index, bar_index - pivotStrength + labelOffset), y = outMacD[pivotStrength],
+             text = bearLblText, color = bearLblColor,
+             textcolor = color.white, style = label.style_label_down, size = bearLblSize)
+        array.push(div_labels, lbl)
+        while array.size(div_labels) > maxDivLabels
+            label.delete(array.shift(div_labels))
+
+    // 標準看漲（強/弱分級 + labelOffset 位移）
+    if (isPriceLow or isMacdLow) and bullishReady
+        string bullLblText  = weakBullish ? "看漲⚠" : (strongBullish and useMtfDivFilter ? "看漲★" : "看漲")
+        color  bullLblColor = strongBullish and useMtfDivFilter ? color.red : weakBullish ? color.new(color.red, 60) : color.red
+        string bullLblSize  = useMtfDivFilter and weakBullish ? size.tiny : useMtfDivFilter and strongBullish ? size.normal : size.small
+        lbl = label.new(x = math.min(bar_index, bar_index - pivotStrength + labelOffset), y = outMacD[pivotStrength],
+             text = bullLblText, color = bullLblColor,
+             textcolor = color.white, style = label.style_label_up, size = bullLblSize)
+        array.push(div_labels, lbl)
+        while array.size(div_labels) > maxDivLabels
+            label.delete(array.shift(div_labels))
+
+// O1: 隱藏背離標籤
+if showHiddenDivergence
+    if (isPriceHigh or isMacdHigh) and hiddenBearish
+        lbl = label.new(x = math.min(bar_index, bar_index - pivotStrength + labelOffset), y = outMacD[pivotStrength],
+             text = "隱跌", color = color.new(color.teal, 40),
+             textcolor = color.white, style = label.style_label_down, size = size.tiny)
+        array.push(div_labels, lbl)
+        while array.size(div_labels) > maxDivLabels
+            label.delete(array.shift(div_labels))
+
+    if (isPriceLow or isMacdLow) and hiddenBullish
+        lbl = label.new(x = math.min(bar_index, bar_index - pivotStrength + labelOffset), y = outMacD[pivotStrength],
+             text = "隱漲", color = color.new(color.orange, 40),
+             textcolor = color.white, style = label.style_label_up, size = size.tiny)
+        array.push(div_labels, lbl)
+        while array.size(div_labels) > maxDivLabels
+            label.delete(array.shift(div_labels))
+
+
+// B3 修復: 零軸穿越線 — 統一使用已定義的 cross 變數
+var line[] zeroCrossLines = array.new_line()
+
+if showMacdZeroCross
+    if zeroCrossUp
+        array.push(zeroCrossLines, line.new(x1 = bar_index, y1 = 0, x2 = bar_index, y2 = 50,
+             color = color.new(color.green, 70), style = line.style_dashed))
+    if zeroCrossDown
+        array.push(zeroCrossLines, line.new(x1 = bar_index, y1 = 0, x2 = bar_index, y2 = -50,
+             color = color.new(color.red, 70), style = line.style_dashed))
+    while array.size(zeroCrossLines) > maxZeroCrossLines
+        line.delete(array.shift(zeroCrossLines))
+
+if showSignalZeroCross
+    if signalZeroCrossUp
+        array.push(zeroCrossLines, line.new(x1 = bar_index, y1 = 0, x2 = bar_index, y2 = 25,
+             color = color.new(color.blue, 70), style = line.style_dashed))
+    if signalZeroCrossDown
+        array.push(zeroCrossLines, line.new(x1 = bar_index, y1 = 0, x2 = bar_index, y2 = -25,
+             color = color.new(color.purple, 70), style = line.style_dashed))
+    while array.size(zeroCrossLines) > maxZeroCrossLines
+        line.delete(array.shift(zeroCrossLines))
+
+
+// ==========================================
+// Ⅶ. 視覺化繪圖
+// ==========================================
+histA_IsUp   = outHist > outHist[1] and outHist > 0
+histA_IsDown = outHist < outHist[1] and outHist > 0
+histB_IsDown = outHist < outHist[1] and outHist <= 0
+histB_IsUp   = outHist > outHist[1] and outHist <= 0
+
+// 移除冗餘 ema20 計算，改用 MACD 與 Signal 的關係判斷顏色
+isDarkDashed   = (outMacD < outSignal)
+isBrightDashed = (outMacD >= outSignal)
+
+pColor = hist_colorChange ? (histA_IsUp ? color.aqua : (histA_IsDown ? color.blue : (histB_IsDown ? color.red : (histB_IsUp ? color.maroon : color.yellow)))) : color.gray
+mColor = macd_colorChange ? (outMacD >= outSignal ? color.lime : (isDarkDashed ? color.maroon : color.red)) : (isDarkDashed ? color.maroon : color.red)
+
+// E1: 多空區域底色
+bgcolor(showZoneBg and outMacD > 0 ? color.new(color.green, 92) : na, title = "多方區域底色")
+bgcolor(showZoneBg and outMacD < 0 ? color.new(color.red, 92)   : na, title = "空方區域底色")
+
+plot(sh  ? outHist   : na, title = "直方圖",   style = plot.style_columns, color = pColor, linewidth = 2)
+plot(smd ? outMacD   : na, title = "MACD",    color = mColor, linewidth = 2)
+plot(smd and isDarkDashed   ? outMacD : na, title = "MACD暗紅圓點", color = color.maroon, linewidth = 3, style = plot.style_circles)
+plot(smd and isBrightDashed ? outMacD : na, title = "MACD亮綠圓點", color = color.lime,   linewidth = 3, style = plot.style_circles)
+plot(smd ? outSignal : na, title = "信號線",  color = color.yellow, linewidth = 2)
+
+plotshape(sd and (goldenCross or deathCross) ? outSignal : na,
+     title = "交叉點", style = shape.circle, location = location.absolute, color = mColor, size = size.tiny)
+plotshape(showDivergence and bearishReady ? outMacD : na,
+     title = "看跌標記", style = shape.diamond, location = location.absolute, color = color.new(color.green, 50), size = size.tiny)
+plotshape(showDivergence and bullishReady ? outMacD : na,
+     title = "看漲標記", style = shape.diamond, location = location.absolute, color = color.new(color.red, 50), size = size.tiny)
+
+hline(0,                                    title = "零線",     color = color.white)
+hline(showBaseLines ? upperBaseLineValue : na,  title = "上方基準線", color = color.yellow, linestyle = hline.style_dashed)
+hline(showBaseLines ? -lowerBaseLineValue : na, title = "下方基準線", color = color.yellow, linestyle = hline.style_dashed)
+
+
+// ==========================================
+// Ⅷ. Alerts 通知系統（O3: 豐富化）
+// ==========================================
+// CE10013修復：string 變數宣告移至 if 外部
+string crossDir = zeroCrossUp ? "📈MACD突破零軸" : zeroCrossDown ? "📉MACD跌破零軸" : signalZeroCrossUp ? "📈信號線突破零軸" : "📉信號線跌破零軸"
+if (zeroCrossUp or zeroCrossDown or signalZeroCrossUp or signalZeroCrossDown) and barstate.isconfirmed
+    alert(str.format("【{0}】{1} | MACD:{2} | TF:{3}", syminfo.ticker, crossDir, str.tostring(outMacD, "#.###"), res), alert.freq_once_per_bar)
+
+if (goldenCross or deathCross) and barstate.isconfirmed
+    alert(str.format("【{0}】MACD {1} | MACD:{2} | 信號:{3} | TF:{4}",
+         syminfo.ticker, goldenCross ? "🟢金叉" : "🔴死叉",
+         str.tostring(outMacD, "#.###"), str.tostring(outSignal, "#.###"), res), alert.freq_once_per_bar)
+
+// CE10013修復：string 變數宣告移至巢狀 if 外部
+string divType  = (useMtfDivFilter and weakBearish) ? "⚠️看跌背離(弱)" : "⚠️看跌背離(強)"
+string divType2 = (useMtfDivFilter and weakBullish) ? "📈看漲背離(弱)" : "📈看漲背離(強)"
+if showDivergence and barstate.isconfirmed
+    if bearishReady and (isPriceHigh or isMacdHigh)
+        alert(str.format("【{0}】{1} | MACD:{2} | TF:{3} (HTF:{4})",
+             syminfo.ticker, divType, str.tostring(outMacD, "#.###"), res, effDivTF), alert.freq_once_per_bar)
+    if bullishReady and (isPriceLow or isMacdLow)
+        alert(str.format("【{0}】{1} | MACD:{2} | TF:{3} (HTF:{4})",
+             syminfo.ticker, divType2, str.tostring(outMacD, "#.###"), res, effDivTF), alert.freq_once_per_bar)
+
+
+// ==========================================
+// Ⅸ. 附加資訊表格（O2: 強化顯示）
+// ==========================================
+// E5: 表格擴充至 6 列（加入冷啟動狀態）
+var table atrTable = table.new(position.bottom_right, 2, 7,
+     border_width = 1,  border_color = color.new(color.gray, 50),
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+if barstate.islast and showVolatilityInfo
+    // 標題列（含版本號）
+    table.cell(atrTable, 0, 0, "MACD V7.04",  text_color = color.white, text_size = size.small, bgcolor = color.new(color.blue, 60))
+    table.cell(atrTable, 1, 0, "數值",        text_color = color.white, text_size = size.small, bgcolor = color.new(color.blue, 60))
+
+    // 波動 ATR
+    table.cell(atrTable, 0, 1, "波動 ATR(14)", text_color = color.yellow, text_size = size.small, bgcolor = color.new(color.black, 70))
+    table.cell(atrTable, 1, 1, str.tostring(currentTfVolatility, "#.##"), text_color = color.white, text_size = size.small, bgcolor = color.new(color.black, 70))
+
+    // 基準
+    table.cell(atrTable, 0, 2, "基準 ATR",    text_color = color.yellow, text_size = size.small, bgcolor = color.new(color.black, 70))
+    table.cell(atrTable, 1, 2, str.tostring(baseVolatility, "#.##"),    text_color = color.white, text_size = size.small, bgcolor = color.new(color.black, 70))
+
+    // 週期（O2: 標示模式）
+    string periodLabel = useAdaptivePeriod ? "週期(自適)" : "週期(固定)"
+    table.cell(atrTable, 0, 3, periodLabel,   text_color = color.yellow, text_size = size.small, bgcolor = color.new(color.black, 70))
+    table.cell(atrTable, 1, 3, str.tostring(lookbackPeriod), text_color = color.white, text_size = size.small, bgcolor = color.new(color.black, 70))
+
+    // 波動狀態（volColor 已在全域宣告，直接使用）
+    table.cell(atrTable, 0, 4, "波動狀態",    text_color = color.yellow, text_size = size.small, bgcolor = color.new(color.black, 70))
+    table.cell(atrTable, 1, 4, volState,       text_color = volColor,     text_size = size.small, bgcolor = color.new(color.black, 70))
+
+    // 冷啟動狀態 (bar_index < 200 時提示)
+    bool isColdStart = bar_index < 200
+    table.cell(atrTable, 0, 5, "系統狀態",    text_color = isColdStart ? color.orange : color.green, text_size = size.small, bgcolor = color.new(color.black, 70))
+    table.cell(atrTable, 1, 5, isColdStart ? "計算中..." : "就緒", text_color = isColdStart ? color.orange : color.green, text_size = size.small, bgcolor = color.new(color.black, 70))
+    // F1: 顯示實際使用的確認大週期
+    table.cell(atrTable, 0, 6, "確認週期",  text_color = color.yellow, text_size = size.small, bgcolor = color.new(color.black, 70))
+    table.cell(atrTable, 1, 6, effDivTF,    text_color = color.white,  text_size = size.small, bgcolor = color.new(color.black, 70))
