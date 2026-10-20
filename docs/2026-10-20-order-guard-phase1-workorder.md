@@ -540,3 +540,18 @@ advisor 已問（`advisor P9`）。交付清單見 QA 報告與本 session 的�
 1. **重啟 `scripts/jev-shadow.py`**：修正未經實盤驗證。等跑完一個完整交易日（約 60 bars）後確認：規則計數器不再是 100% `volatile`，DeepSeek 觸發計數器不再每列都印 `volatile environment`。
 2. **確認 `scripts/jev-shadow.py` 與 `scripts/tests/test_jev_shadow_volatile.py` 的 commit**（使用者擁有該 commit；測試在沒有修正時會失敗，兩檔必須同進一個 commit）。
 3. **Phase 2 前累積樣本**：`PHASE2_GATE: NOT_READY`（approve n=1）。需 approve ≥ 20 筆、flagged ≥ 10 筆且 flagged 虧損率更差，才可把 `GUARD_MODE` 翻成 `"enforce"`。
+
+## 開始實際下單前必修清單（Opus 審查，2026-10-21）
+
+**狀態：暫緩。** 使用者目前不在本系統下單（下單功能尚未完成），優先做看盤系統。守門員沒有資料流入，以下各項等下單功能完成、開始 shadow 收集之前再修。
+
+| # | 嚴重度 | 問題 | 位置 | 修法 |
+|---|---|---|---|---|
+| 1 | 🟠 開始收集前必修 | 掛單 LIMIT／STOP 成交後不會跟平倉結果配對（`positionOpenedAt` 永遠為 null），報表只看得到市價單，樣本偏向市價單；圖表快速下單與手機下單都走 LIMIT | `guardRuntime.ts` `guardedPlaceOrder`、`engine.ts` `fillOrder`／`openPosition` | `fillOrder` 把 `order.id` 傳進 `openPosition`，`PositionOpened` 事件帶上 `orderId`；runtime 訂閱後補記一筆 `kind:"fill"`（orderId → openedAt），`guard_report.py` 用 orderId 補上配對鍵。訂閱沿用 `globalThis` 錨定 |
+| 2 | 🟡 | `daily_loss`、`loss_streak` 用本地日期 `toDateString()` 換日，夜盤跨午夜時會在盤中歸零 | `orderGuard.ts` `todaysClosed` | 改成交易日：**以 15:00 為界**（使用者 2026-10-21 確認：夜盤 15:00 到隔日 05:00、日盤 08:45 到 13:45，夜盤歸屬隔天的交易日）。台灣沒有日光節約，可用固定 +8 時區：`tradingDay = (t + 8h + 9h) 的 UTC 日期`。週五夜盤會被算成週六，與週一日盤分開，這點要記在註解 |
+| 3 | 🟡 | `/__guard-log` 的同源檢查只比對 Origin 與 Host，擋不住 DNS rebinding；外掛中介層排在 Vite 6.4.3 內建 Host 檢查之前（`dep-*.js` 中 configureServer hook 先於 cors／host 驗證） | `vite.config.ts` `guardLogPlugin` | Origin 的 hostname 限定 `localhost`／`127.0.0.1`／`[::1]`，並保留原本的 host 比對 |
+| 4 | ⚪ 翻 enforce 前必修（計畫 4a） | `demoApi.modifyOrder` 不經守門員；`OrderModifyDialog` 可把掛單停損清成 `null`、改價讓停損跑到錯邊，或加大口數繞過減碼 | `demo/api.ts`、`guardRuntime.ts` | 新增 `guardedModifyOrder`：把修改後的掛單組成 EntryIntent 重跑 `checkEntry`，記成 `kind:"order_modify"`（報表不計入），enforce 下 veto 就 throw |
+| 5 | ⚪ 翻 enforce 前必修 | `reduce` 直接把口數砍半，期貨會變 0.5 口 | `orderGuard.ts` `decide` | 整數口數向下取整，最少 1 口（或依商品最小下單單位） |
+| 6 | 備註 | DeepSeek 升級審查在 `score >= 1.0` 觸發。score 是三種狀態的加權平均，判定為 Normal 的 K 棒分數就在 1.0 附近，可能每天打滿 150 次付費呼叫 | `jev-shadow.py` `should_escalate` | 重啟收集器後先看 `logs/jev-shadow.jsonl` 的分數分布，再決定門檻 |
+
+**另一項：** 上一節「仍需使用者動手」第 2 點說 `jev-shadow.py` 只需跟測試同進一個 commit，但它未提交的 diff 是 +559/−34 行，混有 10-16 的重試／限速機制、DeepSeek 升級審查、`RiskSession` 等多次對話的成果，不能當成單一修正提交。
