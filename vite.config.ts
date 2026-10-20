@@ -1,9 +1,43 @@
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+import fs from "node:fs";
 import path from "path";
 
+/** Dev-only sink for the order guard (src/services/guard/guardRuntime.ts):
+ *  POST /__guard-log appends one JSON object per line to logs/order-guard.jsonl.
+ *  A body that is not a JSON object gets 400 and writes nothing. */
+function guardLogPlugin(): Plugin {
+  const file = path.resolve(__dirname, "logs/order-guard.jsonl");
+  return {
+    name: "order-guard-log",
+    configureServer(server) {
+      server.middlewares.use("/__guard-log", (req, res) => {
+        let body = "";
+        req.on("data", (chunk) => (body += chunk));
+        req.on("end", () => {
+          let event: unknown = null;
+          try {
+            event = JSON.parse(body);
+          } catch {
+            event = null;
+          }
+          if (event === null || typeof event !== "object" || Array.isArray(event)) {
+            res.statusCode = 400;
+            res.end();
+            return;
+          }
+          fs.mkdirSync(path.dirname(file), { recursive: true });
+          fs.appendFileSync(file, JSON.stringify(event) + "\n");
+          res.statusCode = 204;
+          res.end();
+        });
+      });
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), guardLogPlugin()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
