@@ -25,13 +25,19 @@ def ans(score, prob2, choice="buy", conf=0.9):
 
 
 def test_normal_regime_is_not_vetoed():
-    verdict, _, _, rule = js.RiskSession().gate({}, ans(0.7, 0.02))
+    verdict, _, _, rule = js.RiskSession().gate({}, ans(0.5, 0.02))
     assert (verdict, rule) == ("approve", "full")
 
 
 def test_high_score_is_vetoed():
     _, _, _, rule = js.RiskSession().gate({}, ans(1.6, 0.02))
     assert rule == "volatile"
+
+
+def test_p60_threshold_is_the_boundary():
+    # 0.67 is P60 of the logged scores: at or above it the bar is volatile.
+    assert js.RiskSession().gate({}, ans(0.67, 0.02))[3] == "volatile"
+    assert js.RiskSession().gate({}, ans(0.66, 0.02))[3] == "full"
 
 
 def test_high_volatile_probability_is_vetoed():

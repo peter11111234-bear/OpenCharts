@@ -744,7 +744,14 @@ def _bump_deepseek_paid():
         pass
 
 
-def _is_volatile(vol, min_score=1.5):
+# P60 of volatility_regime.score over 1324 logged bars (2026-09-22..10-20):
+# about 40% of bars count as volatile (user decision 2026-10-21). The old 1.5
+# sat above the highest score ever logged (1.3), so it never fired.
+# Recompute once a month or so of new bars is logged.
+VOLATILE_MIN_SCORE = 0.67
+
+
+def _is_volatile(vol, min_score=VOLATILE_MIN_SCORE):
     """volatility_regime is a Jev Score (0 Calm, 1 Normal, 2 Volatile).
     Read the numbers only: the answer's `legend` always contains "Volatile:",
     so any substring test on the dict is always true (bug of 2026-10-19)."""
