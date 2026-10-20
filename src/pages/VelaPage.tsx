@@ -9,6 +9,7 @@ import "./velaPineEditor.ts"; // 註冊頂列 "Pine" 按鈕（side effect）
 import { bindVelaWorkspace, unbindVelaWorkspace, normScript } from "./velaPineEditor.ts";
 import { initVelaLayouts } from "./velaLayouts.ts";
 import "./velaTechRating.ts"; // 註冊「技術評分」側邊面板與頂列 "評分" 按鈕（side effect）
+import "./velaMarketWidgets.ts"; // 註冊報價列、電子熱力圖與排行榜（side effect）
 
 
 /**
