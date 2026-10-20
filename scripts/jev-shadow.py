@@ -745,7 +745,8 @@ def _bump_deepseek_paid():
 
 
 # P60 of volatility_regime.score over 1324 logged bars (2026-09-22..10-20):
-# about 40% of bars count as volatile (user decision 2026-10-21). The old 1.5
+# about 40% of bars count as volatile (user decision 2026-10-21) and are
+# followed at half size, not vetoed (see RiskSession.gate). The old 1.5
 # sat above the highest score ever logged (1.3), so it never fired.
 # Recompute once a month or so of new bars is logged.
 VOLATILE_MIN_SCORE = 0.67
@@ -915,8 +916,6 @@ class RiskSession:
         # (user decision 2026-10-20), or a hold bar falls through to approve/reduce.
         if choice in ('flat', 'hold'):
             return 'veto', 0.0, 'flat choice', 'flat'
-        if _is_volatile(vol):
-            return 'veto', 0.0, 'volatile environment -> risk>=1', 'volatile'
         if self.follow_count_today >= 5:
             return 'veto', 0.0, 'daily follow cap (5) reached', 'max_follow_day'
         if self.in_profit_protect and choice in ('buy', 'sell'):
@@ -927,6 +926,13 @@ class RiskSession:
         # --- reduces ---
         lots_mult = 1.0
         reasons = []
+        # A volatile bar is still followed (breakouts need range: user decision
+        # 2026-10-21), at half size because each lot carries more points of risk.
+        # Checked first so the rule tag stays 'volatile' for the later comparison.
+        volatile = _is_volatile(vol)
+        if volatile:
+            lots_mult = 0.5
+            reasons.append('volatile environment -> half lots')
         if conf < 0.85:
             lots_mult = min(lots_mult, 0.5)
             reasons.append('medium confidence (<0.85)')
@@ -937,7 +943,7 @@ class RiskSession:
             lots_mult = min(lots_mult, 0.5)
             reasons.append('2 consecutive losses -> half lots')
         if lots_mult < 1.0:
-            return 'reduce', lots_mult, reasons[0], 'reduce'
+            return 'reduce', lots_mult, reasons[0], 'volatile' if volatile else 'reduce'
         return 'approve', 1.0, 'strong signal, risk=0', 'full'
 
 if __name__ == "__main__":

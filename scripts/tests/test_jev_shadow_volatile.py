@@ -29,9 +29,10 @@ def test_normal_regime_is_not_vetoed():
     assert (verdict, rule) == ("approve", "full")
 
 
-def test_high_score_is_vetoed():
-    _, _, _, rule = js.RiskSession().gate({}, ans(1.6, 0.02))
-    assert rule == "volatile"
+def test_high_score_is_followed_at_half_size():
+    # Breakouts need range: a volatile bar is followed, at half size.
+    verdict, mult, _, rule = js.RiskSession().gate({}, ans(1.6, 0.02))
+    assert (verdict, mult, rule) == ("reduce", 0.5, "volatile")
 
 
 def test_p60_threshold_is_the_boundary():
@@ -40,9 +41,14 @@ def test_p60_threshold_is_the_boundary():
     assert js.RiskSession().gate({}, ans(0.66, 0.02))[3] == "full"
 
 
-def test_high_volatile_probability_is_vetoed():
-    _, _, _, rule = js.RiskSession().gate({}, ans(0.9, 0.55))
-    assert rule == "volatile"
+def test_high_volatile_probability_is_followed_at_half_size():
+    verdict, mult, _, rule = js.RiskSession().gate({}, ans(0.9, 0.55))
+    assert (verdict, mult, rule) == ("reduce", 0.5, "volatile")
+
+
+def test_volatile_keeps_its_tag_when_confidence_is_also_low():
+    verdict, mult, _, rule = js.RiskSession().gate({}, ans(1.6, 0.02, conf=0.5))
+    assert (verdict, mult, rule) == ("reduce", 0.5, "volatile")
 
 
 def test_normal_regime_does_not_escalate():
