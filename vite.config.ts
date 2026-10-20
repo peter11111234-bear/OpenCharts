@@ -5,16 +5,57 @@ import path from "path";
 
 /** Dev-only sink for the order guard (src/services/guard/guardRuntime.ts):
  *  POST /__guard-log appends one JSON object per line to logs/order-guard.jsonl.
- *  A body that is not a JSON object gets 400 and writes nothing. */
+ *  A body that is not a JSON object gets 400 and writes nothing.
+ *
+ *  The audit log decides whether Phase 2 turns the guard on, so a write from
+ *  anywhere but this app would corrupt that decision:
+ *  - only same-origin requests (the browser sends Origin on cross-site POSTs,
+ *    but not on same-origin ones, so an absent Origin is allowed too);
+ *  - only POST, so a stray GET cannot be mistaken for a write;
+ *  - a body cap, so one request cannot fill the disk;
+ *  - the log lives outside the served root, so the dev server cannot hand it
+ *    out as a static file. */
+const GUARD_LOG_MAX_BODY = 64 * 1024;
+
 function guardLogPlugin(): Plugin {
   const file = path.resolve(__dirname, "logs/order-guard.jsonl");
   return {
     name: "order-guard-log",
     configureServer(server) {
       server.middlewares.use("/__guard-log", (req, res) => {
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          res.end();
+          return;
+        }
+        const origin = req.headers.origin;
+        if (origin) {
+          const host = req.headers.host;
+          // "null" (sandboxed iframe) and anything unparseable is not us.
+          let originHost = "";
+          try {
+            originHost = new URL(origin).host;
+          } catch {
+            originHost = "";
+          }
+          if (!host || !originHost || originHost !== host) {
+            res.statusCode = 403;
+            res.end();
+            return;
+          }
+        }
         let body = "";
-        req.on("data", (chunk) => (body += chunk));
+        let tooLarge = false;
+        req.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > GUARD_LOG_MAX_BODY) tooLarge = true;
+        });
         req.on("end", () => {
+          if (tooLarge) {
+            res.statusCode = 413;
+            res.end();
+            return;
+          }
           let event: unknown = null;
           try {
             event = JSON.parse(body);
@@ -31,6 +72,15 @@ function guardLogPlugin(): Plugin {
           res.statusCode = 204;
           res.end();
         });
+      });
+      // The audit log is not a public file: keep it out of the static handler.
+      server.middlewares.use((req, res, next) => {
+        if (req.url?.startsWith("/logs/")) {
+          res.statusCode = 404;
+          res.end();
+          return;
+        }
+        next();
       });
     },
   };

@@ -32,6 +32,8 @@ export interface EntryIntent {
   symbol: string;
   side: string;
   quantity: number;
+  /** MARKET / LIMIT / STOP, as the engine spells it. */
+  type?: string;
   /** LIMIT level (the mobile ticket and chart quick-order send every level here). */
   price?: number;
   /** STOP level from the desktop ticket. */
@@ -65,7 +67,24 @@ type Rule = (i: EntryIntent, c: GuardContext) => Omit<Hit, "rule"> | null;
 
 const veto = (reason: string) => ({ verdict: "veto" as const, reason });
 const isBuy = (side: string) => side === "BUY";
-const entryOf = (i: EntryIntent, c: GuardContext) => i.price ?? i.stopPrice ?? c.lastPrice;
+
+/**
+ * The price the position will actually open at.
+ *
+ * A LIMIT never fills worse than its own level (engine.restingFillPrice):
+ * BUY fills at min(limit, market), SELL at max(limit, market). Judging the
+ * stop against the limit level alone would approve a stop that sits on the
+ * wrong side of the real fill and stops out on the next tick. A STOP is a pure
+ * trigger and fills at the market, so its own level is the conservative guess.
+ */
+const entryOf = (i: EntryIntent, c: GuardContext) => {
+  const level = i.price ?? i.stopPrice;
+  if (level == null) return c.lastPrice;
+  if (i.type === "LIMIT" && c.lastPrice > 0) {
+    return isBuy(i.side) ? Math.min(level, c.lastPrice) : Math.max(level, c.lastPrice);
+  }
+  return level;
+};
 
 function todaysClosed(c: GuardContext): ClosedPosition[] {
   const day = c.now.toDateString();
@@ -73,16 +92,31 @@ function todaysClosed(c: GuardContext): ClosedPosition[] {
 }
 
 function lossStreak(c: GuardContext): number {
-  let n = 0;
+  // One position closed in three partial fills is ONE losing trade, not three.
+  // The engine writes one ClosedPosition per partial close, all sharing the
+  // same openedAt, so count per trade (openedAt) not per row.
+  const byTrade = new Map<string, number>();
   for (const p of todaysClosed(c)) {
-    if (p.realizedPnl >= 0) break;
+    byTrade.set(p.openedAt, (byTrade.get(p.openedAt) ?? 0) + p.realizedPnl);
+  }
+  let n = 0;
+  for (const pnl of byTrade.values()) {
+    if (pnl >= 0) break;
     n++;
   }
   return n;
 }
 
 const ENTRY_RULES: Record<string, Rule> = {
-  stop_required: (i) => (i.stopLoss == null ? veto("Entry needs a stop-loss") : null),
+  stop_required: (i) => {
+    if (i.stopLoss == null) return veto("Entry needs a stop-loss");
+    // A stop of 0 or below never fires on a LONG (engine: price <= stopLoss),
+    // so it is a stop in name only. checkStopChange rejects the same values.
+    if (!(Number.isFinite(i.stopLoss) && i.stopLoss > 0)) {
+      return veto(`Stop-loss ${i.stopLoss} is not a positive price`);
+    }
+    return null;
+  },
 
   stop_side: (i, c) => {
     const e = entryOf(i, c);

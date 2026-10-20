@@ -14,11 +14,16 @@ function pos(p: Partial<Position> = {}): Position {
   } as Position;
 }
 
-function closedTrade(realizedPnl: number, closedAt = AN_HOUR_AGO): ClosedPosition {
+/** Each call is a separate position, so each gets its own openedAt.
+ *  Partial closes of ONE position share an openedAt: pass it explicitly. */
+let tradeSeq = 0;
+function closedTrade(realizedPnl: number, closedAt = AN_HOUR_AGO, openedAt?: string): ClosedPosition {
+  tradeSeq += 1;
   return {
     id: crypto.randomUUID(), accountId: "a", symbolName: "BTCUSD", side: "LONG", quantity: 1,
     entryPrice: 100, exitPrice: 99, realizedPnl, commission: 0, swap: 0,
-    openedAt: closedAt, closedAt, isPartialClose: false,
+    openedAt: openedAt ?? `2026-10-19T08:${String(tradeSeq).padStart(2, "0")}:00+08:00`,
+    closedAt, isPartialClose: false,
   } as ClosedPosition;
 }
 
@@ -101,6 +106,40 @@ describe("checkEntry", () => {
   it("counts the streak from the newest trade and stops at a win", () => {
     const closed = [closedTrade(-10), closedTrade(5), closedTrade(-10), closedTrade(-10)];
     expect(checkEntry(GOOD, ctx({ closed })).verdict).toBe("approve");
+  });
+
+  it("counts one position closed in three partial fills as a single loss", () => {
+    // The engine writes one ClosedPosition per partial close, all sharing the
+    // position's openedAt. Three partials of one position are ONE losing trade.
+    const openedAt = "2026-10-19T08:00:00+08:00";
+    const partials = [
+      closedTrade(-10, AN_HOUR_AGO, openedAt),
+      closedTrade(-10, AN_HOUR_AGO, openedAt),
+      closedTrade(-10, AN_HOUR_AGO, openedAt),
+    ];
+    expect(checkEntry(GOOD, ctx({ closed: partials })).verdict).toBe("approve");
+  });
+
+  it("vetoes an entry whose stop-loss is not a positive price", () => {
+    // A stop of 0 never fires on a LONG (engine: price <= stopLoss), so it is a
+    // stop in name only. The exit path (checkStopChange) rejects the same values.
+    for (const stopLoss of [0, -5]) {
+      const d = checkEntry({ ...GOOD, stopLoss }, ctx());
+      expect(d.verdict).toBe("veto");
+      expect(rules(d)).toContain("stop_required");
+    }
+  });
+
+  it("judges a LIMIT entry against the price it actually fills at", () => {
+    // The engine fills a LIMIT no worse than its own level: BUY at min(limit, market).
+    // A stop judged against the limit alone would approve a stop that sits on the
+    // wrong side of the real fill and stops out on the next tick.
+    const d = checkEntry(
+      { symbol: "BTCUSD", side: "BUY", type: "LIMIT", quantity: 2, price: 105, stopLoss: 103 },
+      ctx({ lastPrice: 100 }),
+    );
+    expect(d.verdict).toBe("veto");
+    expect(rules(d)).toContain("stop_side");
   });
 
   it("vetoes an entry within 5 minutes of a losing close", () => {

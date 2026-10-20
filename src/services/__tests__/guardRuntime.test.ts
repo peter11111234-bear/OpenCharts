@@ -67,6 +67,17 @@ describe("guard runtime", () => {
     expect(typeof outcome.realizedPnl).toBe("number");
   });
 
+  it("writes exactly one outcome line per closed position", () => {
+    // The bus keeps its subscribers across an HMR reload of this module, and a
+    // Set holds handlers by reference, so a second subscriber would double
+    // every outcome line and guard_report.py would double the P&L.
+    engine.mark("DOGEUSD", 0.2);
+    guardedPlaceOrder(market("DOGEUSD", { stopLoss: 0.19 }), "shadow");
+    const pos = engine.getPositions().find((p) => p.symbolName === "DOGEUSD")!;
+    engine.closePosition(pos.id);
+    expect(logs.filter((l) => l.kind === "outcome")).toHaveLength(1);
+  });
+
   it("enforce mode refuses to widen a stop and leaves the stop unchanged", () => {
     engine.mark("XRPUSD", 0.5);
     guardedPlaceOrder(market("XRPUSD", { stopLoss: 0.4 }), "shadow");

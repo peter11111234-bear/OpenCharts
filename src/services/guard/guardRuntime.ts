@@ -86,7 +86,7 @@ export function guardedModifyPosition(
   return engine.modifyPosition(positionId, mods);
 }
 
-const unsubscribeOutcomes = subscribeChannel("closed-positions", (event) => {
+function onClosedPosition(event: unknown): void {
   // The bus payload is `unknown`: pull the record out by key and validate it
   // against the app's own schema instead of trusting the shape.
   const entity = typeof event === "object" && event !== null && "_entity" in event ? event._entity : null;
@@ -101,9 +101,26 @@ const unsubscribeOutcomes = subscribeChannel("closed-positions", (event) => {
     closedAt: c.closedAt,
     realizedPnl: c.realizedPnl,
   });
-});
+}
 
-// HMR re-runs this module when orderGuard.ts changes, but bus.ts keeps its
-// subscribers: without this, every rule edit adds a duplicate outcome line
-// and guard_report.py would double the P&L of every later trade.
-import.meta.hot?.dispose(unsubscribeOutcomes);
+/**
+ * One subscription for the whole page, anchored on globalThis.
+ *
+ * Editing orderGuard.ts re-evaluates this module, but bus.ts keeps its
+ * subscribers and the Set holds the handler by reference, so a fresh arrow
+ * function would be a second subscriber: every rule edit would add another
+ * outcome line and guard_report.py would double the P&L of every later trade.
+ *
+ * `import.meta.hot?.dispose` cannot fix that: Vite only calls the disposer
+ * registered for the module that accepted the update, and a .ts file is never
+ * an HMR boundary (only a source-level `.accept` makes one). The first
+ * instance wins and stays subscribed for the page's lifetime; rule edits
+ * therefore need a reload to take effect.
+ */
+const OUTCOME_SUB_KEY = "__openchartsGuardOutcomeSubscription";
+type GuardGlobal = typeof globalThis & { [OUTCOME_SUB_KEY]?: true };
+const guardGlobal = globalThis as GuardGlobal;
+if (!guardGlobal[OUTCOME_SUB_KEY]) {
+  guardGlobal[OUTCOME_SUB_KEY] = true;
+  subscribeChannel("closed-positions", onClosedPosition);
+}

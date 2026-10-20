@@ -33,7 +33,12 @@ def load(path):
 
 
 def join(rows):
-    """Return [(verdict, rules, pnl)] for entries that have at least one outcome."""
+    """Return [(verdict, rules, pnl)] for entries that have at least one outcome.
+
+    Only shadow-mode rows join: in enforce mode a vetoed order never trades,
+    and a reduced one trades at a size the guard itself chose, so neither is a
+    fair comparison against an approved trade.
+    """
     pnl = defaultdict(float)
     for r in rows:
         if r.get("kind") == "outcome":
@@ -42,10 +47,18 @@ def join(rows):
     for r in rows:
         if r.get("kind") != "entry" or not r.get("positionOpenedAt"):
             continue
-        key = (r["intent"]["symbol"], r["positionOpenedAt"])
+        if r.get("mode") != "shadow":
+            continue
+        intent = r.get("intent") or {}
+        decision = r.get("decision") or {}
+        symbol = intent.get("symbol")
+        if not symbol or "verdict" not in decision:
+            continue
+        key = (symbol, r["positionOpenedAt"])
         if key in pnl:
-            d = r["decision"]
-            out.append((d["verdict"], [h["rule"] for h in d["hits"]], pnl[key]))
+            out.append((decision["verdict"],
+                        [h.get("rule") for h in decision.get("hits") or []],
+                        pnl[key]))
     return out
 
 

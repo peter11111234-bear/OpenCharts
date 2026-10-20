@@ -6,13 +6,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import guard_report as gr  # noqa: E402
 
 
-def entry(symbol, opened, verdict, rules=()):
-    return {"kind": "entry", "intent": {"symbol": symbol}, "positionOpenedAt": opened,
+def entry(symbol, opened, verdict, rules=(), mode="shadow"):
+    return {"kind": "entry", "mode": mode, "intent": {"symbol": symbol}, "positionOpenedAt": opened,
             "decision": {"verdict": verdict, "hits": [{"rule": r} for r in rules]}}
 
 
-def outcome(symbol, opened, pnl):
-    return {"kind": "outcome", "symbol": symbol, "openedAt": opened, "realizedPnl": pnl}
+def outcome(symbol, opened, pnl, mode="shadow"):
+    return {"kind": "outcome", "mode": mode, "symbol": symbol, "openedAt": opened, "realizedPnl": pnl}
 
 
 def test_join_sums_partials_and_skips_unmatched():
@@ -50,3 +50,29 @@ def test_load_skips_malformed_lines(tmp_path):
     p = tmp_path / "g.jsonl"
     p.write_text('{"kind": "probe"}\n{"kind": broken\n{"kind": "outcome"}\n', encoding="utf-8")
     assert [r["kind"] for r in gr.load(p)] == ["probe", "outcome"]
+
+
+def test_join_skips_enforce_mode_rows():
+    # In enforce mode a vetoed order never trades and a reduced one trades at a
+    # size the guard chose: neither is a fair comparison against an approved trade.
+    rows = [
+        entry("BTCUSD", "t1", "approve"),
+        outcome("BTCUSD", "t1", 4.0),
+        entry("ETHUSD", "t2", "reduce", ["loss_streak"], mode="enforce"),
+        outcome("ETHUSD", "t2", -6.0, mode="enforce"),
+    ]
+    assert gr.join(rows) == [("approve", [], 4.0)]
+
+
+def test_join_skips_entry_rows_without_intent_or_decision():
+    # The dev middleware writes whatever JSON object it is given, so a stray
+    # "kind":"entry" line can land in the log without the guard's fields.
+    rows = [
+        {"kind": "entry", "mode": "shadow", "positionOpenedAt": "t1"},
+        {"kind": "entry", "mode": "shadow", "intent": {}, "positionOpenedAt": "t2"},
+        {"kind": "entry", "mode": "shadow", "intent": {"symbol": "BTCUSD"},
+         "positionOpenedAt": "t3", "decision": {}},
+        entry("BTCUSD", "t4", "approve"),
+        outcome("BTCUSD", "t4", 3.0),
+    ]
+    assert gr.join(rows) == [("approve", [], 3.0)]
