@@ -13,8 +13,8 @@ import path from "path";
  *    but not on same-origin ones, so an absent Origin is allowed too);
  *  - only POST, so a stray GET cannot be mistaken for a write;
  *  - a body cap, so one request cannot fill the disk;
- *  - the log lives outside the served root, so the dev server cannot hand it
- *    out as a static file. */
+ *  - the log is denied to the static file handler, so the dev server cannot
+ *    hand it out as a downloadable file. */
 const GUARD_LOG_MAX_BODY = 64 * 1024;
 
 function guardLogPlugin(): Plugin {
@@ -45,16 +45,21 @@ function guardLogPlugin(): Plugin {
           }
         }
         let body = "";
+        let size = 0;
         let tooLarge = false;
         req.on("data", (chunk) => {
           if (tooLarge) return;
-          body += chunk;
-          if (body.length > GUARD_LOG_MAX_BODY) {
+          // chunk is a string: its length counts characters, so a multi-byte
+          // body would slip past a byte cap. Measure the real byte size.
+          size += Buffer.byteLength(chunk);
+          if (size > GUARD_LOG_MAX_BODY) {
             // Stop accumulating: a client that keeps sending must not be able
             // to fill the server's memory.
             tooLarge = true;
             body = "";
+            return;
           }
+          body += chunk;
         });
         req.on("end", () => {
           if (tooLarge) {

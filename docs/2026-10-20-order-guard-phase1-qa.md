@@ -234,6 +234,64 @@ F7-hmr-duplicate-subscription: decided risk p=0.95
 
 **Round 2 收斂：成立。**
 
+## P8 Round 2 發現與修正（2026-10-20 22:10–22:47）
+
+Round 2 只審 Round 1 的修正 diff（`53d1b55` + `dd8329d`）。**4 個 Important、零 Critical**，全部實測確認並修正。
+
+| # | 發現 | 實測證據（修正前） | 修正 |
+|---|---|---|---|
+| R2-1 | `lossStreak` 的聚合 key 只有 `openedAt`，同毫秒開出的不同部位會被合併 | 引擎 `matchRestingOrders` 在同一個 `mark()` 內逐筆成交同 symbol 的掛單，兩次 `openPosition` 幾乎必然同毫秒 → 兩筆獨立部位被當成同一筆的分批平倉 | key 改為 `symbolName\|openedAt` |
+| R2-2 | `join()` 的 hits 未過濾 → `summarize()` 以 `"rule:" + None` 崩潰 | `join()` 回 `('veto', [None], -5.0)` → `summarize` → `TypeError: can only concatenate str (not "NoneType") to str` | 只收 `isinstance(h, dict) and h.get("rule")` 的 hit |
+| R2-3 | `/logs/` 的 404 前綴檢查可繞過，日誌仍能被靜態服務出去 | 實測三種繞過：`/./logs/x` → 200、`/%6Cogs/x` → 200（URL 編碼）、`/Logs/x` → 200（Windows 大小寫不敏感）；`logs/` 下有 **415 個**執行期日誌 | 改用 `server.fs.deny: ["logs/**"]` ＋ middleware 對 **解碼＋正規化後**的路徑做不分大小寫比對 |
+| R2-4 | body 上限只設旗標、仍持續累積 | `body += chunk` 繼續跑到 `end`，單一請求可灌爆 dev server 記憶體 | 超標後停止累積並清空 buffer |
+
+### R2-3 的繞過變體（修正前後實測）
+
+| 請求 | 修正前 | 修正後 |
+|---|---|---|
+| `/logs/order-guard.jsonl` | 200（檔案） | **404** |
+| `/./logs/order-guard.jsonl` | 200 | **404** |
+| `/%6Cogs/order-guard.jsonl` | 200（檔案） | **404** |
+| `/%6Cogs%2Forder-guard.jsonl` | 200 | **404** |
+| `/Logs/order-guard.jsonl` | 200（檔案） | **404** |
+| `/LOGS/order-guard.jsonl` | 200 | **404** |
+| `/logs%5corder-guard.jsonl`（backslash） | 200（檔案） | **404** |
+| `/a/../logs/order-guard.jsonl` | 200 | **404** |
+| `/%2e%2e/logs/x` | 200 | **404** |
+| `/`（首頁） | 200 | 200 ✓ |
+| `/src/main.tsx` | 200 | 200 ✓ |
+| `/@vite/client` | 200 | 200 ✓ |
+
+middleware 邏輯：`decodeURIComponent` → `\` 換成 `/` → `path.posix.normalize` → `/(^\|\/)logs(\/\|$)/i` 比對。`server.fs.deny` 加 `logs/**` 作為第二道防線（對 resolve 後的路徑比對，`nocase: true`）。
+
+### Round 3 新增測試（4 條）
+
+- `orderGuard.test.ts`：同毫秒不同 symbol 的兩個部位不合併（27 tests）
+- `test_guard_report.py`：hit 缺 `rule` 不崩潰、hit 非 dict 不崩潰（10 tests）
+
+## Round 3 重驗（2026-10-20 22:47–22:50）
+
+閘門 `fix` → `enter P7` → 重跑全部驗收。
+
+| # | 指令 | 結果 |
+|---|---|---|
+| A1/A2 | `python -m pytest scripts/tests/test_jev_shadow_volatile.py -q` | `5 passed` |
+| A3 | `grep -c "'volatile' in vol_txt" scripts/jev-shadow.py` | `0` |
+| A4 | `py_compile scripts/jev-shadow.py` | `COMPILE_OK` |
+| A5 | `git status --short -- scripts/jev-shadow.py scripts/tests/test_jev_shadow_volatile.py` | ` M` ＋ `??` → 仍未進版控 |
+| A6/A10/A22 | `npx vitest run`（5 檔） | `49 passed` |
+| A14a | `grep "closePosition\|cancelOrder\|closeAllPositions" guardRuntime.ts` | 只有第 12 行註解 |
+| A14b | `grep` api.ts 的五個方法 | 全部直接呼叫 `engine.*`，無 `guarded*` |
+| A15 | `grep "GUARD_MODE: GuardMode = "` | `18:export const GUARD_MODE: GuardMode = "shadow";` |
+| A16 | `POST {"kind":"probe"}` ＋ 讀檔 | `204` ／ 最後一行 `{"kind":"probe"}` |
+| A17 | `POST not-json` ／ `POST [1,2]` ／ 行數比對 | `400` ／ `400` ／ `unchanged: True` |
+| A18/A19/A20 | `python -m pytest scripts/tests/test_guard_report.py -q` | `10 passed` |
+| A21 | `python scripts/guard_report.py`（無日誌） | `PHASE2_GATE: NOT_READY`，exit 0 |
+| A22 | `npm run typecheck` | `tsc --noEmit` 零錯 |
+| 安全邊界 | 活體探針 | GET → 405；evil Origin → 403；200KB → 413；`/logs/` 四種變體 → 404 |
+
+**Round 3 收斂：成立。**
+
 ## 提交邊界核對
 ```
 $ git log --oneline -n 4
