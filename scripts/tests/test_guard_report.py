@@ -81,3 +81,21 @@ def test_join_skips_entry_rows_without_intent_or_decision():
         outcome("BTCUSD", "t4", 3.0),
     ]
     assert gr.join(rows) == [("approve", [], 3.0)]
+
+
+def test_summarize_survives_a_hit_without_a_rule_name():
+    # A hit without "rule" must not become a group key: "rule:" + None is a TypeError.
+    s = gr.summarize([("veto", [], -5.0)])
+    assert s["flagged"] == {"n": 1, "loss_rate": 1.0, "pnl": -5.0}
+    assert "rule:None" not in s
+
+
+def test_join_survives_hits_that_are_not_objects():
+    # The middleware writes whatever it is given, so a hit can be a string.
+    rows = [
+        {"kind": "entry", "mode": "shadow", "intent": {"symbol": "BTCUSD"},
+         "positionOpenedAt": "t1",
+         "decision": {"verdict": "veto", "hits": ["stop_required", {"verdict": "veto"}]}},
+        outcome("BTCUSD", "t1", -4.0),
+    ]
+    assert gr.join(rows) == [("veto", [], -4.0)]

@@ -62,8 +62,10 @@ def join(rows):
             continue
         key = (symbol, r["positionOpenedAt"])
         if key in pnl:
+            hits = decision.get("hits") or []
             out.append((decision["verdict"],
-                        [h.get("rule") for h in decision.get("hits") or []],
+                        [h["rule"] for h in hits
+                         if isinstance(h, dict) and h.get("rule")],
                         pnl[key]))
     return out
 

@@ -15,14 +15,18 @@ function pos(p: Partial<Position> = {}): Position {
 }
 
 /** Each call is a separate position, so each gets its own openedAt.
- *  Partial closes of ONE position share an openedAt: pass it explicitly. */
+ *  Partial closes of ONE position share an openedAt: pass it explicitly.
+ *  The engine stores closed trades newest-first, and `closed[0]` is the newest,
+ *  so the generated openedAt must also run newest-first: each call is one
+ *  second older than the previous one. */
 let tradeSeq = 0;
+const TRADE_EPOCH = Date.parse(AN_HOUR_AGO);
 function closedTrade(realizedPnl: number, closedAt = AN_HOUR_AGO, openedAt?: string): ClosedPosition {
   tradeSeq += 1;
   return {
     id: crypto.randomUUID(), accountId: "a", symbolName: "BTCUSD", side: "LONG", quantity: 1,
     entryPrice: 100, exitPrice: 99, realizedPnl, commission: 0, swap: 0,
-    openedAt: openedAt ?? `2026-10-19T08:${String(tradeSeq).padStart(2, "0")}:00+08:00`,
+    openedAt: openedAt ?? new Date(TRADE_EPOCH - tradeSeq * 1000).toISOString(),
     closedAt, isPartialClose: false,
   } as ClosedPosition;
 }
@@ -118,6 +122,19 @@ describe("checkEntry", () => {
       closedTrade(-10, AN_HOUR_AGO, openedAt),
     ];
     expect(checkEntry(GOOD, ctx({ closed: partials })).verdict).toBe("approve");
+  });
+
+  it("does not merge two positions opened in the same millisecond on different symbols", () => {
+    // openedAt has millisecond resolution, so the trade key needs the symbol.
+    const sameMoment = "2026-10-19T08:00:00.000Z";
+    const closed = [
+      { ...closedTrade(-10, AN_HOUR_AGO, sameMoment), symbolName: "BTCUSD" },
+      { ...closedTrade(-10, AN_HOUR_AGO, sameMoment), symbolName: "ETHUSD" },
+      { ...closedTrade(-10, AN_HOUR_AGO, sameMoment), symbolName: "SOLUSD" },
+    ];
+    const d = checkEntry(GOOD, ctx({ closed }));
+    expect(d.verdict).toBe("veto");
+    expect(rules(d)).toContain("loss_streak");
   });
 
   it("vetoes an entry whose stop-loss is not a positive price", () => {

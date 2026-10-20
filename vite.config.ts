@@ -47,8 +47,14 @@ function guardLogPlugin(): Plugin {
         let body = "";
         let tooLarge = false;
         req.on("data", (chunk) => {
+          if (tooLarge) return;
           body += chunk;
-          if (body.length > GUARD_LOG_MAX_BODY) tooLarge = true;
+          if (body.length > GUARD_LOG_MAX_BODY) {
+            // Stop accumulating: a client that keeps sending must not be able
+            // to fill the server's memory.
+            tooLarge = true;
+            body = "";
+          }
         });
         req.on("end", () => {
           if (tooLarge) {
@@ -73,9 +79,21 @@ function guardLogPlugin(): Plugin {
           res.end();
         });
       });
-      // The audit log is not a public file: keep it out of the static handler.
+      // The audit log is not a public file: keep the whole logs/ directory out
+      // of the static handler. A raw prefix check is not enough: the static
+      // handler decodes and normalizes the path first, so "/%6Cogs/x.jsonl"
+      // and "/./logs/x.jsonl" both reach the file, and the filesystem is
+      // case-insensitive so "/Logs/x.jsonl" does too.
       server.middlewares.use((req, res, next) => {
-        if (req.url?.startsWith("/logs/")) {
+        const raw = (req.url ?? "").split("?")[0] ?? "";
+        let decoded = raw;
+        try {
+          decoded = decodeURIComponent(raw);
+        } catch {
+          decoded = raw;
+        }
+        const normalized = path.posix.normalize(decoded.replace(/\\/g, "/"));
+        if (/(^|\/)logs(\/|$)/i.test(normalized)) {
           res.statusCode = 404;
           res.end();
           return;
@@ -128,6 +146,11 @@ export default defineConfig({
     // serving this repo — fail loudly instead of spawning :5174/:5175
     // zombies (the multi-tab/multi-server incident of 2026-10-07).
     strictPort: true,
+    // Runtime logs (the guard audit log, watchdog output) are not public files.
+    // The default deny list only covers .env and .git, so logs/ would be served.
+    fs: {
+      deny: [".env", ".env.*", "*.{crt,pem}", "**/.git/**", "logs/**"],
+    },
     proxy: {
       "/api": {
         target: "http://localhost:3000",

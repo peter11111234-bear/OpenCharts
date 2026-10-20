@@ -94,10 +94,13 @@ function todaysClosed(c: GuardContext): ClosedPosition[] {
 function lossStreak(c: GuardContext): number {
   // One position closed in three partial fills is ONE losing trade, not three.
   // The engine writes one ClosedPosition per partial close, all sharing the
-  // same openedAt, so count per trade (openedAt) not per row.
+  // same openedAt, so count per trade (symbol + openedAt) not per row. The
+  // symbol belongs in the key: openedAt has millisecond resolution, so two
+  // positions opened in the same millisecond must not merge.
   const byTrade = new Map<string, number>();
   for (const p of todaysClosed(c)) {
-    byTrade.set(p.openedAt, (byTrade.get(p.openedAt) ?? 0) + p.realizedPnl);
+    const key = `${p.symbolName}|${p.openedAt}`;
+    byTrade.set(key, (byTrade.get(key) ?? 0) + p.realizedPnl);
   }
   let n = 0;
   for (const pnl of byTrade.values()) {
