@@ -6,7 +6,7 @@ import type { ClosedPositionsSummary, FillQuality } from "../queries.ts";
 import { getHistory, type CandleRange } from "./candles.ts";
 import * as engine from "./engine.ts";
 import { DEMO_SYMBOLS } from "./instruments.ts";
-import { guardedModifyPosition, guardedPlaceOrder } from "../guard/guardRuntime.ts";
+import { guardedModifyOrder, guardedModifyPosition, guardedPlaceOrder } from "../guard/guardRuntime.ts";
 
 /**
  * Demo-mode API. Replaces the HTTP client for everything the terminal needs:
@@ -148,7 +148,7 @@ export const demoApi = {
   placeOrder: (data: engine.PlaceOrderArgs) => Promise.resolve().then(() => guardedPlaceOrder(data)),
   cancelOrder: (orderId: string) => Promise.resolve(engine.cancelOrder(orderId)),
   modifyOrder: (orderId: string, modifications: engine.ModifyOrderArgs) =>
-    Promise.resolve().then(() => engine.modifyOrder(orderId, modifications) ?? null),
+    Promise.resolve().then(() => guardedModifyOrder(orderId, modifications) ?? null),
   cancelAllOrders: () => Promise.resolve({ success: true }),
   getOrders: () => Promise.resolve(engine.getOrders()),
   getPositions: () => Promise.resolve(engine.getPositions()),

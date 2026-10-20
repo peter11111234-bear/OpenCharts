@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as engine from "../demo/engine.ts";
-import { guardedModifyPosition, guardedPlaceOrder } from "../guard/guardRuntime.ts";
+import { guardedModifyOrder, guardedModifyPosition, guardedPlaceOrder } from "../guard/guardRuntime.ts";
 
 /** The paper engine is a module singleton: each case claims its own symbol.
  *  Symbol isolation does NOT isolate the account-wide rules (daily_loss, loss_streak,
@@ -16,6 +16,7 @@ interface GuardLog {
   mode?: string;
   decision?: { verdict?: string; hits?: { rule: string }[] };
   positionOpenedAt?: string | null;
+  orderId?: string | null;
   symbol?: string;
   openedAt?: string;
   realizedPnl?: number;
@@ -93,6 +94,42 @@ describe("guard runtime", () => {
     logs = [];
     expect(guardedModifyPosition(pos.id, { stopLoss: 0.35 }, "enforce")!.stopLoss).toBe(0.35);
     expect(logs.filter((l) => l.kind === "stop_change")).toHaveLength(0);
+  });
+
+  it("logs a fill line that joins a resting order to the position it opens later", () => {
+    engine.mark("LTCUSD", 80);
+    const order = guardedPlaceOrder(
+      { accountId: ACCOUNT, symbol: "LTCUSD", side: "BUY", type: "LIMIT", quantity: 1, price: 78, stopLoss: 75 },
+      "shadow",
+    );
+    expect(logs.find((l) => l.kind === "entry")).toMatchObject({ orderId: order.id, positionOpenedAt: null });
+    engine.mark("LTCUSD", 78);
+    const pos = engine.getPositions().find((p) => p.symbolName === "LTCUSD")!;
+    expect(logs.find((l) => l.kind === "fill")).toMatchObject({ orderId: order.id, positionOpenedAt: pos.openedAt });
+  });
+
+  it("enforce mode refuses to drop the stop of a resting order", () => {
+    engine.mark("DOTUSD", 5);
+    const order = guardedPlaceOrder(
+      { accountId: ACCOUNT, symbol: "DOTUSD", side: "BUY", type: "LIMIT", quantity: 1, price: 4, stopLoss: 3.5 },
+      "shadow",
+    );
+    expect(() => guardedModifyOrder(order.id, { stopLoss: null }, "enforce")).toThrow(/Guard veto/);
+    expect(engine.getOrders().find((o) => o.id === order.id)!.stopLoss).toBe(3.5);
+    expect(guardedModifyOrder(order.id, { stopLoss: 3.8 }, "enforce")!.stopLoss).toBe(3.8);
+  });
+
+  it("judges a size increase on a resting order as a new entry", () => {
+    // An open SHORT makes a new BUY a hedge (opposite_side): the TP edit is an
+    // order-level change and passes, the size increase is new exposure and does not.
+    engine.mark("AVAXUSD", 30);
+    guardedPlaceOrder({ ...market("AVAXUSD", { side: "SELL", stopLoss: 32 }) }, "shadow");
+    const order = guardedPlaceOrder(
+      { accountId: ACCOUNT, symbol: "AVAXUSD", side: "BUY", type: "LIMIT", quantity: 1, price: 28, stopLoss: 27 },
+      "shadow",
+    );
+    expect(guardedModifyOrder(order.id, { takeProfit: 31 }, "enforce")!.takeProfit).toBe(31);
+    expect(() => guardedModifyOrder(order.id, { quantity: 2 }, "enforce")).toThrow(/opposite position/);
   });
 
   it("judges a symbol with no tick yet against the seed price the engine fills at", () => {

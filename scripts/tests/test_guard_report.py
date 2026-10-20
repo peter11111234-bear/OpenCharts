@@ -27,6 +27,16 @@ def test_join_sums_partials_and_skips_unmatched():
     assert gr.join(rows) == [("approve", [], 10.0)]
 
 
+def test_join_takes_a_resting_order_key_from_its_fill_line():
+    rows = [
+        {**entry("BTCUSD", None, "veto", ["stop_side"]), "orderId": "o1"},
+        {"kind": "fill", "orderId": "o1", "symbol": "BTCUSD", "positionOpenedAt": "t9"},
+        outcome("BTCUSD", "t9", -3.0),
+        {**entry("ETHUSD", None, "approve"), "orderId": "o2"},  # never filled
+    ]
+    assert gr.join(rows) == [("veto", ["stop_side"], -3.0)]
+
+
 def test_summarize_groups_by_verdict_and_rule():
     s = gr.summarize([("approve", [], 5.0), ("veto", ["stop_required"], -2.0), ("reduce", ["loss_streak"], 1.0)])
     assert s["approve"] == {"n": 1, "loss_rate": 0.0, "pnl": 5.0}

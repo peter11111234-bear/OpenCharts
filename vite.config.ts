@@ -16,6 +16,7 @@ import path from "path";
  *  - the log is denied to the static file handler, so the dev server cannot
  *    hand it out as a downloadable file. */
 const GUARD_LOG_MAX_BODY = 64 * 1024;
+const GUARD_LOG_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 function guardLogPlugin(): Plugin {
   const file = path.resolve(__dirname, "logs/order-guard.jsonl");
@@ -32,13 +33,16 @@ function guardLogPlugin(): Plugin {
         if (origin) {
           const host = req.headers.host;
           // "null" (sandboxed iframe) and anything unparseable is not us.
-          let originHost = "";
+          let originUrl: URL | null = null;
           try {
-            originHost = new URL(origin).host;
+            originUrl = new URL(origin);
           } catch {
-            originHost = "";
+            originUrl = null;
           }
-          if (!host || !originHost || originHost !== host) {
+          // Origin == Host alone passes a DNS-rebinding page (evil.test resolved
+          // to 127.0.0.1 sends Origin and Host both as evil.test), and this
+          // middleware runs before Vite's own host check. Only loopback names.
+          if (!host || !originUrl || originUrl.host !== host || !GUARD_LOG_HOSTS.has(originUrl.hostname)) {
             res.statusCode = 403;
             res.end();
             return;

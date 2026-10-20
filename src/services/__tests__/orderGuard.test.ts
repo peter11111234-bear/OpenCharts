@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
 import type { ClosedPosition, Position } from "../schemas.ts";
-import { checkEntry, checkStopChange, type EntryIntent, type GuardContext } from "../guard/orderGuard.ts";
+import {
+  checkEntry,
+  checkOrderChange,
+  checkStopChange,
+  tradingDay,
+  type EntryIntent,
+  type GuardContext,
+} from "../guard/orderGuard.ts";
 
 const NOW = new Date("2026-10-19T10:00:00+08:00");
 const AN_HOUR_AGO = "2026-10-19T09:00:00+08:00"; // outside the loss cooldown
@@ -178,6 +185,30 @@ describe("checkEntry", () => {
     expect(rules(d)).toEqual(["cooldown_after_loss"]);
   });
 
+  it("counts a night-session loss toward the next day's limit, past midnight", () => {
+    // 16:00 on 10-19 is the night session of trading day 10-20, as is 02:00.
+    const night = [closedTrade(-300, "2026-10-19T16:00:00+08:00"), closedTrade(-250, "2026-10-19T16:30:00+08:00")];
+    const d = checkEntry(GOOD, ctx({ now: new Date("2026-10-20T02:00:00+08:00"), closed: night }));
+    expect(rules(d)).toContain("daily_loss");
+  });
+
+  it("starts a new trading day at 15:00, not at midnight", () => {
+    // 13:30 day-session losses belong to 10-19; a 15:30 entry trades on 10-20.
+    const day = [closedTrade(-300, "2026-10-19T13:30:00+08:00"), closedTrade(-300, "2026-10-19T13:20:00+08:00")];
+    const d = checkEntry(GOOD, ctx({ now: new Date("2026-10-19T15:30:00+08:00"), closed: day }));
+    expect(rules(d)).not.toContain("daily_loss");
+    expect(tradingDay("2026-10-19T14:59:59+08:00")).toBe("2026-10-19");
+    expect(tradingDay("2026-10-19T15:00:00+08:00")).toBe("2026-10-20");
+  });
+
+  it("halves crypto size but rounds futures lots down to at least one", () => {
+    const streak = { closed: [closedTrade(-10), closedTrade(-10)] };
+    expect(checkEntry({ ...GOOD, quantity: 1 }, ctx(streak)).quantity).toBe(0.5);
+    const tmf = { ...GOOD, symbol: "TMFR1" };
+    expect(checkEntry({ ...tmf, quantity: 3 }, ctx(streak))).toMatchObject({ verdict: "reduce", quantity: 1 });
+    expect(checkEntry({ ...tmf, quantity: 1 }, ctx(streak)).quantity).toBe(1);
+  });
+
   it("vetoes an order that would open a hedge against an open position", () => {
     expect(rules(checkEntry(GOOD, ctx({ positions: [pos({ side: "SHORT" })] })))).toContain("opposite_side");
   });
@@ -192,6 +223,21 @@ describe("checkEntry", () => {
     const d = checkEntry(GOOD, broken);
     expect(d.verdict).toBe("veto");
     expect(d.hits.find((h) => h.rule === "daily_loss")?.reason).toMatch(/^Rule failed:/);
+  });
+});
+
+describe("checkOrderChange", () => {
+  const LIMIT: EntryIntent = { ...GOOD, type: "LIMIT", price: 100 };
+
+  it("vetoes dropping the stop or moving the level past it", () => {
+    expect(rules(checkOrderChange({ ...LIMIT, stopLoss: undefined }, ctx()))).toEqual(["stop_required"]);
+    expect(rules(checkOrderChange({ ...LIMIT, price: 97 }, ctx({ lastPrice: 120 })))).toContain("stop_side");
+  });
+
+  it("ignores account state: an edit does not change whether the order rests", () => {
+    const losing = ctx({ closed: [closedTrade(-300), closedTrade(-300), closedTrade(-300)] });
+    expect(checkOrderChange(LIMIT, losing).verdict).toBe("approve");
+    expect(checkEntry(LIMIT, losing).verdict).toBe("veto");
   });
 });
 

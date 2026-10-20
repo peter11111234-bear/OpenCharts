@@ -543,7 +543,15 @@ advisor 已問（`advisor P9`）。交付清單見 QA 報告與本 session 的�
 
 ## 開始實際下單前必修清單（Opus 審查，2026-10-21）
 
-**狀態：暫緩。** 使用者目前不在本系統下單（下單功能尚未完成），優先做看盤系統。守門員沒有資料流入，以下各項等下單功能完成、開始 shadow 收集之前再修。
+**狀態：#1–#5 已修（2026-10-21，使用者要求提前修）；#6 待實盤資料。**
+
+- #1：`fillOrder` 把 `order.id` 傳進 `openPosition`，`PositionOpened` 事件帶上 `orderId`；runtime 記一筆 `kind:"fill"`，`guard_report.py` 用它補上掛單的配對鍵。
+- #2：`tradingDay()` 以 15:00 為界（固定 +8 時區再加 9 小時），`daily_loss` 與 `loss_streak` 改用它。
+- #3：`/__guard-log` 的 Origin hostname 限定 `localhost`／`127.0.0.1`／`[::1]`。實測：rebinding（Host 與 Origin 都是 evil.test）回 403、跨站回 403、localhost 與 127.0.0.1 回 204。
+- #4：`guardedModifyOrder`。一般修改只跑訂單本身的規則（`checkOrderChange`：stop_required、stop_side、reward_risk），帳戶狀態規則不擋修改，因為不論改不改，掛單都已經在場上。加大口數視為新的進場，要跑全部規則；enforce 下判定 reduce 時保留原口數，不再砍半。
+- #5：加密貨幣砍半；其他商品（期貨）向下取整，最少 1 口。
+- 驗證：vitest 57 passed（新增 8 項）、pytest 16 passed、typecheck 零錯。
+- 修正前的頁面要重新整理（F5），新的成交訂閱才會生效（globalThis 錨定）。
 
 | # | 嚴重度 | 問題 | 位置 | 修法 |
 |---|---|---|---|---|

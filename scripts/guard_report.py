@@ -2,6 +2,7 @@
 
 Reads logs/order-guard.jsonl (written by the vite dev middleware), joins each
 entry decision to its closed trade(s) by (symbol, positionOpenedAt == openedAt),
+taking positionOpenedAt from the order's "fill" line when it rested first,
 and prints loss rate and P&L per verdict group and per rule. Read-only.
 
 "flagged" = verdict reduce or veto. Only shadow-mode rows give a fair
@@ -46,12 +47,20 @@ def join(rows):
     fair comparison against an approved trade.
     """
     pnl = defaultdict(float)
+    # A resting LIMIT/STOP order is logged with positionOpenedAt null and
+    # fills later; its "fill" line maps the orderId to the position it opened.
+    filled = {}
     for r in rows:
         if r.get("kind") == "outcome":
             pnl[(r["symbol"], r["openedAt"])] += r["realizedPnl"]
+        elif r.get("kind") == "fill" and r.get("orderId") and r.get("positionOpenedAt"):
+            filled[r["orderId"]] = r["positionOpenedAt"]
     out = []
     for r in rows:
-        if r.get("kind") != "entry" or not r.get("positionOpenedAt"):
+        if r.get("kind") != "entry":
+            continue
+        opened = r.get("positionOpenedAt") or filled.get(r.get("orderId"))
+        if not opened:
             continue
         if r.get("mode") != "shadow":
             continue
@@ -60,7 +69,7 @@ def join(rows):
         symbol = intent.get("symbol")
         if not symbol or "verdict" not in decision:
             continue
-        key = (symbol, r["positionOpenedAt"])
+        key = (symbol, opened)
         if key in pnl:
             hits = decision.get("hits") or []
             out.append((decision["verdict"],

@@ -103,7 +103,15 @@ function emitEquity(): void {
   });
 }
 
-function openPosition(symbol: string, side: string, qty: number, price: number, tp?: number, sl?: number): Position {
+function openPosition(
+  symbol: string,
+  side: string,
+  qty: number,
+  price: number,
+  tp?: number,
+  sl?: number,
+  orderId?: string,
+): Position {
   const isLong = side === "BUY";
   const pos: Position = {
     id: crypto.randomUUID(),
@@ -121,7 +129,9 @@ function openPosition(symbol: string, side: string, qty: number, price: number, 
     stopLoss: sl ?? null,
   };
   positions.push(pos);
-  publish("positions", { eventType: "PositionOpened", accountId: account.id, positionId: pos.id, _entity: { ...pos } });
+  // orderId ties a resting order to the position it opened when it fills later
+  // (the order guard joins its entry decision to the trade by it).
+  publish("positions", { eventType: "PositionOpened", accountId: account.id, positionId: pos.id, orderId, _entity: { ...pos } });
   return pos;
 }
 
@@ -204,6 +214,7 @@ function fillOrder(order: Order, price: number): void {
     price,
     order.takeProfit ?? undefined,
     order.stopLoss ?? undefined,
+    order.id,
   );
 }
 

@@ -1,4 +1,5 @@
 import type { ClosedPosition, Position } from "../schemas.ts";
+import { getDemoSymbol } from "../demo/instruments.ts";
 
 /**
  * Pre-trade guard: pure rules, no I/O (side effects live in guardRuntime.ts).
@@ -86,9 +87,19 @@ const entryOf = (i: EntryIntent, c: GuardContext) => {
   return level;
 };
 
+/**
+ * TAIFEX trading day (Taipei): the night session (15:00 to 05:00) belongs to the
+ * next day's session, so the day turns over at 15:00, not at midnight. Shifting
+ * by +8h (Taipei, no DST) and +9h moves 15:00 onto the next UTC date. A Friday
+ * night session lands on Saturday, apart from Monday's day session.
+ */
+const DAY_SHIFT_MS = (8 + 9) * 3_600_000;
+export const tradingDay = (t: Date | string) =>
+  new Date(new Date(t).getTime() + DAY_SHIFT_MS).toISOString().slice(0, 10);
+
 function todaysClosed(c: GuardContext): ClosedPosition[] {
-  const day = c.now.toDateString();
-  return c.closed.filter((p) => p.closedAt != null && new Date(p.closedAt).toDateString() === day);
+  const day = tradingDay(c.now);
+  return c.closed.filter((p) => p.closedAt != null && tradingDay(p.closedAt) === day);
 }
 
 function lossStreak(c: GuardContext): number {
@@ -183,15 +194,36 @@ const ENTRY_RULES: Record<string, Rule> = {
 
 const RANK: Record<Verdict, number> = { approve: 0, reduce: 1, veto: 2 };
 
-function decide(hits: Hit[], quantity: number): Decision {
-  const verdict = hits.reduce<Verdict>((v, h) => (RANK[h.verdict] > RANK[v] ? h.verdict : v), "approve");
-  // TODO: ponytail debt, halving suits fractional crypto size; integer futures lots need rounding.
-  return { verdict, quantity: verdict === "reduce" ? quantity / 2 : quantity, hits };
+/** Half size. Crypto trades fractional size; anything else (futures) trades whole
+ *  lots, so it rounds down and never drops below one lot. */
+function halve(symbol: string, quantity: number): number {
+  if (getDemoSymbol(symbol)?.category === "CRYPTO") return quantity / 2;
+  return Math.max(1, Math.floor(quantity / 2));
 }
 
+function decide(hits: Hit[], quantity: number, symbol: string): Decision {
+  const verdict = hits.reduce<Verdict>((v, h) => (RANK[h.verdict] > RANK[v] ? h.verdict : v), "approve");
+  return { verdict, quantity: verdict === "reduce" ? halve(symbol, quantity) : quantity, hits };
+}
+
+/** The rules about the order itself. The rest read account state, which an edit
+ *  to a resting order does not change: the order rests either way. */
+const ORDER_RULES = ["stop_required", "stop_side", "reward_risk"];
+
 export function checkEntry(intent: EntryIntent, ctx: GuardContext): Decision {
+  return runRules(Object.keys(ENTRY_RULES), intent, ctx);
+}
+
+/** An edit to a resting order: may not drop its stop, flip it to the wrong side
+ *  of the new level, or break reward/risk. */
+export function checkOrderChange(intent: EntryIntent, ctx: GuardContext): Decision {
+  return runRules(ORDER_RULES, intent, ctx);
+}
+
+function runRules(names: string[], intent: EntryIntent, ctx: GuardContext): Decision {
   const hits: Hit[] = [];
-  for (const [rule, fn] of Object.entries(ENTRY_RULES)) {
+  for (const rule of names) {
+    const fn = ENTRY_RULES[rule]!;
     try {
       const hit = fn(intent, ctx);
       if (hit) hits.push({ rule, ...hit });
@@ -199,7 +231,7 @@ export function checkEntry(intent: EntryIntent, ctx: GuardContext): Decision {
       hits.push({ rule, verdict: "veto", reason: `Rule failed: ${(err as Error).message}` });
     }
   }
-  return decide(hits, intent.quantity);
+  return decide(hits, intent.quantity, intent.symbol);
 }
 
 /** Exit side: a stop may tighten or be set for the first time, never widen or vanish.
@@ -210,7 +242,7 @@ export function checkStopChange(pos: Position, stopLoss: number | null | undefin
     // The paper engine stores any number. A stop at 0 or below is bad input, not a
     // price: it never fires on a LONG, and on a SHORT it exits on the next tick.
     hits.push({ rule: "stop_invalid", verdict: "veto", reason: `Stop-loss ${stopLoss} is not a positive price` });
-    return decide(hits, pos.quantity);
+    return decide(hits, pos.quantity, pos.symbolName);
   }
   if (stopLoss === null && pos.stopLoss != null) {
     hits.push({ rule: "stop_removed", verdict: "veto", reason: "Removing the stop-loss of an open position" });
@@ -225,5 +257,5 @@ export function checkStopChange(pos: Position, stopLoss: number | null | undefin
       });
     }
   }
-  return decide(hits, pos.quantity);
+  return decide(hits, pos.quantity, pos.symbolName);
 }
