@@ -292,6 +292,15 @@ middleware 邏輯：`decodeURIComponent` → `\` 換成 `/` → `path.posix.norm
 
 **Round 3 收斂：成立。**
 
+### Round 3 最終自查（主 LLM，未派 reviewer）
+
+ROUND 3 是 task-workflow 的回頭重做上限（最多 2 次，第 3 輪閘門會擋）。因此本輪不再派 reviewer，改由主 LLM 逐檔複查本次變更的全部程式碼，並實測驗證。查出並修正 2 項：
+
+1. **body 上限用字元數而非位元組數。** `chunk.length` 在 Node 裡是字元數（chunk 是 string），一位元組三字元的多位元組 body 會以 1/3 的實際大小通過上限。實測：90 KB 多位元組 body 回 **204**（應為 413）。改用 `Buffer.byteLength(chunk)` 後：60 KB → 204、90 KB → **413**、64 KB → 204、200 KB → 413。
+2. **註記與實作不符。** middleware 的文件註解寫「the log lives outside the served root」，但 `logs/` 就在 repo 根目錄（served root 內），實際靠 `server.fs.deny` 與 middleware 擋住。註記改為「the log is denied to the static file handler」。
+
+自查結論：無其他遺留。最終回歸 `npm run typecheck` 零錯、`vitest` 49 passed（5 檔）、`pytest` 15 passed。
+
 ## 提交邊界核對
 ```
 $ git log --oneline -n 4
