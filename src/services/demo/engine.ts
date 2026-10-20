@@ -254,7 +254,7 @@ export function placeOrder(input: PlaceOrderArgs): Order {
 
 function recordClose(pos: Position, qty: number, exitPrice: number, realized: number): void {
   const now = new Date().toISOString();
-  closed.unshift({
+  const record: ClosedPosition = {
     id: crypto.randomUUID(),
     accountId: account.id,
     symbolName: pos.symbolName,
@@ -268,7 +268,9 @@ function recordClose(pos: Position, qty: number, exitPrice: number, realized: nu
     openedAt: pos.openedAt,
     closedAt: now,
     isPartialClose: qty < pos.quantity,
-  });
+  };
+  closed.unshift(record);
+  publish("closed-positions", { eventType: "PositionRealized", _entity: { ...record } });
   fills.unshift({
     id: crypto.randomUUID(),
     orderId: pos.id,
