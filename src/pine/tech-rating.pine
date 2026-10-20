@@ -1,0 +1,93 @@
+//@version=6
+//@category=OpenCharts
+// Technical Rating, TradingView "Technical Ratings" rules re-implemented on
+// our own data. Each component votes +1 (buy) / 0 (neutral) / -1 (sell); a
+// component still warming up votes na and is left out of the average.
+// MA = mean of MA votes, Osc = mean of oscillator votes, All = (MA + Osc) / 2.
+indicator("Tech Rating", overlay = false)
+
+vote(bool ready, bool buy, bool sell) => ready ? (buy ? 1.0 : sell ? -1.0 : 0.0) : na
+maVote(float ma) => vote(not na(ma), ma < close, ma > close)
+
+avgOf(array<float> votes) =>
+    float s = 0.0
+    int n = 0
+    for v in votes
+        if not na(v)
+            s += v
+            n += 1
+    n > 0 ? s / n : na
+
+// ── Moving averages ──
+conv = math.avg(ta.highest(high, 9), ta.lowest(low, 9))
+base = math.avg(ta.highest(high, 26), ta.lowest(low, 26))
+lead1 = math.avg(conv, base)
+lead2 = math.avg(ta.highest(high, 52), ta.lowest(low, 52))
+cloud1 = lead1[25]
+cloud2 = lead2[25]
+ichiReady = not na(cloud2) and not na(base)
+ichiVote = vote(ichiReady, base < close and ta.crossover(conv, close) and cloud1 > close and cloud1 > cloud2, base > close and ta.crossunder(conv, close) and cloud1 < close and cloud1 < cloud2)
+
+maVotes = array.from(maVote(ta.sma(close, 10)), maVote(ta.sma(close, 20)), maVote(ta.sma(close, 30)), maVote(ta.sma(close, 50)), maVote(ta.sma(close, 100)), maVote(ta.sma(close, 200)), maVote(ta.ema(close, 10)), maVote(ta.ema(close, 20)), maVote(ta.ema(close, 30)), maVote(ta.ema(close, 50)), maVote(ta.ema(close, 100)), maVote(ta.ema(close, 200)), ichiVote, maVote(ta.vwma(close, 20)), maVote(ta.hma(close, 9)))
+maRating = avgOf(maVotes)
+
+// ── Oscillators ──
+trendMa = ta.sma(close, 50)
+up = close > trendMa
+down = close < trendMa
+
+rsi = ta.rsi(close, 14)
+rsiVote = vote(not na(rsi[1]), rsi < 30 and rsi > rsi[1], rsi > 70 and rsi < rsi[1])
+
+stK = ta.sma(ta.stoch(close, high, low, 14), 3)
+stD = ta.sma(stK, 3)
+stochVote = vote(not na(stD[1]), stK < 20 and ta.crossover(stK, stD), stK > 80 and ta.crossunder(stK, stD))
+
+cci = ta.cci(hlc3, 20)
+cciVote = vote(not na(cci[1]), cci < -100 and cci > cci[1], cci > 100 and cci < cci[1])
+
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+adxVote = vote(not na(adx) and not na(diPlus[1]), adx > 20 and diPlus[1] < diMinus[1] and diPlus > diMinus, adx > 20 and diPlus[1] > diMinus[1] and diPlus < diMinus)
+
+ao = ta.sma(hl2, 5) - ta.sma(hl2, 34)
+aoVote = vote(not na(ao[2]), (ao > 0 and ao > ao[1] and ao[1] < ao[2]) or ta.crossover(ao, 0), (ao < 0 and ao < ao[1] and ao[1] > ao[2]) or ta.crossunder(ao, 0))
+
+mom = close - close[10]
+momVote = vote(not na(mom[1]), mom > mom[1], mom < mom[1])
+
+[macdLine, signalLine, _hist] = ta.macd(close, 12, 26, 9)
+macdVote = vote(not na(signalLine), macdLine > signalLine, macdLine < signalLine)
+
+srRsi = ta.rsi(close, 14)
+srK = ta.sma(ta.stoch(srRsi, srRsi, srRsi, 14), 3)
+srD = ta.sma(srK, 3)
+stochRsiVote = vote(not na(srD[1]) and not na(trendMa), down and srK < 20 and srD < 20 and ta.crossover(srK, srD), up and srK > 80 and srD > 80 and ta.crossunder(srK, srD))
+
+wpr = ta.wpr(14)
+wprVote = vote(not na(wpr[1]), wpr < -80 and wpr > wpr[1], wpr > -20 and wpr < wpr[1])
+
+e13 = ta.ema(close, 13)
+bullPower = high - e13
+bearPower = low - e13
+bbpVote = vote(not na(bearPower[1]) and not na(trendMa), up and bearPower < 0 and bearPower > bearPower[1], down and bullPower > 0 and bullPower < bullPower[1])
+
+bp = close - math.min(low, nz(close[1], close))
+tr = math.max(high, nz(close[1], close)) - math.min(low, nz(close[1], close))
+a7 = math.sum(bp, 7) / math.sum(tr, 7)
+a14 = math.sum(bp, 14) / math.sum(tr, 14)
+a28 = math.sum(bp, 28) / math.sum(tr, 28)
+uo = 100 * (4 * a7 + 2 * a14 + a28) / 7
+uoVote = vote(not na(uo), uo > 70, uo < 30)
+
+oscVotes = array.from(rsiVote, stochVote, cciVote, adxVote, aoVote, momVote, macdVote, stochRsiVote, wprVote, bbpVote, uoVote)
+oscRating = avgOf(oscVotes)
+
+allRating = na(maRating) or na(oscRating) ? na : (maRating + oscRating) / 2
+
+plot(allRating, "All", color = color.yellow)
+plot(maRating, "MA", color = color.blue)
+plot(oscRating, "Osc", color = color.orange)
+hline(0.5, "Strong buy", color = color.green)
+hline(0.1, "Buy", color = color.gray)
+hline(-0.1, "Sell", color = color.gray)
+hline(-0.5, "Strong sell", color = color.red)
