@@ -20,8 +20,14 @@ MIN_FLAGGED = 10
 
 
 def load(path):
+    """Read the JSONL log. A missing file means no trades yet, not a crash:
+    the Phase 2 gate is a tool the user runs by hand, often before the first
+    order exists."""
     rows = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    p = Path(path)
+    if not p.exists():
+        return rows
+    for line in p.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue

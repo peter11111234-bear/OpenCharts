@@ -46,6 +46,11 @@ def test_load_reads_jsonl(tmp_path):
     assert [r["kind"] for r in gr.load(p)] == ["probe", "outcome"]
 
 
+def test_load_returns_nothing_when_the_log_does_not_exist(tmp_path):
+    # The user runs the report by hand, often before the first order exists.
+    assert gr.load(tmp_path / "missing.jsonl") == []
+
+
 def test_load_skips_malformed_lines(tmp_path):
     p = tmp_path / "g.jsonl"
     p.write_text('{"kind": "probe"}\n{"kind": broken\n{"kind": "outcome"}\n', encoding="utf-8")
