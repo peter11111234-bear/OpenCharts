@@ -660,11 +660,15 @@ def main() -> int:
                     if trig_ok:
                         _ds_res = deepseek_escalate(state, ans, trigger)
                     choice = (ans.get('answers') or {}).get('action_choice', {}).get('choice')
-                    if _gate_verdict == 'approve' and choice in ('buy', 'sell'):
+                    # reduce follows too, at its lots_mult: a half-size trade is
+                    # still a trade (volatile bars are followed at half size).
+                    if _gate_verdict in ('approve', 'reduce') and choice in ('buy', 'sell'):
                         risk_session.follow_count_today += 1
                         risk_session.open_entry = bar['close']
                         risk_session.open_direction = choice
                         risk_session.open_ts = bar['time']
+                        risk_session.open_lots = _gate_lots_mult
+                        risk_session.open_rule = _gate_rule
                 event = {"ts": time.time(), "bar_time": bar["time"], "symbol": symbol,
                          "price": bar["close"], "order_flow": state["order_flow"],
                          "answers": ans.get("answers"), "channel": ans.get("_channel"),
@@ -874,6 +878,8 @@ class RiskSession:
         self.open_entry = None
         self.open_direction = None
         self.open_ts = None
+        self.open_lots = 1.0
+        self.open_rule = ''
 
     def _close_open_position(self, current_bar):
         if self.open_entry is None or self.open_direction is None:
@@ -886,7 +892,9 @@ class RiskSession:
         cur = current_bar['close']
         mult = 1 if self.open_direction == 'buy' else -1
         pnl = mult * (cur - self.open_entry)
-        self.realized_points += pnl
+        # pnl_points stays per full lot so groups compare signal quality;
+        # realized_points counts what the sized trade actually made.
+        self.realized_points += pnl * self.open_lots
         if pnl >= 0:
             self.consecutive_losses = 0
         else:
@@ -895,6 +903,7 @@ class RiskSession:
             self.in_profit_protect = True
         outcome = {'entry': self.open_entry, 'exit': cur,
                    'direction': self.open_direction, 'pnl_points': round(pnl, 2),
+                   'lots': self.open_lots, 'rule': self.open_rule,
                    'realized_points': round(self.realized_points, 2)}
         self.open_entry = None
         self.open_direction = None

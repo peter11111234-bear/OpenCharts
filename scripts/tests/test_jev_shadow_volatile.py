@@ -46,6 +46,14 @@ def test_high_volatile_probability_is_followed_at_half_size():
     assert (verdict, mult, rule) == ("reduce", 0.5, "volatile")
 
 
+def test_half_size_trade_reports_full_lot_pnl_and_counts_half():
+    rs = js.RiskSession()
+    rs.open_entry, rs.open_direction, rs.open_lots, rs.open_rule = 100.0, "buy", 0.5, "volatile"
+    out = rs._close_open_position({"close": 110.0})
+    assert (out["pnl_points"], out["lots"], out["rule"]) == (10.0, 0.5, "volatile")
+    assert rs.realized_points == 5.0
+
+
 def test_volatile_keeps_its_tag_when_confidence_is_also_low():
     verdict, mult, _, rule = js.RiskSession().gate({}, ans(1.6, 0.02, conf=0.5))
     assert (verdict, mult, rule) == ("reduce", 0.5, "volatile")
