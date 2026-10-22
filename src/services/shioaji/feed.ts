@@ -29,6 +29,7 @@ import {
   type TickEvent,
 } from "./server.ts";
 import { LIVE_INSTRUMENTS } from "./instruments.ts";
+import { isQuotingNow } from "./tradingSession.ts";
 
 interface BarState {
   bucket: number;
@@ -225,7 +226,12 @@ function ensureWatchdog(): void {
     } catch (err) {
       console.error("[shioaji] reopen streams failed", err);
     }
-    const quiet = LIVE_INSTRUMENTS.filter((i) => Date.now() - (lastTickAt.get(i.symbol.name) ?? 0) > QUIET_THRESHOLD_MS);
+    // Only streams that should be quoting right now can be "quiet": after the close
+    // silence is normal and re-POSTing subscribe every 10s is just noise (E2).
+    const now = Date.now();
+    const quiet = LIVE_INSTRUMENTS.filter(
+      (i) => isQuotingNow(i.contract.security_type, now) && now - (lastTickAt.get(i.symbol.name) ?? 0) > QUIET_THRESHOLD_MS,
+    );
     if (quiet.length > 0) {
       console.warn(`[shioaji] quiet streams: ${quiet.map((i) => i.symbol.name).join(",")} — resubscribing`);
       void subscribeAll();
