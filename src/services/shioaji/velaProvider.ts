@@ -18,7 +18,7 @@
 import type { BarRange, DataProvider, OHLCV, ProviderInfo, SymbolDescriptor, SymbolInfo } from "@luxalgo/vela";
 import { bucketStart, getShioajiHistory } from "./candles.ts";
 import { TW_INSTRUMENTS, getTwInstrument } from "./instruments.ts";
-import { fetchIndexEntries } from "./marketData.ts";
+import { fetchIndexEntries, taipeiDate } from "./marketData.ts";
 import { startShioajiFeed } from "./feed.ts";
 import { subscribeChannel } from "../demo/bus.ts";
 import { wsClient } from "../ws.ts";
@@ -62,6 +62,34 @@ export async function localRecordedBars(
     }
   }
   return [...out.values()].sort((a, b) => a.time - b.time).slice(-limit);
+}
+
+/** listSymbols only needs the component codes, but index_components returns every stock's
+ *  live quote too (~730 KB of quota for TSE+OTC). Codes change at most daily: keep one
+ *  list per Taipei day, and only a complete one (both exchanges answered). */
+const COMPONENT_CODES_KEY = "opencharts.componentCodes.v1";
+type ComponentCode = { code: string; exchange: string };
+
+async function componentCodes(): Promise<ComponentCode[]> {
+  const today = taipeiDate(new Date());
+  try {
+    const c = JSON.parse(localStorage.getItem(COMPONENT_CODES_KEY) ?? "null") as { date?: string; codes?: ComponentCode[] } | null;
+    if (c?.date === today && Array.isArray(c.codes) && c.codes.length > 0) return c.codes;
+  } catch {
+    /* no storage (private window / tests): just fetch */
+  }
+  const lists = await Promise.all([fetchIndexEntries(undefined, "TSE"), fetchIndexEntries(undefined, "OTC")]).catch(
+    () => [] as ComponentCode[][],
+  );
+  const codes = lists.flat().map((e) => ({ code: e.code, exchange: e.exchange }));
+  if (lists.length === 2 && lists.every((l) => l.length > 0)) {
+    try {
+      localStorage.setItem(COMPONENT_CODES_KEY, JSON.stringify({ date: today, codes }));
+    } catch {
+      /* storage full / blocked: next load fetches again */
+    }
+  }
+  return codes;
 }
 
 /** Vela canonical → our timeframe key. */
@@ -177,11 +205,7 @@ export class ShioajiVelaProvider implements DataProvider {
       prefix: i.contract.exchange, // TSE / OTC / TAIFEX = listing-venue prefix
     }));
     const seen = new Set(listed.map((d) => d.ticker));
-    const components = await Promise.all([fetchIndexEntries(undefined, "TSE"), fetchIndexEntries(undefined, "OTC")]).then(
-      (lists) => lists.flat(),
-      () => [],
-    );
-    for (const e of components) {
+    for (const e of await componentCodes()) {
       if (seen.has(e.code)) continue;
       seen.add(e.code);
       listed.push({ ticker: e.code, type: "stock", prefix: e.exchange });

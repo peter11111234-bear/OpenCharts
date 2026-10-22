@@ -8,6 +8,7 @@ const entry = (code: string, exchange: string) => ({ contract: { exchange, code 
 afterEach(() => {
   vi.unstubAllGlobals();
   clearIndexEntriesCache();
+  localStorage.clear();
 });
 
 describe("ShioajiVelaProvider.listSymbols", () => {
@@ -22,6 +23,33 @@ describe("ShioajiVelaProvider.listSymbols", () => {
     expect(list.find((d) => d.ticker === "3081")).toMatchObject({ prefix: "OTC", type: "stock" });
     expect(list.filter((d) => d.ticker === "2330")).toHaveLength(1); // hand-listed entry wins, no duplicate
     expect(list.find((d) => d.ticker === "2330")!.description).toBe("台積電");
+  });
+
+  it("fetches the component code list once per day (each fetch is ~730 KB of quota)", async () => {
+    const fetchSpy = vi.fn(async (_url: string, init: { body: string }) => {
+      const otc = JSON.parse(init.body).contract.exchange === "OTC";
+      return { ok: true, json: async () => ({ entries: otc ? [entry("3081", "OTC")] : [entry("3037", "TSE")] }) };
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    await new ShioajiVelaProvider().listSymbols();
+    expect(fetchSpy).toHaveBeenCalledTimes(2); // TSE + OTC
+    clearIndexEntriesCache(); // a fresh page load: only the per-day store survives
+    const list = await new ShioajiVelaProvider().listSymbols();
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(list.find((d) => d.ticker === "3081")).toMatchObject({ prefix: "OTC", type: "stock" });
+  });
+
+  it("does not keep a partial list for the day when one exchange fails", async () => {
+    const fetchSpy = vi.fn(async (_url: string, init: { body: string }) =>
+      JSON.parse(init.body).contract.exchange === "OTC"
+        ? { ok: false, status: 502 }
+        : { ok: true, json: async () => ({ entries: [entry("3037", "TSE")] }) },
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    await new ShioajiVelaProvider().listSymbols();
+    clearIndexEntriesCache();
+    await new ShioajiVelaProvider().listSymbols();
+    expect(fetchSpy).toHaveBeenCalledTimes(4); // retried, not served from a half list
   });
 
   it("falls back to the hand-listed instruments when the server is down", async () => {
