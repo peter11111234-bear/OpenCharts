@@ -16,7 +16,10 @@ from pathlib import Path
 
 TAIPEI = timezone(timedelta(hours=8))
 LOGS = Path(__file__).resolve().parent.parent / "logs"
-DATA = LOGS / "jev-shadow.jsonl"
+# jev-shadow follows MXF since 2026-10-21 (own file); TXF file until the first MXF bar lands.
+DATA = LOGS / "jev-shadow-mxf.jsonl"
+if not DATA.exists():
+    DATA = LOGS / "jev-shadow.jsonl"
 REPORT = LOGS / "jev-volatile-review.md"
 ALERTS = LOGS / "watchdog-alerts.log"
 DONE = LOGS / ".jev-volatile-review-done"

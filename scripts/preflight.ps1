@@ -42,7 +42,19 @@ Check "watchdog 活著" {
 
 Check "jev sidecar :8787 存活" {
   (Invoke-WebRequest -Uri "http://127.0.0.1:8787/health" -UseBasicParsing -TimeoutSec 10).StatusCode -eq 200
-} "跑 python scripts/jev-sidecar.py（或 scripts/jev-sidecar-watchdog.ps1）"
+} "跑 scripts/jev-shadow-watchdog.ps1（同時看顧 sidecar 與收集器）"
+
+Check "jev shadow 收集器在跑" {
+  @(Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
+    Where-Object { $_.CommandLine -match 'jev-shadow\.py' }).Count -gt 0
+} "跑 python scripts/jev-shadow.py（或 scripts/jev-shadow-watchdog.ps1）"
+
+Check "jev shadow 資料集最近有動" {
+  # MXF 資料集 (2026-10-21 起) 優先；第一根 MXF 寫入前退回 TXF 舊檔
+  $f = Get-Item "$PSScriptRoot\..\logs\jev-shadow-mxf.jsonl", "$PSScriptRoot\..\logs\jev-shadow.jsonl" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  $f -and ((New-TimeSpan -Start $f.LastWriteTime -End (Get-Date)).TotalHours -lt 26)
+} "收集器活著但沒寫檔 -> 看 logs/jev-shadow-out.log 與 jev-shadow-errors.jsonl"
 
 Check "vite proxy 通到 jev sidecar" {
   (Invoke-WebRequest -Uri "http://localhost:5173/jev/health" -UseBasicParsing -TimeoutSec 10).StatusCode -eq 200

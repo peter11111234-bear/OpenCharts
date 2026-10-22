@@ -1,9 +1,10 @@
-"""Jev shadow collector — 5m decisions on TXF, 1m order-flow features, log only.
+"""Jev shadow collector — 5m decisions on MXF, 1m order-flow features, log only.
 
 Every completed 5m bar: fetch 1m kbars from the local shioaji server, resample
 to 5m, compute the Jev-Trades indicator set (pandas parity), add order-flow
 features from the 1m tape, POST {state, questions} to the jev-sidecar, and
-append the result to logs/jev-shadow.jsonl. No orders are placed — this is a
+append the result to the per-symbol dataset (MXF: logs/jev-shadow-mxf.jsonl;
+TXF history: logs/jev-shadow.jsonl, see log_for). No orders are placed — this is a
 measurement loop to see whether Jev's calls have edge before wiring execution.
 
 Discipline (learned 2026-10-16, at the cost of 426 lost bars + a drained free quota):
@@ -34,6 +35,10 @@ SHIOAJI = "http://127.0.0.1:8080"
 SIDECAR = "http://127.0.0.1:8787"
 LOG = Path(__file__).resolve().parent.parent / "logs" / "jev-shadow.jsonl"
 ERRLOG = Path(__file__).resolve().parent.parent / "logs" / "jev-shadow-errors.jsonl"
+# MXF (小台) since 2026-10-21: it carries the real volume (TXF is pricier per lot,
+# so its tape is thinner). Separate file because logged_bar_times keys on bar_time
+# only — sharing jev-shadow.jsonl would make MXF skip every bar TXF already logged.
+LOG_MXF = LOG.with_name("jev-shadow-mxf.jsonl")
 TAIPEI = timezone(timedelta(hours=8))
 TF_SECONDS = 300
 MAX_BARS_5M = 400          # indicator warmup depth
@@ -89,6 +94,7 @@ MONTH_CODES = "ABCDEFGHIJKL"
 CONTRACTS = {
     "TXFJ6": {"security_type": "FUT", "exchange": "TAIFEX", "code": "TXFJ6"},
     "MXFJ6": {"security_type": "FUT", "exchange": "TAIFEX", "code": "MXFJ6"},
+    "MXFK6": {"security_type": "FUT", "exchange": "TAIFEX", "code": "MXFK6"},
     "2330": {"security_type": "STK", "exchange": "TSE", "code": "2330"},
 }
 
@@ -361,23 +367,125 @@ def sidecar_health() -> dict | None:
         return None
 
 
-def front_month_symbol(prefix: str = "TXF", today: date | None = None) -> str:
-    """TAIFEX front-month contract code, rolling after the 3rd-Wednesday expiry.
+def front_month_symbol(prefix: str = "TXF", now: datetime | date | None = None) -> str:
+    """TAIFEX front-month contract code, rolling at 13:45 on the 3rd-Wednesday expiry.
 
-    Without this the collector keeps polling an expired contract and silently
-    collects nothing (the same silent-failure class this file was fixed for).
+    The expiring contract's last session is that day's 08:45-13:45; the 15:00
+    night session already trades next month (and belongs to the next trading
+    day), so waiting for the next calendar day would poll a dead contract all
+    night. Without this the collector keeps polling an expired contract and
+    silently collects nothing (the same silent-failure class this file was fixed for).
+    A bare date is taken as 00:00 that day.
     """
-    today = today or datetime.now(TAIPEI).date()
-    year, month = today.year, today.month
+    if now is None:
+        now = datetime.now(TAIPEI)
+    elif not isinstance(now, datetime):
+        now = datetime.combine(now, datetime.min.time(), TAIPEI)
+    year, month = now.year, now.month
     d = date(year, month, 15)
     while d.weekday() != 2:  # first Wednesday on/after the 15th = 3rd Wednesday
         d += timedelta(days=1)
-    if today > d:
+    roll = datetime.combine(d, datetime.min.time(), TAIPEI).replace(hour=13, minute=45)
+    if now.astimezone(TAIPEI) >= roll:
         if month == 12:
             year, month = year + 1, 1
         else:
             month += 1
     return f"{prefix}{MONTH_CODES[month - 1]}{year % 10}"
+
+
+def _taipei_now(now: datetime | date | None) -> datetime:
+    if now is None:
+        return datetime.now(TAIPEI)
+    if isinstance(now, datetime):
+        return now.astimezone(TAIPEI) if now.tzinfo else now.replace(tzinfo=TAIPEI)
+    return datetime.combine(now, datetime.min.time(), TAIPEI)
+
+
+def roll_time_ms(date_str: str) -> int | None:
+    """13:45 Taipei on a "YYYY-MM-DD" last trading date, as epoch ms."""
+    try:
+        d = date.fromisoformat(date_str)
+    except (TypeError, ValueError):
+        return None
+    return int(datetime(d.year, d.month, d.day, 13, 45, tzinfo=TAIPEI).timestamp() * 1000)
+
+
+def pick_front_month(info: dict | None, rule_code: str, now: datetime | date | None = None) -> dict:
+    """Broker first; the rule when the broker is unreachable, incomplete, or stale.
+
+    Mirrors src/services/shioaji/frontMonth.ts pickFrontMonth exactly, so the
+    three front-month implementations cannot drift (shared cases live in
+    scripts/front_month_cases.json). Returns {code, source, warning}.
+    """
+    if not info:
+        return {"code": rule_code, "source": "rule", "warning": None}
+    target = info.get("target_code")
+    until = roll_time_ms(info.get("last_trading_date")) if info.get("last_trading_date") else None
+    if not target or until is None:
+        return {"code": rule_code, "source": "rule",
+                "warning": f"券商合約資料不完整，暫用規則近月 {rule_code}"}
+    now_dt = _taipei_now(now)
+    if int(now_dt.timestamp() * 1000) >= until:
+        return {"code": rule_code, "source": "rule",
+                "warning": f"券商近月 {target} 已過最後交易日（資料尚未更新），暫用規則近月 {rule_code}"}
+    warning = None
+    if target != rule_code:
+        warning = f"券商近月 {target} 與規則 {rule_code} 不同（可能假日或颱風順延），以券商為準"
+    return {"code": target, "source": "broker", "warning": warning}
+
+
+def fetch_r1_info(root: str) -> dict | None:
+    """GET the continuous contract's info from the local shioaji server; None when unreachable."""
+    try:
+        url = f"{SHIOAJI}/api/v1/data/contracts/{root}R1/info"
+        with urllib.request.urlopen(url, timeout=5) as res:
+            j = json.loads(res.read().decode())
+    except Exception:
+        return None
+    if not isinstance(j, dict):
+        return None
+    return {"target_code": j.get("target_code") or None,
+            "last_trading_date": j.get("last_trading_date") or None}
+
+
+_FRONT_MONTH_CACHE: dict = {}          # root -> (expires_at_ts, code)
+_FRONT_MONTH_WARNED: set = set()       # (day, message) already reported
+FRONT_MONTH_TTL = 600                 # 10 minutes
+
+
+def _warn_once_a_day(message: str) -> None:
+    """Print a front-month warning and append it to ERRLOG, at most once per day per message."""
+    day = datetime.now(TAIPEI).strftime("%Y-%m-%d")
+    key = (day, message)
+    if key in _FRONT_MONTH_WARNED:
+        return
+    _FRONT_MONTH_WARNED.add(key)
+    print(f"front month warning: {message}")
+    try:
+        append_log({"ts": time.time(), "kind": "front_month", "message": message}, ERRLOG)
+    except Exception:
+        pass
+
+
+def resolve_front_month(prefix: str = "TXF", now: datetime | date | None = None) -> str:
+    """Front-month contract code: the broker's answer when usable, else the rule.
+
+    The broker (shioaji's continuous contract) knows TAIFEX holiday / typhoon
+    postponements the 3rd-Wednesday rule cannot. Result cached for 10 minutes
+    so a long-running collector does not hammer the server.
+    """
+    now_dt = _taipei_now(now)
+    cached = _FRONT_MONTH_CACHE.get(prefix)
+    if cached and cached[0] > time.time():
+        return cached[1]
+    rule_code = front_month_symbol(prefix, now_dt)
+    info = fetch_r1_info(prefix)
+    pick = pick_front_month(info, rule_code, now_dt)
+    if pick["warning"]:
+        _warn_once_a_day(pick["warning"])
+    _FRONT_MONTH_CACHE[prefix] = (time.time() + FRONT_MONTH_TTL, pick["code"])
+    return pick["code"]
 
 
 def contract_for(code: str) -> dict:
@@ -457,7 +565,12 @@ def build_state(symbol: str, bars_5m: list[dict], bars_1m: list[dict]) -> dict:
     }
 
 
-def logged_bar_times() -> set[int]:
+def log_for(symbol: str) -> Path:
+    """Dataset file for a symbol: MXF has its own; everything else keeps jev-shadow.jsonl."""
+    return LOG_MXF if symbol.startswith("MXF") else LOG
+
+
+def logged_bar_times(path: Path = LOG) -> set[int]:
     """Bar times already ANSWERED.
 
     Only rows that came back with `answers` count. A failed bar is deliberately
@@ -466,8 +579,8 @@ def logged_bar_times() -> set[int]:
     bars (2026-09-22 13:10 .. 2026-09-24 10:15).
     """
     times = set()
-    if LOG.exists():
-        for line in LOG.read_text(encoding="utf-8").splitlines():
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
             try:
                 rec = json.loads(line)
             except Exception:
@@ -553,7 +666,7 @@ def _day_session(ts):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="auto", choices=list(CONTRACTS) + ["auto"],
-                    help="'auto' = TAIFEX front month (rolls after the 3rd Wednesday)")
+                    help="'auto' = MXF front month (broker R1 first, 3rd-Wednesday rule as fallback)")
     ap.add_argument("--poll", type=int, default=30, help="seconds between kbar refetches")
     ap.add_argument("--days", type=int, default=2, help="days of 1m history to fetch")
     ap.add_argument("--since", help="backfill: only decide bars on/after this Taipei date (YYYY-MM-DD)")
@@ -571,7 +684,7 @@ def main() -> int:
     if args.selftest:
         return selftest()
 
-    symbol = front_month_symbol() if args.symbol == "auto" else args.symbol
+    symbol = resolve_front_month("MXF") if args.symbol == "auto" else args.symbol
     contract = contract_for(symbol)
     if args.symbol == "auto":
         print(f"auto front month -> {symbol}")
@@ -583,17 +696,25 @@ def main() -> int:
     hi = (int(datetime.combine(date.fromisoformat(args.until), datetime.min.time(), TAIPEI).timestamp())
           + 86400 - 1) if args.until else None
 
-    seen = logged_bar_times()
+    dataset = log_for(symbol)   # fixed for the run: a roll stays within the same root
+    seen = logged_bar_times(dataset)
     risk_session = RiskSession() if os.environ.get('RISK_GATE', '1') == '1' else None
     parked: set[int] = set()
     tries: dict[int, int] = {}
     gap = 60.0 / max(1, args.rate)   # min seconds between /decide calls
     last_call = 0.0
     backoff = 0
-    print(f"jev-shadow {symbol}: dataset={LOG} ({len(seen)} bars answered), errors={ERRLOG.name}")
+    print(f"jev-shadow {symbol}: dataset={dataset} ({len(seen)} bars answered), errors={ERRLOG.name}")
     print(f"  rate={args.rate}/min (gap {gap:.1f}s), max {args.max_per_cycle} bars/cycle, poll {args.poll}s")
 
     while True:
+        if args.symbol == "auto":
+            # Re-evaluated every cycle: the collector runs for days and must
+            # follow the 13:45 expiry-day roll without a restart.
+            rolled = resolve_front_month("MXF")
+            if rolled != symbol:
+                print(f"front month rolled {symbol} -> {rolled}")
+                symbol, contract = rolled, contract_for(rolled)
         try:
             health = sidecar_health()
             # Never consume a bar while the sidecar is unreachable or cooling off
@@ -680,7 +801,7 @@ def main() -> int:
                                       "prev_outcome": _prev_outcome},
                          "deepseek": _ds_res}
                 if answered:
-                    append_log(event)              # the dataset: successes only
+                    append_log(event, dataset)     # the dataset: successes only
                     seen.add(bar["time"])
                     tries.pop(bar["time"], None)
                     backoff = 0

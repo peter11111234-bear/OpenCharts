@@ -6,6 +6,11 @@
 # Run once (self-sustains):
 #   powershell -ExecutionPolicy Bypass -File C:\Users\bear9\OpenCharts\scripts\shioaji-watchdog.ps1
 # Optional: $env:SHIOAJI_ALERT_WEBHOOK = Discord/Slack webhook URL
+# -SelfTest: 讀 scripts/front_month_cases.json 跑近月判斷, 印 PASS/FAIL 後結束 (不進主迴圈)
+
+param(
+  [switch]$SelfTest
+)
 
 $ErrorActionPreference = "SilentlyContinue"
 $LogFile    = Join-Path $PSScriptRoot "watchdog.log"
@@ -69,18 +74,18 @@ function Test-Scanner([ref]$reason) {
 # 交易日判斷: 邏輯唯一源頭在 hotscan/tradingday.py（TWSE 官方休市表+週末）。
 # python 印 "open"/"closed"; 叫不出來或輸出異常 → fail-open 視為交易日, 保持監控。
 $script:TradingDayCache = @{}
-function Test-TradingDay {
-  $today = (Get-Date).ToString("yyyy-MM-dd")
-  if ($script:TradingDayCache.ContainsKey($today)) { return $script:TradingDayCache[$today] }
+function Test-TradingDayOn($dateStr) {
+  # 指定日期的交易日判斷 (夜盤凌晨 00:00-04:55 屬前一晚, 要查昨天).
+  if ($script:TradingDayCache.ContainsKey($dateStr)) { return $script:TradingDayCache[$dateStr] }
   $fake = $env:HOTSCAN_FAKE_TRADING_DAY  # 測試用: "1"=強制交易日, "0"=強制休市
-  if ($fake -eq "1" -or $fake -eq "0") { $script:TradingDayCache[$today] = ($fake -eq "1"); return ($fake -eq "1") }
+  if ($fake -eq "1" -or $fake -eq "0") { $script:TradingDayCache[$dateStr] = ($fake -eq "1"); return ($fake -eq "1") }
   $open = $true
   # python 同步呼叫若 hang 會卡死整個 watchdog loop; 用 job 限時 15s, timeout → fail-open
   $job = Start-Job -ScriptBlock {
-    param($py, $dir)
+    param($py, $dir, $d)
     Push-Location $dir
-    try { & $py "-u" "-m" "hotscan.tradingday" 2>$null } finally { Pop-Location }
-  } -ArgumentList $PythonExe, $ScriptsDir
+    try { & $py "-u" "-m" "hotscan.tradingday" "--date" $d 2>$null } finally { Pop-Location }
+  } -ArgumentList $PythonExe, $ScriptsDir, $dateStr
   $out = $null
   if (Wait-Job $job -Timeout 15) {
     $out = Receive-Job $job
@@ -96,8 +101,13 @@ function Test-TradingDay {
   $ans = @($out | Where-Object { $_ -match '^(open|closed)$' } | Select-Object -Last 1)
   if ($ans -eq "closed") { $open = $false }
   # timeout/叫不出來不 cache: 否則一早 python 卡死會把整天錯標成交易日
-  if ($ans) { $script:TradingDayCache[$today] = $open }
+  if ($ans) { $script:TradingDayCache[$dateStr] = $open }
   return $open
+}
+
+function Test-TradingDay {
+  # 今天的交易日判斷 (行為與原本一致)
+  return Test-TradingDayOn ((Get-Date).ToString("yyyy-MM-dd"))
 }
 
 function Test-TickFresh {
@@ -122,6 +132,118 @@ function Test-TickFresh {
   }
   $lastTime = [datetimeoffset]::FromUnixTimeSeconds($tsSec).LocalDateTime
   return ((New-TimeSpan -Start $lastTime -End $now).TotalSeconds -lt 120)
+}
+
+# Vela 三檔訂閱守護: 與 src/services/shioaji/instruments.ts LIVE_INSTRUMENTS 同一組
+# (2330 + 微台 TMF + 小台 MXF 近月)。近月依日期自動算, 不必每月手改:
+# 第三個週三 13:45 (日盤收盤) 後換下個月 — 15:00 夜盤已是新月份。
+function Get-FrontMonth($root, $now = (Get-Date)) {
+  $expiry = Get-Date -Year $now.Year -Month $now.Month -Day 15 -Hour 13 -Minute 45 -Second 0 -Millisecond 0
+  while ($expiry.DayOfWeek -ne [DayOfWeek]::Wednesday) { $expiry = $expiry.AddDays(1) }
+  $m = if ($now -ge $expiry) { $now.AddMonths(1) } else { $now }
+  return "$root$("ABCDEFGHIJKL"[$m.Month - 1])$($m.Year % 10)"
+}
+
+# ── 近月真相: 券商優先 (跟著期交所假日/颱風順延), 規則備援 ──────────────
+# 四條規則與 src/services/shioaji/frontMonth.ts pickFrontMonth 完全相同,
+# 共用測試案例在 scripts/front_month_cases.json (三處實作都讀同一份).
+function Select-FrontMonth($info, $ruleCode, $now = (Get-Date)) {
+  if (-not $info) { return @{ code = $ruleCode; source = "rule"; warning = $null } }
+  $target = $info.target_code
+  $last = $info.last_trading_date
+  $until = $null
+  if ($last) {
+    $parsed = [datetime]::MinValue
+    if ([datetime]::TryParseExact("$last", "yyyy-MM-dd", $null, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+      $until = $parsed.AddHours(13).AddMinutes(45)
+    }
+  }
+  if (-not $target -or $null -eq $until) {
+    return @{ code = $ruleCode; source = "rule"; warning = "券商合約資料不完整，暫用規則近月 $ruleCode" }
+  }
+  if ($now -ge $until) {
+    return @{ code = $ruleCode; source = "rule"; warning = "券商近月 $target 已過最後交易日（資料尚未更新），暫用規則近月 $ruleCode" }
+  }
+  if ($target -eq $ruleCode) {
+    return @{ code = $target; source = "broker"; warning = $null }
+  }
+  return @{ code = $target; source = "broker"; warning = "券商近月 $target 與規則 $ruleCode 不同（可能假日或颱風順延），以券商為準" }
+}
+
+function Get-R1Info($root) {
+  # GET 連續合約的券商資訊; 失敗 → $null (改用規則, 不警告)
+  try {
+    $uri = "http://127.0.0.1:8080/api/v1/data/contracts/${root}R1/info"
+    $r = Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 5
+    if (-not $r) { return $null }
+    return @{ target_code = $r.target_code; last_trading_date = $r.last_trading_date }
+  } catch { return $null }
+}
+
+$script:FmCache = @{}          # root -> @{ code; expires }
+$script:FmWarned = @{}         # (day|message) -> true (同一訊息一天只告警一次)
+
+function Resolve-FrontMonth($root, $now = (Get-Date)) {
+  # 券商優先, 規則備援; 結果快取 5 分鐘 (loop 每 15s 一輪, 不用每輪打 API)
+  $cached = $script:FmCache[$root]
+  if ($cached -and $cached.expires -gt (Get-Date)) { return $cached.code }
+  $ruleCode = Get-FrontMonth $root $now
+  $info = Get-R1Info $root
+  $pick = Select-FrontMonth $info $ruleCode $now
+  if ($pick.warning) {
+    $day = (Get-Date).ToString("yyyy-MM-dd")
+    $key = "$day|$($pick.warning)"
+    if (-not $script:FmWarned.ContainsKey($key)) {
+      $script:FmWarned[$key] = $true
+      Log "換月提醒: $($pick.warning)"
+      Send-Alert "換月提醒" "$($pick.warning)"
+    }
+  }
+  $script:FmCache[$root] = @{ code = $pick.code; expires = (Get-Date).AddMinutes(5) }
+  return $pick.code
+}
+
+function Get-VelaContracts {
+  return @(
+    @{ security_type = "STK"; exchange = "TSE";    code = "2330" },
+    @{ security_type = "FUT"; exchange = "TAIFEX"; code = (Resolve-FrontMonth "TMF") },
+    @{ security_type = "FUT"; exchange = "TAIFEX"; code = (Resolve-FrontMonth "MXF") }
+  )
+}
+
+function Subscribe-Contract($sec, $ex, $code) {
+  try {
+    $body = (@{ security_type = $sec; exchange = $ex; code = $code; quote_type = "Tick" } | ConvertTo-Json -Compress)
+    Invoke-RestMethod -Uri "http://127.0.0.1:8080/api/v1/stream/subscribe" -Method Post -TimeoutSec 10 `
+      -Body $body -ContentType 'application/json' | Out-Null
+    return $true
+  } catch { Log "vela resubscribe failed: $code $_"; return $false }
+}
+
+function Subscribe-VelaInstruments($why) {
+  $ok = 0
+  $contracts = @(Get-VelaContracts)
+  foreach ($c in $contracts) {
+    if (Subscribe-Contract $c.security_type $c.exchange $c.code) { $ok++ }
+  }
+  Log "vela resubscribe ($why): $ok/$($contracts.Count) ($(($contracts | ForEach-Object { $_.code }) -join ','))"
+  return $ok
+}
+
+function Get-FopCodes {
+  # 期貨串流 12s 探針: 回傳這段時間出現過的合約代碼 (TMFK6/MXFK6); 連不上 → 空陣列.
+  # 逐檔比對: 任一 FUT 有 tick 即串流活著, 缺的那檔單獨補訂 (MXF 活著不代表 TXF 活著).
+  $tmp = Join-Path $env:TEMP "fop-probe.txt"
+  try {
+    Start-Process -FilePath "curl.exe" -ArgumentList "-s","-N","-m","12","-H","Accept: text/event-stream",`
+      "http://127.0.0.1:8080/api/v1/stream/data/tick_fop" `
+      -RedirectStandardOutput $tmp -WindowStyle Hidden -Wait -ErrorAction Stop
+    $codes = @()
+    foreach ($m in (Select-String -Path $tmp -Pattern '"code":"([A-Z0-9]+)"' -ErrorAction SilentlyContinue)) {
+      $codes += $m.Matches.Groups[1].Value
+    }
+    return @($codes | Sort-Object -Unique)
+  } catch { return @() }
 }
 
 function Start-Server {
@@ -157,14 +279,67 @@ function Start-Scanner {
   Log "scanner start requested (pid=$($p.Id))"
 }
 
-# single-instance: 殺掉其他跑同一腳本的 watchdog, 只留自己
+function Get-FopSessionWindow($now = (Get-Date), $isTradingDay = $true) {
+  # 期貨交易時段: 日盤 08:50-13:45, 夜盤 15:05-23:59:59 / 00:00-04:55
+  # 夜盤歸屬: 15:05 起屬「今天」開的夜盤; 凌晨 00:00-04:55 屬「昨天」開的夜盤
+  # 回傳 @{ InSession = bool; Night = bool }
+  $t = $now.TimeOfDay
+  if ($t -gt [timespan]'08:50:00' -and $t -lt [timespan]'13:45:00') {
+    return @{ InSession = $isTradingDay; Night = $false }
+  }
+  if ($t -ge [timespan]'15:05:00') {
+    return @{ InSession = $isTradingDay; Night = $true }
+  }
+  if ($t -le [timespan]'04:55:00') {
+    $yesterday = $now.AddDays(-1).ToString("yyyy-MM-dd")
+    return @{ InSession = (Test-TradingDayOn $yesterday); Night = $true }
+  }
+  return @{ InSession = $false; Night = $false }
+}
+
+# ── -SelfTest: 讀共用案例檔跑近月判斷, 不進主迴圈、不啟動任何東西 ──────
+if ($SelfTest) {
+  $casesFile = Join-Path $PSScriptRoot "front_month_cases.json"
+  $cases = Get-Content $casesFile -Raw | ConvertFrom-Json
+  $pass = 0; $fail = 0
+  foreach ($c in $cases) {
+    $now = [datetime]::ParseExact($c.now_taipei, "yyyy-MM-ddTHH:mm:ss", $null)
+    $info = $c.info
+    $pick = Select-FrontMonth $info $c.rule_code $now
+    $gotWarning = [bool]$pick.warning
+    $ok = ($pick.code -eq $c.expect_code) -and ($pick.source -eq $c.expect_source) -and ($gotWarning -eq [bool]$c.expect_warning)
+    if ($ok) {
+      $pass++
+      Write-Output ("PASS  {0}  code={1} source={2} warning={3}" -f $c.name, $pick.code, $pick.source, $gotWarning)
+    } else {
+      $fail++
+      Write-Output ("FAIL  {0}  got code={1} source={2} warning={3} | want code={4} source={5} warning={6}" -f `
+        $c.name, $pick.code, $pick.source, $gotWarning, $c.expect_code, $c.expect_source, $c.expect_warning)
+    }
+  }
+  Write-Output ("front-month self-test: {0} passed, {1} failed, {2} total" -f $pass, $fail, $cases.Count)
+  if ($fail -gt 0) { exit 1 }
+  exit 0
+}
+
+# single-instance: 互斥鎖優先 (harness 重試/手動誤啟會多開, 下面的 kill 有 race ——
+# 兩個同時啟動會互相看不見). 拿不到鎖直接退出; 舊 kill 邏輯保留, 負責清掉
+# mutex 出現之前的殘留進程 (被殺掉的 holder 會留下 AbandonedMutex, 照樣接手).
+$script:WatchdogMutex = New-Object System.Threading.Mutex($false, "Global\OpenCharts-ShioajiWatchdog")
+try {
+  if (-not $script:WatchdogMutex.WaitOne(0)) { exit 0 }
+} catch [System.Threading.AbandonedMutexException] {
+  # 前一個 holder 被殺, 鎖已回到我們手上 — 繼續跑
+}
 $me = $PID
 Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $me -and $_.CommandLine -match 'shioaji-watchdog\.ps1' } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-Log "=== watchdog started (server + scanner + tick-freshness + auto-backfill) ==="
+Log "=== watchdog started (server + scanner + tick-freshness + fop-guard + auto-backfill) ==="
 $failStreak = 0
 $lastTickAlert = [datetime]::MinValue
+$lastFopAlert = [datetime]::MinValue
+$script:FopLoop = 0
 $lastServerAlert = [datetime]::MinValue
 $lastBackfill = [datetime]::MinValue
 $lastScannerRestart = [datetime]::MinValue
@@ -172,6 +347,7 @@ $lastServerBoot = [datetime]::MinValue
 $script:serverProc = $null
 $script:serverBootFails = 0
 $wasStale = $false
+$script:LastFreshAt = [datetime]::MinValue   # 最後一次確認 tick 新鮮的時間 → backfill 只補這之後
 $script:BackfillWatchers = @()
 function Invoke-Backfill($reason) {
   # 去重: 已有 backfill 在跑就跳過 (restart/stale/periodic 可能同時觸發)
@@ -190,11 +366,17 @@ function Invoke-Backfill($reason) {
       Log "backfill skip: already running"; return
     }
   }
-  Log "backfill triggered: $reason"
+  # 只補缺口: 從最後一次 tick 新鮮往前 5 分鐘起抓 (RangeTime); 今天還沒新鮮過才抓整天.
+  # 2026-10-21 每 30 分鐘重抓整天 ~40 萬筆, 新增 <1%, 把 Shioaji 每日 500MB 流量燒光.
+  $bfArgs = @("-u","-m","hotscan.backfill")
+  if ($script:LastFreshAt.Date -eq (Get-Date).Date) {
+    $bfArgs += @("--since", $script:LastFreshAt.AddMinutes(-5).ToString("HH:mm:ss"))
+  }
+  Log "backfill triggered: $reason ($($bfArgs[3..4] -join ' '))"
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
   $outLog = Join-Path $LogDir "backfill-out-$stamp.log"
   $errLog = Join-Path $LogDir "backfill-err-$stamp.log"
-  $p = Start-Process -FilePath $PythonExe -ArgumentList "-u","-m","hotscan.backfill" `
+  $p = Start-Process -FilePath $PythonExe -ArgumentList $bfArgs `
     -WorkingDirectory $ScriptsDir -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput $outLog -RedirectStandardError $errLog
   if (-not $p) { Log "backfill launch FAILED"; return }
@@ -253,6 +435,7 @@ while ($true) {
       Start-Server
       if (Test-Server) {
         Log "restart OK"; Send-Alert "Shioaji 重啟成功" "server 已恢復"; $failStreak = 0; $script:serverBootFails = 0
+        Subscribe-VelaInstruments "server restart" | Out-Null
       } else {
         # 活著但 healthz 也起不來 = 也算 boot 失敗; 連續 3 次升級人工
         $script:serverBootFails++
@@ -311,14 +494,40 @@ while ($true) {
     } else { Log "stale flag cleared outside market window — no recovery alert" }
   }
 
-  # 4. periodic backfill every 30min during market hours (covers silent tick loss)
-  $now = Get-Date
-  $inMarket = ($isTradingDay -and
-               $now.TimeOfDay -gt [timespan]'08:55:00' -and $now.TimeOfDay -lt [timespan]'13:35:00')
-  if ($inMarket -and (New-TimeSpan -Start $lastBackfill -End $now).TotalMinutes -gt 30) {
-    $lastBackfill = $now
-    Invoke-Backfill "periodic 30min"
+  # 4. vela FOP 訂閱守護 — server 重啟會清空 in-memory 訂閱, 前端 feed 未必自癒;
+  #    盤中期貨串流逾 60s 無 tick → 後端直接重訂微台/小台近月 (每 4 個 loop 探一次 ≈60s)
+  #    檢查窗口: 日盤 08:50–13:45 或 夜盤 15:05–23:59:59 / 00:00–04:55
+  #    夜盤歸屬: 15:05 起屬「今天」開的夜盤; 凌晨 00:00–04:55 屬「昨天」開的夜盤
+  $script:FopLoop = ($script:FopLoop + 1) % 4
+  $fopWindow = Get-FopSessionWindow (Get-Date) $isTradingDay
+  $fopInSession = $fopWindow.InSession
+  $fopNightSession = $fopWindow.Night
+  if ($fopInSession -and $failStreak -eq 0 -and $script:FopLoop -eq 0) {
+    $fopSeen = @(Get-FopCodes)
+    $velaContracts = @(Get-VelaContracts)
+    $fopWant = @($velaContracts | Where-Object { $_.security_type -eq "FUT" } | ForEach-Object { $_.code })
+    $fopMissing = @($fopWant | Where-Object { $fopSeen -notcontains $_ })
+    if ($fopSeen.Count -eq 0) {
+      Log "tick_fop silent (>60s, in session) — resubscribing vela instruments"
+      Subscribe-VelaInstruments "fop silent" | Out-Null
+      if ((New-TimeSpan -Start $lastFopAlert -End (Get-Date)).TotalMinutes -gt 10) {
+        $lastFopAlert = Get-Date
+        $typhoonNote = if ($fopNightSession) { "（夜盤檢查，若今天颱風停市可忽略）" } else { "" }
+        Send-Alert "期貨 tick 停了" "tick_fop 逾 60s 無 tick — 已自動重訂微台/小台近月 $typhoonNote"
+      }
+    } elseif ($fopMissing.Count -gt 0) {
+      $typhoonNote = if ($fopNightSession) { "（夜盤檢查，若今天颱風停市可忽略）" } else { "" }
+      Log "tick_fop partial (seen: $($fopSeen -join ',')) — missing $($fopMissing -join ',') — subscribing $typhoonNote"
+      foreach ($m in $fopMissing) {
+        $c = $velaContracts | Where-Object { $_.code -eq $m } | Select-Object -First 1
+        if ($c) { Subscribe-Contract $c.security_type $c.exchange $c.code | Out-Null }
+      }
+    }
   }
+
+  # 5. (已移除) 每 30 分鐘定期 backfill: 即時串流已收 tick, 定期重抓整天只換來 <1% 新增,
+  #    卻吃掉每日流量上限. 現在只在 scanner 重啟 / tick 停 / 恢復時補缺口 (見上方 2、3).
+  if ($fresh) { $script:LastFreshAt = Get-Date }
 
   Set-Content -Path $HeartbeatFile -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -ErrorAction SilentlyContinue
   Start-Sleep -Seconds 15

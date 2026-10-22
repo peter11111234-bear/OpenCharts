@@ -131,6 +131,18 @@ $wd = Start-Process -FilePath $ShellExe -ArgumentList "-NoProfile","-ExecutionPo
 Start-Sleep -Seconds 4
 if ($wd -and -not $wd.HasExited) { Log "watchdog relaunched (pid=$($wd.Id))" } else { Log "WATCHDOG FAILED TO START"; Send-Alert "開工異常" "watchdog 起不來" }
 
+# 4.5 jev-shadow watchdog — sidecar (JEV 決策代理) + shadow collector (影子收集器)。
+#     2026-10-16 補上：先前沒有任何東西在看收集器，sidecar 掛掉兩天沒人知道，
+#     426 根 bar 被靜默燒毀；而 sidecar 自己的 watchdog 從未被排程、也沒釘 python 路徑。
+Get-CimInstance Win32_Process -Filter "Name like '%powershell%' or Name like '%pwsh%'" |
+  Where-Object { $_.CommandLine -match 'jev-(shadow|sidecar)-watchdog\.ps1' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 2
+$jwd = Start-Process -FilePath $ShellExe -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",
+  (Join-Path $ScriptsDir "jev-shadow-watchdog.ps1") -WindowStyle Hidden -PassThru
+Start-Sleep -Seconds 6
+if ($jwd -and -not $jwd.HasExited) { Log "jev-shadow watchdog relaunched (pid=$($jwd.Id))" } else { Log "JEV WATCHDOG FAILED TO START"; Send-Alert "開工異常" "jev-shadow watchdog 起不來" }
+
 # 5. 等開盤確認 tick 流入 (驗到 09:10); 盤中手動補跑則直接驗
 $openDeadline = (Get-Date).Date.AddHours(9).AddMinutes(10)
 if ((Get-Date) -lt $openDeadline) {

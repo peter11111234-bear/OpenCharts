@@ -1,0 +1,83 @@
+[
+  {
+    "name": "broker agrees with rule",
+    "info": { "target_code": "TMFK6", "last_trading_date": "2026-11-18" },
+    "rule_code": "TMFK6",
+    "now_taipei": "2026-10-21T14:10:00",
+    "expect_code": "TMFK6",
+    "expect_source": "broker",
+    "expect_warning": false
+  },
+  {
+    "name": "holiday or typhoon postponement follows the broker",
+    "info": { "target_code": "TMFJ6", "last_trading_date": "2026-10-22" },
+    "rule_code": "TMFK6",
+    "now_taipei": "2026-10-21T14:10:00",
+    "expect_code": "TMFJ6",
+    "expect_source": "broker",
+    "expect_warning": true
+  },
+  {
+    "name": "broker data is stale (past its last trading day)",
+    "info": { "target_code": "TMFJ6", "last_trading_date": "2026-10-21" },
+    "rule_code": "TMFK6",
+    "now_taipei": "2026-10-21T14:10:00",
+    "expect_code": "TMFK6",
+    "expect_source": "rule",
+    "expect_warning": true
+  },
+  {
+    "name": "server unreachable falls back to the rule silently",
+    "info": null,
+    "rule_code": "TMFK6",
+    "now_taipei": "2026-10-21T14:10:00",
+    "expect_code": "TMFK6",
+    "expect_source": "rule",
+    "expect_warning": false
+  },
+  {
+    "name": "incomplete broker data falls back with a warning",
+    "info": { "target_code": null, "last_trading_date": "2026-11-18" },
+    "rule_code": "TMFK6",
+    "now_taipei": "2026-10-21T14:10:00",
+    "expect_code": "TMFK6",
+    "expect_source": "rule",
+    "expect_warning": true
+  },
+  {
+    "name": "missing last_trading_date is incomplete broker data",
+    "info": { "target_code": "TMFK6", "last_trading_date": null },
+    "rule_code": "TMFK6",
+    "now_taipei": "2026-10-21T14:10:00",
+    "expect_code": "TMFK6",
+    "expect_source": "rule",
+    "expect_warning": true
+  },
+  {
+    "name": "rolls across the year end",
+    "info": { "target_code": "TMFA7", "last_trading_date": "2027-01-20" },
+    "rule_code": "TMFA7",
+    "now_taipei": "2026-12-16T14:00:00",
+    "expect_code": "TMFA7",
+    "expect_source": "broker",
+    "expect_warning": false
+  },
+  {
+    "name": "exactly 13:45:00 is already rolled over",
+    "info": { "target_code": "TMFJ6", "last_trading_date": "2026-10-21" },
+    "rule_code": "TMFK6",
+    "now_taipei": "2026-10-21T13:45:00",
+    "expect_code": "TMFK6",
+    "expect_source": "rule",
+    "expect_warning": true
+  },
+  {
+    "name": "13:44:59 is still the old contract",
+    "info": { "target_code": "TMFJ6", "last_trading_date": "2026-10-21" },
+    "rule_code": "TMFK6",
+    "now_taipei": "2026-10-21T13:44:59",
+    "expect_code": "TMFJ6",
+    "expect_source": "broker",
+    "expect_warning": true
+  }
+]

@@ -1,8 +1,16 @@
-"""Backfill missing ticks from 09:00 to now for all watchlist stocks.
+"""Backfill missing ticks for all watchlist stocks.
+
+Usage: python -m hotscan.backfill [--since HH:MM:SS]
+  --since  fetch only ticks from this Taipei time to now (RangeTime query).
+           Without it the whole day is fetched (AllDay) — only for the first
+           backfill of a day: a full day of ~100 stocks is ~400k ticks, and
+           repeating that every 30 min burned the 500MB daily Shioaji quota
+           on 2026-10-21 while adding <1% new ticks.
 
 Dedup strategy: use full datetime string (microsecond precision) as unique key.
 Validation: warn if stored count < API count.
 """
+import argparse
 import json
 import sys
 import time
@@ -16,9 +24,17 @@ TAIPEI = timezone(timedelta(hours=config.TZ_OFFSET))
 TICK_LOG = config.LOG_DIR / "hot-ticks.jsonl"
 
 
-def fetch_ticks(contract: dict, date_str: str) -> list[dict]:
-    """Fetch all ticks for a contract on a date."""
+def ticks_body(contract: dict, date_str: str, since: str | None, until: str) -> dict:
+    """Request body: the whole day, or only [since, until] when since is given."""
     body = {"contract": contract, "date": date_str}
+    if since:
+        body.update(query_type="RangeTime", time_start=since, time_end=until)
+    return body
+
+
+def fetch_ticks(contract: dict, date_str: str, since: str | None = None, until: str = "23:59:59") -> list[dict]:
+    """Fetch ticks for a contract on a date (whole day, or from `since`)."""
+    body = ticks_body(contract, date_str, since, until)
     try:
         res = stream.post("/api/v1/data/ticks", body, timeout=60)
         dts = res.get("datetime", [])
@@ -40,8 +56,17 @@ def fetch_ticks(contract: dict, date_str: str) -> list[dict]:
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--since", help="HH:MM:SS Taipei; fetch only from this time (default: whole day)")
+    args = ap.parse_args()
+    if args.since:
+        datetime.strptime(args.since, "%H:%M:%S")  # fail fast on a bad value
+
     stocks = storage.load_watchlist()
-    today = datetime.now(TAIPEI).strftime("%Y-%m-%d")
+    now = datetime.now(TAIPEI)
+    today = now.strftime("%Y-%m-%d")
+    until = now.strftime("%H:%M:%S")
+    print(f"range: {args.since or 'all day'} -> {until if args.since else ''}")
 
     # load existing datetime keys per code
     seen: dict[str, set] = {}
@@ -63,7 +88,7 @@ def main():
     for s in stocks:
         code = s["code"]
         contract = {"security_type": "STK", "exchange": s["exchange"], "code": code}
-        ticks = fetch_ticks(contract, today)
+        ticks = fetch_ticks(contract, today, args.since, until)
         total_api += len(ticks)
         added = 0
         for t in ticks:
