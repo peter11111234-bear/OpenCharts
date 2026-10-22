@@ -6,17 +6,6 @@ export const UP = "#f23645";
 export const DOWN = "#089981";
 export const FLAT = "#787b86";
 
-export const CATEGORY_NAMES: Record<string, string> = {
-  "24": "半導體",
-  "25": "電腦週邊",
-  "26": "光電",
-  "27": "通信網路",
-  "28": "電子零組件",
-  "29": "電子通路",
-  "30": "資訊服務",
-  "31": "其他電子",
-};
-
 export function changeColor(pct: number): string {
   if (!Number.isFinite(pct) || pct === 0) return FLAT;
   return pct > 0 ? UP : DOWN;
@@ -69,11 +58,14 @@ const CSS = `
 .qs-range-mark{position:absolute;top:-3px;width:2px;height:10px;background:currentColor}
 .qs-card{display:flex;flex-direction:column;line-height:1.2}
 .qs-card b{font-weight:600}
+.hm-theme{width:100%;margin-bottom:6px;padding:3px;border:1px solid var(--vela-border,#2a2e39);border-radius:4px;
+  background:var(--vela-bg,#131722);color:inherit}
 .hm-box{position:relative;width:100%}
 .hm-tile{position:absolute;box-sizing:border-box;border:1px solid var(--vela-bg,#131722);overflow:hidden;
   cursor:pointer;color:#fff;font-size:10px;line-height:1.15;padding:2px}
 .hm-group{position:absolute;box-sizing:border-box;border:1px solid #000;pointer-events:none}
-.hm-group span{position:absolute;top:0;left:2px;font-size:9px;color:rgba(255,255,255,.75)}
+.hm-group span{position:absolute;top:0;left:0;right:0;height:13px;padding:0 2px;font-size:9px;line-height:13px;
+  color:rgba(255,255,255,.8);background:rgba(0,0,0,.55);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .hl-tabs{display:flex;gap:4px;margin-bottom:6px}
 .hl-tabs button{flex:1;border:0;border-radius:4px;padding:4px 0;background:var(--vela-border,#2a2e39);
   color:inherit;cursor:pointer}

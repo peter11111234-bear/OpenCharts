@@ -1,13 +1,19 @@
 /**
- * Electronics heatmap side panel (TradingView "Stock Heatmap" look) on
- * shioaji's TAIEX components: tiles grouped by TWSE industry (24–31), sized by
- * index weight, coloured by % change (red up / green down). Clicking a tile
- * switches the active chart to that stock — the only chart write, and only on
- * an explicit click.
+ * Theme heatmap side panel (TradingView "Stock Heatmap" look) over the
+ * hand-curated tech supply-chain themes in data/techThemes.json (glass
+ * substrate, CPO, CoWoS, liquid cooling …). Prices come from shioaji's TAIEX
+ * and TPEx index components; tiles are sized by turnover (成交金額 — listed and
+ * OTC index weights are not comparable), equal-sized when there is none yet
+ * (pre-market), and coloured by % change (red up / green down). The overview
+ * shows each theme's top stocks; picking one theme shows all of its stocks
+ * grouped by sub-group. Clicking a tile switches the active chart to that
+ * stock — the only chart write, and only on an explicit click.
+ * Usage, data format and known gaps: heatmap.README.md.
  */
-import { ELECTRONICS_CATEGORIES, type IndexEntry } from "../services/shioaji/marketData.ts";
-import { CATEGORY_NAMES, ensureMarketStyles, escapeHtml, fmtPct, heatColor, latestRunner } from "./marketKit.ts";
+import type { IndexEntry } from "../services/shioaji/marketData.ts";
+import { ensureMarketStyles, escapeHtml, fmtPct, heatColor, latestRunner } from "./marketKit.ts";
 import type { WidgetHandle } from "./quoteStrip.ts";
+import techThemes from "../data/techThemes.json";
 
 export interface Rect {
   x: number;
@@ -72,87 +78,171 @@ export function squarify<T>(items: ReadonlyArray<{ item: T; value: number }>, re
   return out;
 }
 
-export interface HeatmapLayout {
-  groups: Array<Rect & { item: string }>;
-  tiles: Array<Rect & { item: IndexEntry }>;
+export interface ThemeStock {
+  code: string;
+  name: string;
+  sub_group: string;
+  role: string;
 }
 
-/** Top `topN` electronics stocks by index weight, grouped by industry. */
-export function layoutHeatmap(entries: readonly IndexEntry[], topN: number, rect: Rect): HeatmapLayout {
-  const picked = entries
-    .filter((e) => ELECTRONICS_CATEGORIES.includes(e.category) && e.weightPpm > 0)
-    .sort((a, b) => b.weightPpm - a.weightPpm)
-    .slice(0, topN);
-  const byCat = new Map<string, IndexEntry[]>();
-  for (const e of picked) byCat.set(e.category, [...(byCat.get(e.category) ?? []), e]);
+export type ThemeDb = Record<string, { title: string; description: string; stocks: Record<string, ThemeStock> }>;
+
+export const THEMES = techThemes as ThemeDb;
+
+export interface HeatTile {
+  stock: ThemeStock;
+  quote: IndexEntry;
+}
+
+export interface HeatmapLayout {
+  groups: Array<Rect & { item: string }>;
+  tiles: Array<Rect & { item: HeatTile }>;
+  /** Theme stocks with no quote from either index (unlisted, emerging board …). */
+  missing: ThemeStock[];
+}
+
+/** Short group label: the Chinese part of "玻璃基板 (Glass Substrate)". */
+export const shortTitle = (title: string) => title.replace(/\s*\(.*\)\s*$/, "");
+
+/**
+ * `theme === null`: one group per theme with its `perTheme` biggest stocks
+ * (a stock may sit in several themes). Otherwise: that theme's stocks, all of
+ * them, grouped by sub_group. `labelH` px at the top of each group (tall
+ * enough to hold it) are left free for the group's label.
+ */
+export function layoutThemeHeatmap(
+  db: ThemeDb,
+  theme: string | null,
+  entries: readonly IndexEntry[],
+  rect: Rect,
+  perTheme = 8,
+  labelH = 0,
+): HeatmapLayout {
+  const quotes = new Map(entries.map((e) => [e.code, e]));
+  const missing: ThemeStock[] = [];
+  const byGroup = new Map<string, HeatTile[]>();
+  for (const key of theme === null ? Object.keys(db) : [theme]) {
+    const t = db[key];
+    if (!t) continue;
+    for (const stock of Object.values(t.stocks)) {
+      const quote = quotes.get(stock.code);
+      if (!quote) {
+        missing.push(stock);
+        continue;
+      }
+      const g = theme === null ? shortTitle(t.title) : stock.sub_group;
+      byGroup.set(g, [...(byGroup.get(g) ?? []), { stock, quote }]);
+    }
+  }
+  const anyAmount = [...byGroup.values()].some((l) => l.some((h) => h.quote.amount > 0));
+  const size = (h: HeatTile) => (anyAmount ? h.quote.amount : 1);
+  if (theme === null) {
+    for (const [g, list] of byGroup) byGroup.set(g, [...list].sort((a, b) => size(b) - size(a)).slice(0, perTheme));
+  }
   const groups = squarify(
-    [...byCat.entries()].map(([cat, list]) => ({ item: cat, value: list.reduce((s, e) => s + e.weightPpm, 0) })),
+    [...byGroup.entries()].map(([g, list]) => ({ item: g, value: list.reduce((s, h) => s + size(h), 0) })),
     rect,
   );
   const tiles = groups.flatMap((g) =>
     squarify(
-      (byCat.get(g.item) ?? []).map((e) => ({ item: e, value: e.weightPpm })),
-      { x: g.x, y: g.y, w: g.w, h: g.h },
+      (byGroup.get(g.item) ?? []).map((h) => ({ item: h, value: size(h) })),
+      g.h > labelH * 3 ? { x: g.x, y: g.y + labelH, w: g.w, h: g.h - labelH } : { x: g.x, y: g.y, w: g.w, h: g.h },
     ),
   );
-  return { groups, tiles };
+  return { groups, tiles, missing: [...new Map(missing.map((m) => [m.code, m])).values()] };
 }
 
 export interface HeatmapDeps {
   entries: () => Promise<IndexEntry[]>;
   onPick: (symbol: string) => void;
-  topN?: number;
-  height?: number;
+  themes?: ThemeDb;
+  /** Box height in px; a function is re-read on every draw (the popout window follows its size). */
+  height?: number | (() => number);
+  /** Overview: stocks shown per theme. */
+  perTheme?: number;
+  /** Group label strip height in px (match `.hm-group span` when restyling it). */
+  labelHeight?: number;
   refreshMs?: number;
 }
 
-export const HEATMAP_TOP_N = 60;
+export type HeatmapHandle = WidgetHandle & {
+  /** Re-lay out the last data (e.g. after a resize) without refetching. */
+  redraw(): void;
+};
 
-export function mountHeatmapPanel(body: HTMLElement, deps: HeatmapDeps): WidgetHandle {
+/** BroadcastChannel between the popout window (heatmap.html) and the main app: `{ t: "pick", symbol }`. */
+export const HEATMAP_WINDOW_CHANNEL = "opencharts.heatmap.win";
+
+/** Height of the group label strip (matches `.hm-group span`). */
+const LABEL_H = 13;
+
+export function mountHeatmapPanel(body: HTMLElement, deps: HeatmapDeps): HeatmapHandle {
   const doc = body.ownerDocument;
   ensureMarketStyles(doc);
+  const db = deps.themes ?? THEMES;
   const root = doc.createElement("div");
   root.className = "mw";
   root.style.padding = "8px";
   body.appendChild(root);
-  const topN = deps.topN ?? HEATMAP_TOP_N;
-  const height = deps.height ?? 420;
+  const boxHeight = () => (typeof deps.height === "function" ? deps.height() : (deps.height ?? 420));
+  const perTheme = deps.perTheme ?? 8;
 
-  root.addEventListener("click", (ev) => {
+  const select = doc.createElement("select");
+  select.className = "hm-theme";
+  select.innerHTML =
+    `<option value="">全部主題（各取成交前 ${perTheme}）</option>` +
+    Object.entries(db)
+      .map(([k, t]) => `<option value="${escapeHtml(k)}">${escapeHtml(shortTitle(t.title))}</option>`)
+      .join("");
+  const view = doc.createElement("div");
+  root.append(select, view);
+
+  let last: IndexEntry[] | null = null;
+  const draw = (entries: IndexEntry[]): void => {
+    last = entries;
+    const theme = select.value || null;
+    const width = root.clientWidth > 0 ? root.clientWidth - 16 : 300;
+    const height = boxHeight();
+    const { groups, tiles, missing } = layoutThemeHeatmap(db, theme, entries, { x: 0, y: 0, w: width, h: height }, perTheme, deps.labelHeight ?? LABEL_H);
+    if (tiles.length === 0) {
+      view.innerHTML = `<div class="mw-meta">沒有主題股報價資料</div>`;
+      return;
+    }
+    const box = (r: Rect) =>
+      `left:${r.x.toFixed(1)}px;top:${r.y.toFixed(1)}px;width:${r.w.toFixed(1)}px;height:${r.h.toFixed(1)}px`;
+    const tileHtml = tiles
+      .map((t) => {
+        const { stock, quote } = t.item;
+        const label = t.w >= 34 && t.h >= 22 ? `${escapeHtml(stock.name)}<br>${fmtPct(quote.pct)}` : "";
+        const title = `${stock.code} ${stock.name} ${fmtPct(quote.pct)}\n${stock.sub_group}\n${stock.role}`;
+        return `<div class="hm-tile" data-symbol="${escapeHtml(`${quote.exchange}:${quote.code}`)}" title="${escapeHtml(title)}" style="${box(t)};background:${heatColor(quote.pct)}">${label}</div>`;
+      })
+      .join("");
+    const groupHtml = groups
+      .map((g) => `<div class="hm-group" style="${box(g)}"><span>${escapeHtml(g.item)}</span></div>`)
+      .join("");
+    const desc = theme ? `${escapeHtml(db[theme]!.description)} · ` : "";
+    const lost = missing.length ? ` · ${missing.length} 檔無報價（${missing.map((m) => escapeHtml(m.name)).join("、")}）` : "";
+    view.innerHTML =
+      `<div class="mw-meta">${desc}${tiles.length} 檔 · 面積＝成交金額 · 點方塊切換商品${lost}</div>` +
+      `<div class="hm-box" style="height:${height}px">${tileHtml}${groupHtml}</div>` +
+      `<div class="mw-meta">${fmtPct(-3)} <span style="color:${heatColor(-3)}">■</span> 0 <span style="color:${heatColor(3)}">■</span> ${fmtPct(3)}</div>`;
+  };
+
+  select.addEventListener("change", () => {
+    if (last) draw(last);
+  });
+  view.addEventListener("click", (ev) => {
     const tile = (ev.target as HTMLElement).closest?.("[data-symbol]") as HTMLElement | null;
     if (tile?.dataset.symbol) deps.onPick(tile.dataset.symbol);
   });
 
   const runner = latestRunner(
     () => deps.entries(),
-    (entries) => {
-      const width = root.clientWidth > 0 ? root.clientWidth - 16 : 300;
-      const { groups, tiles } = layoutHeatmap(entries, topN, { x: 0, y: 0, w: width, h: height });
-      if (tiles.length === 0) {
-        root.innerHTML = `<div class="mw-meta">沒有電子類成分股資料</div>`;
-        return;
-      }
-      const box = (r: Rect) =>
-        `left:${r.x.toFixed(1)}px;top:${r.y.toFixed(1)}px;width:${r.w.toFixed(1)}px;height:${r.h.toFixed(1)}px`;
-      const tileHtml = tiles
-        .map((t) => {
-          const e = t.item;
-          const label = t.w >= 34 && t.h >= 22 ? `${escapeHtml(e.code)}<br>${fmtPct(e.pct)}` : "";
-          const title = `${e.code} ${fmtPct(e.pct)} · 權重 ${(e.weightPpm / 10_000).toFixed(2)}%`;
-          return `<div class="hm-tile" data-symbol="${escapeHtml(`${e.exchange}:${e.code}`)}" title="${escapeHtml(title)}" style="${box(t)};background:${heatColor(e.pct)}">${label}</div>`;
-        })
-        .join("");
-      const groupHtml = groups
-        .map((g) => `<div class="hm-group" style="${box(g)}"><span>${escapeHtml(CATEGORY_NAMES[g.item] ?? g.item)}</span></div>`)
-        .join("");
-      root.innerHTML =
-        `<div class="mw-meta">電子類前 ${tiles.length} 大（依加權指數權重）· 點方塊切換商品</div>` +
-        `<div class="hm-box" style="height:${height}px">${tileHtml}${groupHtml}</div>` +
-        `<div class="mw-meta">${fmtPct(-3)} <span style="color:${heatColor(-3)}">■</span> 0 <span style="color:${heatColor(3)}">■</span> ${fmtPct(3)}</div>`;
-    },
+    draw,
     (err) => {
       const msg = err instanceof Error ? err.message : String(err);
-      root.innerHTML = `<div class="mw-warn">無法取得熱力圖：${escapeHtml(msg)}</div>`;
+      view.innerHTML = `<div class="mw-warn">無法取得熱力圖：${escapeHtml(msg)}</div>`;
     },
   );
 
@@ -161,6 +251,9 @@ export function mountHeatmapPanel(body: HTMLElement, deps: HeatmapDeps): WidgetH
 
   return {
     refresh: () => runner.run(),
+    redraw() {
+      if (last) draw(last);
+    },
     destroy() {
       runner.dispose();
       clearInterval(tick);

@@ -1,17 +1,31 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IndexEntry } from "../../services/shioaji/marketData.ts";
-import { layoutHeatmap, mountHeatmapPanel, squarify, type Rect } from "../heatmap.ts";
+import { layoutThemeHeatmap, mountHeatmapPanel, squarify, THEMES, type Rect, type ThemeDb } from "../heatmap.ts";
 import type { WidgetHandle } from "../quoteStrip.ts";
 
-const entry = (code: string, category: string, weightPpm: number, pct = 0): IndexEntry => ({
+const entry = (code: string, amount: number, pct = 0, exchange = "TSE"): IndexEntry => ({
   code,
-  exchange: "TSE",
-  category,
+  exchange,
+  category: "24",
   price: 100,
   pct,
-  weightPpm,
-  amount: 0,
+  weightPpm: 0,
+  amount,
 });
+
+const stock = (code: string, name: string, sub_group: string) => ({ code, name, sub_group, role: `${name} role` });
+const DB: ThemeDb = {
+  cool: {
+    title: "液冷散熱 (Liquid Cooling)",
+    description: "散熱",
+    stocks: { "3017": stock("3017", "奇鋐", "水冷板"), "3324": stock("3324", "雙鴻", "水冷板"), "6230": stock("6230", "尼得科超眾", "均熱片") },
+  },
+  cpo: {
+    title: "矽光子 (CPO)",
+    description: "光通訊",
+    stocks: { "3017": stock("3017", "奇鋐", "散熱"), "3081": stock("3081", "聯亞", "雷射"), "9999": stock("9999", "未上市", "雷射") },
+  },
+};
 
 const overlap = (a: Rect, b: Rect) =>
   Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x) > 1e-6 && Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) > 1e-6;
@@ -41,17 +55,54 @@ describe("squarify", () => {
   });
 });
 
-describe("layoutHeatmap", () => {
-  it("keeps only electronics (24–31), top N by weight, grouped by category", () => {
-    const entries = [entry("2330", "24", 300), entry("2317", "28", 50), entry("2882", "17", 999), entry("2454", "24", 40), entry("3008", "26", 5)];
-    const { groups, tiles } = layoutHeatmap(entries, 3, { x: 0, y: 0, w: 300, h: 200 });
-    expect(tiles.map((t) => t.item.code).sort()).toEqual(["2317", "2330", "2454"]);
-    expect(groups.map((g) => g.item).sort()).toEqual(["24", "28"]);
-    const g24 = groups.find((g) => g.item === "24")!;
-    for (const t of tiles.filter((t) => t.item.category === "24")) {
-      expect(t.x).toBeGreaterThanOrEqual(g24.x - 1e-6);
-      expect(t.x + t.w).toBeLessThanOrEqual(g24.x + g24.w + 1e-6);
+describe("layoutThemeHeatmap", () => {
+  const rect = { x: 0, y: 0, w: 300, h: 200 };
+  const quotes = [entry("3017", 50), entry("3324", 30), entry("6230", 20), entry("3081", 10, 0, "OTC")];
+
+  it("overview: one group per theme (short title), a stock may sit in several, top N by turnover", () => {
+    const { groups, tiles, missing } = layoutThemeHeatmap(DB, null, quotes, rect, 2);
+    expect(groups.map((g) => g.item).sort()).toEqual(["液冷散熱", "矽光子"]);
+    const inCool = tiles.filter((t) => t.item.stock.sub_group !== "散熱" && t.item.stock.sub_group !== "雷射");
+    expect(inCool.map((t) => t.item.stock.code).sort()).toEqual(["3017", "3324"]);
+    expect(tiles.filter((t) => t.item.quote.code === "3017")).toHaveLength(2);
+    expect(missing.map((m) => m.code)).toEqual(["9999"]);
+  });
+
+  it("one theme: all its stocks, grouped by sub_group, area ∝ turnover, inside their group", () => {
+    const { groups, tiles } = layoutThemeHeatmap(DB, "cool", quotes, rect);
+    expect(groups.map((g) => g.item).sort()).toEqual(["均熱片", "水冷板"]);
+    expect(tiles).toHaveLength(3);
+    const area = (c: string) => tiles.find((t) => t.item.quote.code === c)!;
+    expect(area("3017").w * area("3017").h).toBeCloseTo((50 / 100) * 60_000, 6);
+    const g = groups.find((g) => g.item === "水冷板")!;
+    for (const t of tiles.filter((t) => t.item.stock.sub_group === "水冷板")) {
+      expect(t.x).toBeGreaterThanOrEqual(g.x - 1e-6);
+      expect(t.x + t.w).toBeLessThanOrEqual(g.x + g.w + 1e-6);
     }
+  });
+
+  it("leaves a label strip at the top of each group", () => {
+    const { groups, tiles } = layoutThemeHeatmap(DB, "cool", quotes, rect, 8, 13);
+    for (const t of tiles) {
+      const g = groups.find((g) => g.item === t.item.stock.sub_group)!;
+      expect(t.y).toBeGreaterThanOrEqual(g.y + 13 - 1e-6);
+      expect(t.y + t.h).toBeLessThanOrEqual(g.y + g.h + 1e-6);
+    }
+  });
+
+  it("equal-sized tiles before any turnover (pre-market)", () => {
+    const { tiles } = layoutThemeHeatmap(DB, "cool", quotes.map((q) => ({ ...q, amount: 0 })), rect);
+    expect(tiles).toHaveLength(3);
+    for (const t of tiles) expect(t.w * t.h).toBeCloseTo(60_000 / 3, 6);
+  });
+
+  it("the bundled database parses: 11 themes, every stock has code/name/sub_group", () => {
+    expect(Object.keys(THEMES)).toHaveLength(11);
+    for (const t of Object.values(THEMES))
+      for (const [k, s] of Object.entries(t.stocks)) {
+        expect(s.code).toBe(k);
+        expect(s.name && s.sub_group).toBeTruthy();
+      }
   });
 });
 
@@ -72,22 +123,36 @@ describe("mountHeatmapPanel", () => {
     vi.useRealTimers();
   });
 
-  it("draws coloured tiles with category labels; clicking picks EXCHANGE:CODE", async () => {
+  it("draws named tiles with group labels; clicking picks EXCHANGE:CODE (OTC too)", async () => {
     const onPick = vi.fn();
-    const entries = vi.fn(async () => [entry("2330", "24", 300, 2.5), entry("2317", "28", 100, -1.2)]);
-    handle = mountHeatmapPanel(body, { entries, onPick });
-    await vi.waitFor(() => expect(body.querySelectorAll(".hm-tile")).toHaveLength(2));
-    expect(body.textContent).toContain("半導體");
-    expect(body.textContent).toContain("電子零組件");
-    const tile = body.querySelector<HTMLElement>('[data-symbol="TSE:2330"]')!;
+    const entries = vi.fn(async () => [entry("3017", 50, 2.5), entry("3081", 10, -1.2, "OTC")]);
+    handle = mountHeatmapPanel(body, { entries, onPick, themes: DB });
+    await vi.waitFor(() => expect(body.querySelectorAll(".hm-tile")).toHaveLength(3));
+    expect(body.textContent).toContain("液冷散熱");
+    expect(body.textContent).toContain("奇鋐");
+    expect(body.textContent).toContain("3 檔無報價（雙鴻、尼得科超眾、未上市）");
+    const tile = body.querySelector<HTMLElement>('[data-symbol="OTC:3081"]')!;
     expect(tile.style.background).not.toBe("");
+    expect(tile.title).toContain("聯亞 role");
     tile.click();
-    expect(onPick).toHaveBeenCalledWith("TSE:2330");
+    expect(onPick).toHaveBeenCalledWith("OTC:3081");
   });
 
-  it("says so when no electronics data is available", async () => {
-    handle = mountHeatmapPanel(body, { entries: async () => [entry("2882", "17", 10)], onPick: vi.fn() });
-    await vi.waitFor(() => expect(body.textContent).toContain("沒有電子類成分股資料"));
+  it("switching theme redraws from the last data without refetching", async () => {
+    const entries = vi.fn(async () => [entry("3017", 50), entry("3324", 30), entry("6230", 20)]);
+    handle = mountHeatmapPanel(body, { entries, onPick: vi.fn(), themes: DB });
+    await vi.waitFor(() => expect(body.querySelectorAll(".hm-tile")).toHaveLength(4));
+    const select = body.querySelector<HTMLSelectElement>("select")!;
+    select.value = "cool";
+    select.dispatchEvent(new Event("change"));
+    expect(body.querySelectorAll(".hm-tile")).toHaveLength(3);
+    expect(body.textContent).toContain("水冷板");
+    expect(entries).toHaveBeenCalledTimes(1);
+  });
+
+  it("says so when no theme stock has a quote", async () => {
+    handle = mountHeatmapPanel(body, { entries: async () => [entry("2882", 10)], onPick: vi.fn(), themes: DB });
+    await vi.waitFor(() => expect(body.textContent).toContain("沒有主題股報價資料"));
   });
 
   it("shows a warning on server failure and refreshes on its timer", async () => {

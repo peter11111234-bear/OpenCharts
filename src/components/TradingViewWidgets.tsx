@@ -105,8 +105,51 @@ const TV_TECHNICAL_INTERVAL_MAP: Record<string, string> = {
   "1w": "1W",
 };
 
-function mapSymbol(symbol: string): string {
+// ── Taiwan symbols (shioaji / Vela) → TradingView ──
+// Vela uses shioaji's listing prefixes: TSE = TWSE (on TV, "TSE:" is Tokyo!),
+// OTC = TPEx. Futures codes carry a TAIFEX month letter A–L = Jan–Dec
+// (shioaji contracts: TXFJ6 → 202610), but TV names dated contracts with CME
+// month codes + full year (TAIFEX:TXFV2026), so J must become V, not stay J.
+// R1/R2 are shioaji's continuous near/next month → TV's 1!/2!.
+// TV lists micro TAIEX (TMF) but its scanner has no data for it, so the
+// technical-rating widgets come up blank; show the same-month mini (MXF) —
+// same index, same expiry — instead.
+const TW_EXCHANGE_MAP: Record<string, string> = { TSE: "TWSE", OTC: "TPEX" };
+const TV_FUTURES_ROOT: Record<string, string> = { TMF: "MXF" };
+const TAIFEX_MONTHS = "ABCDEFGHIJKL";
+const CME_MONTHS = "FGHJKMNQUVXZ";
+
+function mapTaiwanSymbol(symbol: string, now: Date): string | null {
+  const colon = symbol.indexOf(":");
+  const prefix = colon < 0 ? "" : symbol.slice(0, colon);
+  const code = colon < 0 ? symbol : symbol.slice(colon + 1);
+
+  const fut = /^(TXF|MXF|TMF)(?:R([12])|([A-L])(\d))?$/.exec(code);
+  if (fut && (prefix === "" || prefix === "TAIFEX")) {
+    const [, twRoot = "", continuous, month, yearDigit] = fut;
+    const root = TV_FUTURES_ROOT[twRoot] ?? twRoot;
+    if (continuous) return `TAIFEX:${root}${continuous}!`;
+    if (!month) return `TAIFEX:${root}1!`;
+    // One year digit: pick the decade that lands nearest now (contracts list
+    // ~3 years out; an expired one is at most a year old).
+    const thisYear = now.getFullYear();
+    let year = thisYear - (thisYear % 10) + Number(yearDigit);
+    if (year < thisYear - 1) year += 10;
+    else if (year > thisYear + 5) year -= 10;
+    return `TAIFEX:${root}${CME_MONTHS[TAIFEX_MONTHS.indexOf(month)]}${year}`;
+  }
+
+  if (/^\d{4,6}[A-Z]?$/.test(code)) {
+    if (prefix === "") return `TWSE:${code}`;
+    if (TW_EXCHANGE_MAP[prefix]) return `${TW_EXCHANGE_MAP[prefix]}:${code}`;
+  }
+  return null;
+}
+
+function mapSymbol(symbol: string, now: Date = new Date()): string {
   if (TV_SYMBOL_MAP[symbol]) return TV_SYMBOL_MAP[symbol];
+  const tw = mapTaiwanSymbol(symbol, now);
+  if (tw) return tw;
   if (/^[A-Z]{6}$/.test(symbol)) return `FX:${symbol}`;
   return symbol;
 }

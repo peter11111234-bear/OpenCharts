@@ -7,7 +7,7 @@
  * subpath are separate module instances, and registering on the wrong one
  * leaves the panel invisible (see velaPineEditor.ts header).
  */
-import { registerIcon, registerSidePanel, registerWidgetAction } from "@luxalgo/vela/plugin";
+import { registerIcon, registerSidePanel, registerWidgetAction, type WidgetContext } from "@luxalgo/vela/plugin";
 import { svg16 } from "@luxalgo/vela/ui";
 import { ShioajiVelaProvider } from "../services/shioaji/velaProvider.ts";
 import { computeRating, type FetchBarsFn } from "./techRating.ts";
@@ -19,6 +19,13 @@ const provider = new ShioajiVelaProvider();
 const fetchBars: FetchBarsFn = (symbol, timeframe, fromMs, limit) =>
   provider.getBars(symbol, timeframe, { from: fromMs, limit });
 
+/** The rating for `ctx`'s active chart, mounted into `body` (also used under the hotlists). */
+export function mountRating(ctx: WidgetContext, body: HTMLElement) {
+  return mountTechRatingPanel(ctx, body, {
+    compute: (symbol, timeframe) => computeRating(symbol, timeframe, { fetchBars }),
+  });
+}
+
 registerIcon("tech-rating", svg16('<path d="M2.5 11.5a5.5 5.5 0 0 1 11 0"/><path d="M8 11.5l3-4"/>'));
 
 registerSidePanel({
@@ -29,9 +36,7 @@ registerSidePanel({
   resizable: true,
   minWidth: 240,
   mount(ctx, body) {
-    const panel = mountTechRatingPanel(ctx, body, {
-      compute: (symbol, timeframe) => computeRating(symbol, timeframe, { fetchBars }),
-    });
+    const panel = mountRating(ctx, body);
     return {
       onOpen() {
         panel.refresh();

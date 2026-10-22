@@ -51,6 +51,23 @@ describe("mountHotlistsPanel", () => {
     expect(body.querySelector("button[data-active]")!.textContent).toBe("成交金額");
   });
 
+  it("keeps the old table (dimmed) while a new tab loads, so nothing below it jumps", async () => {
+    let release!: (rows: RankRow[]) => void;
+    const ranking = vi.fn(async (k: RankKind) =>
+      k === "gainers" ? [row("2330", 9.9)] : new Promise<RankRow[]>((r) => (release = r)),
+    );
+    handle = mountHotlistsPanel(body, { ranking, onPick: vi.fn() });
+    await vi.waitFor(() => expect(body.querySelector('tr[data-code="2330"]')).not.toBeNull());
+    body.querySelector<HTMLButtonElement>('button[data-kind="losers"]')!.click();
+    await vi.waitFor(() => expect(ranking).toHaveBeenLastCalledWith("losers"));
+    expect(body.querySelector('tr[data-code="2330"]')).not.toBeNull();
+    const list = body.querySelector<HTMLElement>(".hl-table")!.parentElement!;
+    expect(list.style.opacity).toBe("0.4");
+    release([row("6141", -9.9)]);
+    await vi.waitFor(() => expect(body.querySelector('tr[data-code="6141"]')).not.toBeNull());
+    expect(list.style.opacity).toBe("");
+  });
+
   it("clicking a row picks its code", async () => {
     const onPick = vi.fn();
     handle = mountHotlistsPanel(body, { ranking: async () => [row("6547", 1)], onPick });

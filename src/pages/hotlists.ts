@@ -55,6 +55,7 @@ export function mountHotlistsPanel(body: HTMLElement, deps: HotlistsDeps): Widge
       return { k, rows: await deps.ranking(k) };
     },
     ({ k, rows }) => {
+      list.style.opacity = "";
       if (rows.length === 0) {
         list.innerHTML = `<div class="mw-meta">無資料</div>`;
         return;
@@ -80,6 +81,7 @@ export function mountHotlistsPanel(body: HTMLElement, deps: HotlistsDeps): Widge
         `</tbody></table>`;
     },
     (err) => {
+      list.style.opacity = "";
       const msg = err instanceof Error ? err.message : String(err);
       list.innerHTML = `<div class="mw-warn">無法取得排行：${escapeHtml(msg)}</div>`;
     },
@@ -91,7 +93,10 @@ export function mountHotlistsPanel(body: HTMLElement, deps: HotlistsDeps): Widge
     if (!k || k === kind) return;
     kind = k;
     markTab();
-    list.innerHTML = `<div class="mw-meta">載入中…</div>`;
+    // Keep the old table (dimmed) until the new one arrives: swapping in a
+    // one-line "loading" placeholder collapsed the list and made whatever sits
+    // below it (the rating) jump up and back down.
+    list.style.opacity = "0.4";
     runner.run();
   });
   list.addEventListener("click", (ev) => {
