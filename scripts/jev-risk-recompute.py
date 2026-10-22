@@ -36,13 +36,7 @@ def recompute(rows: list[dict]) -> list[dict]:
     for r in gated:
         bar = {"time": r["bar_time"], "close": r["price"]}
         sess, key = js.rotate_risk_session(sess, key, bar["time"])
-        prev = sess._close_open_position(bar)
-        verdict, lots_mult, reason, rule = sess.gate(bar, {"answers": r["answers"]})
-        choice = (r["answers"].get("action_choice") or {}).get("choice")
-        if verdict in ("approve", "reduce") and choice in ("buy", "sell"):
-            sess.follow_count_today += 1
-            sess.open_entry, sess.open_direction = bar["close"], choice
-            sess.open_ts, sess.open_lots, sess.open_rule = bar["time"], lots_mult, rule
+        prev, (verdict, lots_mult, reason, rule) = sess.step(bar, {"answers": r["answers"]})
         new_gate[r["bar_time"]] = {"verdict": verdict, "lots_mult": lots_mult, "reason": reason,
                                    "rule": rule, "prev_outcome": prev}
     out = []

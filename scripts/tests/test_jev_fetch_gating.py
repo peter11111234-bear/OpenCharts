@@ -146,3 +146,38 @@ def test_monday_night_loss_streak_still_stops_tuesday_day_until_tuesday_1500():
     s3, key = js.rotate_risk_session(s2, key, tue_night)
     assert s3 is not sess and s3.consecutive_losses == 0                   # Tuesday 15:00: fresh counters
     assert s3.gate({"time": tue_night, "close": 100.0}, ans)[0] != "veto"
+
+
+# ---- F1c: follow cap per session; loss/streak/profit-protect per trading day -------------
+
+def _buy(conf=0.9):
+    return {"answers": {"action_choice": {"choice": "buy", "confidence": conf}}}
+
+
+def test_monday_night_five_follows_do_not_use_up_tuesday_days_cap():
+    sess, key = js.rotate_risk_session(None, None, at(16, 0, day=26))      # Mon night
+    for i in range(5):                                                      # five followed bars, flat prices
+        verdict = sess.step({"time": at(16, 5 * i, day=26), "close": 100.0}, _buy())[1]
+        assert verdict[0] == "approve", i
+    capped = sess.step({"time": at(17, 0, day=26), "close": 100.0}, _buy())[1]
+    assert capped[3] == "max_follow_day"                                    # 6th night follow: capped
+    sess, key = js.rotate_risk_session(sess, key, at(10, 0, day=27))        # Tue day: same trading day
+    assert sess.follow_count.get("day", 0) == 0                             # day count starts at 0
+    assert sess.step({"time": at(10, 0, day=27), "close": 100.0}, _buy())[1][0] == "approve"
+    assert sess.follow_count == {"night": 5, "day": 1}
+
+
+def test_monday_night_losses_count_into_tuesday_days_realized_points():
+    sess, key = js.rotate_risk_session(None, None, at(16, 0, day=26))
+    sess.step({"time": at(16, 0, day=26), "close": 100.0}, _buy())          # buy @100
+    sess.step({"time": at(16, 5, day=26), "close": 90.0}, {"answers": {"action_choice": {"choice": "hold"}}})  # closes at 90: -10
+    assert sess.realized_points == -10.0 and sess.consecutive_losses == 1
+    s2, _ = js.rotate_risk_session(sess, key, at(10, 0, day=27))
+    assert s2 is sess and s2.realized_points == -10.0                       # still Tuesday's "today's loss"
+
+
+def test_profit_protect_spans_night_and_next_day():
+    sess, key = js.rotate_risk_session(None, None, at(16, 0, day=26))
+    sess.realized_points, sess.in_profit_protect = 800.0, True
+    s2, _ = js.rotate_risk_session(sess, key, at(10, 0, day=27))
+    assert s2.gate({"time": at(10, 0, day=27), "close": 1.0}, _buy())[3] == "profit_protect"

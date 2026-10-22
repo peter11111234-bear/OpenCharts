@@ -858,22 +858,11 @@ def main() -> int:
                 if risk_session is not None:
                     risk_session, risk_key_cur = rotate_risk_session(risk_session, risk_key_cur, bar["time"])
                 if risk_session is not None and answered:
-                    _prev_outcome = risk_session._close_open_position(bar)
-                    gate_res = risk_session.gate(bar, ans)
+                    _prev_outcome, gate_res = risk_session.step(bar, ans)
                     _gate_verdict, _gate_lots_mult, _gate_reason, _gate_rule = gate_res
                     trig_ok, trigger = should_escalate(ans)
                     if trig_ok:
                         _ds_res = deepseek_escalate(state, ans, trigger)
-                    choice = (ans.get('answers') or {}).get('action_choice', {}).get('choice')
-                    # reduce follows too, at its lots_mult: a half-size trade is
-                    # still a trade (volatile bars are followed at half size).
-                    if _gate_verdict in ('approve', 'reduce') and choice in ('buy', 'sell'):
-                        risk_session.follow_count_today += 1
-                        risk_session.open_entry = bar['close']
-                        risk_session.open_direction = choice
-                        risk_session.open_ts = bar['time']
-                        risk_session.open_lots = _gate_lots_mult
-                        risk_session.open_rule = _gate_rule
                 event = {"ts": time.time(), "bar_time": bar["time"], "symbol": symbol,
                          "session": session_label(bar["time"]),
                          "price": bar["close"], "order_flow": state["order_flow"],
@@ -1080,7 +1069,12 @@ class RiskSession:
     """
 
     def __init__(self):
-        self.follow_count_today = 0
+        # Follow cap (5) is counted per SESSION ("day" / "night") inside the trading day: the night
+        # session and the next day's day session get 5 each. Losses, the loss streak and the +800
+        # profit protect stay per TRADING DAY (night + next day session), like orderGuard.ts tradingDay().
+        # NOTE: the 5-follow cap is a shadow-simulation rule only. The real orderGuard.ts has NO
+        # follow-count cap; adding one there is a separate decision.
+        self.follow_count: dict[str, int] = {}
         self.realized_points = 0.0
         self.consecutive_losses = 0
         self.in_profit_protect = False
@@ -1119,6 +1113,24 @@ class RiskSession:
         self.open_ts = None
         return outcome
 
+    def step(self, bar, ans):
+        """One decided bar, shared by the live loop and jev-risk-recompute.py: close the previous
+        position, gate this bar, then open/follow. Returns (prev_outcome, (verdict, lots_mult, reason, rule))."""
+        prev = self._close_open_position(bar)
+        verdict, lots_mult, reason, rule = self.gate(bar, ans)
+        choice = ((ans or {}).get('answers') or {}).get('action_choice', {}).get('choice')
+        # reduce follows too, at its lots_mult: a half-size trade is still a trade
+        # (volatile bars are followed at half size).
+        if verdict in ('approve', 'reduce') and choice in ('buy', 'sell'):
+            label = session_label(bar['time'])
+            self.follow_count[label] = self.follow_count.get(label, 0) + 1
+            self.open_entry = bar['close']
+            self.open_direction = choice
+            self.open_ts = bar['time']
+            self.open_lots = lots_mult
+            self.open_rule = rule
+        return prev, (verdict, lots_mult, reason, rule)
+
     def gate(self, bar, ans):
         answers = (ans or {}).get('answers') or {}
         a = answers.get('action_choice', {}) or {}
@@ -1134,7 +1146,8 @@ class RiskSession:
         # (user decision 2026-10-20), or a hold bar falls through to approve/reduce.
         if choice in ('flat', 'hold'):
             return 'veto', 0.0, 'flat choice', 'flat'
-        if self.follow_count_today >= 5:
+        label = session_label(bar['time']) if bar.get('time') is not None else 'day'   # bare test bars carry no time
+        if self.follow_count.get(label, 0) >= 5:
             return 'veto', 0.0, 'daily follow cap (5) reached', 'max_follow_day'
         if self.in_profit_protect and choice in ('buy', 'sell'):
             return 'veto', 0.0, 'daily profit protect gate (+800 pts already)', 'profit_protect'
