@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>技術指標研究筆記（一）：ATR、ADX、DMI（PDI/MDI）與 CHOP 實戰量化體系</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --card-border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --heading: #f0f6fc;
+      --accent: #58a6ff;
+      --accent-glow: rgba(88, 166, 255, 0.15);
+      --green: #3fb950;
+      --green-bg: rgba(63, 185, 80, 0.12);
+      --red: #f85149;
+      --red-bg: rgba(248, 81, 73, 0.12);
+      --amber: #d29922;
+      --amber-bg: rgba(210, 153, 34, 0.12);
+      --purple: #bc8cff;
+      --code-bg: #090d13;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    }
+
+    [data-theme="light"] {
+      --bg: #f6f8fa;
+      --card-bg: #ffffff;
+      --card-border: #d0d7de;
+      --text: #24292f;
+      --text-muted: #57606a;
+      --heading: #1f2328;
+      --accent: #0969da;
+      --accent-glow: rgba(9, 105, 218, 0.1);
+      --green: #1a7f37;
+      --green-bg: rgba(26, 127, 55, 0.1);
+      --red: #cf222e;
+      --red-bg: rgba(207, 34, 46, 0.1);
+      --amber: #9a6700;
+      --amber-bg: rgba(154, 103, 0, 0.1);
+      --purple: #8250df;
+      --code-bg: #f6f8fa;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      line-height: 1.68;
+      padding: 32px 16px 80px;
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+    }
+
+    /* Header */
+    header {
+      border-bottom: 1px solid var(--card-border);
+      padding-bottom: 24px;
+      margin-bottom: 40px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .title-group h1 {
+      font-size: 28px;
+      color: var(--heading);
+      margin-bottom: 8px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .title-group p {
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+
+    .theme-toggle {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+    .theme-toggle:hover {
+      border-color: var(--accent);
+    }
+
+    /* Sections */
+    section {
+      margin-bottom: 48px;
+    }
+
+    h2 {
+      font-size: 20px;
+      color: var(--heading);
+      margin-bottom: 18px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--card-border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    h3 {
+      font-size: 16px;
+      color: var(--heading);
+      margin: 20px 0 10px;
+    }
+
+    p {
+      margin-bottom: 14px;
+    }
+
+    /* Cards */
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+
+    .card-highlight {
+      border-left: 4px solid var(--accent);
+      background: linear-gradient(90deg, var(--accent-glow) 0%, var(--card-bg) 100%);
+    }
+
+    .callout {
+      padding: 14px 18px;
+      border-radius: 6px;
+      margin: 16px 0;
+      font-size: 14px;
+      border: 1px solid transparent;
+    }
+    .callout-green { background: var(--green-bg); border-color: rgba(63,185,80,0.3); color: var(--green); }
+    .callout-amber { background: var(--amber-bg); border-color: rgba(210,153,34,0.3); color: var(--amber); }
+    .callout-red { background: var(--red-bg); border-color: rgba(248,81,73,0.3); color: var(--red); }
+
+    /* Tables */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 24px;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 10px 14px;
+      border: 1px solid var(--card-border);
+      text-align: left;
+    }
+    th {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--heading);
+      font-weight: 600;
+    }
+    [data-theme="light"] th {
+      background: #f6f8fa;
+    }
+
+    /* Code Blocks */
+    pre, code {
+      font-family: var(--font-mono);
+      font-size: 13px;
+    }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 6px;
+      padding: 16px;
+      overflow-x: auto;
+      margin: 14px 0 20px;
+      line-height: 1.5;
+    }
+    p code, td code {
+      background: rgba(255, 255, 255, 0.08);
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: var(--heading);
+    }
+    [data-theme="light"] p code, [data-theme="light"] td code {
+      background: #eaeef2;
+    }
+
+    /* Formula Box */
+    .formula {
+      background: var(--code-bg);
+      border: 1px dashed var(--card-border);
+      border-radius: 6px;
+      padding: 14px 18px;
+      margin: 14px 0;
+      font-family: var(--font-mono);
+      font-size: 13.5px;
+      color: var(--accent);
+    }
+
+    /* Badges */
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-right: 6px;
+    }
+    .badge-green { background: var(--green-bg); color: var(--green); }
+    .badge-amber { background: var(--amber-bg); color: var(--amber); }
+    .badge-red { background: var(--red-bg); color: var(--red); }
+    .badge-blue { background: var(--accent-glow); color: var(--accent); }
+
+    /* Sticky Quick Nav */
+    .nav-bar {
+      position: sticky;
+      top: 12px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 8px 14px;
+      margin-bottom: 28px;
+      display: flex;
+      gap: 12px;
+      overflow-x: auto;
+      font-size: 13px;
+      z-index: 100;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+    }
+    .nav-bar a {
+      color: var(--text-muted);
+      text-decoration: none;
+      white-space: nowrap;
+      transition: color 0.15s;
+    }
+    .nav-bar a:hover {
+      color: var(--accent);
+    }
+
+    ul, ol {
+      padding-left: 24px;
+      margin-bottom: 16px;
+    }
+    li {
+      margin-bottom: 6px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header>
+    <div class="title-group">
+      <h1>技術指標研究筆記（一）</h1>
+      <p>ATR、ADX、DMI（PDI/MDI）與 CHOP 實戰量化體系 · 專案落地研究</p>
+      <p style="margin-top: 4px; font-size: 12px;">日期：2026-10-18 · 對標代碼：<code>TRIS390.pine</code> ＆ <code>jev-shadow.py</code></p>
+    </div>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓 切換主題</button>
+  </header>
+
+  <!-- Quick Nav -->
+  <nav class="nav-bar">
+    <a href="#sec-overview">體系總覽</a>
+    <a href="#sec-dmi">DMI (PDI/MDI)</a>
+    <a href="#sec-adx">ADX 趨勢強度</a>
+    <a href="#sec-chop">CHOP 碎形指標</a>
+    <a href="#sec-combo">雙重共振過濾</a>
+    <a href="#sec-timeframe">週期框架</a>
+    <a href="#sec-code">程式碼實作落地</a>
+  </nav>
+
+  <!-- 1. 體系總覽 -->
+  <section id="sec-overview">
+    <h2>1. 四大核心指標量化體系總覽</h2>
+    <p>在趨勢追蹤（Trend Following）與突破交易中，最常造成虧損的主因並非「方向猜錯」，而是「在錯誤的環境做單」——即**在無方向的洗盤泥淖中頻繁順勢追價，導致多空反覆雙巴**。本套體系利用四大指標分工形成立體防護網：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>指標</th>
+          <th>英文全稱</th>
+          <th>衡量目標</th>
+          <th>核心功能</th>
+          <th>警戒/關鍵閥值</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>ATR</strong></td>
+          <td>Average True Range</td>
+          <td><strong>真實振幅</strong></td>
+          <td>動態停損距離計算、波動率擴張/壓縮判定</td>
+          <td>相對歷史百分位</td>
+        </tr>
+        <tr>
+          <td><strong>PDI (+DI)</strong></td>
+          <td>Plus Directional Indicator</td>
+          <td><strong>多方攻擊力道</strong></td>
+          <td>衡量向上突破動能，辨別漲勢主導權</td>
+          <td>PDI &gt; MDI (多方掌控)</td>
+        </tr>
+        <tr>
+          <td><strong>MDI (-DI)</strong></td>
+          <td>Minus Directional Indicator</td>
+          <td><strong>空方打壓力道</strong></td>
+          <td>衡量向下摜壓動能，辨別跌勢主導權</td>
+          <td>MDI &gt; PDI (空方掌控)</td>
+        </tr>
+        <tr>
+          <td><strong>ADX</strong></td>
+          <td>Average Directional Index</td>
+          <td><strong>趨勢總強度</strong></td>
+          <td>過濾假突破/假跌破，判斷市場是否具備單邊動能</td>
+          <td>&gt; 25.0 (趨勢成立) / &lt; 20 (無動能)</td>
+        </tr>
+        <tr>
+          <td><strong>CHOP</strong></td>
+          <td>Choppiness Index</td>
+          <td><strong>碎形路徑效率</strong></td>
+          <td>辨別洗盤絞肉區，識別市場是否在折返跑原地踏步</td>
+          <td>&lt; 60.0 (趨勢環境) / &ge; 60.0 (泡茶盤整)</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 2. DMI 體系 -->
+  <section id="sec-dmi">
+    <h2>2. DMI 體系（PDI 與 MDI）—— 破解 ADX 的「方向色盲」</h2>
+    
+    <div class="card card-highlight">
+      <h3>核心痛點：為什麼不能單看 ADX？</h3>
+      <p><strong>ADX 本身是完全「色盲」的！</strong> 當行情連續急跌暴跌，ADX 會飆高到 40；當行情連續急拉暴漲，ADX 也會飆高到 40。如果 AI 或策略只讀取 ADX，它只知道「現在行情爆大」，但完全無法辨認究竟是<strong>大多頭</strong>還是<strong>大空頭</strong>。</p>
+    </div>
+
+    <h3>數學原理解析</h3>
+    <p>Welles Wilder 透過觀察當前 K 棒邊界相對前一根 K 棒的突破幅度來定義方向位移（Directional Movement）：</p>
+    <div class="formula">
++DM = (Today's High - Yesterday's High) > 0 且大於下跌位移時，否則為 0<br>
+-DM = (Yesterday's Low - Today's Low) > 0 且大於上漲位移時，否則為 0<br>
+PDI (+DI) = 100 × WilderSmooth(+DM, 14) / ATR(14)<br>
+MDI (-DI) = 100 × WilderSmooth(-DM, 14) / ATR(14)
+    </div>
+
+    <h3>實戰交易規則</h3>
+    <ul>
+      <li><span class="badge badge-green">PDI &gt; MDI</span> <strong>買方主導</strong>：多方向上突破的動能壓過空方，順勢以逢低做多為主。</li>
+      <li><span class="badge badge-red">MDI &gt; PDI</span> <strong>賣方主導</strong>：空方向下摜壓的動能壓過多方，順勢以逢高做空為主。</li>
+      <li><span class="badge badge-amber">兩線黃金/死亡交叉</span> 往往是日線或小時線級別趨勢反轉的第一個先鋒訊號。</li>
+    </ul>
+  </section>
+
+  <!-- 3. ADX 趨勢強度 -->
+  <section id="sec-adx">
+    <h2>3. ADX 趨勢強度 —— 為什麼單根暴跌大黑K拉不動 ADX？</h2>
+
+    <p>市場常見的慘劇是：<strong>「盤整時突然往下一根 80 點大黑K破底，散戶嚇瘋追空，結果剛好空在全天最低點（阿呆谷），下一秒直接 V 轉拉回！」</strong></p>
+    <p>在成熟量化體系中，這筆空單會被 ADX <strong>百分之百物理擋下</strong>。原因包含三個層面：</p>
+
+    <div class="card">
+      <h3>層面 1：雙重 Wilder 平滑的數學抑制</h3>
+      <p>ADX 不是即時時速表，而是由兩層 14 週期的指數平滑組成的重型指標：</p>
+      <div class="formula">
+DX = 100 × |PDI - MDI| / (PDI + MDI)<br>
+ADX = WilderSmooth(DX, 14)
+      </div>
+      <p>Wilder 平滑公式每根 K 棒的新資料權重只有：</p>
+      <div class="formula">
+Weight(New) = 1 / 14 ≈ 7.14%<br>
+Weight(History) = 13 / 14 ≈ 92.86%
+      </div>
+      <p>若過去 13 根 K 棒都在死魚盤整（ADX 原本趴在 15），突然出現一根暴跌黑K，就像<strong>將一滴紅墨水滴進一大桶清水</strong>，整桶水稍微變濁，但數值頂多從 15.0 蠕動到 16.5，**完全無法越過 25.0 的趨勢門檻**！</p>
+    </div>
+
+    <div class="card">
+      <h3>層面 2：微觀結構揭密 —— 那根暴跌黑K究竟是什麼？</h3>
+      <p>既然不是真趨勢，為什麼圖表上會出現大黑K？</p>
+      <ul>
+        <li><strong>掃停損（Stop-Loss Hunt）</strong>：箱型盤整時，多數散戶的多單停損市價賣單全都堆疊在關鍵支撐點下方。主力只需用少量籌碼瞬間敲破支撐，就會觸發骨牌效應引發連鎖市價賣出，在 10 秒內打出 50 點長下影大黑K。</li>
+        <li><strong>真空滑價</strong>：在中午流動性匱乏時段，薄弱的買盤委託簿容易因少量拋盤出現短暫價格懸崖。</li>
+        <li><strong>真趨勢 vs 假洗盤特徵</strong>：
+          <ul>
+            <li><strong>真趨勢</strong>：主力持續性、多根 K 棒連續大量出貨，ADX 會穩步爬升越過 25。</li>
+            <li><strong>假破底</strong>：單根爆量下殺但隨後成交量急縮，ADX 趴在 20 以下不動。</li>
+          </ul>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 4. CHOP 碎形指標 -->
+  <section id="sec-chop">
+    <h2>4. CHOP（Choppiness Index）—— 碎形路徑效率與「泡茶盤」</h2>
+
+    <p>由 E.W. Dreiss 提出的 Choppiness Index 衡量的是價格走勢的<strong>碎形維度（Fractal Dimension）</strong>，即「累積跑過的總里程」與「起點到終點直線淨位移」的比率。</p>
+
+    <div class="formula">
+CHOP = 100 × log10( Sum(TrueRange, 14) / (HighestHigh(14) - LowestLow(14)) ) / log10(14)
+    </div>
+
+    <div class="callout callout-amber">
+      <strong>「CHOP 40 ~ 65 是盤整區間」這句話對嗎？</strong><br>
+      <strong>不完全正確！</strong> 40 ~ 55 經常包含穩健推進的「慢牛 / 慢熊趨勢」（走 3 步退 1 步）。若將 40 以上都視為盤整，將錯過大部分最穩定的波段利潤。<strong>只有 60（或經典 61.8）以上才是嚴禁進場的「真正泡茶盤」</strong>。
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>CHOP 數值區間</th>
+          <th>市場狀態</th>
+          <th>實戰意涵</th>
+          <th>TRIS390 處理邏輯</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="badge badge-green">&le; 40.0</span></td>
+          <td><strong>Clean Trend (強勢單邊)</strong></td>
+          <td>直線噴出或雪崩，能量未被消耗，順勢做單最舒服的黃金期。</td>
+          <td>全速開單，利潤奔跑</td>
+        </tr>
+        <tr>
+          <td><span class="badge badge-amber">40.0 ~ 60.0</span></td>
+          <td><strong>Transitional (過渡整理帶)</strong></td>
+          <td>包含兩種情境：(1) 急漲後的良性旗型回檔；(2) 盤整末期的三角收斂蓄勢。</td>
+          <td>放行進場 (&lt; 60)，但建議搭配共振確認</td>
+        </tr>
+        <tr>
+          <td><span class="badge badge-red">&ge; 60.0</span></td>
+          <td><strong>Choppy Range (泥淖絞肉區)</strong></td>
+          <td>多空互扯，過去 14 根 K 棒 60% 以上的能量互相抵消，原地折返跑。</td>
+          <td><strong>物理鎖死開關 (isTrendingEnv = false)</strong>，全面禁止開倉</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 5. 雙重共振過濾 -->
+  <section id="sec-combo">
+    <h2>5. 雙重共振過濾：ADX &gt; 25 與 CHOP &lt; 60 的實戰照妖鏡</h2>
+
+    <p>在 <code>TRIS390.pine</code> 策略中，將這兩個指標組合為進場的必備門檻：</p>
+    <div class="formula">
+bool isTrendingEnv = (adxValue > 25.0 and chopValue < 60.0)
+    </div>
+
+    <p>將兩者比喻為開車系統：</p>
+    <ul>
+      <li><strong>ADX 是「引擎油門深度」</strong>：ADX &lt; 20 代表沒有主力踩油門，動力空轉。</li>
+      <li><strong>CHOP 是「方向盤穩定度」</strong>：CHOP &ge; 60 代表方向盤左右劇烈打轉，車子原地打滑折返跑。</li>
+    </ul>
+
+    <div class="card card-highlight">
+      <h3>互為雙重保險的典型場景</h3>
+      <ol>
+        <li><strong>破除誘多陷阱（假突破）</strong>：一根長紅拔起，ADX 瞬間被短線拉高到 26（以為要噴了！）；但回頭看 CHOP 依然高達 64（整體結構仍被卡在箱型泥淖內）&rarr; <strong>被 CHOP 擋下，免於追在最高點</strong>。</li>
+        <li><strong>破除誘空陷阱（假摜破）</strong>：突然重挫跌破支撐線；但 ADX 只有 16（完全沒有持續殺盤動量）&rarr; <strong>被 ADX 擋下，免於空在阿呆谷</strong>。</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- 6. 週期選擇架構 -->
+  <section id="sec-timeframe">
+    <h2>6. 週期架構指南（台指期專用實戰規劃）</h2>
+
+    <p>台指期日盤時間僅 5 小時（08:45 ~ 13:45），不可生搬外匯或加密貨幣的 4H 框架：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>交易類型</th>
+          <th>大週期濾網 (Macro Trend Filter)</th>
+          <th>執行與觸發週期 (Execution Trigger)</th>
+          <th>設計原因與操作邏輯</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>當沖交易 (Intraday)</strong><br><span style="font-size: 12px; color: var(--text-muted);">當天平倉不留倉</span></td>
+          <td><strong>30 分鐘 (30m)</strong> 或 <strong>15 分鐘 (15m)</strong><br>ADX &gt; 25 &amp; CHOP &lt; 60</td>
+          <td><strong>5 分鐘 (5m)</strong> 或 <strong>1 分鐘 (1m)</strong></td>
+          <td>30m 棒子一天只有 10 根，14 週期覆蓋一天半，足以過濾一整天的雜訊。30m 亮綠燈時，在 5m 找拉回均線的順勢上車點。</td>
+        </tr>
+        <tr>
+          <td><strong>隔夜短波 (Swing)</strong><br><span style="font-size: 12px; color: var(--text-muted);">留倉 2 ~ 5 天</span></td>
+          <td><strong>60 分鐘 (1H)</strong><br>ADX &gt; 25 &amp; CHOP &lt; 45</td>
+          <td><strong>15 分鐘 (15m)</strong></td>
+          <td>1H 覆蓋近 3 個交易日。1H 的 CHOP 低於 45 代表跨日級別的大行情發動，不怕盤中洗盤，安心抱單過夜。</td>
+        </tr>
+        <tr>
+          <td><strong>避坑警告</strong></td>
+          <td colspan="3"><strong>請勿在台指期使用 4 小時 (4H) 看 ADX/CHOP</strong>。日盤一天僅 1.25 根 4H K棒，計算 14 週期需要近兩週，信號嚴重鈍化，完全無法應對台指當沖與短波。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 7. 程式碼落地篇 -->
+  <section id="sec-code">
+    <h2>7. 專案程式碼落地與對齊清單</h2>
+
+    <h3>7.1 Pine 策略端：<code>src/pine/TRIS390.pine</code></h3>
+    <pre><code>// 盤整過濾設置
+useTrendFilter = input.bool(true, "啟用盤整過濾 (ADX & CHOP)", group=grpFilter)
+adxThreshold   = input.float(25.0, "ADX 趨勢閥值 (>)", group=grpFilter)
+chopThreshold  = input.float(60.0, "CHOP 震盪閥值 (<)", group=grpFilter)
+
+// 運算邏輯
+[_, _, adxValue] = ta.dmi(diLength = 14, adxSmoothing = 14)
+float trSum       = math.sum(ta.tr, 14)
+float rangeDiff   = ta.highest(high, 14) - ta.lowest(low, 14)
+float chopValue   = rangeDiff == 0 ? 100 : 100 * math.log10(trSum / rangeDiff) / math.log10(14)
+
+// 趨勢環境總開關
+bool isTrendingEnv = useTrendFilter ? (adxValue > adxThreshold and chopValue < chopThreshold) : true</code></pre>
+
+    <h3>7.2 Python 端：<code>scripts/jev-shadow.py</code> 特徵計算補全</h3>
+    <pre><code># 1. 計算 DMI 與 CHOP (對標 TRIS390.pine:289-293)
+atr14 = _wilder(tr, 14)
+pdi, mdi = 100 * _wilder(pdm, 14) / atr14, 100 * _wilder(mdm, 14) / atr14
+adx = _wilder(100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, float("nan")), 14)
+
+tr_sum_14 = tr.rolling(14).sum()
+range_diff_14 = high.rolling(14).max() - low.rolling(14).min()
+chop_ratio = (tr_sum_14 / range_diff_14.replace(0, float("nan"))).clip(lower=1e-9)
+chop_14 = 100.0 * (np.log10(chop_ratio) / np.log10(14.0))
+chop_14 = chop_14.mask(range_diff_14 == 0, 100.0)
+
+# 2. 注入 state 輸出字典
+out.update({
+    "average_directional_index_14": _last(adx.iloc[-1]),
+    "plus_di_14": _last(pdi.iloc[-1]),
+    "minus_di_14": _last(mdi.iloc[-1]),
+    "chop_14": _last(chop_14.iloc[-1]),
+    "atr14": _last(atr14.iloc[-1]),
+})</code></pre>
+
+    <h3>7.3 Jev Sidecar 新增問卷規格（14 道決策問卷）</h3>
+    <pre><code># 新增之 3 道題目 (scripts/jev-shadow.py:186-212)
+"volatility_amplitude_atr": {
+    "type": "choice",
+    "instructions": "Evaluate current price amplitude and volatility using `atr14` relative to `current_price` and recent day range.",
+    "criteria": {
+        "compressed": "ATR is low, tightly coiled, awaiting expansion.",
+        "normal": "ATR is within typical intraday expansion levels.",
+        "expanded_or_exhausted": "ATR is unusually wide with climactic erratic bars, high volatility risk."
+    }
+},
+"trend_breakout_adx": {
+    "type": "choice",
+    "instructions": "Using `average_directional_index_14`, `plus_di_14`, and `minus_di_14`, classify the trend breakout direction.",
+    "criteria": {
+        "bullish_breakout": "ADX > 25 with +DI clearly above -DI, strong upward momentum.",
+        "bearish_breakout": "ADX > 25 with -DI clearly above +DI, strong downward breakdown.",
+        "consolidation": "ADX < 20 or DIs intertwined with no directional leadership."
+    }
+},
+"choppiness_regime": {
+    "type": "choice",
+    "instructions": "Using `chop_14` (where >= 60 is choppy range and < 60 is trend according to TRIS390 threshold), is market choppy?",
+    "criteria": {
+        "choppy_range": "CHOP >= 60, oscillating in consolidation zone with high false breakout risk.",
+        "transitional": "CHOP between 45 and 60, transitioning between consolidation and breakout.",
+        "clean_trend": "CHOP < 45, clean directional trending environment."
+    }
+}</code></pre>
+  </section>
+
+</div>
+
+<script>
+  function toggleTheme() {
+    const current = document.documentElement.getAttribute('data-theme');
+    const target = current === 'light' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', target);
+    localStorage.setItem('opencharts_notes_theme', target);
+  }
+
+  // Restore theme preference
+  const saved = localStorage.getItem('opencharts_notes_theme');
+  if (saved) {
+    document.documentElement.setAttribute('data-theme', saved);
+  } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+    document.documentElement.setAttribute('data-theme', 'light');
+  }
+</script>
+
+</body>
+</html>

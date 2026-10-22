@@ -44,6 +44,8 @@
 
 - 能：擋掉沒停損的進場、停損放錯邊、報酬風險比 < 1.5、當日虧損到上限、連虧 3 筆、虧損後 5 分鐘內報復性進場、反向開出對沖單、攤平虧損部位、把停損拉遠或移除。
 - 不能：保證勝率。勝率提升只能靠 Task 5 的報告證明：「被標記的進場」虧損率 > 「通過的進場」虧損率，且樣本足夠，才進 Phase 2（enforce）。
+- 不能：跨頁面重新整理記住紀律狀態。紙上引擎只存在記憶體，F5 後 `closed[]` 清空，冷卻、當日虧損、連虧全部歸零（帳戶也一起重置）。
+- 不能：量到 LIMIT/STOP 掛單的結果。掛單成交在之後的 `engine.mark()`，沒有 join key（見 Log line format）。圖表右鍵快速下單只產生 LIMIT/STOP，所以 Phase 1 報告的樣本只含市價單。
 
 ---
 
@@ -74,11 +76,13 @@ PY=/c/Users/bear9/AppData/Local/Programs/Python/Python312/python.exe
 
 ```bash
 npm run typecheck 2>&1 | tail -5
-npx vitest run 2>&1 | tail -8
+npx vitest run src/services/__tests__/demo-contract.test.ts src/services/__tests__/demo-engine-resting-orders.test.ts 2>&1 | tail -8
 git status --short
 ```
 
 Write the three outputs verbatim into the Review Ledger as `Baseline:`.
+
+Do NOT run the bare `npx vitest run` (whole suite) as the baseline. It takes about 6.5 minutes (82 files, 1140 tests, measured 2026-10-20), and a 2-minute tool timeout kills it. The only later comparison is Task 3 Step 6, which checks exactly these two files. `npm run typecheck` takes about 1 minute: give it a timeout of at least 180 s.
 
 **Plan-specific Nevers:**
 - NEVER route `closePosition`, `closeAllPositions`, `cancelOrder`, `cancelAllOrders`, or `engine.mark()` through the guard (Spec invariant).
@@ -118,7 +122,7 @@ Write the three outputs verbatim into the Review Ledger as `Baseline:`.
 - Outcome: (filled during execution)
 
 ### D2: How the browser writes `logs/order-guard.jsonl`   (T2)
-- Status: needs human confirmation
+- Status: confirmed by the user (2026-10-20): C
 - Consumed by: Task 3, Task 4, Task 5
 - Candidates:
   - A (existing pattern): add `POST /log` to `scripts/jev-sidecar.py` (proxied at `/jev`)
@@ -214,6 +218,7 @@ Join key: `entry.intent.symbol == outcome.symbol` and `entry.positionOpenedAt ==
 - `"$PY" -m pytest scripts/tests/test_jev_shadow_volatile.py -v` → 5 passed
 - A Normal-regime answer (`score 0.7`, `probabilities["2"] 0.02`, buy, confidence 0.9) → `gate` returns `approve`, not `veto`
 - `score 1.6` → `gate` returns rule `volatile`
+- `grep -c "if choice in ('flat', 'hold'):" scripts/jev-shadow.py` → `1`
 - `should_escalate` on the Normal-regime answer → `(False, '')`
 - `grep -c "'volatile' in vol_txt" scripts/jev-shadow.py` → `0`
 - `git diff --stat scripts/jev-shadow.py` is reported verbatim; neither Task 1 file is committed
@@ -360,7 +365,9 @@ Replacement:
         vol = answers.get('volatility_regime', {}) or {}
 
         # --- hard vetoes ---
-        if choice == 'flat':
+        # Jev's action_choice offers buy/hold/sell only, never 'flat': treat hold as flat
+        # (user decision 2026-10-20), or a hold bar falls through to approve/reduce.
+        if choice in ('flat', 'hold'):
             return 'veto', 0.0, 'flat choice', 'flat'
         if _is_volatile(vol):
             return 'veto', 0.0, 'volatile environment -> risk>=1', 'volatile'
@@ -419,11 +426,14 @@ Expected after the restart and one full day session (~60 bars): the rule counter
   - `checkEntry(intent: EntryIntent, ctx: GuardContext): Decision`
   - `checkStopChange(pos: Position, stopLoss: number | null | undefined): Decision`
 
-**Assumptions:** "Today" means the local calendar date of `ctx.now` (`Date.prototype.toDateString`). When the entry price is unknown (`price` absent and `lastPrice` is 0), `stop_side` and `reward_risk` skip; `stop_required` still applies.
+**Assumptions:** "Today" means the local calendar date of `ctx.now` (`Date.prototype.toDateString`). It applies to `daily_loss` and `loss_streak` only. `cooldown_after_loss` reads the newest close regardless of date, because crypto trades through midnight. When the entry price is unknown (`price` absent and `lastPrice` is 0), `stop_side` and `reward_risk` skip; `stop_required` still applies.
 
 **Done when:**
-- `npx vitest run src/services/__tests__/orderGuard.test.ts` → all tests pass (20)
+- `npx vitest run src/services/__tests__/orderGuard.test.ts` → all tests pass (23)
 - A loss closed 3 minutes ago → `veto` `cooldown_after_loss`; 6 minutes ago → `approve`
+- A loss closed at 23:58 and an entry at 00:01 the next day → `veto` `cooldown_after_loss`
+- A BUY whose take-profit is below entry → `veto` `reward_risk` (no R:R computed)
+- A stop-loss change to `0`, a negative number, or `NaN` → `veto` `stop_invalid`
 - `npm run typecheck` → no new errors versus the baseline
 - An entry without `stopLoss` → `veto` with rule `stop_required`
 - 2 losses today → `reduce`, quantity halved; 3 losses today → `veto` `loss_streak`
@@ -503,6 +513,12 @@ describe("checkEntry", () => {
     expect(rules(checkEntry({ ...GOOD, takeProfit: 101 }, ctx()))).toContain("reward_risk");
   });
 
+  it("vetoes a take-profit on the wrong side of entry", () => {
+    // BUY @ 100, TP 90 is a loss target: |90 - 100| / 2 = 5.0 would pass a non-directional R:R
+    const d = checkEntry({ ...GOOD, takeProfit: 90 }, ctx());
+    expect(d.hits.find((h) => h.rule === "reward_risk")?.reason).toMatch(/wrong side/);
+  });
+
   it("skips price-based rules when the entry price is unknown", () => {
     expect(checkEntry({ ...GOOD, stopLoss: 101 }, ctx({ lastPrice: 0 })).verdict).toBe("approve");
   });
@@ -546,6 +562,14 @@ describe("checkEntry", () => {
     expect(checkEntry(GOOD, ctx({ closed: [closedTrade(10, "2026-10-19T09:59:00+08:00")] })).verdict).toBe("approve");
   });
 
+  it("keeps the loss cooldown across midnight", () => {
+    const d = checkEntry(GOOD, ctx({
+      now: new Date("2026-10-20T00:01:00+08:00"),
+      closed: [closedTrade(-10, "2026-10-19T23:58:00+08:00")],
+    }));
+    expect(rules(d)).toEqual(["cooldown_after_loss"]);
+  });
+
   it("vetoes an order that would open a hedge against an open position", () => {
     expect(rules(checkEntry(GOOD, ctx({ positions: [pos({ side: "SHORT" })] })))).toContain("opposite_side");
   });
@@ -575,6 +599,12 @@ describe("checkStopChange", () => {
     expect(rules(checkStopChange(pos({ stopLoss: 98 }), null))).toEqual(["stop_removed"]);
     expect(checkStopChange(pos({ stopLoss: 98 }), undefined).verdict).toBe("approve");
     expect(checkStopChange(pos({ stopLoss: null }), 95).verdict).toBe("approve");
+  });
+
+  it("vetoes a stop that is not a positive finite number, first stop included", () => {
+    expect(rules(checkStopChange(pos({ stopLoss: null }), 0))).toEqual(["stop_invalid"]);
+    expect(rules(checkStopChange(pos({ stopLoss: 98 }), -1))).toEqual(["stop_invalid"]);
+    expect(rules(checkStopChange(pos({ stopLoss: 98 }), Number.NaN))).toEqual(["stop_invalid"]);
   });
 });
 ```
@@ -613,7 +643,7 @@ export const LIMITS = {
   dailyLossLimit: 500,
   /** This many losses in a row today blocks entries; one fewer halves size. */
   maxConsecutiveLosses: 3,
-  /** |takeProfit - entry| / |entry - stopLoss|, checked only when a TP is given. */
+  /** Directional reward / |entry - stopLoss|, checked only when a TP is given. A TP on the loss side is a veto. */
   minRewardRisk: 1.5,
   /** Minutes after a losing close during which new entries are blocked (revenge-trade brake). */
   cooldownMinutes: 5,
@@ -685,7 +715,10 @@ const ENTRY_RULES: Record<string, Rule> = {
   reward_risk: (i, c) => {
     const e = entryOf(i, c);
     if (i.stopLoss == null || i.takeProfit == null || !(e > 0)) return null;
-    const rr = Math.abs(i.takeProfit - e) / Math.abs(e - i.stopLoss);
+    // Directional: Math.abs would score a loss-side TP as a high R:R.
+    const reward = isBuy(i.side) ? i.takeProfit - e : e - i.takeProfit;
+    if (reward <= 0) return veto(`Take-profit ${i.takeProfit} is on the wrong side of entry ${e}`);
+    const rr = reward / Math.abs(e - i.stopLoss);
     return rr < LIMITS.minRewardRisk
       ? veto(`Reward/risk ${rr.toFixed(2)} is below ${LIMITS.minRewardRisk}`)
       : null;
@@ -708,7 +741,8 @@ const ENTRY_RULES: Record<string, Rule> = {
   },
 
   cooldown_after_loss: (_i, c) => {
-    const last = todaysClosed(c)[0];
+    // Newest close of any date: a 23:58 loss must still brake a 00:01 entry.
+    const last = c.closed[0];
     if (!last || last.realizedPnl >= 0 || last.closedAt == null) return null;
     const mins = (c.now.getTime() - new Date(last.closedAt).getTime()) / 60_000;
     return mins < LIMITS.cooldownMinutes
@@ -752,9 +786,16 @@ export function checkEntry(intent: EntryIntent, ctx: GuardContext): Decision {
   return decide(hits, intent.quantity);
 }
 
-/** Exit side: a stop may tighten or be set for the first time, never widen or vanish. */
+/** Exit side: a stop may tighten or be set for the first time, never widen or vanish.
+ *  A stop past the market is allowed: it exits at once, which reduces risk (Spec invariant). */
 export function checkStopChange(pos: Position, stopLoss: number | null | undefined): Decision {
   const hits: Hit[] = [];
+  if (stopLoss != null && !(Number.isFinite(stopLoss) && stopLoss > 0)) {
+    // The paper engine stores any number. A stop at 0 or below is bad input, not a
+    // price: it never fires on a LONG, and on a SHORT it exits on the next tick.
+    hits.push({ rule: "stop_invalid", verdict: "veto", reason: `Stop-loss ${stopLoss} is not a positive price` });
+    return decide(hits, pos.quantity);
+  }
   if (stopLoss === null && pos.stopLoss != null) {
     hits.push({ rule: "stop_removed", verdict: "veto", reason: "Removing the stop-loss of an open position" });
   }
@@ -779,7 +820,7 @@ npx vitest run src/services/__tests__/orderGuard.test.ts
 npm run typecheck 2>&1 | tail -5
 ```
 
-Expected: `20 passed`; typecheck output equals the baseline.
+Expected: `23 passed`; typecheck output equals the baseline.
 
 - [ ] **Step 5: Commit**
 
@@ -803,7 +844,7 @@ git commit -m "feat(guard): pure entry and stop-change rules for the paper termi
 - Test: `src/services/__tests__/guardRuntime.test.ts`
 
 **Interfaces:**
-- Consumes: Task 2 exports; `engine.placeOrder(PlaceOrderArgs): Order`, `engine.modifyPosition(id, mods): Position | undefined`, `engine.getPositions()`, `engine.getClosedPositions()`, `engine.getLastPrice(symbol): number`, `engine.mark(symbol, price)`, `engine.closePosition(id)`; `subscribeChannel(channel, handler)` and `publish(channel, event)` from `src/services/demo/bus.ts`
+- Consumes: Task 2 exports; `getSeedPrice(symbol): number` from `src/services/demo/candles.ts`; `engine.placeOrder(PlaceOrderArgs): Order`, `engine.modifyPosition(id, mods): Position | undefined`, `engine.getPositions()`, `engine.getClosedPositions()`, `engine.getLastPrice(symbol): number`, `engine.mark(symbol, price)`, `engine.closePosition(id)`; `subscribeChannel(channel, handler)` and `publish(channel, event)` from `src/services/demo/bus.ts`
 - Produces:
   - `guardedPlaceOrder(data: engine.PlaceOrderArgs, mode?: GuardMode): Order`
   - `guardedModifyPosition(positionId: string, mods: { takeProfit?: number | null; stopLoss?: number | null }, mode?: GuardMode): Position | undefined`
@@ -813,7 +854,9 @@ git commit -m "feat(guard): pure entry and stop-change rules for the paper termi
 **Assumptions:** A MARKET order fills synchronously inside `engine.placeOrder`, and `openPosition` pushes the new position at the end of the array, so the newest position is the last element of `engine.getPositions()`.
 
 **Done when:**
-- `npx vitest run src/services/__tests__/guardRuntime.test.ts` → 5 passed
+- `npx vitest run src/services/__tests__/guardRuntime.test.ts` → 6 passed
+- A MARKET entry on a symbol with no tick yet → judged against `getSeedPrice` (the engine's fill price), not skipped on price 0
+- `grep -n "import.meta.hot?.dispose" src/services/guard/guardRuntime.ts` → 1 match
 - `npx vitest run src/services/__tests__/demo-contract.test.ts src/services/__tests__/demo-engine-resting-orders.test.ts` → same result as the baseline
 - `npm run typecheck` → no new errors versus the baseline
 - Shadow mode, entry without a stop → order still FILLED, one `entry` log with verdict `veto`
@@ -830,7 +873,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as engine from "../demo/engine.ts";
 import { guardedModifyPosition, guardedPlaceOrder } from "../guard/guardRuntime.ts";
 
-/** The paper engine is a module singleton: each case claims its own symbol. */
+/** The paper engine is a module singleton: each case claims its own symbol.
+ *  Symbol isolation does NOT isolate the account-wide rules (daily_loss, loss_streak,
+ *  cooldown_after_loss read every symbol's closes). Keep every close at P&L >= 0
+ *  (close at the entry mark), or a later case trips the 5-minute loss cooldown. */
 const ACCOUNT = "guard-test";
 let logs: Record<string, unknown>[] = [];
 
@@ -891,6 +937,16 @@ describe("guard runtime", () => {
     logs = [];
     expect(guardedModifyPosition(pos.id, { stopLoss: 0.35 }, "enforce")!.stopLoss).toBe(0.35);
     expect(logs.filter((l) => l.kind === "stop_change")).toHaveLength(0);
+  });
+
+  it("judges a symbol with no tick yet against the seed price the engine fills at", () => {
+    // BTCUSD is never marked in this file. A stop far above any BTC price is on the
+    // wrong side of the seed fill, so stop_side must fire instead of skipping on price 0.
+    expect(engine.getLastPrice("BTCUSD")).toBe(0);
+    const order = guardedPlaceOrder(market("BTCUSD", { stopLoss: 1e9 }), "shadow");
+    expect(order.status).toBe("FILLED");
+    const entry = logs.find((l) => l.kind === "entry") as { decision: { hits: { rule: string }[] } };
+    expect(entry.decision.hits.map((h) => h.rule)).toContain("stop_side");
   });
 });
 ```
@@ -957,6 +1013,7 @@ Create `src/services/guard/guardRuntime.ts`:
 ```ts
 import type { ClosedPosition } from "../schemas.ts";
 import { subscribeChannel } from "../demo/bus.ts";
+import { getSeedPrice } from "../demo/candles.ts";
 import * as engine from "../demo/engine.ts";
 import { checkEntry, checkStopChange, GUARD_MODE, type Decision, type GuardMode } from "./orderGuard.ts";
 
@@ -990,7 +1047,9 @@ function vetoError(d: Decision): Error {
 export function guardedPlaceOrder(data: engine.PlaceOrderArgs, mode: GuardMode = GUARD_MODE) {
   const decision = checkEntry(data, {
     now: new Date(),
-    lastPrice: engine.getLastPrice(data.symbol),
+    // Same fallback as engine.placeOrder's MARKET fill: before the first tick the
+    // engine fills at the seed price, so the guard must judge against it too.
+    lastPrice: engine.getLastPrice(data.symbol) || getSeedPrice(data.symbol),
     positions: engine.getPositions(),
     closed: engine.getClosedPositions(),
   });
@@ -1040,7 +1099,7 @@ export function guardedModifyPosition(
   return engine.modifyPosition(positionId, mods);
 }
 
-subscribeChannel("closed-positions", (event) => {
+const unsubscribeOutcomes = subscribeChannel("closed-positions", (event) => {
   const c = (event as { _entity: ClosedPosition })._entity;
   postGuardLog({
     kind: "outcome",
@@ -1051,6 +1110,11 @@ subscribeChannel("closed-positions", (event) => {
     realizedPnl: c.realizedPnl,
   });
 });
+
+// HMR re-runs this module when orderGuard.ts changes, but bus.ts keeps its
+// subscribers: without this, every rule edit adds a duplicate outcome line
+// and guard_report.py would double the P&L of every later trade.
+import.meta.hot?.dispose(unsubscribeOutcomes);
 ```
 
 - [ ] **Step 5: Route `demoApi` through the runtime**
@@ -1113,9 +1177,10 @@ npx vitest run src/services/__tests__/guardRuntime.test.ts
 npx vitest run src/services/__tests__/demo-contract.test.ts src/services/__tests__/demo-engine-resting-orders.test.ts
 npm run typecheck 2>&1 | tail -5
 grep -n "closePosition\|cancelOrder\|closeAllPositions" src/services/guard/guardRuntime.ts
+grep -n "import.meta.hot?.dispose" src/services/guard/guardRuntime.ts
 ```
 
-Expected: `5 passed`; the two existing files match the baseline; typecheck matches the baseline; the grep shows only comment lines (lines inside the `/** … */` block).
+Expected: `6 passed`; the two existing files match the baseline; typecheck matches the baseline; the first grep shows only comment lines (lines inside the `/** … */` block); the second grep shows exactly 1 line.
 
 - [ ] **Step 7: Commit**
 
@@ -1130,7 +1195,7 @@ git commit -m "feat(guard): route paper entries and stop changes through the sha
 
 > Planned: 2026-10-19 ｜ Executed: ____
 
-**Blocked by:** None, can start immediately (D2 must be confirmed by the user first)
+**Blocked by:** None, can start immediately (D2 confirmed by the user 2026-10-20: C)
 
 **Files:**
 - Modify: `vite.config.ts` (import line, `plugins:` line, new function above `export default`)
@@ -1448,10 +1513,15 @@ git commit -m "feat(guard): report loss rate of flagged vs approved entries"
 
 ## After all tasks (user gate, not executor work)
 
-1. **D2 confirmation** before Task 4 runs.
+1. ~~**D2 confirmation** before Task 4 runs.~~ Done: the user confirmed C on 2026-10-20.
 2. Review and restart the TXF collector (Task 1 diff is uncommitted on purpose).
 3. Trade on the paper terminal in shadow mode. Every entry needs a stop to be "clean".
-4. Run `python scripts/guard_report.py` weekly. When it prints `PHASE2_GATE: READY`, the user changes `GUARD_MODE` to `"enforce"` in `src/services/guard/orderGuard.ts`.
+4. Run `python scripts/guard_report.py` weekly. When it prints `PHASE2_GATE: READY`, the user changes `GUARD_MODE` to `"enforce"` in `src/services/guard/orderGuard.ts`, **but only after the Phase 2 prerequisites below are done**.
+4a. **Phase 2 prerequisites（enforce 之前必補，Phase 1 不做）：**
+   - `demoApi.modifyOrder` 也要過守門員：PENDING 掛單可在成交前清空或拉寬停損（`OrderModifyDialog.tsx` 會送 `stopLoss: null`），enforce 下這是繞過路徑。
+   - `TradingPage.tsx` 的 `OrderConfirmDialog onConfirm`（`._submit().then(...).finally(...)`）沒有 `.catch`，行動版一鍵下單是 `.catch(() => {})`。enforce 的 `Guard veto` 會變成未處理的 rejection 或被靜默吞掉，必須補 `toast.error`。這是既有 bug（engine 本來就會丟 `No tradable price`），enforce 只是讓它更常發生。
+   - 掛單成交的結果要能 join：在 `fillOrder` 發出 `OrderFilled` 後記一行 `{kind:"fill", orderId, positionOpenedAt}`，或讓 Position 帶 `orderId`。
+5a. **附帶發現（Phase 1 不處理）：** `low_reliability_setup` 在日誌裡是 noul 型（`{"noul":0.68}`），`should_escalate` 讀 `value`/`choice`，所以 `lr_num` 恆為 0，該升級分支是死碼。
 5. Out of scope for Phase 1, in order of value: TXF order entry (connect `/vela` and the order path, or wire `shioajiApi` through the guard); Pine `alert()` JSON as an entry condition (each alert payload must carry `time`, because `RunResult.alerts` has no bar index: `src/pine/builtins/plot.ts` pushes `{ id, msg }` only); VELA `chart.drawings.add('position', …)` R:R box.
 
 ## Fact Annex (verified 2026-10-19)
@@ -1470,6 +1540,22 @@ git commit -m "feat(guard): report loss rate of flagged vs approved entries"
 | Python with pandas + pytest | `C:\Users\bear9\AppData\Local\Programs\Python\Python312\python.exe` (pinned in `scripts/jev-shadow-watchdog.ps1`) |
 | Scripts | `package.json`: `dev`=`vite`, `typecheck`=`tsc --noEmit`, `test`=`vitest run`; `tsconfig.json` `include: ["src", "vite-env.d.ts"]`, `noUncheckedIndexedAccess: true` |
 | Uncommitted user changes at planning time | `git status`: `scripts/jev-shadow.py`, `scripts/jev-sidecar.py`, `src/pages/VelaPage.tsx`, `src/services/shioaji/*.ts`, others |
+
+## Plan Revision Log
+
+- 2026-10-20（執行前，依外部審查 + 實測修訂）：
+  - Baseline 不跑全庫 vitest（實測 6.4 分鐘，會被 2 分鐘工具逾時砍掉），改跑 Task 3 會比對的兩個檔。
+  - `reward_risk` 改為有方向：停利在虧損側直接 veto（原 `Math.abs` 會把 TP 90 / entry 100 / SL 98 算成 R:R 5.0 放行）。
+  - `cooldown_after_loss` 改讀最新一筆平倉，不限日曆日（23:58 虧損、00:01 進場原本會漏擋）。
+  - `checkStopChange` 新增 `stop_invalid`（0、負數、NaN）。停損移過現價**不擋**：立即出場是降低風險，擋了違反 Spec invariant。
+  - `guardedPlaceOrder` 的 `lastPrice` 退回 `getSeedPrice`，和 engine 的市價成交價一致（原本未 tick 時為 0，價格規則全跳過）。
+  - outcome 訂閱加 `import.meta.hot?.dispose`（預防性）：若 HMR 重跑 `guardRuntime.ts` 而 `bus.ts` 保留舊訂閱者，改一次規則就多一行 outcome，報表損益翻倍。使用者決定保留此行、不另做實測（2026-10-20）。
+  - `RiskSession.gate` 的 `choice == 'flat'` 改為 `choice in ('flat', 'hold')`（使用者決定 2026-10-20）：Jev 只回 buy/hold/sell，原條件永遠不成立，hold 棒（約 83%）會落到 approve/reduce，`risk_gate` 統計失真。修正後 hold 棒記為 `veto / flat`。
+  - `stop_invalid` 對 SHORT 的 0／負停損也會擋（那種停損會立即出場）。這和「停損移過現價不擋」不衝突：0、負數、NaN 是無效輸入，不是降低風險的動作。
+  - 測試數：Task 2 20 → 23，Task 3 5 → 6。
+  - Task 3 Step 6 補上 `import.meta.hot?.dispose` 的 grep，和 Done when 對齊。
+  - D2 由使用者確認採方案 C（Vite dev middleware），Task 4 不再等人確認。
+  - 審查後**不採納**：在 `should_escalate` 用 `_is_volatile` 取代 `vnum >= 1.0`（會打破 `test_score_one_still_escalates`，且是升級成本取捨不是 bug）；`postGuardLog` 的 mode（`...event` 在後，明確 mode 會覆蓋）；`EntryIntent.type`（沒有任何 UI 入口在 MARKET 單帶 price）；`guard_report.load` 防呆（Step 4 已有 `test -f`）。
 
 ## Review Ledger
 

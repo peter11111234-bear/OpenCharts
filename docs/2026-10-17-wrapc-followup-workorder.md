@@ -74,3 +74,30 @@
 |---|---|---|
 | A2 | `strategyEquity.equityAt` 逐 bar 從 0 重放 ⇒ 超二次項（100 根 21.51→**798.21 ms**；500 根 148.43→**108,204.61 ms**） | 依 commit 邊界；修法＝`2026-10-17-t8a-snapshot-stepper.md` §1 選項①（stepper 順手記 `equity[b]`，`equityCurve` 改讀） |
 | A3 | T3 的 **A4 成長倍率未量**（`pine-bench` 的 `growth` 為空） | 需一道真實 ≥1000 根 tape：起 `shioaji:8080` 跑 `pine-bench --fetch-bars`；起服務後量測須重過 `quiet-gate` |
+
+---
+
+## C. 設定探索：把 omp 的 `judge` 角色指到免費 JEV 1.13（**已試、未成**，2026-10-17）
+
+**目標**：`modelRoles.judge` 由 `google-antigravity/gemini-4-argon` 改為免費 JEV（版本 1.13）。
+
+**已做**：`~/.omp/agent/models.yml` 新增 provider `jev-zen`（`baseUrl: https://opencode.ai/zen/v1`、金鑰以 YAML anchor 指向 opencode-go 那把＝與 `~/.local/share/opencode/auth.json` 的 `opencode-go` 同值、models `jev-1.13-free` 與 `jev-1.13`）；`config.yml` 的 `judge` 曾設 `jev-zen/jev-1.13-free`（`api: typesafe` 與 `kind: typesafe` 兩種寫法都試過）。
+
+**實測結果**
+
+| 檢查 | 結果 |
+|---|---|
+| 端點／金鑰／模型是否存在 | `curl POST https://opencode.ai/zen/v1/systemone` `{model:"jev-1.13-free"}` → **`FreeUsageLimitError`** ⇒ 三者都對，只是**免費配額用盡** |
+| JEV 能不能當 chat 模型用 | `zen/go/v1/chat/completions` → `Model is unavailable`；`zen/v1/chat/completions` → `FreeTierError`（"free tier can only be used from within OpenCode"）⇒ **不行**，JEV 只在 systemone 判定端點 |
+| `modelRoles.judge` 有沒有被吃 | **有**：設 `opencode-go/glm-5.3-flash` 時 `judge()` 立刻回答案 |
+| 設 `jev-zen/*` 時 | 兩次都失敗，且 omp 日誌**沒有任何**來自該候選的錯誤行 ⇒ 該 provider 沒被 judge 路徑採用，錯誤全部來自內建鏈 `typesafe/jev-latest` → `openrouter/~typesafe/jev-latest`（兩者 401，本機無 typesafe／openrouter 憑證） |
+
+**結論**：omp 的 judge 走內建候選鏈；`models.yml` 自建的 systemone provider 目前不被採用（`kind` vs `api` 皆試過）。**`judge` 已還原為 `google-antigravity/gemini-4-argon`（實測可用）**，`jev-zen` 區塊保留在 `models.yml` 供後續。
+
+**可行替代（三選一）**
+
+1. 走**受管管道** `jev_judge.py`（它自己 `jev-zen` 優先、`jev-direct` 後備；2026-10-17 實測走的是 `jev-direct`，因 zen 免費配額已盡）。
+2. omp 的 judge 改用**免費 chat 模型**：`providers.judgmentProvider: llm` ＋ 把 `tiny`／`smol` 指到免費模型（如 `magpie-zen/opencode-zen/*-free`）。
+3. omp 的 judge 改用**便宜可用**的 chat 模型：`judge: opencode-go/glm-5.3-flash`（實測可用）。
+
+**未解**：omp 期望的 systemone-kind provider 宣告方式（enum 有 `typesafe`／`workers-ai-systemone`，但 judge 客戶端未採用自建 provider）——待查 omp 文件或原始碼。

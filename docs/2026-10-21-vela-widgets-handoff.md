@@ -12,7 +12,7 @@
 |---|---|---|---|
 | 1 | 技術評分（半圓儀表＋均線/震盪兩列） | 頂列「評分」→ 側邊面板 `opencharts.tech-rating` | `src/pine/tech-rating.pine`、`src/pages/techRating.ts`、`techRatingPanel.ts`、`velaTechRating.ts` |
 | 2 | 報價列（加權 IX0001、大台 TXFR1、小台 MXFR1、微台 TMFR1、台積電 2330） | 常駐條，attachment `opencharts.quote-strip`（`dockStrip`） | `src/pages/quoteStrip.ts` |
-| 3 | 電子熱力圖（類股 24–31，權重前 60） | 頂列「熱力圖」→ 側邊面板 `opencharts.heatmap` | `src/pages/heatmap.ts` |
+| 3 | 主題熱力圖（2026-10-21 起依 `src/data/techThemes.json` 的 11 個科技主題分組，取代原本的電子類 24–31；說明見 `src/pages/heatmap.README.md`） | 頂列「熱力圖」→ 側邊面板 `opencharts.heatmap` | `src/pages/heatmap.ts` |
 | 4 | 排行榜（漲幅／跌幅／成交量／成交金額） | 頂列「排行」→ 側邊面板 `opencharts.hotlists` | `src/pages/hotlists.ts` |
 | – | 共用 | | `src/services/shioaji/marketData.ts`、`src/pages/marketKit.ts`、`src/pages/velaMarketWidgets.ts` |
 

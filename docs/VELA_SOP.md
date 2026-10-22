@@ -101,6 +101,7 @@ powershell -NoProfile -Command "(Invoke-WebRequest -Uri 'http://localhost:5173/s
 ```
 * **正常輸出**：`200`（連線成功並維持 SSE 串流）。
 * **檢查機制**：確認 `src/services/shioaji/velaProvider.ts` 的 `subscribe()` 是否有呼叫 `void startShioajiFeed()`。若漏呼叫，前端只會顯示開盤歷史靜態棒，無法隨盤中即時 Tick 自動更新。
+* **先查 `live` 開關（最常見）**：`src/pages/VelaPage.tsx` 的 `liveBarsEnabled()` 回 false 時 Vela 不會訂閱，F5 才補棒。2026-10-07～10-21 曾寫死 `live: false`。關閉／開啟：console `localStorage.setItem("vela-live","0"|"1")` 後 F5。
 
 ---
 

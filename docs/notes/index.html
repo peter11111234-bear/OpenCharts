@@ -1,0 +1,1138 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>交易研究知識庫 · 專業雙色工作台</title>
+  <style>
+    :root {
+      /* 側邊欄專用：專業黑曜石深色調 (Obsidian Dark) */
+      --sb-bg: #0b0f19;
+      --sb-surface: #111827;
+      --sb-hover: #1f293d;
+      --sb-border: #1e293b;
+      --sb-text: #f1f5f9;
+      --sb-muted: #94a3b8;
+      --sb-accent: #38bdf8;
+      --sb-accent-glow: rgba(56, 189, 248, 0.16);
+
+      /* 正文專用：紙質清爽淺色調 (Clean Paper Light) */
+      --main-bg: #f8fafc;
+      --main-surface: #ffffff;
+      --main-border: #e2e8f0;
+      --main-text: #334155;
+      --main-heading: #0f172a;
+      --main-muted: #64748b;
+      --main-accent: #0284c7;
+      --main-accent-glow: rgba(2, 132, 199, 0.08);
+
+      --green: #059669;
+      --green-bg: rgba(5, 150, 105, 0.08);
+      --green-border: rgba(5, 150, 105, 0.25);
+
+      --amber: #b45309;
+      --amber-bg: rgba(217, 119, 6, 0.08);
+      --amber-border: rgba(217, 119, 6, 0.25);
+
+      --red: #b91c1c;
+      --red-bg: rgba(220, 38, 38, 0.08);
+      --red-border: rgba(220, 38, 38, 0.25);
+
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; font-family: var(--font-sans); background: var(--main-bg); color: var(--main-text); }
+
+    .app-layout {
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ========================================================
+       1. 左側側邊欄：深色系 (Dark Sidebar)
+       ======================================================== */
+    .sidebar {
+      width: 290px;
+      min-width: 290px;
+      background: var(--sb-bg);
+      border-right: 1px solid var(--sb-border);
+      display: flex;
+      flex-direction: column;
+      transition: margin-left 0.25s ease;
+      z-index: 20;
+    }
+
+    .sidebar.collapsed {
+      margin-left: -290px;
+    }
+
+    .sidebar-header {
+      padding: 16px;
+      border-bottom: 1px solid var(--sb-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 15px;
+      color: var(--sb-text);
+      letter-spacing: -0.3px;
+    }
+    .brand-icon {
+      background: var(--sb-accent-glow);
+      color: var(--sb-accent);
+      padding: 5px 8px;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+
+    .search-box {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--sb-border);
+    }
+
+    .search-input {
+      width: 100%;
+      background: var(--sb-surface);
+      border: 1px solid var(--sb-border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      color: var(--sb-text);
+      font-size: 12.5px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .search-input:focus { border-color: var(--sb-accent); }
+
+    /* Tree Explorer */
+    .explorer {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px 8px;
+    }
+
+    details.folder { margin-bottom: 6px; }
+    details.folder > summary {
+      padding: 7px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--sb-muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      list-style: none;
+      user-select: none;
+      transition: background 0.15s, color 0.15s;
+    }
+    details.folder > summary::-webkit-details-marker { display: none; }
+    details.folder > summary:hover {
+      background: var(--sb-hover);
+      color: var(--sb-text);
+    }
+    details.folder[open] > summary { color: var(--sb-accent); }
+
+    .folder-title-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .folder-items {
+      padding-left: 12px;
+      margin-top: 2px;
+      border-left: 1px dashed var(--sb-border);
+      margin-left: 14px;
+    }
+
+    .note-link {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      color: var(--sb-muted);
+      text-decoration: none;
+      font-size: 12.5px;
+      transition: all 0.15s;
+      margin-bottom: 2px;
+      cursor: pointer;
+    }
+    .note-link:hover {
+      background: var(--sb-hover);
+      color: var(--sb-text);
+    }
+    .note-link.active {
+      background: var(--sb-accent-glow);
+      color: var(--sb-accent);
+      font-weight: 600;
+    }
+
+    /* Sidebar Footer */
+    .sidebar-footer {
+      padding: 12px 14px;
+      border-top: 1px solid var(--sb-border);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 7px 12px;
+      border-radius: 6px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: all 0.15s;
+      outline: none;
+    }
+    .btn-sb-primary { background: var(--sb-accent); color: #0b0f19; }
+    .btn-sb-primary:hover { filter: brightness(1.1); }
+    .btn-sb-outline { background: var(--sb-surface); border-color: var(--sb-border); color: var(--sb-text); }
+    .btn-sb-outline:hover { border-color: var(--sb-accent); background: var(--sb-hover); }
+
+    /* ========================================================
+       2. 右側正文區：極致清爽紙質淺色 (Clean Paper Light)
+       ======================================================== */
+    .main-pane {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+      background: var(--main-bg);
+    }
+
+    .top-nav {
+      height: 48px;
+      background: var(--main-surface);
+      border-bottom: 1px solid var(--main-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      z-index: 10;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+    }
+
+    .top-nav-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .breadcrumb {
+      font-size: 13px;
+      font-family: var(--font-mono);
+      color: var(--main-muted);
+    }
+
+    .top-nav-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .icon-btn {
+      background: var(--main-surface);
+      border: 1px solid var(--main-border);
+      color: var(--main-muted);
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-size: 14px;
+    }
+    .icon-btn:hover { color: var(--main-heading); border-color: var(--main-accent); }
+
+    .btn-export {
+      background: var(--main-surface);
+      border: 1px solid var(--main-border);
+      color: var(--main-text);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .btn-export:hover {
+      border-color: var(--main-accent);
+      color: var(--main-accent);
+    }
+
+    /* Reading Scroll Area */
+    .content-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 36px 32px 80px;
+      scroll-behavior: smooth;
+    }
+
+    .article-container {
+      max-width: 860px;
+      margin: 0 auto;
+    }
+
+    /* Typography & Light Content Elements */
+    h1 { font-size: 26px; color: var(--main-heading); margin-bottom: 8px; font-weight: 700; letter-spacing: -0.4px; }
+    h2 { font-size: 19px; color: var(--main-heading); margin: 36px 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--main-border); font-weight: 600; }
+    h3 { font-size: 15.5px; color: var(--main-heading); margin: 20px 0 10px; font-weight: 600; }
+    p { margin-bottom: 14px; line-height: 1.7; font-size: 14.5px; color: var(--main-text); }
+    ul, ol { padding-left: 24px; margin-bottom: 16px; font-size: 14.5px; color: var(--main-text); }
+    li { margin-bottom: 6px; }
+
+    .card {
+      background: var(--main-surface);
+      border: 1px solid var(--main-border);
+      border-radius: 8px;
+      padding: 20px;
+      margin: 18px 0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+    }
+    .card-highlight {
+      border-left: 4px solid var(--main-accent);
+      background: linear-gradient(90deg, var(--main-accent-glow) 0%, var(--main-surface) 100%);
+    }
+
+    .callout {
+      padding: 12px 16px;
+      border-radius: 6px;
+      margin: 16px 0;
+      font-size: 13.5px;
+      border: 1px solid transparent;
+    }
+    .callout-green { background: var(--green-bg); color: var(--green); border-color: var(--green-border); }
+    .callout-amber { background: var(--amber-bg); color: var(--amber); border-color: var(--amber-border); }
+    .callout-red { background: var(--red-bg); color: var(--red); border-color: var(--red-border); }
+
+    table { width: 100%; border-collapse: collapse; margin: 18px 0 24px; font-size: 13.5px; background: var(--main-surface); }
+    th, td { padding: 10px 14px; border: 1px solid var(--main-border); text-align: left; }
+    th { background: #f1f5f9; color: var(--main-heading); font-weight: 600; }
+
+    pre, code { font-family: var(--font-mono); font-size: 13px; }
+    pre {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      color: #f8fafc;
+      border-radius: 8px;
+      padding: 16px;
+      overflow-x: auto;
+      margin: 14px 0 20px;
+      line-height: 1.5;
+    }
+    p code, td code {
+      background: #e2e8f0;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: var(--main-heading);
+      font-size: 12.5px;
+    }
+
+    .formula {
+      background: #f0f9ff;
+      border: 1px dashed #bae6fd;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 14px 0;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      color: #0369a1;
+      line-height: 1.55;
+    }
+
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11.5px; font-weight: 600; margin-right: 4px; }
+    .badge-green { background: var(--green-bg); color: var(--green); }
+    .badge-amber { background: var(--amber-bg); color: var(--amber); }
+    .badge-red { background: var(--red-bg); color: var(--red); }
+
+    .nav-bar {
+      position: sticky;
+      top: -16px;
+      background: var(--main-surface);
+      border: 1px solid var(--main-border);
+      border-radius: 8px;
+      padding: 8px 14px;
+      margin-bottom: 24px;
+      display: flex;
+      gap: 12px;
+      overflow-x: auto;
+      font-size: 13px;
+      z-index: 5;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+    }
+    .nav-bar a { color: var(--main-muted); text-decoration: none; white-space: nowrap; transition: color 0.15s; }
+    .nav-bar a:hover { color: var(--main-accent); }
+
+    /* Modal */
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); display: none; align-items: center; justify-content: center; z-index: 999; }
+    .modal-backdrop.show { display: flex; }
+    .modal { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 10px; width: 440px; padding: 22px; box-shadow: 0 16px 36px rgba(0,0,0,0.2); }
+    .modal h3 { margin-bottom: 14px; font-size: 16px; color: #0f172a; }
+    .form-group { margin-bottom: 12px; }
+    .form-group label { display: block; font-size: 12.5px; color: #64748b; margin-bottom: 5px; }
+    .form-control { width: 100%; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; color: #0f172a; font-size: 13px; outline: none; }
+    .form-control:focus { border-color: #0284c7; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+  </style>
+</head>
+<body>
+
+<div class="app-layout">
+
+  <!-- Left Sidebar (Always Dark & Sleek) -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="brand">
+        <span class="brand-icon">📚</span>
+        <span>交易研究知識庫</span>
+      </div>
+      <button class="icon-btn" style="border-color: var(--sb-border); color: var(--sb-muted);" onclick="toggleSidebar()" title="收折側邊欄">☰</button>
+    </div>
+
+    <!-- Search -->
+    <div class="search-box">
+      <input type="text" class="search-input" id="search-input" placeholder="🔍 搜尋筆記或關鍵字..." oninput="filterNotes()">
+    </div>
+
+    <!-- Tree Explorer -->
+    <div class="explorer" id="explorer">
+
+      <!-- Folder 1: 技術指標 -->
+      <details class="folder" open>
+        <summary>
+          <div class="folder-title-left">
+            <span>📁</span>
+            <span>01_技術指標研究</span>
+          </div>
+        </summary>
+        <div class="folder-items">
+          <div class="note-link active" id="link-note1" onclick="showNote('note1', this)">
+            <span>📄</span>
+            <span>01. ATR、ADX 與 CHOP 實戰量化體系</span>
+          </div>
+          <div class="note-link" onclick="showNote('note2', this)">
+            <span>📄</span>
+            <span>02. 顧比複合均線 (GMMA) 多空共振架構</span>
+          </div>
+        </div>
+      </details>
+
+      <!-- Folder 2: 交易策略 -->
+      <details class="folder" open>
+        <summary>
+          <div class="folder-title-left">
+            <span>📁</span>
+            <span>02_量化交易策略</span>
+          </div>
+        </summary>
+        <div class="folder-items">
+          <div class="note-link" onclick="showNote('note-strat1', this)">
+            <span>📄</span>
+            <span>01. TRIS390 旗艦策略全邏輯拆解</span>
+          </div>
+        </div>
+      </details>
+
+      <!-- Folder 3: AI 決策管線 -->
+      <details class="folder" open>
+        <summary>
+          <div class="folder-title-left">
+            <span>📁</span>
+            <span>03_AI決策管線</span>
+          </div>
+        </summary>
+        <div class="folder-items">
+          <div class="note-link" onclick="showNote('note-ai1', this)">
+            <span>📄</span>
+            <span>01. Jev Sidecar 14道決策問卷規格</span>
+          </div>
+        </div>
+      </details>
+
+    </div>
+
+    <!-- Sidebar Footer Actions -->
+    <div class="sidebar-footer">
+      <div style="display: flex; gap: 6px;">
+        <button class="btn btn-sb-primary" style="flex: 1;" onclick="openNewFolderModal()">
+          <span>📁⁺ 新建分類</span>
+        </button>
+        <button class="btn btn-sb-outline" style="flex: 1;" onclick="openNewNoteModal()">
+          <span>📄⁺ 新增筆記</span>
+        </button>
+      </div>
+      <button class="btn btn-sb-outline" style="font-size: 11.5px;" onclick="bindLocalDirectory()">
+        <span id="bind-status-btn">📂 綁定桌面/硬碟目錄 (自動持久化)</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- Right Reading Pane (Clean Paper Light) -->
+  <main class="main-pane">
+    <!-- Top Nav -->
+    <div class="top-nav">
+      <div class="top-nav-left">
+        <button class="icon-btn" onclick="toggleSidebar()" title="收折/展開側邊欄">☰</button>
+        <div class="breadcrumb" id="breadcrumb">01_技術指標研究 / 01. ATR、ADX 與 CHOP 實戰量化體系</div>
+      </div>
+      <div class="top-nav-right">
+        <button class="btn-export" onclick="downloadCurrentArticle()">
+          <span>💾 匯出目前 HTML</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Article Content (Single Scroll Container) -->
+    <div class="content-scroll" id="content-scroll">
+      <div class="article-container" id="article-body">
+<!-- Header -->
+  <header>
+    <div class="title-group">
+      <h1>技術指標研究筆記（一）</h1>
+      <p>ATR、ADX、DMI（PDI/MDI）與 CHOP 實戰量化體系 · 專案落地研究</p>
+      <p style="margin-top: 4px; font-size: 12px;">日期：2026-10-18 · 對標代碼：<code>TRIS390.pine</code> ＆ <code>jev-shadow.py</code></p>
+    </div>
+    <button class="theme-toggle" onclick="toggleTheme()">🌓 切換主題</button>
+  </header>
+
+  <!-- Quick Nav -->
+  <nav class="nav-bar">
+    <a href="#sec-overview">體系總覽</a>
+    <a href="#sec-dmi">DMI (PDI/MDI)</a>
+    <a href="#sec-adx">ADX 趨勢強度</a>
+    <a href="#sec-chop">CHOP 碎形指標</a>
+    <a href="#sec-combo">雙重共振過濾</a>
+    <a href="#sec-timeframe">週期框架</a>
+    <a href="#sec-code">程式碼實作落地</a>
+  </nav>
+
+  <!-- 1. 體系總覽 -->
+  <section id="sec-overview">
+    <h2>1. 四大核心指標量化體系總覽</h2>
+    <p>在趨勢追蹤（Trend Following）與突破交易中，最常造成虧損的主因並非「方向猜錯」，而是「在錯誤的環境做單」——即**在無方向的洗盤泥淖中頻繁順勢追價，導致多空反覆雙巴**。本套體系利用四大指標分工形成立體防護網：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>指標</th>
+          <th>英文全稱</th>
+          <th>衡量目標</th>
+          <th>核心功能</th>
+          <th>警戒/關鍵閥值</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>ATR</strong></td>
+          <td>Average True Range</td>
+          <td><strong>真實振幅</strong></td>
+          <td>動態停損距離計算、波動率擴張/壓縮判定</td>
+          <td>相對歷史百分位</td>
+        </tr>
+        <tr>
+          <td><strong>PDI (+DI)</strong></td>
+          <td>Plus Directional Indicator</td>
+          <td><strong>多方攻擊力道</strong></td>
+          <td>衡量向上突破動能，辨別漲勢主導權</td>
+          <td>PDI &gt; MDI (多方掌控)</td>
+        </tr>
+        <tr>
+          <td><strong>MDI (-DI)</strong></td>
+          <td>Minus Directional Indicator</td>
+          <td><strong>空方打壓力道</strong></td>
+          <td>衡量向下摜壓動能，辨別跌勢主導權</td>
+          <td>MDI &gt; PDI (空方掌控)</td>
+        </tr>
+        <tr>
+          <td><strong>ADX</strong></td>
+          <td>Average Directional Index</td>
+          <td><strong>趨勢總強度</strong></td>
+          <td>過濾假突破/假跌破，判斷市場是否具備單邊動能</td>
+          <td>&gt; 25.0 (趨勢成立) / &lt; 20 (無動能)</td>
+        </tr>
+        <tr>
+          <td><strong>CHOP</strong></td>
+          <td>Choppiness Index</td>
+          <td><strong>碎形路徑效率</strong></td>
+          <td>辨別洗盤絞肉區，識別市場是否在折返跑原地踏步</td>
+          <td>&lt; 60.0 (趨勢環境) / &ge; 60.0 (泡茶盤整)</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 2. DMI 體系 -->
+  <section id="sec-dmi">
+    <h2>2. DMI 體系（PDI 與 MDI）—— 破解 ADX 的「方向色盲」</h2>
+    
+    <div class="card card-highlight">
+      <h3>核心痛點：為什麼不能單看 ADX？</h3>
+      <p><strong>ADX 本身是完全「色盲」的！</strong> 當行情連續急跌暴跌，ADX 會飆高到 40；當行情連續急拉暴漲，ADX 也會飆高到 40。如果 AI 或策略只讀取 ADX，它只知道「現在行情爆大」，但完全無法辨認究竟是<strong>大多頭</strong>還是<strong>大空頭</strong>。</p>
+    </div>
+
+    <h3>數學原理解析</h3>
+    <p>Welles Wilder 透過觀察當前 K 棒邊界相對前一根 K 棒的突破幅度來定義方向位移（Directional Movement）：</p>
+    <div class="formula">
++DM = (Today's High - Yesterday's High) > 0 且大於下跌位移時，否則為 0<br>
+-DM = (Yesterday's Low - Today's Low) > 0 且大於上漲位移時，否則為 0<br>
+PDI (+DI) = 100 × WilderSmooth(+DM, 14) / ATR(14)<br>
+MDI (-DI) = 100 × WilderSmooth(-DM, 14) / ATR(14)
+    </div>
+
+    <h3>實戰交易規則</h3>
+    <ul>
+      <li><span class="badge badge-green">PDI &gt; MDI</span> <strong>買方主導</strong>：多方向上突破的動能壓過空方，順勢以逢低做多為主。</li>
+      <li><span class="badge badge-red">MDI &gt; PDI</span> <strong>賣方主導</strong>：空方向下摜壓的動能壓過多方，順勢以逢高做空為主。</li>
+      <li><span class="badge badge-amber">兩線黃金/死亡交叉</span> 往往是日線或小時線級別趨勢反轉的第一個先鋒訊號。</li>
+    </ul>
+  </section>
+
+  <!-- 3. ADX 趨勢強度 -->
+  <section id="sec-adx">
+    <h2>3. ADX 趨勢強度 —— 為什麼單根暴跌大黑K拉不動 ADX？</h2>
+
+    <p>市場常見的慘劇是：<strong>「盤整時突然往下一根 80 點大黑K破底，散戶嚇瘋追空，結果剛好空在全天最低點（阿呆谷），下一秒直接 V 轉拉回！」</strong></p>
+    <p>在成熟量化體系中，這筆空單會被 ADX <strong>百分之百物理擋下</strong>。原因包含三個層面：</p>
+
+    <div class="card">
+      <h3>層面 1：雙重 Wilder 平滑的數學抑制</h3>
+      <p>ADX 不是即時時速表，而是由兩層 14 週期的指數平滑組成的重型指標：</p>
+      <div class="formula">
+DX = 100 × |PDI - MDI| / (PDI + MDI)<br>
+ADX = WilderSmooth(DX, 14)
+      </div>
+      <p>Wilder 平滑公式每根 K 棒的新資料權重只有：</p>
+      <div class="formula">
+Weight(New) = 1 / 14 ≈ 7.14%<br>
+Weight(History) = 13 / 14 ≈ 92.86%
+      </div>
+      <p>若過去 13 根 K 棒都在死魚盤整（ADX 原本趴在 15），突然出現一根暴跌黑K，就像<strong>將一滴紅墨水滴進一大桶清水</strong>，整桶水稍微變濁，但數值頂多從 15.0 蠕動到 16.5，**完全無法越過 25.0 的趨勢門檻**！</p>
+    </div>
+
+    <div class="card">
+      <h3>層面 2：微觀結構揭密 —— 那根暴跌黑K究竟是什麼？</h3>
+      <p>既然不是真趨勢，為什麼圖表上會出現大黑K？</p>
+      <ul>
+        <li><strong>掃停損（Stop-Loss Hunt）</strong>：箱型盤整時，多數散戶的多單停損市價賣單全都堆疊在關鍵支撐點下方。主力只需用少量籌碼瞬間敲破支撐，就會觸發骨牌效應引發連鎖市價賣出，在 10 秒內打出 50 點長下影大黑K。</li>
+        <li><strong>真空滑價</strong>：在中午流動性匱乏時段，薄弱的買盤委託簿容易因少量拋盤出現短暫價格懸崖。</li>
+        <li><strong>真趨勢 vs 假洗盤特徵</strong>：
+          <ul>
+            <li><strong>真趨勢</strong>：主力持續性、多根 K 棒連續大量出貨，ADX 會穩步爬升越過 25。</li>
+            <li><strong>假破底</strong>：單根爆量下殺但隨後成交量急縮，ADX 趴在 20 以下不動。</li>
+          </ul>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- 4. CHOP 碎形指標 -->
+  <section id="sec-chop">
+    <h2>4. CHOP（Choppiness Index）—— 碎形路徑效率與「泡茶盤」</h2>
+
+    <p>由 E.W. Dreiss 提出的 Choppiness Index 衡量的是價格走勢的<strong>碎形維度（Fractal Dimension）</strong>，即「累積跑過的總里程」與「起點到終點直線淨位移」的比率。</p>
+
+    <div class="formula">
+CHOP = 100 × log10( Sum(TrueRange, 14) / (HighestHigh(14) - LowestLow(14)) ) / log10(14)
+    </div>
+
+    <div class="callout callout-amber">
+      <strong>「CHOP 40 ~ 65 是盤整區間」這句話對嗎？</strong><br>
+      <strong>不完全正確！</strong> 40 ~ 55 經常包含穩健推進的「慢牛 / 慢熊趨勢」（走 3 步退 1 步）。若將 40 以上都視為盤整，將錯過大部分最穩定的波段利潤。<strong>只有 60（或經典 61.8）以上才是嚴禁進場的「真正泡茶盤」</strong>。
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>CHOP 數值區間</th>
+          <th>市場狀態</th>
+          <th>實戰意涵</th>
+          <th>TRIS390 處理邏輯</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="badge badge-green">&le; 40.0</span></td>
+          <td><strong>Clean Trend (強勢單邊)</strong></td>
+          <td>直線噴出或雪崩，能量未被消耗，順勢做單最舒服的黃金期。</td>
+          <td>全速開單，利潤奔跑</td>
+        </tr>
+        <tr>
+          <td><span class="badge badge-amber">40.0 ~ 60.0</span></td>
+          <td><strong>Transitional (過渡整理帶)</strong></td>
+          <td>包含兩種情境：(1) 急漲後的良性旗型回檔；(2) 盤整末期的三角收斂蓄勢。</td>
+          <td>放行進場 (&lt; 60)，但建議搭配共振確認</td>
+        </tr>
+        <tr>
+          <td><span class="badge badge-red">&ge; 60.0</span></td>
+          <td><strong>Choppy Range (泥淖絞肉區)</strong></td>
+          <td>多空互扯，過去 14 根 K 棒 60% 以上的能量互相抵消，原地折返跑。</td>
+          <td><strong>物理鎖死開關 (isTrendingEnv = false)</strong>，全面禁止開倉</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 5. 雙重共振過濾 -->
+  <section id="sec-combo">
+    <h2>5. 雙重共振過濾：ADX &gt; 25 與 CHOP &lt; 60 的實戰照妖鏡</h2>
+
+    <p>在 <code>TRIS390.pine</code> 策略中，將這兩個指標組合為進場的必備門檻：</p>
+    <div class="formula">
+bool isTrendingEnv = (adxValue > 25.0 and chopValue < 60.0)
+    </div>
+
+    <p>將兩者比喻為開車系統：</p>
+    <ul>
+      <li><strong>ADX 是「引擎油門深度」</strong>：ADX &lt; 20 代表沒有主力踩油門，動力空轉。</li>
+      <li><strong>CHOP 是「方向盤穩定度」</strong>：CHOP &ge; 60 代表方向盤左右劇烈打轉，車子原地打滑折返跑。</li>
+    </ul>
+
+    <div class="card card-highlight">
+      <h3>互為雙重保險的典型場景</h3>
+      <ol>
+        <li><strong>破除誘多陷阱（假突破）</strong>：一根長紅拔起，ADX 瞬間被短線拉高到 26（以為要噴了！）；但回頭看 CHOP 依然高達 64（整體結構仍被卡在箱型泥淖內）&rarr; <strong>被 CHOP 擋下，免於追在最高點</strong>。</li>
+        <li><strong>破除誘空陷阱（假摜破）</strong>：突然重挫跌破支撐線；但 ADX 只有 16（完全沒有持續殺盤動量）&rarr; <strong>被 ADX 擋下，免於空在阿呆谷</strong>。</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- 6. 週期選擇架構 -->
+  <section id="sec-timeframe">
+    <h2>6. 週期架構指南（台指期專用實戰規劃）</h2>
+
+    <p>台指期日盤時間僅 5 小時（08:45 ~ 13:45），不可生搬外匯或加密貨幣的 4H 框架：</p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>交易類型</th>
+          <th>大週期濾網 (Macro Trend Filter)</th>
+          <th>執行與觸發週期 (Execution Trigger)</th>
+          <th>設計原因與操作邏輯</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>當沖交易 (Intraday)</strong><br><span style="font-size: 12px; color: var(--text-muted);">當天平倉不留倉</span></td>
+          <td><strong>30 分鐘 (30m)</strong> 或 <strong>15 分鐘 (15m)</strong><br>ADX &gt; 25 &amp; CHOP &lt; 60</td>
+          <td><strong>5 分鐘 (5m)</strong> 或 <strong>1 分鐘 (1m)</strong></td>
+          <td>30m 棒子一天只有 10 根，14 週期覆蓋一天半，足以過濾一整天的雜訊。30m 亮綠燈時，在 5m 找拉回均線的順勢上車點。</td>
+        </tr>
+        <tr>
+          <td><strong>隔夜短波 (Swing)</strong><br><span style="font-size: 12px; color: var(--text-muted);">留倉 2 ~ 5 天</span></td>
+          <td><strong>60 分鐘 (1H)</strong><br>ADX &gt; 25 &amp; CHOP &lt; 45</td>
+          <td><strong>15 分鐘 (15m)</strong></td>
+          <td>1H 覆蓋近 3 個交易日。1H 的 CHOP 低於 45 代表跨日級別的大行情發動，不怕盤中洗盤，安心抱單過夜。</td>
+        </tr>
+        <tr>
+          <td><strong>避坑警告</strong></td>
+          <td colspan="3"><strong>請勿在台指期使用 4 小時 (4H) 看 ADX/CHOP</strong>。日盤一天僅 1.25 根 4H K棒，計算 14 週期需要近兩週，信號嚴重鈍化，完全無法應對台指當沖與短波。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 7. 程式碼落地篇 -->
+  <section id="sec-code">
+    <h2>7. 專案程式碼落地與對齊清單</h2>
+
+    <h3>7.1 Pine 策略端：<code>src/pine/TRIS390.pine</code></h3>
+    <pre><code>// 盤整過濾設置
+useTrendFilter = input.bool(true, "啟用盤整過濾 (ADX & CHOP)", group=grpFilter)
+adxThreshold   = input.float(25.0, "ADX 趨勢閥值 (>)", group=grpFilter)
+chopThreshold  = input.float(60.0, "CHOP 震盪閥值 (<)", group=grpFilter)
+
+// 運算邏輯
+[_, _, adxValue] = ta.dmi(diLength = 14, adxSmoothing = 14)
+float trSum       = math.sum(ta.tr, 14)
+float rangeDiff   = ta.highest(high, 14) - ta.lowest(low, 14)
+float chopValue   = rangeDiff == 0 ? 100 : 100 * math.log10(trSum / rangeDiff) / math.log10(14)
+
+// 趨勢環境總開關
+bool isTrendingEnv = useTrendFilter ? (adxValue > adxThreshold and chopValue < chopThreshold) : true</code></pre>
+
+    <h3>7.2 Python 端：<code>scripts/jev-shadow.py</code> 特徵計算補全</h3>
+    <pre><code># 1. 計算 DMI 與 CHOP (對標 TRIS390.pine:289-293)
+atr14 = _wilder(tr, 14)
+pdi, mdi = 100 * _wilder(pdm, 14) / atr14, 100 * _wilder(mdm, 14) / atr14
+adx = _wilder(100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, float("nan")), 14)
+
+tr_sum_14 = tr.rolling(14).sum()
+range_diff_14 = high.rolling(14).max() - low.rolling(14).min()
+chop_ratio = (tr_sum_14 / range_diff_14.replace(0, float("nan"))).clip(lower=1e-9)
+chop_14 = 100.0 * (np.log10(chop_ratio) / np.log10(14.0))
+chop_14 = chop_14.mask(range_diff_14 == 0, 100.0)
+
+# 2. 注入 state 輸出字典
+out.update({
+    "average_directional_index_14": _last(adx.iloc[-1]),
+    "plus_di_14": _last(pdi.iloc[-1]),
+    "minus_di_14": _last(mdi.iloc[-1]),
+    "chop_14": _last(chop_14.iloc[-1]),
+    "atr14": _last(atr14.iloc[-1]),
+})</code></pre>
+
+    <h3>7.3 Jev Sidecar 新增問卷規格（14 道決策問卷）</h3>
+    <pre><code># 新增之 3 道題目 (scripts/jev-shadow.py:186-212)
+"volatility_amplitude_atr": {
+    "type": "choice",
+    "instructions": "Evaluate current price amplitude and volatility using `atr14` relative to `current_price` and recent day range.",
+    "criteria": {
+        "compressed": "ATR is low, tightly coiled, awaiting expansion.",
+        "normal": "ATR is within typical intraday expansion levels.",
+        "expanded_or_exhausted": "ATR is unusually wide with climactic erratic bars, high volatility risk."
+    }
+},
+"trend_breakout_adx": {
+    "type": "choice",
+    "instructions": "Using `average_directional_index_14`, `plus_di_14`, and `minus_di_14`, classify the trend breakout direction.",
+    "criteria": {
+        "bullish_breakout": "ADX > 25 with +DI clearly above -DI, strong upward momentum.",
+        "bearish_breakout": "ADX > 25 with -DI clearly above +DI, strong downward breakdown.",
+        "consolidation": "ADX < 20 or DIs intertwined with no directional leadership."
+    }
+},
+"choppiness_regime": {
+    "type": "choice",
+    "instructions": "Using `chop_14` (where >= 60 is choppy range and < 60 is trend according to TRIS390 threshold), is market choppy?",
+    "criteria": {
+        "choppy_range": "CHOP >= 60, oscillating in consolidation zone with high false breakout risk.",
+        "transitional": "CHOP between 45 and 60, transitioning between consolidation and breakout.",
+        "clean_trend": "CHOP < 45, clean directional trending environment."
+    }
+}</code></pre>
+  </section>
+      </div>
+    </div>
+  </main>
+
+</div>
+
+<!-- Modal 1: New Folder -->
+<div class="modal-backdrop" id="new-folder-modal">
+  <div class="modal">
+    <h3>📁⁺ 新增分類資料夾</h3>
+    <div class="form-group">
+      <label>資料夾名稱</label>
+      <input type="text" class="form-control" id="modal-folder-name" placeholder="例：04_台指夜盤籌碼">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-sb-outline" style="color: #0f172a;" onclick="closeNewFolderModal()">取消</button>
+      <button class="btn btn-sb-primary" onclick="createFolder()">建立</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal 2: New Note -->
+<div class="modal-backdrop" id="new-note-modal">
+  <div class="modal">
+    <h3>📄⁺ 新增筆記</h3>
+    <div class="form-group">
+      <label>所屬分類</label>
+      <select class="form-control" id="modal-note-folder"></select>
+    </div>
+    <div class="form-group">
+      <label>筆記標題</label>
+      <input type="text" class="form-control" id="modal-note-title" placeholder="例：開盤第一根 15 分鐘形態觀察">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-sb-outline" style="color: #0f172a;" onclick="closeNewNoteModal()">取消</button>
+      <button class="btn btn-sb-primary" onclick="createNote()">建立筆記</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Article Store for Instant Zero-Reload Switch
+  const ARTICLES = {
+    'note1': {
+      path: '01_技術指標研究 / 01. ATR、ADX 與 CHOP 實戰量化體系',
+      html: document.getElementById('article-body').innerHTML
+    },
+    'note2': {
+      path: '01_技術指標研究 / 02. 顧比複合均線 (GMMA) 多空共振架構',
+      html: `
+        <header style="border-bottom: 1px solid var(--main-border); padding-bottom: 20px; margin-bottom: 30px;">
+          <h1>顧比複合均線 (GMMA) 多空共振架構</h1>
+          <p style="color: var(--main-muted); font-size: 13.5px;">短期組 vs 長期組收斂發散實戰 · 專案對標：<code>TRIS390.pine:42-50</code></p>
+        </header>
+        <div class="card card-highlight">
+          <h3>核心概念：短期投機組 vs 長期投資組</h3>
+          <p>由戴若·顧比（Daryl Guppy）發明的 GMMA 由兩組指數移動平均線（EMA）組成：</p>
+          <ul>
+            <li><strong>短期組（EMA 3, 5, 8, 10, 12, 15）</strong>：代表市場散戶與短線投機客的即時追價意願。</li>
+            <li><strong>長期組（EMA 30, 35, 40, 45, 50, 60）</strong>：代表法人大戶、機構資金的持倉成本與大趨勢方向。</li>
+          </ul>
+        </div>
+        <h2>實戰判讀法則</h2>
+        <div class="card">
+          <h3>1. 趨勢真確立（共振發散）</h3>
+          <p>短期組完全位在長期組之上，且兩組均線呈現整齊的平行發散狀。此時拉回短期組下緣都是絕佳買點。</p>
+          <h3>2. 快速反轉預警（Early Alert）</h3>
+          <p>在 <code>TRIS390.pine:45</code> 中設定了 <code>showGMMAEarly</code>：當短期組急遽收縮並向長期組靠攏，甚至出現倒掛時，即使大趨勢未破，也必須提防假突破或急遽折返。</p>
+        </div>
+      `
+    },
+    'note-strat1': {
+      path: '02_量化交易策略 / 01. TRIS390 旗艦策略全邏輯拆解',
+      html: `
+        <header style="border-bottom: 1px solid var(--main-border); padding-bottom: 20px; margin-bottom: 30px;">
+          <h1>TRIS390 旗艦策略全邏輯拆解</h1>
+          <p style="color: var(--main-muted); font-size: 13.5px;">多空互斥機制、動態 ATR 停損與三道嚴格濾網</p>
+        </header>
+        <div class="card card-highlight">
+          <h3>進場三道防線（必須同時滿足）：</h3>
+          <ol>
+            <li><strong>基礎方向區</strong>：<code>fastTotalScore &gt;= entryThreshold</code>（多方區）</li>
+            <li><strong>訊號共振</strong>：SuperTrend、Range Filter、HT 趨勢多方成立</li>
+            <li><strong>環境濾網（關鍵防護）</strong>：<code>isTrendingEnv = (adxValue &gt; 25.0 and chopValue &lt; 60.0)</code></li>
+          </ol>
+        </div>
+      `
+    },
+    'note-ai1': {
+      path: '03_AI決策管線 / 01. Jev Sidecar 14道決策問卷規格',
+      html: `
+        <header style="border-bottom: 1px solid var(--main-border); padding-bottom: 20px; margin-bottom: 30px;">
+          <h1>Jev Sidecar 14道決策問卷規格</h1>
+          <p style="color: var(--main-muted); font-size: 13.5px;">本機 8787 決策微服務、免費 OpenCode Zen 路由與全問卷定義</p>
+        </header>
+        <div class="card">
+          <h3>今日最新擴充之 3 道題目（總題數增至 14 道）：</h3>
+          <ul>
+            <li><code>volatility_amplitude_atr</code>：ATR14 振幅體制評估（compressed / normal / expanded）</li>
+            <li><code>trend_breakout_adx</code>：ADX + PDI/MDI 突破方向辨識（bullish / bearish / consolidation）</li>
+            <li><code>choppiness_regime</code>：CHOP 60 門檻盤整辨識（choppy_range / transitional / clean_trend）</li>
+          </ul>
+        </div>
+      `
+    }
+  };
+
+  let currentArticleId = 'note1';
+  let boundDirectoryHandle = null;
+
+  function showNote(id, linkElem) {
+    if (!ARTICLES[id]) return;
+    currentArticleId = id;
+
+    const body = document.getElementById('article-body');
+    body.innerHTML = ARTICLES[id].html;
+    document.getElementById('breadcrumb').textContent = ARTICLES[id].path;
+
+    document.querySelectorAll('.note-link').forEach(el => el.classList.remove('active'));
+    if (linkElem) linkElem.classList.add('active');
+
+    document.getElementById('content-scroll').scrollTop = 0;
+    localStorage.setItem('hub_active_note', id);
+  }
+
+  function toggleSidebar() {
+    document.getElementById('sidebar').classList.toggle('collapsed');
+  }
+
+  function filterNotes() {
+    const q = document.getElementById('search-input').value.toLowerCase();
+    document.querySelectorAll('.note-link').forEach(item => {
+      const txt = item.textContent.toLowerCase();
+      item.style.display = txt.includes(q) ? 'flex' : 'none';
+    });
+  }
+
+  function downloadCurrentArticle() {
+    const art = ARTICLES[currentArticleId];
+    if (!art) return;
+    const fullHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${art.path}</title><style>${document.querySelector('style').innerHTML}</style></head><body><div style="max-width:860px;margin:30px auto;padding:20px;">${art.html}</div></body></html>`;
+    const blob = new Blob([fullHtml], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${currentArticleId}.html`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  // 持久化目錄綁定 (IndexedDB)
+  const DB_NAME = 'OpenChartsNotesHubDB_v2';
+  function openDB() {
+    return new Promise((resolve) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('dir');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    });
+  }
+
+  async function bindLocalDirectory() {
+    if (!('showDirectoryPicker' in window)) {
+      alert("瀏覽器不支援本機直接寫檔，但你仍可正常使用網頁瀏覽、新增與匯出下載！");
+      return;
+    }
+    try {
+      boundDirectoryHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      const db = await openDB();
+      if (db) {
+        const tx = db.transaction('dir', 'readwrite');
+        tx.objectStore('dir').put(boundDirectoryHandle, 'root');
+      }
+      document.getElementById('bind-status-btn').textContent = `✅ 已永久鎖定：${boundDirectoryHandle.name}`;
+      alert(`🎉 成功鎖定目錄：【${boundDirectoryHandle.name}】！下次打開無需再選！`);
+    } catch (e) {}
+  }
+
+  function openNewFolderModal() {
+    document.getElementById('new-folder-modal').classList.add('show');
+    document.getElementById('modal-folder-name').focus();
+  }
+  function closeNewFolderModal() {
+    document.getElementById('new-folder-modal').classList.remove('show');
+    document.getElementById('modal-folder-name').value = '';
+  }
+
+  async function createFolder() {
+    const name = document.getElementById('modal-folder-name').value.trim();
+    if (!name) return;
+
+    if (boundDirectoryHandle) {
+      try {
+        await boundDirectoryHandle.getDirectoryHandle(name, { create: true });
+      } catch (e) { console.warn("FS create folder err:", e); }
+    }
+
+    const explorer = document.getElementById('explorer');
+    const details = document.createElement('details');
+    details.className = 'folder';
+    details.open = true;
+    details.innerHTML = `
+      <summary>
+        <div class="folder-title-left">
+          <span>📁</span>
+          <span>${name}</span>
+        </div>
+      </summary>
+      <div class="folder-items">
+        <div style="font-size:12px;color:var(--sb-muted);padding:4px 10px;">(空分類，點「新增筆記」加入)</div>
+      </div>
+    `;
+    explorer.appendChild(details);
+    closeNewFolderModal();
+    updateFolderSelectOptions();
+    alert(`📁 分類資料夾【${name}】已建立！`);
+  }
+
+  function openNewNoteModal() {
+    updateFolderSelectOptions();
+    document.getElementById('new-note-modal').classList.add('show');
+    document.getElementById('modal-note-title').focus();
+  }
+  function closeNewNoteModal() {
+    document.getElementById('new-note-modal').classList.remove('show');
+    document.getElementById('modal-note-title').value = '';
+  }
+
+  function updateFolderSelectOptions() {
+    const sel = document.getElementById('modal-note-folder');
+    sel.innerHTML = '';
+    document.querySelectorAll('details.folder summary .folder-title-left span:last-child').forEach(sp => {
+      const opt = document.createElement('option');
+      opt.value = sp.textContent;
+      opt.textContent = sp.textContent;
+      sel.appendChild(opt);
+    });
+  }
+
+  async function createNote() {
+    const folder = document.getElementById('modal-note-folder').value;
+    const title = document.getElementById('modal-note-title').value.trim() || '未命名筆記';
+    const noteKey = 'custom_' + Date.now();
+
+    const noteObj = {
+      path: `${folder} / ${title}`,
+      html: `
+        <header style="border-bottom: 1px solid var(--main-border); padding-bottom: 20px; margin-bottom: 30px;">
+          <h1>${title}</h1>
+          <p style="color: var(--main-muted); font-size: 13.5px;">分類：${folder} · 建立日期：${new Date().toISOString().split('T')[0]}</p>
+        </header>
+        <div class="card">
+          <p>在此記錄你的新研究心得...</p>
+        </div>
+      `
+    };
+
+    ARTICLES[noteKey] = noteObj;
+
+    let targetFolderItems = null;
+    document.querySelectorAll('details.folder').forEach(d => {
+      const fName = d.querySelector('summary .folder-title-left span:last-child');
+      if (fName && fName.textContent === folder) {
+        targetFolderItems = d.querySelector('.folder-items');
+      }
+    });
+
+    if (targetFolderItems) {
+      const emptyHint = targetFolderItems.querySelector('div');
+      if (emptyHint && emptyHint.textContent.includes('空分類')) emptyHint.remove();
+
+      const link = document.createElement('div');
+      link.className = 'note-link';
+      link.innerHTML = `<span>📄</span><span>${title}</span>`;
+      link.onclick = () => showNote(noteKey, link);
+      targetFolderItems.appendChild(link);
+      link.click();
+    }
+
+    closeNewNoteModal();
+  }
+
+  window.addEventListener('DOMContentLoaded', async () => {
+    const db = await openDB();
+    if (db) {
+      try {
+        const tx = db.transaction('dir', 'readonly');
+        const req = tx.objectStore('dir').get('root');
+        req.onsuccess = () => {
+          if (req.result) {
+            boundDirectoryHandle = req.result;
+            document.getElementById('bind-status-btn').textContent = `✅ 已永久鎖定：${boundDirectoryHandle.name}`;
+          }
+        };
+      } catch (e) {}
+    }
+
+    const lastNote = localStorage.getItem('hub_active_note');
+    if (lastNote && ARTICLES[lastNote]) {
+      const el = document.querySelector(`.note-link[onclick*="'${lastNote}'"]`);
+      showNote(lastNote, el);
+    }
+  });
+</script>
+
+</body>
+</html>
