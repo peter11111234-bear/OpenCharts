@@ -279,6 +279,21 @@ function Start-Scanner {
   Log "scanner start requested (pid=$($p.Id))"
 }
 
+# fop-tick-recorder: 期貨 tick → logs/fop-ticks-*.jsonl + public/local-bars (永豐 kbars 超額時的備援)
+# 先找程序再啟動，絕不開第二支（兩支同時錄 = tick 重複寫兩次）
+function Get-FopRecorderProcs {
+  Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
+    Where-Object { $_.CommandLine -match 'fop-tick-recorder\.py' }
+}
+function Start-FopRecorder {
+  $p = Start-Process -FilePath $PythonExe -ArgumentList "-u",(Join-Path $ScriptsDir "fop-tick-recorder.py") `
+    -WorkingDirectory (Join-Path $ScriptsDir "..") -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $LogDir "fop-recorder-out.log") `
+    -RedirectStandardError (Join-Path $LogDir "fop-recorder-err.log")
+  if (-not $p) { Log "fop-recorder launch FAILED"; return }
+  Log "fop-recorder start requested (pid=$($p.Id))"
+}
+
 function Get-FopSessionWindow($now = (Get-Date), $isTradingDay = $true) {
   # 期貨交易時段: 日盤 08:50-13:45, 夜盤 15:05-23:59:59 / 00:00-04:55
   # 夜盤歸屬: 15:05 起屬「今天」開的夜盤; 凌晨 00:00-04:55 屬「昨天」開的夜盤
@@ -343,6 +358,7 @@ $script:FopLoop = 0
 $lastServerAlert = [datetime]::MinValue
 $lastBackfill = [datetime]::MinValue
 $lastScannerRestart = [datetime]::MinValue
+$lastFopRecorderStart = [datetime]::MinValue
 $lastServerBoot = [datetime]::MinValue
 $script:serverProc = $null
 $script:serverBootFails = 0
@@ -523,6 +539,14 @@ while ($true) {
         if ($c) { Subscribe-Contract $c.security_type $c.exchange $c.code | Out-Null }
       }
     }
+  }
+
+  # 4.5 fop-tick-recorder 存活: 沒在跑才啟動 (server 正常時、60s 冷卻)
+  if ($failStreak -eq 0 -and -not @(Get-FopRecorderProcs) -and
+      (New-TimeSpan -Start $lastFopRecorderStart -End (Get-Date)).TotalSeconds -gt 60) {
+    $lastFopRecorderStart = Get-Date
+    Log "fop-recorder not running — starting"
+    Start-FopRecorder
   }
 
   # 5. (已移除) 每 30 分鐘定期 backfill: 即時串流已收 tick, 定期重抓整天只換來 <1% 新增,

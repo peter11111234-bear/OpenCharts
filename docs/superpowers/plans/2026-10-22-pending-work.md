@@ -11,7 +11,7 @@
 | A2 | 補 tick 只補缺口（hotscan） | ✅ 已改：取消每 30 分鐘重抓、`--since` 只抓斷線後；已重啟看門狗。**RangeTime 未實打驗證** | 明天真打 1 次確認回傳正確 | 明天盤中 |
 | A3 | 補 tick 完整版（REAL PLAN） | 設計已定，未實作 | scanner 收 tick 時記缺口（原始量 vs 累計量）→ 只補缺口、**補抓帳本防重複抓**、精準邊界、補不到不重試、流量保險絲（剩 <150MB 不補）、補的資料寫 `hot-ticks-backfill.jsonl` 不影響盤中判斷、backfill 不再讀 1.5GB 全檔；dashboard.py 合併邏輯要同步改 | Opus 試作＋測 → 派 MiniMax |
 | A4 | 以前補的 1% 是真漏還是重複 | ✅ 2026-10-21 查完：6269 在 10–11 點補回 1,603 筆，其中 97%（1,560）是即時串流已經收過的重複資料，因為兩邊時間格式不同，去重沒認出來；真漏只有約 40 筆。`flow.py` 沒有去重，重複的會被重算一次，dashboard 的資金流因此偏多（scanner 的盤中訊號不受影響） | 歷史檔內已有的重複資料留著；A3 改成獨立檔後根除 |
-| A5 | 期貨 tick 錄製器自動化 | ✅ `scripts/fop-tick-recorder.py` 已跑（手動啟動）；`/vela` 永豐回空時讀 `public/local-bars/` | 交給看門狗自動啟動／顧著 | 非開盤時段重啟看門狗 |
+| A5 | 期貨 tick 錄製器自動化 | ✅ `scripts/fop-tick-recorder.py` 已跑（手動啟動）；`/vela` 永豐回空時讀 `public/local-bars/` | ✅ 2026-10-22 14:29 已寫進 `shioaji-watchdog.ps1`（`Get-FopRecorderProcs`／`Start-FopRecorder`，先找程序才啟動、60 秒冷卻）；實測手動結束後 30 秒內被拉起，8080 PID 未變、錄製器只有一支 |, |
 | A6 | 熱力圖／排行榜／報價列流量 | 熱力圖、排行榜 **30 秒不變**（使用者決定）；報價列每 5 秒打 snapshots；`index_components` 出現 429 | 量每輪用掉多少 bytes，只報告不改頻率 | 明天流量歸零後 |
 | A7 | hot-ticks.jsonl 去重 | ✅ 乾淨檔已產生並通過獨立驗證：`logs/hot-ticks.dedup.jsonl`（刪 1,316,277 筆完全重複，佔 11.4%；只刪不改、刪的都有同 key 的保留行、新檔 0 重複、undated 70,978 筆全保留）。工具 `scripts/hotscan/dedup_ticks.py`＋`verify_dedup.py`＋`tests/test_dedup_ticks.py` | **換檔要使用者同意**：在 scanner 沒寫檔的時段做，舊檔改名留作備份 |
 | A8 | 即時 tick 混入試撮／盤中零股？ | 去重後量÷交易所累計量的中位數仍是 1.095；累計量不變卻記了量的紀錄，盤中約每 5 秒一筆；hotscan／feed.ts 都沒過濾 `simtrade`、`intraday_odd` | **2026-10-22 09:00 後**抽原始 `tick_stk` 確認欄位；確認後才改（會影響 scanner 盤中判斷，修不修由使用者決定） |
