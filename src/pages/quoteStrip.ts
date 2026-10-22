@@ -6,7 +6,7 @@
  * the chart.
  */
 import type { ContractRef } from "../services/shioaji/server.ts";
-import { toContractRef, type QuoteSnap } from "../services/shioaji/marketData.ts";
+import { isTwStockSession, toContractRef, type QuoteSnap } from "../services/shioaji/marketData.ts";
 import { changeColor, ensureMarketStyles, escapeHtml, fmtBig, fmtNum, fmtPct, latestRunner } from "./marketKit.ts";
 
 export interface StripCard {
@@ -29,6 +29,13 @@ export interface QuoteStripDeps {
   pollMs?: number;
   /** How often to refresh quotes for the same symbol. */
   refreshMs?: number;
+  /** True during the TW stock session (default: isTwStockSession). Outside it
+   *  the timer refresh only asks for `nightCodes` plus an active future; the
+   *  other cards keep their last quote. Mount, symbol change and refresh()
+   *  still fetch every card once. */
+  isOpen?: () => boolean;
+  /** Codes worth refreshing at night (default: 小台 MXFR1). */
+  nightCodes?: readonly string[];
 }
 
 export interface WidgetHandle {
@@ -66,17 +73,28 @@ export function mountQuoteStrip(ctx: { readonly symbol: string }, el: HTMLElemen
   ensureMarketStyles(el.ownerDocument);
   el.classList.add("mw", "qs-strip");
   const cards = deps.cards ?? DEFAULT_CARDS;
+  const isOpen = deps.isOpen ?? (() => isTwStockSession(new Date()));
+  const nightCodes = deps.nightCodes ?? ["MXFR1"];
   let lastSymbol = "";
+  // Last quote per code: night refreshes only re-ask for a few codes, so the
+  // rest of the strip renders from here.
+  const lastQuotes = new Map<string, QuoteSnap>();
+  let fullNext = true;
 
   const runner = latestRunner(
     async () => {
       const symbol = ctx.symbol;
       lastSymbol = symbol;
       const active = toContractRef(symbol);
-      const refs = cards.map((c) => c.ref);
+      let refs = cards.map((c) => c.ref);
       if (active && !refs.some((r) => r.code === active.code && r.exchange === active.exchange)) refs.push(active);
-      const quotes = await deps.quotes(refs);
-      return { symbol, active, quotes };
+      const full = fullNext || isOpen();
+      fullNext = false;
+      if (!full) {
+        refs = refs.filter((r) => nightCodes.includes(r.code) || (r.security_type === "FUT" && r.code === active?.code));
+      }
+      for (const q of await deps.quotes(refs)) lastQuotes.set(q.code, q);
+      return { symbol, active, quotes: [...lastQuotes.values()] };
     },
     ({ symbol, active, quotes }) => {
       const byCode = new Map(quotes.map((q) => [q.code, q]));
@@ -92,13 +110,18 @@ export function mountQuoteStrip(ctx: { readonly symbol: string }, el: HTMLElemen
   );
 
   const poll = setInterval(() => {
-    if (ctx.symbol !== lastSymbol) runner.run();
+    if (ctx.symbol === lastSymbol) return;
+    fullNext = true;
+    runner.run();
   }, deps.pollMs ?? 1000);
   const tick = setInterval(() => runner.run(), deps.refreshMs ?? 5000);
   runner.run();
 
   return {
-    refresh: () => runner.run(),
+    refresh: () => {
+      fullNext = true;
+      runner.run();
+    },
     destroy() {
       runner.dispose();
       clearInterval(poll);

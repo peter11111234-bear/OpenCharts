@@ -1,8 +1,8 @@
 /**
  * Theme heatmap side panel (TradingView "Stock Heatmap" look) over the
  * hand-curated tech supply-chain themes in data/techThemes.json (glass
- * substrate, CPO, CoWoS, liquid cooling …). Prices come from shioaji's TAIEX
- * and TPEx index components; tiles are sized by turnover (成交金額 — listed and
+ * substrate, CPO, CoWoS, liquid cooling …). Prices come from shioaji snapshots
+ * of just the theme stocks (fetchStockEntries); tiles are sized by turnover (成交金額 — listed and
  * OTC index weights are not comparable), equal-sized when there is none yet
  * (pre-market), and coloured by % change (red up / green down). The overview
  * shows each theme's top stocks; picking one theme shows all of its stocks
@@ -10,7 +10,7 @@
  * stock — the only chart write, and only on an explicit click.
  * Usage, data format and known gaps: heatmap.README.md.
  */
-import type { IndexEntry } from "../services/shioaji/marketData.ts";
+import { isTwStockSession, type IndexEntry } from "../services/shioaji/marketData.ts";
 import { ensureMarketStyles, escapeHtml, fmtPct, heatColor, latestRunner } from "./marketKit.ts";
 import type { WidgetHandle } from "./quoteStrip.ts";
 import techThemes from "../data/techThemes.json";
@@ -89,6 +89,11 @@ export type ThemeDb = Record<string, { title: string; description: string; stock
 
 export const THEMES = techThemes as ThemeDb;
 
+/** Every stock code across the themes, once (a stock may sit in several). */
+export function themeCodes(db: ThemeDb = THEMES): string[] {
+  return [...new Set(Object.values(db).flatMap((t) => Object.values(t.stocks).map((s) => s.code)))];
+}
+
 export interface HeatTile {
   stock: ThemeStock;
   quote: IndexEntry;
@@ -163,6 +168,9 @@ export interface HeatmapDeps {
   /** Group label strip height in px (match `.hm-group span` when restyling it). */
   labelHeight?: number;
   refreshMs?: number;
+  /** Timer refreshes only run while this is true (default: TW stock session).
+   *  The mount-time load always runs so the last close still shows. */
+  isOpen?: () => boolean;
 }
 
 export type HeatmapHandle = WidgetHandle & {
@@ -246,7 +254,12 @@ export function mountHeatmapPanel(body: HTMLElement, deps: HeatmapDeps): Heatmap
     },
   );
 
-  const tick = setInterval(() => runner.run(), deps.refreshMs ?? 30_000);
+  // Each refresh pulls ~750 KB of the daily Shioaji quota, and quotes don't move
+  // outside the stock session — so the timer only fetches while it's open.
+  const isOpen = deps.isOpen ?? (() => isTwStockSession(new Date()));
+  const tick = setInterval(() => {
+    if (isOpen()) runner.run();
+  }, deps.refreshMs ?? 30_000);
   runner.run();
 
   return {

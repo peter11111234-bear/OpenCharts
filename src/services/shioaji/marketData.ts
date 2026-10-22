@@ -96,10 +96,35 @@ interface RawEntry {
 /** Index codes the server accepts for index_components: TAIEX (listed) and the TPEx index (OTC). */
 const COMPONENT_INDEX = { TSE: "IX0001", OTC: "IX0043" } as const;
 
-export async function fetchIndexEntries(
+/** Each response is ~350–415 KB of the 500 MB/day Shioaji quota, and the heatmap,
+ *  its popout and listSymbols all ask at once (measured 2026-10-22: 5 identical
+ *  requests in one second). Share one in-flight request per index and reuse the
+ *  result for 20 s — under the heatmap's 30 s poll, so every poll still refetches. */
+const INDEX_TTL_MS = 20_000;
+const indexCache = new WeakMap<HttpFn, Map<string, { at: number; p: Promise<IndexEntry[]> }>>();
+
+export function fetchIndexEntries(
   http: HttpFn = defaultHttp,
   exchange: keyof typeof COMPONENT_INDEX = "TSE",
 ): Promise<IndexEntry[]> {
+  let byIndex = indexCache.get(http);
+  if (!byIndex) indexCache.set(http, (byIndex = new Map()));
+  const hit = byIndex.get(exchange);
+  if (hit && Date.now() - hit.at < INDEX_TTL_MS) return hit.p;
+  const p = loadIndexEntries(http, exchange);
+  const entry = { at: Date.now(), p };
+  byIndex.set(exchange, entry);
+  p.catch(() => {
+    if (byIndex.get(exchange) === entry) byIndex.delete(exchange);
+  });
+  return p;
+}
+
+export function clearIndexEntriesCache(): void {
+  indexCache.delete(defaultHttp);
+}
+
+async function loadIndexEntries(http: HttpFn, exchange: keyof typeof COMPONENT_INDEX): Promise<IndexEntry[]> {
   const raw = (await http("/data/index_components", {
     method: "POST",
     body: { contract: { security_type: "IND", exchange, code: COMPONENT_INDEX[exchange] } },
@@ -115,6 +140,27 @@ export async function fetchIndexEntries(
       amount: e.total_amount ?? 0,
     }))
     .filter((e) => Number.isFinite(e.pct));
+}
+
+/** Quotes for a fixed code list, shaped like index entries (theme heatmap).
+ *  Snapshots cost ~0.4 KB per code — the 309 theme stocks are ~120 KB, against
+ *  ~730 KB for both full index lists (1980 stocks; measured 2026-10-22). The
+ *  server resolves each code's real exchange and drops unknown codes, so every
+ *  ref goes out as TSE. */
+export async function fetchStockEntries(codes: readonly string[], http: HttpFn = defaultHttp): Promise<IndexEntry[]> {
+  const quotes = await fetchQuotes(
+    codes.map((code) => ({ security_type: "STK" as const, exchange: "TSE" as const, code })),
+    http,
+  );
+  return quotes.map((q) => ({
+    code: q.code,
+    exchange: q.exchange,
+    category: "",
+    price: q.close,
+    pct: q.changeRate,
+    weightPpm: 0,
+    amount: q.totalAmount,
+  }));
 }
 
 // ── Scanner (hotlists) ──
@@ -152,6 +198,16 @@ interface RawRank {
 /** YYYY-MM-DD of `d` in Asia/Taipei (UTC+8, no DST). */
 export function taipeiDate(d: Date): string {
   return new Date(d.getTime() + 8 * 3_600_000).toISOString().slice(0, 10);
+}
+
+/** TWSE/TPEx regular session in Asia/Taipei: weekdays 09:00–13:35 (13:30 close
+ *  plus the closing-auction print). Exchange holidays are not known here. */
+export function isTwStockSession(d: Date): boolean {
+  const t = new Date(d.getTime() + 8 * 3_600_000);
+  const day = t.getUTCDay();
+  if (day === 0 || day === 6) return false;
+  const min = t.getUTCHours() * 60 + t.getUTCMinutes();
+  return min >= 9 * 60 && min <= 13 * 60 + 35;
 }
 
 /** The server often returns names with U+FFFD (lost encoding) — show none rather than garbage. */

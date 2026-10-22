@@ -6,6 +6,7 @@ import {
   fetchIndexEntries,
   fetchQuotes,
   fetchRanking,
+  fetchStockEntries,
   taipeiDate,
   toContractRef,
   type HttpFn,
@@ -49,6 +50,52 @@ describe("fetchIndexEntries", () => {
     const http = vi.fn<HttpFn>(async () => ({ entries: [] }));
     await fetchIndexEntries(http, "OTC");
     expect(http.mock.calls[0]![1]!.body).toEqual({ contract: { security_type: "IND", exchange: "OTC", code: "IX0043" } });
+  });
+
+  it("sends one request for concurrent callers and reuses it within the TTL", async () => {
+    vi.useFakeTimers();
+    try {
+      const http = vi.fn<HttpFn>(async () => ({ entries: [] }));
+      await Promise.all([fetchIndexEntries(http), fetchIndexEntries(http), fetchIndexEntries(http)]);
+      expect(http).toHaveBeenCalledTimes(1);
+      await fetchIndexEntries(http, "OTC");
+      expect(http).toHaveBeenCalledTimes(2); // other index = separate request
+      vi.advanceTimersByTime(19_000);
+      await fetchIndexEntries(http);
+      expect(http).toHaveBeenCalledTimes(2); // still fresh
+      vi.advanceTimersByTime(2_000);
+      await fetchIndexEntries(http);
+      expect(http).toHaveBeenCalledTimes(3); // expired → refetch
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not cache a failed request", async () => {
+    const http = vi.fn<HttpFn>().mockRejectedValueOnce(new Error("down")).mockResolvedValue({ entries: [] });
+    await expect(fetchIndexEntries(http)).rejects.toThrow("down");
+    await fetchIndexEntries(http);
+    expect(http).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("fetchStockEntries", () => {
+  it("snapshots only the given codes and maps them to heatmap entries", async () => {
+    const http = vi.fn<HttpFn>(async () => [
+      { code: "3081", exchange: "OTC", open: 1, high: 1, low: 1, close: 2375, change_price: -250, change_rate: -9.52, total_volume: 3325, total_amount: 8242155000 },
+    ]);
+    const out = await fetchStockEntries(["3081", "2330"], http);
+    // The server resolves each code's real exchange, so refs all go out as TSE.
+    expect(http).toHaveBeenCalledWith("/data/snapshots", {
+      method: "POST",
+      body: {
+        contracts: [
+          { security_type: "STK", exchange: "TSE", code: "3081" },
+          { security_type: "STK", exchange: "TSE", code: "2330" },
+        ],
+      },
+    });
+    expect(out).toEqual([{ code: "3081", exchange: "OTC", category: "", price: 2375, pct: -9.52, weightPpm: 0, amount: 8242155000 }]);
   });
 });
 

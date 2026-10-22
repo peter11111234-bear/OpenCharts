@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { IndexEntry } from "../../services/shioaji/marketData.ts";
-import { layoutThemeHeatmap, mountHeatmapPanel, squarify, THEMES, type Rect, type ThemeDb } from "../heatmap.ts";
+import { isTwStockSession, type IndexEntry } from "../../services/shioaji/marketData.ts";
+import { layoutThemeHeatmap, mountHeatmapPanel, squarify, themeCodes, THEMES, type Rect, type ThemeDb } from "../heatmap.ts";
 import type { WidgetHandle } from "../quoteStrip.ts";
 
 const entry = (code: string, amount: number, pct = 0, exchange = "TSE"): IndexEntry => ({
@@ -159,9 +159,41 @@ describe("mountHeatmapPanel", () => {
     const entries = vi.fn(async (): Promise<IndexEntry[]> => {
       throw new Error("down");
     });
-    handle = mountHeatmapPanel(body, { entries, onPick: vi.fn(), refreshMs: 30_000 });
+    handle = mountHeatmapPanel(body, { entries, onPick: vi.fn(), refreshMs: 30_000, isOpen: () => true });
     await vi.waitFor(() => expect(body.textContent).toContain("無法取得熱力圖：down"));
     await vi.advanceTimersByTimeAsync(30_000);
     expect(entries).toHaveBeenCalledTimes(2);
+  });
+
+  it("loads once on mount but skips timer refreshes outside the stock session", async () => {
+    const entries = vi.fn(async () => [entry("3017", 50)]);
+    handle = mountHeatmapPanel(body, { entries, onPick: vi.fn(), themes: DB, refreshMs: 30_000, isOpen: () => false });
+    await vi.waitFor(() => expect(entries).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(entries).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("themeCodes", () => {
+  it("lists each stock once even when it sits in several themes (395 rows → 309 codes)", () => {
+    const rows = Object.values(THEMES).flatMap((t) => Object.values(t.stocks));
+    expect(rows).toHaveLength(395);
+    const codes = themeCodes();
+    expect(codes).toHaveLength(309);
+    expect(new Set(codes).size).toBe(codes.length);
+  });
+});
+
+describe("isTwStockSession", () => {
+  // Instants in UTC; Taipei = UTC+8. 2026-10-22 is a Thursday.
+  it.each([
+    ["2026-10-22T00:59:00Z", false], // 08:59
+    ["2026-10-22T01:00:00Z", true], // 09:00
+    ["2026-10-22T05:35:00Z", true], // 13:35 (closing auction settles)
+    ["2026-10-22T05:36:00Z", false], // 13:36
+    ["2026-10-24T02:00:00Z", false], // Saturday 10:00
+    ["2026-10-25T02:00:00Z", false], // Sunday 10:00
+  ])("%s → %s", (iso, want) => {
+    expect(isTwStockSession(new Date(iso))).toBe(want);
   });
 });

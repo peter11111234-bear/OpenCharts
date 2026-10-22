@@ -2,8 +2,8 @@
 // opened from the topbar "熱力圖" button or straight by URL (a second monitor).
 // It fetches its own data; a tile click is sent to the main app over
 // BroadcastChannel, which switches the active chart (velaMarketWidgets.ts).
-import { fetchIndexEntries } from "../services/shioaji/marketData.ts";
-import { HEATMAP_WINDOW_CHANNEL, mountHeatmapPanel } from "./heatmap.ts";
+import { fetchStockEntries } from "../services/shioaji/marketData.ts";
+import { HEATMAP_WINDOW_CHANNEL, mountHeatmapPanel, themeCodes } from "./heatmap.ts";
 
 const app = document.getElementById("app")!;
 const ch = new BroadcastChannel(HEATMAP_WINDOW_CHANNEL);
@@ -19,7 +19,7 @@ let toastTimer: ReturnType<typeof setTimeout> | undefined;
 const CHROME_PX = 110;
 
 const panel = mountHeatmapPanel(app, {
-  entries: async () => (await Promise.all([fetchIndexEntries(), fetchIndexEntries(undefined, "OTC")])).flat(),
+  entries: () => fetchStockEntries(themeCodes()),
   onPick: (symbol) => {
     ch.postMessage({ t: "pick", symbol });
     try {

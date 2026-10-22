@@ -88,4 +88,16 @@ describe("mountHotlistsPanel", () => {
     });
     await vi.waitFor(() => expect(body.textContent).toContain("無法取得排行：down"));
   });
+
+  it("refreshes on its timer only during the stock session", async () => {
+    let open = false;
+    const ranking = vi.fn(async (_k: RankKind) => [row("2330", 1)]);
+    handle = mountHotlistsPanel(body, { ranking, onPick: vi.fn(), refreshMs: 30_000, isOpen: () => open });
+    await vi.waitFor(() => expect(ranking).toHaveBeenCalledTimes(1)); // mount load always runs
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(ranking).toHaveBeenCalledTimes(1);
+    open = true;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(ranking).toHaveBeenCalledTimes(2);
+  });
 });

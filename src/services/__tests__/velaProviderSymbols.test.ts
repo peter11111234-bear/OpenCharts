@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { frontMonthCode } from "../shioaji/instruments.ts";
+import { clearIndexEntriesCache } from "../shioaji/marketData.ts";
 import { ShioajiVelaProvider } from "../shioaji/velaProvider.ts";
 
 const entry = (code: string, exchange: string) => ({ contract: { exchange, code }, category: "24", price: "1", pct_chg: "0" });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  clearIndexEntriesCache();
+});
 
 describe("ShioajiVelaProvider.listSymbols", () => {
   it("indexes TAIEX and TPEx components with their listing prefix (so TSE:3037 / OTC:3081 resolve)", async () => {

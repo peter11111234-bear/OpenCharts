@@ -11,11 +11,11 @@ import { registerIcon, registerSidePanel, registerWidgetAction, registerWidgetAt
 import { svg16 } from "@luxalgo/vela/ui";
 import {
   fetchContractInfo,
-  fetchIndexEntries,
   fetchQuotes,
   fetchRanking,
+  fetchStockEntries,
 } from "../services/shioaji/marketData.ts";
-import { HEATMAP_WINDOW_CHANNEL, mountHeatmapPanel } from "./heatmap.ts";
+import { HEATMAP_WINDOW_CHANNEL, mountHeatmapPanel, themeCodes } from "./heatmap.ts";
 import { mountHotlistsPanel } from "./hotlists.ts";
 import { mountQuoteStrip } from "./quoteStrip.ts";
 import { mountRating } from "./velaTechRating.ts";
@@ -58,7 +58,7 @@ registerSidePanel({
   minWidth: 280,
   mount(ctx, body) {
     const panel = mountHeatmapPanel(body, {
-      entries: async () => (await Promise.all([fetchIndexEntries(), fetchIndexEntries(undefined, "OTC")])).flat(),
+      entries: () => fetchStockEntries(themeCodes()),
       onPick: (symbol) => ctx.setSymbol(symbol),
     });
     return {

@@ -23,7 +23,9 @@ Vela 看盤殼的側邊面板 `opencharts.heatmap`（頂列「熱力圖」按鈕
 | 來源 | 內容 |
 |---|---|
 | `src/data/techThemes.json` | 主題資料庫：11 個主題、309 檔股票。原檔是 `C:\Users\bear9\taiwan_advanced_tech_full_database.json` |
-| Shioaji `POST /data/index_components` | 報價。上市取 `IND/TSE/IX0001`（1087 檔），上櫃取 `IND/OTC/IX0043`（893 檔），兩邊合併 |
+| Shioaji `POST /data/snapshots` | 報價。只查主題裡的 309 檔，一次約 120 KB（2026-10-22 改；以前抓上市＋上櫃全部 1980 檔的 `index_components`，一次約 730 KB）。伺服器會依代碼自己找交易所，不認得的代碼直接略過 |
+
+更新頻率：打開面板時抓一次；之後每 30 秒更新，**但只在台股日盤（平日 09:00–13:35）**。其他時段資料不會變，不再浪費永豐每日 500 MB 的流量。國定假日不會自動判斷。
 
 JSON 格式（`ThemeDb`）：
 
@@ -46,7 +48,7 @@ JSON 格式（`ThemeDb`）：
 
 ## 已知限制
 
-- 有 7 檔不在上市或上櫃指數成分股裡，所以沒有報價（2026-10-21 實測）：梭特 6812、盛新材料 6930、元鈦科 7892、智微 4925、乾瞻科技 7898、恆勁科技 6920、精星 8183。它們可能是興櫃股或新上市股。
+- 有 7 檔不在上市或上櫃指數成分股裡，以前沒有報價（2026-10-21 實測）。改用 snapshots 後 7 檔都有報價（2026-10-22 實測）：6 檔是興櫃（exchange `OES`），精星 8183 是上櫃。點興櫃方塊切到 `OES:代碼`，主圖能不能開還沒驗證：梭特 6812、盛新材料 6930、元鈦科 7892、智微 4925、乾瞻科技 7898、恆勁科技 6920、精星 8183。它們可能是興櫃股或新上市股。
 - Shioaji 目前只有盤後資料。盤前的 `pct_chg` 和 `total_amount` 都是 0，所以畫面會是全灰、方塊等大。
 
 ## 程式位置
@@ -54,8 +56,8 @@ JSON 格式（`ThemeDb`）：
 | 檔案 | 內容 |
 |---|---|
 | `src/pages/heatmap.ts` | `squarify`（treemap 排版）、`layoutThemeHeatmap`（分組和尺寸）、`mountHeatmapPanel`（畫面） |
-| `src/services/shioaji/marketData.ts` | `fetchIndexEntries(http, "TSE" \| "OTC")` |
-| `src/pages/velaMarketWidgets.ts` | 註冊側邊面板，合併上市和上櫃資料 |
+| `src/services/shioaji/marketData.ts` | `fetchStockEntries(codes)`（主題股報價）、`isTwStockSession`（日盤判斷） |
+| `src/pages/velaMarketWidgets.ts` | 註冊側邊面板，`fetchStockEntries(themeCodes())` |
 | `src/pages/marketKit.ts` | 顏色、格式化、樣式（`.hm-*`） |
 
 ## 測試

@@ -3,7 +3,7 @@
  * scanner: 漲幅 / 跌幅 / 成交量 / 成交金額, latest trading day. Clicking a row
  * switches the active chart to that stock (explicit click only).
  */
-import type { RankKind, RankRow } from "../services/shioaji/marketData.ts";
+import { isTwStockSession, type RankKind, type RankRow } from "../services/shioaji/marketData.ts";
 import { changeColor, ensureMarketStyles, escapeHtml, fmtBig, fmtNum, fmtPct, latestRunner } from "./marketKit.ts";
 import type { WidgetHandle } from "./quoteStrip.ts";
 
@@ -19,6 +19,9 @@ export interface HotlistsDeps {
   /** Called with the stock code of a clicked row. */
   onPick: (code: string) => void;
   refreshMs?: number;
+  /** Timer refreshes only run while this is true (default: TW stock session).
+   *  The mount-time load always runs so the last trading day still shows. */
+  isOpen?: () => boolean;
 }
 
 export function mountHotlistsPanel(body: HTMLElement, deps: HotlistsDeps): WidgetHandle {
@@ -105,7 +108,12 @@ export function mountHotlistsPanel(body: HTMLElement, deps: HotlistsDeps): Widge
   });
 
   markTab();
-  const tick = setInterval(() => runner.run(), deps.refreshMs ?? 30_000);
+  // Rankings are stock-only and frozen outside the session — don't spend the
+  // Shioaji daily quota re-fetching them after the close or overnight.
+  const isOpen = deps.isOpen ?? (() => isTwStockSession(new Date()));
+  const tick = setInterval(() => {
+    if (isOpen()) runner.run();
+  }, deps.refreshMs ?? 30_000);
   runner.run();
 
   return {
