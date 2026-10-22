@@ -181,3 +181,29 @@ def test_profit_protect_spans_night_and_next_day():
     sess.realized_points, sess.in_profit_protect = 800.0, True
     s2, _ = js.rotate_risk_session(sess, key, at(10, 0, day=27))
     assert s2.gate({"time": at(10, 0, day=27), "close": 1.0}, _buy())[3] == "profit_protect"
+
+
+# ---- F5: a restart replays the dataset so the counters carry over -------------------------
+
+def _row(ts, close=100.0):
+    return {"bar_time": ts, "price": close, "answers": _buy()["answers"], "risk_gate": {"verdict": "approve"}}
+
+
+def test_restart_after_five_night_follows_vetoes_the_sixth(tmp_path):
+    import json
+    f = tmp_path / "ds.jsonl"
+    f.write_text("".join(json.dumps(_row(at(16, 5 * i, day=26))) + "\n" for i in range(5)), encoding="utf-8")
+    sess, key = js.replay_risk_session(f, at(17, 0, day=26))
+    assert key == js.risk_key(at(17, 0, day=26)) and sess.follow_count == {"night": 5}
+    sess, key = js.rotate_risk_session(sess, key, at(17, 0, day=26))        # live loop's first bar: same session kept
+    assert sess.step({"time": at(17, 0, day=26), "close": 100.0}, _buy())[1][3] == "max_follow_day"
+
+
+def test_replay_ignores_other_trading_days_and_failed_rows(tmp_path):
+    import json
+    f = tmp_path / "ds.jsonl"
+    rows = [_row(at(16, 0, day=25)), {"bar_time": at(16, 5, day=26), "price": 1, "answers": None}, _row(at(16, 10, day=26))]
+    f.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    sess, key = js.replay_risk_session(f, at(17, 0, day=26))
+    assert sess.follow_count == {"night": 1}
+    assert js.replay_risk_session(tmp_path / "missing.jsonl", at(17, 0, day=26))[1] is None

@@ -707,6 +707,27 @@ def rotate_risk_session(cur, cur_key, ts: float):
     return (cur, cur_key) if k == cur_key else (RiskSession(), k)
 
 
+def replay_risk_session(path: Path, now: float):
+    """F5: a restart must not zero the risk counters. Replay this trading day's answered rows of
+    the dataset (bar-time order, same RiskSession.step as the live loop and jev-risk-recompute.py)
+    and return (session, key) ready to continue. No rows today -> (fresh session, None)."""
+    key = risk_key(now)
+    rows = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("answers") and r.get("risk_gate") is not None and risk_key(r["bar_time"]) == key:
+                rows.append(r)
+    sess, k = RiskSession(), None
+    for r in sorted(rows, key=lambda r: r["bar_time"]):
+        sess, k = rotate_risk_session(sess, k, r["bar_time"])
+        sess.step({"time": r["bar_time"], "close": r["price"]}, {"answers": r["answers"]})
+    return sess, k
+
+
 FETCH_GRACE_S = 10    # wait this long after a 5m boundary so the last 1m bar has landed
 FETCH_RETRIES = 3     # fetches allowed within one bucket while the last 1m bar is missing
 
@@ -773,8 +794,7 @@ def main() -> int:
 
     dataset = log_for(symbol)   # fixed for the run: a roll stays within the same root
     seen = logged_bar_times(dataset)
-    risk_session = RiskSession() if os.environ.get('RISK_GATE', '1') == '1' else None
-    risk_key_cur = None
+    risk_session, risk_key_cur = replay_risk_session(dataset, time.time()) if os.environ.get('RISK_GATE', '1') == '1' else (None, None)
     parked: set[int] = set()
     tries: dict[int, int] = {}
     gap = 60.0 / max(1, args.rate)   # min seconds between /decide calls
