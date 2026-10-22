@@ -15,8 +15,12 @@ export interface RatingPanelDeps {
   compute: (symbol: string, timeframe: string) => Promise<RatingSnapshot>;
   /** How often to check whether the active symbol/timeframe changed. */
   pollMs?: number;
-  /** How often to recompute for the same market (new bars). */
+  /** How often to recompute for the same market (new bars). Ignored when autoRefreshKey is set. */
   refreshMs?: number;
+  /** Quota-aware refresh: recompute when this key changes (e.g. a bar closed); null = this
+   *  market should not be refetched now. Checked every `checkMs`. */
+  autoRefreshKey?: (symbol: string, timeframe: string, nowMs: number) => string | null;
+  checkMs?: number;
 }
 
 export interface RatingPanelHandle {
@@ -98,6 +102,7 @@ export function mountTechRatingPanel(ctx: RatingPanelCtx, body: HTMLElement, dep
   let busy = false;
   let again = false;
   let lastKey = "";
+  let lastRefreshKey: string | null = null;
   let disposed = false;
 
   const render = (html: string) => {
@@ -130,6 +135,7 @@ export function mountTechRatingPanel(ctx: RatingPanelCtx, body: HTMLElement, dep
     const symbol = ctx.symbol;
     const timeframe = ctx.timeframe;
     lastKey = `${symbol}|${timeframe}`;
+    lastRefreshKey = deps.autoRefreshKey?.(symbol, timeframe, Date.now()) ?? null;
     if (!root.firstChild) render(`<div class="tr-meta">計算中…</div>`);
     deps
       .compute(symbol, timeframe)
@@ -158,7 +164,13 @@ export function mountTechRatingPanel(ctx: RatingPanelCtx, body: HTMLElement, dep
   const poll = setInterval(() => {
     if (`${ctx.symbol}|${ctx.timeframe}` !== lastKey) refresh();
   }, deps.pollMs ?? 1000);
-  const tick = setInterval(refresh, deps.refreshMs ?? 60_000);
+  const autoKey = deps.autoRefreshKey;
+  const tick = autoKey
+    ? setInterval(() => {
+        const key = autoKey(ctx.symbol, ctx.timeframe, Date.now());
+        if (key !== null && key !== lastRefreshKey) refresh();
+      }, deps.checkMs ?? 10_000)
+    : setInterval(refresh, deps.refreshMs ?? 60_000);
 
   refresh();
 

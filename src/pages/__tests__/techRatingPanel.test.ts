@@ -78,6 +78,24 @@ describe("mountTechRatingPanel", () => {
     expect(compute).toHaveBeenCalledTimes(1);
   });
 
+  it("with autoRefreshKey: refreshes only when the key changes, never when it is null", async () => {
+    const compute = vi.fn(async () => snap(0.2, 0.2, 0.2));
+    let key: string | null = "a";
+    handle = mountTechRatingPanel(ctx, body, { compute, pollMs: 1000, checkMs: 1000, autoRefreshKey: () => key });
+    await vi.waitFor(() => expect(compute).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(compute).toHaveBeenCalledTimes(1); // same bar: no refetch
+    key = "b";
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(compute).toHaveBeenCalledTimes(2); // new bar closed
+    key = null;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(compute).toHaveBeenCalledTimes(2); // market closed for this symbol
+    ctx.symbol = "TAIFEX:TMFJ6";
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(compute).toHaveBeenCalledTimes(3); // a symbol switch still computes once
+  });
+
   it("a stale result never overwrites the newer symbol", async () => {
     let release!: (s: RatingSnapshot) => void;
     const compute = vi

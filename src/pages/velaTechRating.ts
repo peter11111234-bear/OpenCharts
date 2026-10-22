@@ -9,6 +9,7 @@
  */
 import { registerIcon, registerSidePanel, registerWidgetAction, type WidgetContext } from "@luxalgo/vela/plugin";
 import { svg16 } from "@luxalgo/vela/ui";
+import { autoRefreshAllowed, barRefreshKey } from "../services/shioaji/fetchPolicy.ts";
 import { ShioajiVelaProvider } from "../services/shioaji/velaProvider.ts";
 import { computeRating, type FetchBarsFn } from "./techRating.ts";
 import { mountTechRatingPanel } from "./techRatingPanel.ts";
@@ -23,6 +24,10 @@ const fetchBars: FetchBarsFn = (symbol, timeframe, fromMs, limit) =>
 export function mountRating(ctx: WidgetContext, body: HTMLElement) {
   return mountTechRatingPanel(ctx, body, {
     compute: (symbol, timeframe) => computeRating(symbol, timeframe, { fetchBars }),
+    // Each recompute re-downloads today's kbars (~65 KB of quota): only once per closed
+    // bar, and only for markets the user rule says to keep fresh (see fetchPolicy.ts).
+    autoRefreshKey: (symbol, timeframe, now) =>
+      autoRefreshAllowed(symbol, now) ? barRefreshKey(timeframe, now) : null,
   });
 }
 
