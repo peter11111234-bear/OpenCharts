@@ -128,9 +128,21 @@ def test_all_sessions_fetches_every_bucket_in_the_night():
     assert 12 <= len(f) <= 14
 
 
-def test_risk_counters_are_kept_per_session_and_trading_day():
+def test_risk_key_is_the_trading_day_like_order_guard():
     k = js.risk_key
-    assert k(at(10, 0, day=21)) != k(at(16, 0, day=21))            # day vs the night that follows
-    assert k(at(16, 0, day=21)) == k(at(2, 0, day=22))             # one night session across midnight
-    assert k(at(2, 0, day=22)) != k(at(10, 0, day=22))             # that night is not Thursday's day session
-    assert k(at(10, 0, day=21)) != k(at(10, 0, day=22))            # day counters restart every day
+    assert k(at(16, 0, day=21)) == k(at(2, 0, day=22)) == k(at(10, 0, day=22))   # Wed night + Thu day
+    assert k(at(10, 0, day=22)) != k(at(15, 0, day=22))                           # Thu 15:00 starts the next day
+    assert k(at(10, 0, day=21)) != k(at(10, 0, day=22))
+
+
+def test_monday_night_loss_streak_still_stops_tuesday_day_until_tuesday_1500():
+    mon_night, tue_day, tue_night = at(16, 0, day=26), at(10, 0, day=27), at(15, 0, day=27)
+    sess, key = js.rotate_risk_session(None, None, mon_night)
+    sess.consecutive_losses = 3
+    ans = {"answers": {"action_choice": {"choice": "buy", "confidence": 0.9}}}
+    bar = {"time": tue_day, "close": 100.0}
+    s2, key = js.rotate_risk_session(sess, key, tue_day)
+    assert s2 is sess and s2.gate(bar, ans)[3] == "consec_loss_stop"        # Tuesday day: still stopped
+    s3, key = js.rotate_risk_session(s2, key, tue_night)
+    assert s3 is not sess and s3.consecutive_losses == 0                   # Tuesday 15:00: fresh counters
+    assert s3.gate({"time": tue_night, "close": 100.0}, ans)[0] != "veto"

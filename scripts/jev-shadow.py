@@ -693,12 +693,18 @@ def session_label(ts: float) -> str:
     return "day" if 8 * 60 + 45 <= mins.hour * 60 + mins.minute <= 13 * 60 + 45 else "night"
 
 
-def risk_key(ts: float) -> tuple:
-    """(session, trading day): the night session (15:00 on) belongs to the next trading day.
-    The risk counters (daily follow cap, loss streak, profit protect) restart per key so night
-    bars never use up or inherit the day session's counters."""
-    d = (datetime.fromtimestamp(ts, TAIPEI) + timedelta(hours=9)).date()
-    return session_label(ts), d
+def risk_key(ts: float):
+    """Trading day, exactly like orderGuard.ts tradingDay(): the night session (15:00 on) and the
+    next day's day session are ONE trading day. The risk counters (daily follow cap, loss streak,
+    profit protect) restart per trading day, so a Monday-night loss streak still stops Tuesday's
+    day session and only clears at Tuesday 15:00."""
+    return (datetime.fromtimestamp(ts, TAIPEI) + timedelta(hours=9)).date()
+
+
+def rotate_risk_session(cur, cur_key, ts: float):
+    """Keep the current RiskSession while the trading day is unchanged, else start a fresh one."""
+    k = risk_key(ts)
+    return (cur, cur_key) if k == cur_key else (RiskSession(), k)
 
 
 FETCH_GRACE_S = 10    # wait this long after a 5m boundary so the last 1m bar has landed
@@ -849,8 +855,8 @@ def main() -> int:
                     aborted = True
                     break
                 answered = bool(ans.get("answers"))
-                if risk_session is not None and risk_key(bar["time"]) != risk_key_cur:
-                    risk_session, risk_key_cur = RiskSession(), risk_key(bar["time"])
+                if risk_session is not None:
+                    risk_session, risk_key_cur = rotate_risk_session(risk_session, risk_key_cur, bar["time"])
                 if risk_session is not None and answered:
                     _prev_outcome = risk_session._close_open_position(bar)
                     gate_res = risk_session.gate(bar, ans)
