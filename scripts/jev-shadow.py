@@ -667,6 +667,42 @@ def _day_session(ts):
 
 
 
+# --- kbars refetch gating (F1, 2026-10-22) ---------------------------------------
+# The loop used to refetch 3 calendar days of 1m kbars (~40KB) every --poll seconds, all day,
+# although a decision can only appear when a 5m bar completes (>99.9% of each fetch was a
+# repeat of the last one). fetch_due() skips the fetch unless something can have changed;
+# what is fetched (days / warmup) and what is decided is untouched.
+FETCH_GRACE_S = 10    # wait this long after a 5m boundary so the last 1m bar has landed
+FETCH_RETRIES = 3     # fetches allowed within one bucket while the last 1m bar is missing
+
+
+def bucket_of(now: float) -> int:
+    return int(now) - int(now) % TF_SECONDS
+
+
+def fetch_due(now: float, st: dict, all_sessions: bool, gated: bool = True) -> bool:
+    """True when kbars must be fetched now. `st` is the loop's fetch state (mutated by note_fetch)."""
+    if not gated or st.get("last_bucket") is None or st.get("pending"):
+        return True
+    bucket = bucket_of(now)
+    if st["last_bucket"] == bucket:
+        return st.get("retry", 0) > 0          # last 1m bar of the previous bucket still missing
+    if now - bucket < FETCH_GRACE_S:
+        return False
+    # a decision needs a completed bar that passes the session filter
+    return all_sessions or _day_session(bucket - TF_SECONDS)
+
+
+def note_fetch(st: dict, now: float, bars_1m: list[dict], pending: bool) -> None:
+    bucket = bucket_of(now)
+    if st.get("last_bucket") != bucket:
+        st["retry"] = FETCH_RETRIES
+    st["last_bucket"] = bucket
+    complete = bool(bars_1m) and bars_1m[-1]["time"] >= bucket - 60
+    st["retry"] = 0 if complete else max(0, st["retry"] - 1)
+    st["pending"] = pending
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="auto", choices=list(CONTRACTS) + ["auto"],
@@ -708,6 +744,8 @@ def main() -> int:
     gap = 60.0 / max(1, args.rate)   # min seconds between /decide calls
     last_call = 0.0
     backoff = 0
+    fetch_state: dict = {}
+    gated = not (args.since or args.until)   # a backfill run keeps polling every cycle
     print(f"jev-shadow {symbol}: dataset={dataset} ({len(seen)} bars answered), errors={ERRLOG.name}")
     print(f"  rate={args.rate}/min (gap {gap:.1f}s), max {args.max_per_cycle} bars/cycle, poll {args.poll}s")
 
@@ -742,6 +780,10 @@ def main() -> int:
                 time.sleep(wait)
                 continue
 
+            if not fetch_due(time.time(), fetch_state, getattr(args, "all_sessions", False), gated):
+                time.sleep(args.poll)
+                continue
+            _fetch_at = time.time()
             bars_1m = fetch_1m(contract, days=args.days, start_date=fetch_start)
             bars_5m = resample_5m(bars_1m)[-args.warmup:]
             now_bucket = int(time.time()) - (int(time.time()) % TF_SECONDS)
@@ -826,12 +868,15 @@ def main() -> int:
                       f"px={bar['close']} action={a.get('choice')} conf={a.get('confidence')} "
                       f"ch={ans.get('_channel')} risk={_gate_verdict} ds={ds_txt} "
                       f"err={ans.get('error')} tries={used}")
+            note_fetch(fetch_state, _fetch_at, bars_1m,
+                       aborted or any(b["time"] not in seen and b["time"] not in parked for b in completed))
             if aborted:
                 backoff = 60 if backoff == 0 else min(backoff * 2, 900)
                 print(f"  sleeping {backoff}s before retrying")
                 time.sleep(backoff)
         except Exception as e:
             print(f"loop error: {type(e).__name__}: {e}")
+            fetch_state["pending"] = True   # unknown state: do not skip the next fetch
         time.sleep(args.poll)
 
 
