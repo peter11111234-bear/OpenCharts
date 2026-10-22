@@ -22,6 +22,9 @@ $ScriptsDir = $PSScriptRoot
 $HeartbeatFile = Join-Path $LogDir "watchdog-heartbeat.txt"
 $AlertWebhook = $env:SHIOAJI_ALERT_WEBHOOK
 $AlertsFile  = Join-Path $LogDir "watchdog-alerts.log"
+# fop-tick-recorder 只是「每日 500MB 流量用完」的備援; 2026-10-22 使用者決定先停,
+# 改從源頭減少 K 棒重複抓取. 要恢復就改回 $true 並重啟看門狗.
+$EnableFopRecorder = $false
 function Log($msg) {
   $line = "{0} {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $msg
   Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
@@ -542,7 +545,7 @@ while ($true) {
   }
 
   # 4.5 fop-tick-recorder 存活: 沒在跑才啟動 (server 正常時、60s 冷卻)
-  if ($failStreak -eq 0 -and -not @(Get-FopRecorderProcs) -and
+  if ($EnableFopRecorder -and $failStreak -eq 0 -and -not @(Get-FopRecorderProcs) -and
       (New-TimeSpan -Start $lastFopRecorderStart -End (Get-Date)).TotalSeconds -gt 60) {
     $lastFopRecorderStart = Get-Date
     Log "fop-recorder not running — starting"
