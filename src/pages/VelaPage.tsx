@@ -8,8 +8,12 @@ import { combinedManifestEntries } from "../pineScripts.ts";
 import "./velaPineEditor.ts"; // 註冊頂列 "Pine" 按鈕（side effect）
 import { bindVelaWorkspace, unbindVelaWorkspace, normScript } from "./velaPineEditor.ts";
 import { initVelaLayouts } from "./velaLayouts.ts";
+import "./velaNautilusBacktest.ts"; // 註冊頂列 "Nautilus 回測" 按鈕（side effect）
 import "./velaTechRating.ts"; // 註冊「技術評分」側邊面板與頂列 "評分" 按鈕（side effect）
 import "./velaMarketWidgets.ts"; // 註冊報價列、電子熱力圖與排行榜（side effect）
+import "./velaAiAssistant.ts"; // 註冊「AI 副駕駛」側邊面板與頂列 "AI" 按鈕（side effect）
+import "./velaMcpClient.ts"; // 連上 /__mcp 中轉，讓外部 AI（Claude Code／OMP）用 MCP 控制圖表（side effect）
+import "./velaContractRoll.ts"; // 期貨自動換月：以券商近月為準、假日／颱風順延（side effect）
 
 
 /**
@@ -38,6 +42,16 @@ const STYLE_CHOICES: ReadonlyArray<[string, string]> = [
   ["baseline", "Base"],
   ["heikinashi", "HA"],
 ];
+
+/** Live-bar switch: localStorage "vela-live" = "1" on, "0" off, unset = default. */
+function liveBarsEnabled(): boolean {
+  try {
+    const v = localStorage.getItem("vela-live");
+    if (v === "1") return true;
+    if (v === "0") return false;
+  } catch { /* storage blocked */ }
+  return true;
+}
 
 function mountCellToolbar(ws: VelaWorkspace, cell: ChartCell): void {
   const doc = cell.host.ownerDocument;
@@ -279,7 +293,10 @@ export function VelaPage() {
         layout: "1",
         symbol: "TSE:2330",
         timeframe: "5",
-        live: false, // 暫停：SSE tick 一直推 → main thread 洗 render
+        // Live bars (throttled in velaProvider.subscribe). Off since 2026-10-07 because
+        // raw ticks flooded the main thread; console kill switch:
+        // localStorage.setItem("vela-live", "0") then F5 ("1" turns it back on).
+        live: liveBarsEnabled(),
         theme: "dark",
         timezone: "Asia/Taipei",
         timeframes: ["1", "5", "15", "30", "60", "240", "D", "W"],

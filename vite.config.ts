@@ -2,6 +2,7 @@ import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import fs from "node:fs";
 import path from "path";
+import { velaMcpPlugin } from "./src/services/vela-mcp/bridge.ts";
 
 /** Dev-only sink for the order guard (src/services/guard/guardRuntime.ts):
  *  POST /__guard-log appends one JSON object per line to logs/order-guard.jsonl.
@@ -113,8 +114,101 @@ function guardLogPlugin(): Plugin {
   };
 }
 
+/** Dev-only LLM relay for the AI 副駕駛 panel (src/pages/velaAiAssistant.ts):
+ *  POST /__ai-chat {messages, tools} → local LLM proxy, streamed back as SSE.
+ *  The upstream URL and model are fixed here, never taken from the request,
+ *  so this cannot be used as an open relay; same loopback-origin, POST-only
+ *  and body-cap rules as /__guard-log. */
+const AI_UPSTREAM = "http://127.0.0.1:3425/v1/chat/completions"; // local magpie proxy
+const AI_MODEL = "auto/minimax-m3";
+const AI_MAX_BODY = 512 * 1024;
+
+function aiChatPlugin(): Plugin {
+  return {
+    name: "ai-chat-relay",
+    configureServer(server) {
+      server.middlewares.use("/__ai-chat", (req, res) => {
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          res.end();
+          return;
+        }
+        const origin = req.headers.origin;
+        if (origin) {
+          let originUrl: URL | null = null;
+          try {
+            originUrl = new URL(origin);
+          } catch {
+            originUrl = null;
+          }
+          if (!req.headers.host || !originUrl || originUrl.host !== req.headers.host || !GUARD_LOG_HOSTS.has(originUrl.hostname)) {
+            res.statusCode = 403;
+            res.end();
+            return;
+          }
+        }
+        let body = "";
+        let size = 0;
+        let tooLarge = false;
+        req.on("data", (chunk) => {
+          if (tooLarge) return;
+          size += Buffer.byteLength(chunk);
+          if (size > AI_MAX_BODY) {
+            tooLarge = true;
+            body = "";
+            return;
+          }
+          body += chunk;
+        });
+        req.on("end", async () => {
+          if (tooLarge) {
+            res.statusCode = 413;
+            res.end();
+            return;
+          }
+          let parsed: { messages?: unknown; tools?: unknown } | null = null;
+          try {
+            parsed = JSON.parse(body);
+          } catch {
+            parsed = null;
+          }
+          if (!parsed || !Array.isArray(parsed.messages) || !Array.isArray(parsed.tools)) {
+            res.statusCode = 400;
+            res.end();
+            return;
+          }
+          try {
+            const up = await fetch(AI_UPSTREAM, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ model: AI_MODEL, stream: true, messages: parsed.messages, tools: parsed.tools }),
+            });
+            res.statusCode = up.status;
+            res.setHeader("Content-Type", up.headers.get("content-type") ?? "text/event-stream");
+            res.setHeader("Cache-Control", "no-cache");
+            if (!up.body) {
+              res.end();
+              return;
+            }
+            const reader = up.body.getReader();
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              res.write(value);
+            }
+            res.end();
+          } catch (e) {
+            if (!res.headersSent) res.statusCode = 502;
+            res.end(`LLM proxy unreachable: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        });
+      });
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), guardLogPlugin()],
+  plugins: [react(), guardLogPlugin(), aiChatPlugin(), velaMcpPlugin()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -126,6 +220,7 @@ export default defineConfig({
       input: {
         main: path.resolve(__dirname, "index.html"),
         pineEditor: path.resolve(__dirname, "pine-editor.html"),
+        heatmap: path.resolve(__dirname, "heatmap.html"),
       },
       output: {
         manualChunks(id) {
