@@ -62,5 +62,11 @@ BUCKET_LABELS = ["<1M", "1-10M", "10-30M", "30-50M", "50-100M", "100-500M", ">50
 SSE_BACKOFF_INIT = 1
 SSE_BACKOFF_MAX = 30
 
+# ── 日盤時段 (HH:MM, 台北) — 時段外不連 SSE、不訂閱，安靜待機到下個交易日 ──
+# 收盤後股票無 tick → SSE 30s 逾時 → 重訂 100 檔，整晚循環會把 :8080 卡住 5–20s
+SESSION_START = "08:30"
+SESSION_END = "13:40"
+SESSION_IDLE_POLL = 60  # 待機時多久檢查一次 (s)
+
 # ── Timezone ──
 TZ_OFFSET = 8  # UTC+8 Taipei

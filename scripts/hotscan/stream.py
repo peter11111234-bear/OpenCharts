@@ -5,8 +5,31 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from datetime import datetime, timedelta, timezone
 
-from . import config
+from . import config, tradingday
+
+TAIPEI = timezone(timedelta(hours=config.TZ_OFFSET))
+
+
+def in_session(now: datetime | None = None) -> bool:
+    """交易日 SESSION_START–SESSION_END 才需要股票 tick。"""
+    now = now or datetime.now(TAIPEI)
+    hm = now.strftime("%H:%M")
+    return (config.SESSION_START <= hm < config.SESSION_END
+            and tradingday.is_trading_day(now.date()))
+
+
+def wait_for_session() -> bool:
+    """時段外就待機到開盤。回傳 True = 有待機過（呼叫端需重新訂閱）。"""
+    if in_session():
+        return False
+    print(f"outside day session — idle until next trading day {config.SESSION_START}",
+          flush=True)
+    while not in_session():
+        time.sleep(config.SESSION_IDLE_POLL)
+    print("day session open — resuming", flush=True)
+    return True
 
 
 def post(path: str, payload: dict, timeout: int = 30) -> dict | list:
@@ -73,6 +96,9 @@ def stream_loop(stocks: list[dict], on_tick_fn) -> None:
     """Main SSE loop with reconnect. Calls on_tick_fn(code, tick_dict)."""
     backoff = config.SSE_BACKOFF_INIT
     while True:
+        if wait_for_session():
+            subscribe_all(stocks)
+            backoff = config.SSE_BACKOFF_INIT
         try:
             print(f"connecting SSE {config.SHIOAJI_BASE}{config.SSE_TICK_PATH} ...")
             for event, data in sse_events(config.SSE_TICK_PATH):
@@ -89,6 +115,8 @@ def stream_loop(stocks: list[dict], on_tick_fn) -> None:
         except Exception as e:
             print(f"SSE error: {type(e).__name__}: {e} — reconnect in {backoff}s",
                   file=sys.stderr)
+            if not in_session():
+                continue  # 收盤：不重訂閱，回圈頂端進待機
             time.sleep(backoff)
             backoff = min(backoff * 2, config.SSE_BACKOFF_MAX)
             subscribe_all(stocks)

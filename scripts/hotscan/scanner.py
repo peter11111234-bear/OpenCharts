@@ -220,6 +220,7 @@ class Scanner:
         alternate = [s for s in self.stocks if s.get("role") == "alternate"]
         print(f"watchlist: {len(primary)} primary + {len(alternate)} alternate")
 
+        stream.wait_for_session()  # 盤後被重啟時不訂閱，等下個交易日
         n = stream.subscribe_all(primary)
         print(f"subscribed {n}/{len(primary)}")
         if n < len(primary) and alternate:
