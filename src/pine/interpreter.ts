@@ -39,7 +39,6 @@ import {
   type DrawObj,
   type HistRef,
   type IndicatorDecl,
-  type InputSchemaLite,
   type Member,
   type Node,
   type Param,
@@ -77,9 +76,13 @@ import {
   type UdtMethodDef,
 } from './udt';
 import { jitCompile, jitCompileUdf } from './jit';
+import { isNum, numVal, stmtMayExitTop, walkNodes } from './astUtil';
+import { collectInputs, declOverlay, declProps, declShortTitle, declTitle } from './scriptDecl';
 
 export type { Frame } from './scope';
 export { PineRuntimeError } from './errors';
+export { astChildren } from './astUtil';
+export { collectInputs } from './scriptDecl';
 
 // ── MTF injection seam ────────────────────────────────────────────────────────
 
@@ -271,14 +274,6 @@ function warn(run: RunState, ctx: BuiltinCtx, msg: string): void {
 }
 
 // ── value helpers ─────────────────────────────────────────────────────────────
-
-function isNum(v: Value): v is { kind: 'int' | 'float'; v: number } {
-  return v.kind === 'int' || v.kind === 'float';
-}
-
-function numVal(n: number, preferInt: boolean): Value {
-  return preferInt && Number.isInteger(n) ? { kind: 'int', v: n } : { kind: 'float', v: n };
-}
 
 /** Builtins may hand back `{kind:'series'}`; interpreter ops read the current bar. */
 function unseries(v: Value): Value {
@@ -549,82 +544,6 @@ function stableArgSeries(run: RunState, key: object, v: Series): Series {
   e.inner = v;
   e.wrap = null;
   return v;
-}
-
-/** Child nodes of an AST node (skips scalars like loc/type/name). Shared
- *  with mtf.ts's gate walker via this export (F11). */
-export function astChildren(node: object): Node[] {
-  const out: Node[] = [];
-  const collect = (v: unknown): void => {
-    if (!v || typeof v !== 'object') return;
-    if (Array.isArray(v)) {
-      for (const it of v) collect(it);
-    } else if ('type' in v) {
-      out.push(v as Node);
-    } else {
-      // Wrapper objects without a `type` field — elseIfs entries
-      // ({test, body}), call args ({name?, value}), var-multi items
-      // ({name, typeAnn?, value}), switch cases — transparently expose
-      // their Node-valued fields. No visited set needed: the parser
-      // emits trees, and an (impossible) shared subtree would only
-      // rescan nodes, never corrupt the result.
-      for (const inner of Object.values(v)) collect(inner);
-    }
-  };
-  for (const v of Object.values(node)) collect(v);
-  return out;
-}
-
-/**
- * May evaluating this top-level stmt skip the REST of the body's stmts?
- * `return` always exits the run; `break`/`continue` exit the top-level
- * sequence unless a loop or switch on the path absorbs them (`for`/
- * `while` absorb both in their body, `switch` absorbs `break` in matched
- * case bodies). Function bodies are opaque — their `return`/`break`/
- * `continue` can't escape to the top level. Used once per run to pick
- * `run.pruneCutoff`: decls at or after an early-exit stmt aren't provably
- * written every bar, so their slots keep registering for ensureBar.
- */
-function stmtMayExitTop(n: Node, absorbBreak: boolean, absorbCont: boolean): boolean {
-  switch (n.type) {
-    case 'return': return true;
-    case 'break': return !absorbBreak;
-    case 'continue': return !absorbCont;
-    case 'func': case 'method': case 'arrow': return false;
-    case 'for': case 'while': {
-      // Loop bodies absorb break/continue; bound/test exprs can't contain
-      // them, but scan generically with the outer flags anyway.
-      const loop = n as { body?: Node[]; from?: Node; to?: Node; step?: Node; test?: Node };
-      for (const s of loop.body ?? []) if (stmtMayExitTop(s, true, true)) return true;
-      for (const e of [loop.from, loop.to, loop.step, loop.test]) {
-        if (e && stmtMayExitTop(e, absorbBreak, absorbCont)) return true;
-      }
-      return false;
-    }
-    case 'switch': {
-      const sw = n as { subject?: Node; cases?: { test?: Node; body?: Node[] }[] };
-      if (sw.subject && stmtMayExitTop(sw.subject, absorbBreak, absorbCont)) return true;
-      for (const c of sw.cases ?? []) {
-        if (c.test && stmtMayExitTop(c.test, absorbBreak, absorbCont)) return true;
-        // Only matched arms (c.test !== undefined) run inside a try that
-        // absorbs BREAK — evalSwitch catches BREAK around c.test arms
-        // only; the default arm propagates break/continue out, so its
-        // body scans with the outer absorbBreak. CONTINUE escapes every
-        // arm either way (absorbCont unchanged).
-        const armAbsorb = c.test !== undefined ? true : absorbBreak;
-        for (const s of c.body ?? []) {
-          if (stmtMayExitTop(s, armAbsorb, absorbCont)) return true;
-        }
-      }
-      return false;
-    }
-    default: {
-      for (const c of astChildren(n)) {
-        if (stmtMayExitTop(c, absorbBreak, absorbCont)) return true;
-      }
-      return false;
-    }
-  }
 }
 
 /**
@@ -3914,159 +3833,6 @@ export async function incRun(
   });
   runScriptTail = p.then(() => {}, () => {});
   return p;
-}
-
-// ── script declaration (indicator/strategy) ───────────────────────────────────
-
-function declArgValue(decl: IndicatorDecl | StrategyDecl | null, name: string): Value | undefined {
-  if (!decl) return undefined;
-  const named = decl.args.find(a => a.name === name);
-  return named ? staticLit(named.value) : undefined;
-}
-
-function declTitle(decl: IndicatorDecl | StrategyDecl | null): string | undefined {
-  const named = declArgValue(decl, 'title');
-  if (named?.kind === 'string') return named.v;
-  const first = decl?.args.find(a => a.name === undefined);
-  const v = first ? staticLit(first.value) : undefined;
-  return v?.kind === 'string' ? v.v : undefined;
-}
-
-function declShortTitle(decl: IndicatorDecl | StrategyDecl | null): string | undefined {
-  const v = declArgValue(decl, 'shorttitle');
-  return v?.kind === 'string' ? v.v : undefined;
-}
-
-function declOverlay(decl: IndicatorDecl | StrategyDecl | null): boolean {
-  const v = declArgValue(decl, 'overlay');
-  return v?.kind === 'bool' ? v.v : false;
-}
-
-function declProps(decl: IndicatorDecl | StrategyDecl | null): InputSchemaLite[] {
-  if (!decl) return [];
-  return decl.args.map((a, i) => {
-    const v = staticLit(a.value);
-    return {
-      id: a.name ?? `arg_${i}`,
-      name: a.name ?? `arg_${i}`,
-      type: v?.kind ?? 'na',
-      defval: v && 'v' in v ? v.v : undefined,
-    };
-  });
-}
-
-/** Evaluate literal-ish nodes at scan time (no frame). */
-function staticLit(n: Node): Value | undefined {
-  switch (n.type) {
-    case 'num': return numVal(n.v, n.isInt);
-    case 'str': return { kind: 'string', v: n.v };
-    case 'bool': return n.v ? VTRUE : VFALSE;
-    case 'color': return { kind: 'color', v: n.v };
-    case 'na': return NA;
-    case 'unary': {
-      if (n.op !== '-') return undefined;
-      const a = staticLit(n.arg);
-      return a && isNum(a) ? numVal(-a.v, a.kind === 'int') : undefined;
-    }
-    case 'member':
-      return n.obj.type === 'ident' ? getConstant(`${n.obj.name}.${n.prop}`) : undefined;
-    default:
-      return undefined;
-  }
-}
-
-// ── input schema collection (prepare-time backstop) ───────────────────────────
-
-/**
- * Walk `body` for `input.<kind>(...)` calls and emit InputSchemaLite entries.
- * Live runs prefer ctx.inputSchemas (populated by builtins/input.ts with
- * override-aware ids); this static pass is the fallback / prepare-time path.
- */
-export function collectInputs(body: Node[]): InputSchemaLite[] {
-  const out: InputSchemaLite[] = [];
-  const seen = new Set<string>();
-  let seq = 0;
-
-  const argVal = (args: Arg[], idx: number, name: string): Value | undefined => {
-    const named = args.find(a => a.name === name);
-    const node = named?.value ?? args.filter(a => a.name === undefined)[idx]?.value;
-    return node ? staticLit(node) : undefined;
-  };
-
-  walkNodes(body, n => {
-    if (n.type !== 'call') return;
-    const c = n.callee;
-    if (c.type !== 'member' || c.obj.type !== 'ident' || c.obj.name !== 'input') return;
-    const kind = c.prop;
-    const defval = argVal(n.args, 0, 'defval');
-    const title = argVal(n.args, 1, 'title');
-    const idArg = argVal(n.args, -1, 'id');
-    const titleStr = title?.kind === 'string' ? title.v : '';
-    const id =
-      idArg?.kind === 'string' && idArg.v ? idArg.v : titleStr || `input_${kind}_${seq++}`;
-    if (seen.has(id)) return;
-    seen.add(id);
-    const schema: InputSchemaLite = {
-      id,
-      name: titleStr || id,
-      type: kind,
-      defval: defval && 'v' in defval ? defval.v : undefined,
-    };
-    const minval = argVal(n.args, -1, 'minval');
-    const maxval = argVal(n.args, -1, 'maxval');
-    const step = argVal(n.args, -1, 'step');
-    const group = argVal(n.args, -1, 'group');
-    const inline = argVal(n.args, -1, 'inline');
-    const tooltip = argVal(n.args, -1, 'tooltip');
-    const options = argVal(n.args, -1, 'options');
-    if (minval && isNum(minval)) schema.minval = minval.v;
-    if (maxval && isNum(maxval)) schema.maxval = maxval.v;
-    if (step && isNum(step)) schema.step = step.v;
-    if (group?.kind === 'string') schema.group = group.v;
-    if (inline?.kind === 'string') schema.inline = inline.v;
-    if (tooltip?.kind === 'string') schema.tooltip = tooltip.v;
-    if (options?.kind === 'array') {
-      schema.options = options.v.map(v => ('v' in v ? v.v : v.kind));
-    }
-    out.push(schema);
-  });
-  return out;
-}
-
-/** Generic recursive AST walker (Arg / case / elseIf wrappers handled).
- *  Kept separate from astChildren: this one VISITS each node (callback)
- *  and recurses pre-order, while astChildren only COLLECTS one level of
- *  children — stmtMayExitTop needs that two-phase shape. Unifying them
- *  isn't worth the flag-parameter complexity (CR2). */
-function walkNodes(nodes: Node | Node[] | undefined | null, fn: (n: Node) => void): void {
-  if (!nodes) return;
-  if (Array.isArray(nodes)) {
-    for (const n of nodes) walkNodes(n, fn);
-    return;
-  }
-  fn(nodes);
-  const rec = nodes as unknown as Record<string, unknown>;
-  for (const k of Object.keys(rec)) {
-    if (k === 'loc' || k === 'type') continue;
-    const v = rec[k];
-    if (Array.isArray(v)) {
-      for (const item of v) {
-        if (!item || typeof item !== 'object') continue;
-        if ('type' in item) {
-          walkNodes(item as Node, fn);
-          continue;
-        }
-        // Arg / case / elseIf wrapper objects
-        if ('value' in item && item.value && typeof item.value === 'object' && 'type' in item.value)
-          walkNodes(item.value as Node, fn);
-        if ('body' in item && Array.isArray(item.body)) walkNodes(item.body as Node[], fn);
-        if ('test' in item && item.test && typeof item.test === 'object' && 'type' in item.test)
-          walkNodes(item.test as Node, fn);
-      }
-    } else if (v && typeof v === 'object' && 'type' in v) {
-      walkNodes(v as Node, fn);
-    }
-  }
 }
 
 // ── interpreter-owned constants ───────────────────────────────────────────────
