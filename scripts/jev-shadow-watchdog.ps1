@@ -53,9 +53,10 @@ function Start-Sidecar {
 }
 
 function Start-Collector {
+  # --all-sessions: day AND night session, one decision per 5m bar (user decision 2026-10-22).
   # No --since/--until/--warmup overrides here: the watchdog always restores the
   # normal live settings. A backfill run is a deliberate manual act.
-  $p = Start-Process -FilePath $PythonExe -ArgumentList "-u", "`"$Collector`"" `
+  $p = Start-Process -FilePath $PythonExe -ArgumentList "-u", "`"$Collector`"", "--all-sessions" `
     -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru `
     -RedirectStandardOutput (Join-Path $LogDir "jev-shadow-out.log") `
     -RedirectStandardError  (Join-Path $LogDir "jev-shadow-err.log")

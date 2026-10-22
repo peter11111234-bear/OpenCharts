@@ -48,6 +48,23 @@ def load(path):
     return rows
 
 
+def session_of(row):
+    """'day' (08:45-13:45) or 'night'. New rows carry it; older rows are classified by bar time.
+    The day-session numbers set the P60 threshold and the half-size rule, so night rows must
+    never be folded into them."""
+    if row.get("session") in ("day", "night"):
+        return row["session"]
+    t = datetime.fromtimestamp(row["bar_time"], TAIPEI)
+    return "day" if 8 * 60 + 45 <= t.hour * 60 + t.minute <= 13 * 60 + 45 else "night"
+
+
+def split_by_session(rows):
+    out = {"day": [], "night": []}
+    for r in rows:
+        out[session_of(r)].append(r)
+    return out
+
+
 def summarize(rows):
     groups = defaultdict(list)
     for r in rows:
@@ -66,10 +83,8 @@ def summarize(rows):
     return stats
 
 
-def render(days, stats):
-    lines = [f"# JEV 高波動規則檢討（{datetime.now(TAIPEI):%Y-%m-%d}）", "",
-             f"規則上線（2026-10-21）後已收 {days} 個交易日。", "",
-             "| 組別 | 交易數 | 勝率 | 每筆平均（點，一口計） | 實際加總（點，含減半） |",
+def _table(stats):
+    lines = ["| 組別 | 交易數 | 勝率 | 每筆平均（點，一口計） | 實際加總（點，含減半） |",
              "|---|---|---|---|---|"]
     for name, label in (("volatile", "高波動（減半跟）"), ("normal", "正常")):
         s = stats.get(name)
@@ -77,6 +92,18 @@ def render(days, stats):
             lines.append(f"| {label} | {s['n']} | {s['win_rate']:.0%} | {s['avg_points']:.1f} | {s['sized_points']:.0f} |")
         else:
             lines.append(f"| {label} | 0 | – | – | – |")
+    return lines
+
+
+def render(days, stats, night=None):
+    """`stats` = day-session stats (they decide P60 / half-size); `night` = (days, stats) shown
+    separately and never mixed into the day numbers."""
+    lines = [f"# JEV 高波動規則檢討（{datetime.now(TAIPEI):%Y-%m-%d}）", "",
+             f"規則上線（2026-10-21）後日盤已收 {days} 個交易日。", "",
+             "## 日盤（P60 門檻與減半規則的依據）", ""] + _table(stats)
+    if night is not None:
+        n_days, n_stats = night
+        lines += ["", f"## 夜盤（{n_days} 個交易日；另計，不混入日盤，不用來定 P60 門檻）", ""] + _table(n_stats)
     lines += ["", "下一步：請 Claude 讀這份報告，決定 P60 門檻與減半要不要調整（myopenchart skill 待做清單）。"]
     return "\n".join(lines) + "\n"
 
@@ -97,11 +124,12 @@ def main(argv):
     force = "--force" in argv
     if DONE.exists() and not force:
         return 0
-    rows = load(DATA)
-    days = len({trading_day(r["bar_time"]) for r in rows})
+    parts = split_by_session(load(DATA))
+    days = len({trading_day(r["bar_time"]) for r in parts["day"]})      # the 20-day gate counts day sessions only
     if days < MIN_DAYS and not force:
         return 0
-    report = render(days, summarize(rows))
+    night = (len({trading_day(r["bar_time"]) for r in parts["night"]}), summarize(parts["night"]))
+    report = render(days, summarize(parts["day"]), night)
     if force:
         print(report)
         return 0

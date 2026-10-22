@@ -90,3 +90,47 @@ def test_missing_last_1m_bar_retries_at_most_three_times_per_bucket():
 
 def test_backfill_run_keeps_polling_every_cycle():
     assert js.fetch_due(at(3, 0), {"last_bucket": js.bucket_of(at(3, 0)), "retry": 0}, False, gated=False)
+
+
+# ---- F1b: night session decided too; real trading windows only --------------------------
+
+def test_market_open_windows():
+    mo = js.market_open
+    assert mo(at(8, 45)) and mo(at(13, 45)) and not mo(at(8, 44)) and not mo(at(13, 46))
+    assert not mo(at(14, 30)) and not mo(at(14, 59))          # gap between sessions
+    assert mo(at(15, 0)) and mo(at(23, 59)) and mo(at(0, 0, day=22)) and mo(at(4, 59, day=22))
+    assert not mo(at(5, 0, day=22)) and not mo(at(8, 44, day=22))
+    assert mo(at(9, 0, day=22))                                # Thursday day session
+    # Fri 2026-10-23 night runs into Sat 05:00; Sat 05:00 -> Mon 08:45 closed
+    assert mo(at(23, 0, day=23)) and mo(at(4, 59, day=24)) and not mo(at(5, 0, day=24))
+    assert not mo(at(12, 0, day=24)) and not mo(at(20, 0, day=24))
+    assert not mo(at(3, 0, day=25)) and not mo(at(12, 0, day=25))   # Sunday
+    assert not mo(at(3, 0, day=26)) and not mo(at(8, 44, day=26)) and mo(at(8, 45, day=26))  # Monday
+
+
+def test_fetch_and_decide_use_the_same_predicate():
+    for h in range(24):
+        for m in (0, 5, 30, 45, 55):
+            ts = at(h, m)
+            assert js.session_ok(ts, True) == js.market_open(ts)
+            assert js.session_ok(ts, False) == js._day_session(ts)
+
+
+def test_all_sessions_does_not_fetch_in_gaps_or_on_weekends():
+    for start, end in [(at(13, 52), at(14, 58)), (at(5, 6, day=22), at(8, 40, day=22)),
+                       (at(5, 6, day=24), at(23, 0, day=25))]:   # Sat 05:06 .. Sun night
+        f = simulate(start, end, all_sessions=True)
+        assert all(t < start + 2 * POLL for t in f), [(t - start) for t in f]
+
+
+def test_all_sessions_fetches_every_bucket_in_the_night():
+    f = simulate(at(22, 0), at(23, 0), all_sessions=True)
+    assert 12 <= len(f) <= 14
+
+
+def test_risk_counters_are_kept_per_session_and_trading_day():
+    k = js.risk_key
+    assert k(at(10, 0, day=21)) != k(at(16, 0, day=21))            # day vs the night that follows
+    assert k(at(16, 0, day=21)) == k(at(2, 0, day=22))             # one night session across midnight
+    assert k(at(2, 0, day=22)) != k(at(10, 0, day=22))             # that night is not Thursday's day session
+    assert k(at(10, 0, day=21)) != k(at(10, 0, day=22))            # day counters restart every day

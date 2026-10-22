@@ -39,3 +39,19 @@ def test_silent_until_enough_days(tmp_path, monkeypatch):
     monkeypatch.setattr(rv, "REPORT", tmp_path / "report.md")
     assert rv.main(["x"]) == 0
     assert not (tmp_path / "report.md").exists()
+
+
+def test_night_rows_stay_out_of_the_day_numbers():
+    day = {**row(at(2026, 10, 22, 10), {"pnl_points": 10.0, "lots": 1.0, "rule": "full"})}
+    night = {**row(at(2026, 10, 22, 21), {"pnl_points": -50.0, "lots": 1.0, "rule": "full"})}
+    parts = rv.split_by_session([day, night])
+    assert [r["bar_time"] for r in parts["day"]] == [day["bar_time"]]
+    assert [r["bar_time"] for r in parts["night"]] == [night["bar_time"]]
+    assert rv.summarize(parts["day"])["normal"]["avg_points"] == 10.0
+    assert rv.summarize(parts["night"])["normal"]["avg_points"] == -50.0
+    report = rv.render(1, rv.summarize(parts["day"]), (1, rv.summarize(parts["night"])))
+    assert "## 日盤" in report and "## 夜盤" in report
+
+
+def test_session_field_wins_over_bar_time():
+    assert rv.session_of({"bar_time": at(2026, 10, 22, 10), "session": "night"}) == "night"

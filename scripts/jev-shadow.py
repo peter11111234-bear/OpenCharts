@@ -672,6 +672,35 @@ def _day_session(ts):
 # although a decision can only appear when a 5m bar completes (>99.9% of each fetch was a
 # repeat of the last one). fetch_due() skips the fetch unless something can have changed;
 # what is fetched (days / warmup) and what is decided is untouched.
+def market_open(ts: float) -> bool:
+    """Real TAIFEX trading windows (Taipei): day 08:45-13:45, night 15:00-05:00;
+    Sat 05:00 -> Mon 08:45 is closed (weekdays only: no holiday calendar here)."""
+    t = datetime.fromtimestamp(ts, TAIPEI)
+    mins, dow = t.hour * 60 + t.minute, t.weekday()        # Mon=0 .. Sun=6
+    if dow < 5 and (8 * 60 + 45 <= mins <= 13 * 60 + 45 or mins >= 15 * 60):
+        return True
+    return 1 <= dow <= 5 and mins < 5 * 60                  # after-midnight part of the night session
+
+
+def session_ok(ts: float, all_sessions: bool) -> bool:
+    """One predicate for both "fetch kbars for this bar" and "decide this bar", so a bar
+    is never fetched without being decided nor decided without having been fetched."""
+    return market_open(ts) if all_sessions else _day_session(ts)
+
+
+def session_label(ts: float) -> str:
+    mins = datetime.fromtimestamp(ts, TAIPEI)
+    return "day" if 8 * 60 + 45 <= mins.hour * 60 + mins.minute <= 13 * 60 + 45 else "night"
+
+
+def risk_key(ts: float) -> tuple:
+    """(session, trading day): the night session (15:00 on) belongs to the next trading day.
+    The risk counters (daily follow cap, loss streak, profit protect) restart per key so night
+    bars never use up or inherit the day session's counters."""
+    d = (datetime.fromtimestamp(ts, TAIPEI) + timedelta(hours=9)).date()
+    return session_label(ts), d
+
+
 FETCH_GRACE_S = 10    # wait this long after a 5m boundary so the last 1m bar has landed
 FETCH_RETRIES = 3     # fetches allowed within one bucket while the last 1m bar is missing
 
@@ -690,7 +719,7 @@ def fetch_due(now: float, st: dict, all_sessions: bool, gated: bool = True) -> b
     if now - bucket < FETCH_GRACE_S:
         return False
     # a decision needs a completed bar that passes the session filter
-    return all_sessions or _day_session(bucket - TF_SECONDS)
+    return session_ok(bucket - TF_SECONDS, all_sessions)
 
 
 def note_fetch(st: dict, now: float, bars_1m: list[dict], pending: bool) -> None:
@@ -739,6 +768,7 @@ def main() -> int:
     dataset = log_for(symbol)   # fixed for the run: a roll stays within the same root
     seen = logged_bar_times(dataset)
     risk_session = RiskSession() if os.environ.get('RISK_GATE', '1') == '1' else None
+    risk_key_cur = None
     parked: set[int] = set()
     tries: dict[int, int] = {}
     gap = 60.0 / max(1, args.rate)   # min seconds between /decide calls
@@ -790,7 +820,7 @@ def main() -> int:
             completed = [b for b in bars_5m
                          if b["time"] < now_bucket and b["time"] not in seen and b["time"] not in parked
                          and (lo is None or b["time"] >= lo) and (hi is None or b["time"] <= hi)
-                         and (getattr(args, "all_sessions", False) or _day_session(b["time"]))]
+                         and session_ok(b["time"], getattr(args, "all_sessions", False))]
             if len(completed) > args.max_per_cycle:
                 print(f"  backlog {len(completed)} bars — taking {args.max_per_cycle} this cycle")
 
@@ -819,6 +849,8 @@ def main() -> int:
                     aborted = True
                     break
                 answered = bool(ans.get("answers"))
+                if risk_session is not None and risk_key(bar["time"]) != risk_key_cur:
+                    risk_session, risk_key_cur = RiskSession(), risk_key(bar["time"])
                 if risk_session is not None and answered:
                     _prev_outcome = risk_session._close_open_position(bar)
                     gate_res = risk_session.gate(bar, ans)
@@ -837,6 +869,7 @@ def main() -> int:
                         risk_session.open_lots = _gate_lots_mult
                         risk_session.open_rule = _gate_rule
                 event = {"ts": time.time(), "bar_time": bar["time"], "symbol": symbol,
+                         "session": session_label(bar["time"]),
                          "price": bar["close"], "order_flow": state["order_flow"],
                          "answers": ans.get("answers"), "channel": ans.get("_channel"),
                          "model": ans.get("model"), "error": ans.get("error"), "attempts": used,
