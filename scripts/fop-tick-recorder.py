@@ -24,6 +24,7 @@ STREAM = "http://127.0.0.1:8080/api/v1/stream/data/tick_fop"
 TAIPEI = timezone(timedelta(hours=8))
 KEEP_DAYS = 3
 FLUSH_EVERY = 10
+RECORD_PREFIXES = ("TMF",)  # /vela 只看微台；小台 MXF 不錄（換月後代碼前綴不變）
 
 bars: dict[str, dict[int, dict]] = {}  # code -> minute epoch s -> bar
 dirty: set[str] = set()
@@ -41,6 +42,8 @@ def add_tick(t: dict) -> bool:
     if t.get("simtrade"):
         return False
     code = t.get("code")
+    if not code or not code.startswith(RECORD_PREFIXES):
+        return False
     ts = tick_epoch(t)
     try:
         price = float(t.get("close"))
@@ -60,6 +63,17 @@ def add_tick(t: dict) -> bool:
         b["volume"] += vol
     dirty.add(code)
     return True
+
+
+def prune_logs() -> None:
+    """Delete raw tick logs older than replay() reads (~20–60MB/day otherwise piles up)."""
+    cutoff = datetime.now(TAIPEI).date() - timedelta(days=KEEP_DAYS)
+    for f in LOG_DIR.glob("fop-ticks-*.jsonl"):
+        try:
+            if datetime.strptime(f.stem[-8:], "%Y%m%d").date() < cutoff:
+                f.unlink()
+        except (ValueError, OSError):
+            pass
 
 
 def replay() -> None:
@@ -101,10 +115,12 @@ def flush() -> None:
 
 
 def run() -> None:
+    prune_logs()
     replay()
     flush()
     print(f"replayed: { {c: len(s) for c, s in bars.items()} }", flush=True)
     last_flush = time.time()
+    last_prune = datetime.now(TAIPEI).date()
     while True:
         try:
             req = urllib.request.Request(STREAM, headers={"Accept": "text/event-stream"})
@@ -121,6 +137,9 @@ def run() -> None:
                     if time.time() - last_flush >= FLUSH_EVERY:
                         flush()
                         last_flush = time.time()
+                        if datetime.now(TAIPEI).date() != last_prune:
+                            prune_logs()
+                            last_prune = datetime.now(TAIPEI).date()
         except Exception as e:  # stream drop / server restart: reconnect
             print(f"stream error: {e}; reconnect in 5s", flush=True)
             flush()

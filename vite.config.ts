@@ -250,6 +250,12 @@ export default defineConfig({
     // serving this repo — fail loudly instead of spawning :5174/:5175
     // zombies (the multi-tab/multi-server incident of 2026-10-07).
     strictPort: true,
+    // fop-tick-recorder appends to logs/ ~10x/s and rewrites public/local-bars/ every 10s;
+    // watching them kept this dev server at ~1 full core while idle (2026-10-22).
+    // Serving public/local-bars does not need the watcher.
+    watch: {
+      ignored: ["**/logs/**", "**/public/local-bars/**"],
+    },
     // Runtime logs (the guard audit log, watchdog output) are not public files.
     // The default deny list only covers .env and .git, so logs/ would be served.
     fs: {
