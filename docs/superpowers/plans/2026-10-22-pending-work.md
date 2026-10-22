@@ -54,5 +54,5 @@
 |---|---|---|
 | E1 | 根因：`VelaPage.tsx` 自 10-07 寫死 `live: false`。改為 `liveBarsEnabled()`（預設開，`localStorage vela-live=0` 可關）＋ `throttleBars` 每秒最多 1 根 | 已改、無頭實測 OK，待使用者 F5 確認 |
 | E2 | 盤後 2330 沒 tick → feed 看門狗每 10 秒 `quiet streams: 2330 — resubscribing` 重送 subscribe（疑為今天 25,884 次 subscribe 的來源）。應只在該商品交易時段內判定 quiet | 待做 |
-| E3 | Shioaji kbars 時間是「分鐘起點」還是「分鐘終點」？live/本機錄製都是起點；若 kbars 是終點會差一根。額度恢復後比對 | 待查（10-22） |
+| E3 | Shioaji kbars 時間是「分鐘起點」還是「分鐘終點」？ | ✅ 2026-10-22 查證：**kbars 標分鐘終點**（09:00–09:01 的成交標 09:01），我們的 live（`feed.ts`）、`fop-tick-recorder.py`、`taifex-local-bars.py` 標起點（同 TradingView）——不是永豐錯，是慣例不同，/vela 把兩種接在一起。證據：① 2330 10-21 kbars 無 09:00、首根 09:01＝09:00:07 開盤撮合（量 1748 吻合）；② tick 自算 09:00／09:01／13:24 分別＝kbars 09:01／09:02／13:25；③ MXFK6 對期交所逐筆：時間不動 583 根只 20 根同量，kbars −60s 後 583/583 同量；期貨日盤首根 08:46、末根 13:45。**規則不是一律 −60s**：股票 13:30 收盤集合競價（成交時間 13:30:00 整）起點標法也是 13:30，要保留不動。影響：`candles.ts` 歷史晚一分鐘、5 分 K 分錯格；`jev-shadow.py` `fetch_1m` 同樣錯位，已存的 `jev-shadow*.jsonl` 是用錯位 5 分 K 算的 | 待使用者同意後**收盤後**改：① `candles.ts` 讀入 −60s（股票 13:30 例外）＋測試 09:01→09:00、13:25→13:24、13:30 不變；② `jev-shadow.py` 同規則，舊資料是否重算另議；③ 改完使用者 Ctrl+Shift+R |
 | E4 | `scripts/taifex-local-bars.py MXFK6 TMFK6`：期交所逐筆 → `public/local-bars/hist/`，流量超標時當歷史備援。每天下載新檔後要重跑；換月後代碼要換 | 已做，未排程 |

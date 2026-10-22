@@ -30,6 +30,19 @@ export function taipeiToEpochSec(local: string): number {
   return Math.floor(Date.parse(`${local}+08:00`) / 1000);
 }
 
+/**
+ * Shioaji kbars stamp a 1m bar with the minute's END (09:00–09:01 trades → "09:01:00"),
+ * while live bars and local recordings stamp the START (TradingView convention).
+ * Verified 2026-10-22 against tick data and TAIFEX per-trade files (see
+ * docs/superpowers/plans/2026-10-22-pending-work.md E3). Shift back one minute.
+ * Exception: the TW stock closing auction (13:30:00 exactly) is already start-stamped.
+ */
+export function kbarStartSec(local: string, securityType: string): number {
+  const sec = taipeiToEpochSec(local);
+  if (securityType === "STK" && local.slice(11, 19) === "13:30:00") return sec;
+  return sec - 60;
+}
+
 function toDateStr(d: Date): string {
   const y = d.getFullYear();
   const m = `${d.getMonth() + 1}`.padStart(2, "0");
@@ -154,7 +167,7 @@ export async function getShioajiHistory(
     if (![open, high, low, close].every(Number.isFinite)) continue;
     // The timestamp comes off an unvalidated `res.json()` too: an unparsable one
     // yields NaN, which survives the sort and reaches Vela as a bar with no time.
-    const time = taipeiToEpochSec(dt);
+    const time = kbarStartSec(dt, contract.security_type);
     if (!Number.isFinite(time)) continue;
     const volume = res.Volume[i];
     bars.push({

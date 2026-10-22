@@ -501,6 +501,10 @@ def fetch_1m(contract: dict, days: int = 2, start_date: date | None = None) -> l
     bars = []
     for i, dt in enumerate(res.get("datetime", [])):
         epoch = int(datetime.fromisoformat(dt).replace(tzinfo=TAIPEI).timestamp())
+        # kbars stamp the minute END; shift to START like live/TAIFEX data (E3, 2026-10-22).
+        # TW stock closing auction 13:30:00 is already start-stamped.
+        if not (contract.get("security_type") == "STK" and dt[11:19] == "13:30:00"):
+            epoch -= 60
         bars.append({"time": epoch, "open": res["Open"][i], "high": res["High"][i],
                      "low": res["Low"][i], "close": res["Close"][i], "volume": res["Volume"][i]})
     bars.sort(key=lambda b: b["time"])
