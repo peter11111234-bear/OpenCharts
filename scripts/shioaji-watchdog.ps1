@@ -256,7 +256,13 @@ function Start-Server {
   Start-Sleep -Seconds 2
   # 用絕對路徑啟動: PATH 裡可能有多個 shioaji/惡意同名牌
   $sjExe = "C:\Users\bear9\.openharness-venv\Scripts\shioaji.exe"
-  $p = Start-Process -FilePath $sjExe -ArgumentList "server","start","--no-open" -PassThru -WindowStyle Hidden
+  # 每次啟動一份帶時間的 log (請求紀錄是量流量/去重的唯一來源), 留 7 天
+  Get-ChildItem $LogDir -Filter "shioaji-server-*.log" -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force -ErrorAction SilentlyContinue
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+  $p = Start-Process -FilePath $sjExe -ArgumentList "server","start","--no-open" -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $LogDir "shioaji-server-$stamp.out.log") `
+    -RedirectStandardError (Join-Path $LogDir "shioaji-server-$stamp.err.log")
   if (-not $p) { Log "server launch FAILED ($sjExe)"; return }
   $script:lastServerBoot = Get-Date
   $script:serverProc = $p

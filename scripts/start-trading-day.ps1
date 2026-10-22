@@ -85,7 +85,12 @@ if (Test-Server) {
   if (-not $env:SJ_API_KEY) { Send-Alert "開工失敗" "找不到 API key ($ProjectEnv)"; exit 1 }
   Get-Process shioaji -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Seconds 2
-  Start-Process -FilePath "shioaji" -ArgumentList "server","start","--no-open" -WindowStyle Hidden
+  # 絕對路徑 (PATH 可能有同名 shioaji) + 每次啟動一份帶時間的 log, 與 watchdog 相同
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+  Start-Process -FilePath "C:\Users\bear9\.openharness-venv\Scripts\shioaji.exe" `
+    -ArgumentList "server","start","--no-open" -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $LogDir "shioaji-server-$stamp.out.log") `
+    -RedirectStandardError (Join-Path $LogDir "shioaji-server-$stamp.err.log")
   Start-Sleep -Seconds 15
   if (Test-Server) { Log "server restart OK" } else { Send-Alert "開工失敗" "shioaji server 起不來"; exit 1 }
 }
