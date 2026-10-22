@@ -31,7 +31,7 @@
 | C1 | Phase 2（看門狗＋jev-shadow 用券商近月、夜盤檢查） | ✅ MiniMax 完成、Opus 驗收通過；看門狗已重啟到新版 | jev-shadow 尚未重啟（非開盤時段重啟） |
 | C2 | Phase 2b：jev-shadow 改追 MXF | ✅ 程式已改好、測過（2026-10-21 夜）：`resolve_front_month("MXF")`、MXF 寫獨立的 `logs/jev-shadow-mxf.jsonl`（`log_for`），`logged_bar_times(path)` 依檔案分開；volatile-review／phase0-report／preflight 有 MXF 檔就讀 MXF，否則退回 TXF 檔；新增 `tests/test_jev_mxf_dataset.py`；pytest 41 passed | **只剩重啟**：明天 13:45–15:00 透過 jev-shadow-watchdog 重啟，不碰 8080；重啟後確認 log 印出 `jev-shadow MXFK6: dataset=...jev-shadow-mxf.jsonl` |
 | C3 | MXF 補數據（9/22–10/21） | 改用**期交所每筆成交資料**（免費、不吃永豐流量）較佳 | 確認下載格式與可抓天數 → 小量試補 → 全量 → 重算 P60，門檻由使用者決定 |
-| C4 | 3b：夜盤缺合約自動補訂（實戰） | 模擬過、夜盤探測確認有在跑；補訂這條路還沒實際觸發 | **2026-10-22 夜盤 15:06 測**：`POST /api/v1/stream/unsubscribe` 取消 **MXFK6**（不動使用者交易的 TMF）→ 約 75 秒內 `scripts/watchdog.log` 應出現 `tick_fop partial ... missing MXFK6 — subscribing` → `tick_fop` 串流恢復 MXFK6 的 tick。必須在夜盤時段測（收盤後看門狗不檢查）。11/18 換月當晚再看一次 |
+| C4 | 3b：夜盤缺合約自動補訂（實戰） | ✅ 2026-10-22 15:42 通過：取消 MXFK6 後 21 秒看門狗 step 4 判定「missing MXFK6」→ 補訂 → 41 秒內 tick 恢復（用 AST 載入 shioaji-watchdog.ps1 正式函式的單次腳本，結束代碼 0）。注意：開著 /vela 時前端 feed.ts 看門狗約 25–30 秒內會先補回，直接取消再看 watchdog.log 會測不出 | 11/18 換月當晚再看一次 |
 
 ## D. AI 副駕駛
 
