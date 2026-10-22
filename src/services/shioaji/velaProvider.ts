@@ -18,12 +18,83 @@
 import type { BarRange, DataProvider, OHLCV, ProviderInfo, SymbolDescriptor, SymbolInfo } from "@luxalgo/vela";
 import { bucketStart, getShioajiHistory } from "./candles.ts";
 import { TW_INSTRUMENTS, getTwInstrument } from "./instruments.ts";
+import { fetchIndexEntries } from "./marketData.ts";
 import { startShioajiFeed } from "./feed.ts";
 import { subscribeChannel } from "../demo/bus.ts";
 import { wsClient } from "../ws.ts";
 const TAIPEI_OFFSET_MS = 8 * 3600 * 1000;
 
+type LocalBar = { time: number; open: number; high: number; low: number; close: number; volume: number };
+
+/** 1m bars recorded locally, resampled to `tf` (time in epoch s): history built from
+ *  TAIFEX daily files (public/local-bars/hist/<CODE>.json, scripts/taifex-local-bars.py)
+ *  merged with the live recorder's public/local-bars/<CODE>.json (recorder wins on overlap). */
+export async function localRecordedBars(
+  name: string,
+  tf: string,
+  fromMs: number,
+  toMs: number,
+  limit: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<LocalBar[]> {
+  if (!name || tf === "1d" || tf === "1w") return [];
+  const load = async (path: string): Promise<LocalBar[]> => {
+    try {
+      const res = await fetchImpl(`/local-bars/${path}${encodeURIComponent(name)}.json`, { cache: "no-store" });
+      return res.ok ? ((await res.json()) as LocalBar[]) : [];
+    } catch {
+      return [];
+    }
+  };
+  const byMinute = new Map<number, LocalBar>();
+  for (const part of await Promise.all([load("hist/"), load("")])) for (const b of part) byMinute.set(b.time, b);
+  const out = new Map<number, LocalBar>();
+  for (const b of [...byMinute.values()].sort((a, b) => a.time - b.time)) {
+    if (b.time * 1000 < fromMs || b.time * 1000 > toMs || !(b.low > 0)) continue;
+    const key = bucketStart(tf, b.time);
+    const cur = out.get(key);
+    if (!cur) out.set(key, { ...b, time: key });
+    else {
+      cur.high = Math.max(cur.high, b.high);
+      cur.low = Math.min(cur.low, b.low);
+      cur.close = b.close;
+      cur.volume += b.volume;
+    }
+  }
+  return [...out.values()].sort((a, b) => a.time - b.time).slice(-limit);
+}
+
 /** Vela canonical → our timeframe key. */
+/** Live bars reach Vela at most this often: every onBar re-renders and re-runs
+ *  each Pine indicator, and raw tick rate is what froze /vela on 2026-10-07. */
+export const LIVE_BAR_THROTTLE_MS = 1000;
+
+/** Coalesce live bars to one onBar per `ms` (latest wins). A bar with a new
+ *  time flushes the pending one first, so a closing bar's final value is kept. */
+export function throttleBars(onBar: (bar: OHLCV) => void, ms: number) {
+  let pending: OHLCV | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const flush = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    const bar = pending;
+    pending = undefined;
+    if (bar) onBar(bar);
+  };
+  return {
+    push(bar: OHLCV) {
+      if (pending && pending.time !== bar.time) flush();
+      pending = bar;
+      timer ??= setTimeout(flush, ms);
+    },
+    cancel() {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      pending = undefined;
+    },
+  };
+}
+
 export function normalizeTimeframe(tf: string): string {
   if (tf === "D" || tf === "1d") return "1d";
   if (tf === "W" || tf === "1w") return "1w";
@@ -92,13 +163,30 @@ export class ShioajiVelaProvider implements DataProvider {
     };
   }
 
+  /**
+   * Vela resolves `TSE:3037` / `OTC:3081` against this index — a stock missing
+   * here never loads (the chart spins forever), so besides the hand-listed
+   * instruments it indexes every TAIEX and TPEx component (heatmap / hotlist
+   * picks). If the server is down, the hand-listed ones still resolve.
+   */
   async listSymbols(): Promise<SymbolDescriptor[]> {
-    return TW_INSTRUMENTS.map((i) => ({
+    const listed: SymbolDescriptor[] = TW_INSTRUMENTS.map((i) => ({
       ticker: i.symbol.name,
       description: i.symbol.displayName ?? undefined,
       type: i.contract.security_type === "FUT" ? "futures" : "stock",
       prefix: i.contract.exchange, // TSE / OTC / TAIFEX = listing-venue prefix
     }));
+    const seen = new Set(listed.map((d) => d.ticker));
+    const components = await Promise.all([fetchIndexEntries(undefined, "TSE"), fetchIndexEntries(undefined, "OTC")]).then(
+      (lists) => lists.flat(),
+      () => [],
+    );
+    for (const e of components) {
+      if (seen.has(e.code)) continue;
+      seen.add(e.code);
+      listed.push({ ticker: e.code, type: "stock", prefix: e.exchange });
+    }
+    return listed;
   }
 
   async getSymbolInfo(ticker: string): Promise<SymbolInfo | undefined> {
@@ -137,10 +225,12 @@ export class ShioajiVelaProvider implements DataProvider {
     // chasing a phantom "missing drawings" cause and made every first paint
     // evaluate 2000+ bars (~16ms/bar → 30s+). Drawings/history needs are met
     // by the window Vela asks for; older bars load on demand.
-    const candles = await getShioajiHistory(name, tf, range.limit ?? 300, {
-      fromMs: range.from ?? Date.now() - 29 * 86400 * 1000,
-      toMs: range.to ?? Date.now(),
-    });
+    const fromMs = range.from ?? Date.now() - 29 * 86400 * 1000;
+    const toMs = range.to ?? Date.now();
+    let candles = await getShioajiHistory(name, tf, range.limit ?? 300, { fromMs, toMs });
+    // Shioaji returns nothing once the daily 500MB quota is spent: fall back to
+    // the 1m bars scripts/fop-tick-recorder.py builds from the live tick stream.
+    if (candles.length === 0) candles = await localRecordedBars(name, tf, fromMs, toMs, range.limit ?? 300);
     return candles.map((c) => ({
       time: c.time * 1000,
       open: c.open,
@@ -164,6 +254,7 @@ export class ShioajiVelaProvider implements DataProvider {
     // each time the 1m bucket rolls (detected via timestamp change).
     let last1mStart = -1;
     let prev1mVol = 0;
+    const out = throttleBars(onBar, LIVE_BAR_THROTTLE_MS);
 
     const unsub = subscribeChannel("market-data", (raw) => {
       const ev = raw as CandleUpdateEvent;
@@ -171,7 +262,7 @@ export class ShioajiVelaProvider implements DataProvider {
       if (ev.open === undefined || ev.high === undefined || ev.low === undefined || ev.close === undefined) return;
 
       if (tf === "1m") {
-        onBar({ time: ev.timestamp * 1000, open: ev.open, high: ev.high, low: ev.low, close: ev.close, volume: ev.volume });
+        out.push({ time: ev.timestamp * 1000, open: ev.open, high: ev.high, low: ev.low, close: ev.close, volume: ev.volume });
         return;
       }
       // Aggregate 1m → target timeframe using the same bucket math as resample().
@@ -188,11 +279,12 @@ export class ShioajiVelaProvider implements DataProvider {
         agg.close = ev.close;
         agg.volume = (agg.volume ?? 0) + volDelta;
       }
-      onBar({ ...agg });
+      out.push({ ...agg });
     });
 
     return () => {
       unsub();
+      out.cancel();
       agg = undefined;
     };
   }

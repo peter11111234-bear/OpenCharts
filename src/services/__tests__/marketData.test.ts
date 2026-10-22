@@ -44,6 +44,12 @@ describe("fetchIndexEntries", () => {
       body: { contract: { security_type: "IND", exchange: "TSE", code: "IX0001" } },
     });
   });
+
+  it("asks for the TPEx index when exchange is OTC", async () => {
+    const http = vi.fn<HttpFn>(async () => ({ entries: [] }));
+    await fetchIndexEntries(http, "OTC");
+    expect(http.mock.calls[0]![1]!.body).toEqual({ contract: { security_type: "IND", exchange: "OTC", code: "IX0043" } });
+  });
 });
 
 describe("fetchRanking", () => {

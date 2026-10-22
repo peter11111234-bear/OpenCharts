@@ -1,5 +1,5 @@
 /**
- * Market-wide data for the Vela quote widgets (quote strip, electronics
+ * Market-wide data for the Vela quote widgets (quote strip, theme
  * heatmap, hotlists), straight from the local shioaji server through the Vite
  * `/shioaji` proxy like server.ts. Server behaviour verified 2026-10-20:
  * - snapshots accept continuous futures (TXFR1/MXFR1/TMFR1) and the index IX0001.
@@ -74,9 +74,6 @@ export async function fetchQuotes(refs: ContractRef[], http: HttpFn = defaultHtt
 
 // ── Index components (heatmap) ──
 
-/** TWSE industry codes for the electronics sector. */
-export const ELECTRONICS_CATEGORIES: readonly string[] = ["24", "25", "26", "27", "28", "29", "30", "31"];
-
 export interface IndexEntry {
   code: string;
   exchange: string;
@@ -96,10 +93,16 @@ interface RawEntry {
   total_amount?: number | null;
 }
 
-export async function fetchIndexEntries(http: HttpFn = defaultHttp): Promise<IndexEntry[]> {
+/** Index codes the server accepts for index_components: TAIEX (listed) and the TPEx index (OTC). */
+const COMPONENT_INDEX = { TSE: "IX0001", OTC: "IX0043" } as const;
+
+export async function fetchIndexEntries(
+  http: HttpFn = defaultHttp,
+  exchange: keyof typeof COMPONENT_INDEX = "TSE",
+): Promise<IndexEntry[]> {
   const raw = (await http("/data/index_components", {
     method: "POST",
-    body: { contract: { security_type: "IND", exchange: "TSE", code: "IX0001" } },
+    body: { contract: { security_type: "IND", exchange, code: COMPONENT_INDEX[exchange] } },
   })) as { entries?: RawEntry[] };
   return (raw.entries ?? [])
     .map((e) => ({

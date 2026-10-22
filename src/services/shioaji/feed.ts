@@ -28,7 +28,7 @@ import {
   tickStreamPath,
   type TickEvent,
 } from "./server.ts";
-import { TW_INSTRUMENTS } from "./instruments.ts";
+import { LIVE_INSTRUMENTS } from "./instruments.ts";
 
 interface BarState {
   bucket: number;
@@ -140,7 +140,7 @@ function handleTick(symbol: string, tickSize: number, t: TickEvent): void {
 
 async function subscribeAll(): Promise<void> {
   await Promise.all(
-    TW_INSTRUMENTS.map((i) =>
+    LIVE_INSTRUMENTS.map((i) =>
       subscribeQuote(i.contract, "Tick").catch((e) => console.error(`[shioaji] subscribe ${i.symbol.name} failed`, e)),
     ),
   );
@@ -148,10 +148,10 @@ async function subscribeAll(): Promise<void> {
 
 async function seedCloses(): Promise<void> {
   try {
-    const snaps = await getSnapshots(TW_INSTRUMENTS.map((i) => i.contract));
+    const snaps = await getSnapshots(LIVE_INSTRUMENTS.map((i) => i.contract));
     for (const s of snaps) {
       if (s && s.close > 0) {
-        const inst = TW_INSTRUMENTS.find((x) => x.contract.code === s.code);
+        const inst = LIVE_INSTRUMENTS.find((x) => x.contract.code === s.code);
         if (inst) lastClose.set(inst.symbol.name, s.close);
       }
     }
@@ -160,15 +160,9 @@ async function seedCloses(): Promise<void> {
   }
 }
 
-export async function startShioajiFeed(): Promise<void> {
-  if (started) return;
-  started = true;
-
-  await seedCloses();
-  await subscribeAll();
-
+function openStreams(): void {
   const byType = new Map<string, { path: string; event: string }>();
-  for (const i of TW_INSTRUMENTS) {
+  for (const i of LIVE_INSTRUMENTS) {
     if (!byType.has(i.contract.security_type)) {
       byType.set(i.contract.security_type, {
         path: tickStreamPath(i.contract.security_type),
@@ -181,7 +175,7 @@ export async function startShioajiFeed(): Promise<void> {
     es.addEventListener(s.event, (e) => {
       try {
         const t = JSON.parse((e as MessageEvent).data) as TickEvent;
-        const inst = TW_INSTRUMENTS.find((x) => x.contract.code === t.code);
+        const inst = LIVE_INSTRUMENTS.find((x) => x.contract.code === t.code);
         if (inst) handleTick(inst.symbol.name, inst.symbol.tickSize, t);
       } catch (err) {
         console.error("[shioaji] bad tick event", err);
@@ -190,10 +184,48 @@ export async function startShioajiFeed(): Promise<void> {
     es.onerror = () => console.error(`[shioaji] SSE ${s.path} error (auto-retrying)`);
     sources.push(es);
   }
+}
 
+/** 關掉 CLOSED (不再自連) 的舊流並重開 — 冪等, 活著的不動. */
+function reopenDeadStreams(): void {
+  const kept: EventSource[] = [];
+  let dropped = 0;
+  for (const es of sources.splice(0)) {
+    if (es.readyState === EventSource.CLOSED) {
+      dropped++;
+      try {
+        es.close();
+      } catch {
+        /* already dead */
+      }
+    } else {
+      kept.push(es);
+    }
+  }
+  sources.push(...kept);
+  if (dropped > 0) {
+    console.warn(`[shioaji] ${dropped} dead SSE stream(s) — reopening`);
+    for (const es of sources.splice(0)) {
+      try {
+        es.close();
+      } catch {
+        /* already dead */
+      }
+    }
+    openStreams();
+  }
+}
+
+function ensureWatchdog(): void {
+  if (watchdog) return;
   // Watchdog: server restarts wipe subscriptions; silence means resubscribe.
   watchdog = setInterval(() => {
-    const quiet = TW_INSTRUMENTS.filter((i) => Date.now() - (lastTickAt.get(i.symbol.name) ?? 0) > QUIET_THRESHOLD_MS);
+    try {
+      reopenDeadStreams();
+    } catch (err) {
+      console.error("[shioaji] reopen streams failed", err);
+    }
+    const quiet = LIVE_INSTRUMENTS.filter((i) => Date.now() - (lastTickAt.get(i.symbol.name) ?? 0) > QUIET_THRESHOLD_MS);
     if (quiet.length > 0) {
       console.warn(`[shioaji] quiet streams: ${quiet.map((i) => i.symbol.name).join(",")} — resubscribing`);
       void subscribeAll();
@@ -201,10 +233,47 @@ export async function startShioajiFeed(): Promise<void> {
   }, 10_000);
 }
 
+/** Console 逃生口: 卡住時在 DevTools 跑 `await __shioajiResubscribe()` 即重訂+重連. */
+function exposeResubscribe(): void {
+  try {
+    (window as unknown as Record<string, unknown>).__shioajiResubscribe = () => {
+      try {
+        reopenDeadStreams();
+      } catch (err) {
+        console.error("[shioaji] reopen streams failed", err);
+      }
+      return subscribeAll();
+    };
+  } catch {
+    /* non-browser (SSR/test) */
+  }
+}
+
+export async function startShioajiFeed(): Promise<void> {
+  if (started) return;
+  started = true;
+
+  try {
+    await seedCloses();
+    await subscribeAll();
+    openStreams();
+  } finally {
+    // 保證 watchdog 一定建成: 之前中途拋錯會留下 started=true + 無 watchdog,
+    // 後續 subscribe() 直接 return → 永久靜默 (2026-10-16 MXFJ6 事故).
+    ensureWatchdog();
+  }
+  exposeResubscribe();
+}
+
 export function stopShioajiFeed(): void {
   for (const es of sources.splice(0)) es.close();
   if (watchdog) clearInterval(watchdog);
   watchdog = null;
   bars.clear();
+  try {
+    delete (window as unknown as Record<string, unknown>).__shioajiResubscribe;
+  } catch {
+    /* non-browser */
+  }
   started = false;
 }

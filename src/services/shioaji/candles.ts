@@ -1,6 +1,7 @@
 import type { Candle } from "../schemas.ts";
 import { getKbars, type KbarsResponse } from "./server.ts";
 import { getTwInstrument } from "./instruments.ts";
+import { toContractRef } from "./marketData.ts";
 
 /**
  * History for Taiwan symbols via shioaji server kbars (1m bars).
@@ -116,8 +117,10 @@ export async function getShioajiHistory(
   limit?: number,
   range?: HistoryRange,
 ): Promise<Candle[]> {
-  const inst = getTwInstrument(symbol);
-  if (!inst) return [];
+  // Not in the hand-listed TW_INSTRUMENTS (e.g. a heatmap/hotlist pick)? Derive
+  // the contract from the code itself — the server ignores TSE vs OTC for STK kbars.
+  const contract = getTwInstrument(symbol)?.contract ?? toContractRef(symbol);
+  if (!contract) return [];
   const want = limit && limit > 0 ? limit : 500;
 
   let start: Date;
@@ -136,20 +139,31 @@ export async function getShioajiHistory(
     end = new Date();
     start = new Date(end.getTime() - 29 * 86400 * 1000);
   }
-  const res = await getKbarsDedup(inst.contract, toDateStr(start), toDateStr(end));
+  const res = await getKbarsDedup(contract, toDateStr(start), toDateStr(end));
 
   const n = res.datetime.length;
   const bars: Candle[] = [];
   for (let i = 0; i < n; i++) {
     const dt = res.datetime[i];
     if (dt === undefined) continue;
+    const open = res.Open[i], high = res.High[i], low = res.Low[i], close = res.Close[i];
+    // A row whose parallel arrays are short/null is a MALFORMED row, not a bar priced
+    // at 0: the old `?? 0` filled 0 and Vela's price autoscale then folded a real 0
+    // into the visible range, flattening the whole chart. Drop the row instead.
+    if (open == null || high == null || low == null || close == null) continue;
+    if (![open, high, low, close].every(Number.isFinite)) continue;
+    // The timestamp comes off an unvalidated `res.json()` too: an unparsable one
+    // yields NaN, which survives the sort and reaches Vela as a bar with no time.
+    const time = taipeiToEpochSec(dt);
+    if (!Number.isFinite(time)) continue;
+    const volume = res.Volume[i];
     bars.push({
-      time: taipeiToEpochSec(dt),
-      open: res.Open[i] ?? 0,
-      high: res.High[i] ?? 0,
-      low: res.Low[i] ?? 0,
-      close: res.Close[i] ?? 0,
-      volume: res.Volume[i] ?? 0,
+      time,
+      open,
+      high,
+      low,
+      close,
+      volume: typeof volume === 'number' && Number.isFinite(volume) ? volume : 0,
     });
   }
   bars.sort((a, b) => a.time - b.time);
