@@ -6,6 +6,8 @@ when trading DOES run (e.g. 農曆春節後開始交易日); every other listed 
 market closure (holidays + 僅結算交割 days). Weekends are never listed.
 
 Lookup order: memory → logs/twse-holidays-{year}.json → live fetch.
+Unscheduled closures (颱風假、臨時放假) are not in the TWSE schedule: list them
+one ISO date per line in logs/market-closures.txt (# comments allowed).
 Fail-open: on any error (offline, API down) returns True — monitoring stays on
 rather than going silent on a real trading day.
 
@@ -68,6 +70,23 @@ def _holidays(year: int) -> frozenset:
     return days
 
 
+def _extra_closures() -> frozenset:
+    """Manual closures; read on every call so a running scanner sees new lines."""
+    try:
+        text = (config.LOG_DIR / "market-closures.txt").read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    days = set()
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            try:
+                days.add(date.fromisoformat(line))
+            except ValueError:
+                pass
+    return frozenset(days)
+
+
 def is_trading_day(d: date | None = None) -> bool:
     fake = os.environ.get("HOTSCAN_FAKE_TRADING_DAY")  # 測試用: "1"=強制交易日, "0"=強制休市
     if fake == "1":
@@ -75,7 +94,7 @@ def is_trading_day(d: date | None = None) -> bool:
     if fake == "0":
         return False
     d = d or date.today()
-    if d.weekday() >= 5:
+    if d.weekday() >= 5 or d in _extra_closures():
         return False
     try:
         return d not in _holidays(d.year)
