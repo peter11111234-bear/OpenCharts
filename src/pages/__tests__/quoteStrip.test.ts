@@ -85,7 +85,7 @@ describe("mountQuoteStrip", () => {
     await vi.waitFor(() => expect(el.textContent).toContain("報價暫停：down"));
   });
 
-  it("outside the stock session refreshes only MXF (and an active future), keeping the other cards", async () => {
+  it("outside the stock session refreshes only 微台 (and an active 微台 chart), keeping the other cards", async () => {
     ctx.symbol = "TAIFEX:TMFK6";
     const quotes = vi.fn(async (refs: ContractRef[]) => refs.map((r) => snap(r.code, 100, 1)));
     handle = mountQuoteStrip(ctx, el, { quotes, refreshMs: 5000, isOpen: () => false });
@@ -93,7 +93,7 @@ describe("mountQuoteStrip", () => {
     expect(quotes.mock.calls[0]![0]).toHaveLength(DEFAULT_CARDS.length + 1); // first load: everything
     await vi.advanceTimersByTimeAsync(5000);
     expect(quotes).toHaveBeenCalledTimes(2);
-    expect(quotes.mock.calls[1]![0].map((r) => r.code)).toEqual(["MXFR1", "TMFK6"]);
+    expect(quotes.mock.calls[1]![0].map((r) => r.code)).toEqual(["TMFR1", "TMFK6"]);
     expect(el.querySelectorAll(".qs-card b")[0]!.textContent).not.toBe("—"); // 加權 keeps its last quote
   });
 
@@ -102,7 +102,16 @@ describe("mountQuoteStrip", () => {
     handle = mountQuoteStrip(ctx, el, { quotes, refreshMs: 5000, isOpen: () => false });
     await vi.waitFor(() => expect(quotes).toHaveBeenCalledTimes(1));
     await vi.advanceTimersByTimeAsync(5000);
-    expect(quotes.mock.calls[1]![0].map((r) => r.code)).toEqual(["MXFR1"]);
+    expect(quotes.mock.calls[1]![0].map((r) => r.code)).toEqual(["TMFR1"]);
+  });
+
+  it("does not refresh a 小台 chart's symbol at night (user rule: only 微台)", async () => {
+    ctx.symbol = "TAIFEX:MXFK6";
+    const quotes = vi.fn(async (refs: ContractRef[]) => refs.map((r) => snap(r.code, 100, 1)));
+    handle = mountQuoteStrip(ctx, el, { quotes, refreshMs: 5000, isOpen: () => false });
+    await vi.waitFor(() => expect(quotes).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(quotes.mock.calls[1]![0].map((r) => r.code)).toEqual(["TMFR1"]);
   });
 
   it("destroy stops polling and clears the strip", async () => {

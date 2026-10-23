@@ -16,8 +16,6 @@ export interface StripCard {
 
 export const DEFAULT_CARDS: readonly StripCard[] = [
   { label: "加權", ref: { security_type: "IND", exchange: "TSE", code: "IX0001" } },
-  { label: "大台", ref: { security_type: "FUT", exchange: "TAIFEX", code: "TXFR1" } },
-  { label: "小台", ref: { security_type: "FUT", exchange: "TAIFEX", code: "MXFR1" } },
   { label: "微台", ref: { security_type: "FUT", exchange: "TAIFEX", code: "TMFR1" } },
   { label: "台積電", ref: { security_type: "STK", exchange: "TSE", code: "2330" } },
 ];
@@ -30,11 +28,11 @@ export interface QuoteStripDeps {
   /** How often to refresh quotes for the same symbol. */
   refreshMs?: number;
   /** True during the TW stock session (default: isTwStockSession). Outside it
-   *  the timer refresh only asks for `nightCodes` plus an active future; the
+   *  the timer refresh only asks for `nightCodes` plus an active 微台 chart; the
    *  other cards keep their last quote. Mount, symbol change and refresh()
    *  still fetch every card once. */
   isOpen?: () => boolean;
-  /** Codes worth refreshing at night (default: 小台 MXFR1). */
+  /** Codes worth refreshing at night (default: 微台 TMFR1, user rule in fetchPolicy.ts). */
   nightCodes?: readonly string[];
 }
 
@@ -74,7 +72,7 @@ export function mountQuoteStrip(ctx: { readonly symbol: string }, el: HTMLElemen
   el.classList.add("mw", "qs-strip");
   const cards = deps.cards ?? DEFAULT_CARDS;
   const isOpen = deps.isOpen ?? (() => isTwStockSession(new Date()));
-  const nightCodes = deps.nightCodes ?? ["MXFR1"];
+  const nightCodes = deps.nightCodes ?? ["TMFR1"];
   let lastSymbol = "";
   // Last quote per code: night refreshes only re-ask for a few codes, so the
   // rest of the strip renders from here.
@@ -91,7 +89,7 @@ export function mountQuoteStrip(ctx: { readonly symbol: string }, el: HTMLElemen
       const full = fullNext || isOpen();
       fullNext = false;
       if (!full) {
-        refs = refs.filter((r) => nightCodes.includes(r.code) || (r.security_type === "FUT" && r.code === active?.code));
+        refs = refs.filter((r) => nightCodes.includes(r.code) || (r.code === active?.code && r.code.startsWith("TMF")));
       }
       for (const q of await deps.quotes(refs)) lastQuotes.set(q.code, q);
       return { symbol, active, quotes: [...lastQuotes.values()] };

@@ -137,8 +137,8 @@ function Test-TickFresh {
   return ((New-TimeSpan -Start $lastTime -End $now).TotalSeconds -lt 120)
 }
 
-# Vela 三檔訂閱守護: 與 src/services/shioaji/instruments.ts LIVE_INSTRUMENTS 同一組
-# (2330 + 微台 TMF + 小台 MXF 近月)。近月依日期自動算, 不必每月手改:
+# Vela 兩檔訂閱守護: src/services/shioaji/instruments.ts LIVE_INSTRUMENTS 去掉小台
+# (2330 + 微台 TMF 近月；使用者 2026-10-23：小台不再守護訂閱)。近月依日期自動算, 不必每月手改:
 # 第三個週三 13:45 (日盤收盤) 後換下個月 — 15:00 夜盤已是新月份。
 function Get-FrontMonth($root, $now = (Get-Date)) {
   $expiry = Get-Date -Year $now.Year -Month $now.Month -Day 15 -Hour 13 -Minute 45 -Second 0 -Millisecond 0
@@ -209,8 +209,7 @@ function Resolve-FrontMonth($root, $now = (Get-Date)) {
 function Get-VelaContracts {
   return @(
     @{ security_type = "STK"; exchange = "TSE";    code = "2330" },
-    @{ security_type = "FUT"; exchange = "TAIFEX"; code = (Resolve-FrontMonth "TMF") },
-    @{ security_type = "FUT"; exchange = "TAIFEX"; code = (Resolve-FrontMonth "MXF") }
+    @{ security_type = "FUT"; exchange = "TAIFEX"; code = (Resolve-FrontMonth "TMF") }
   )
 }
 
