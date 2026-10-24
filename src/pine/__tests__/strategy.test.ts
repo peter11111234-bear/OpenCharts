@@ -216,6 +216,13 @@ describe('strategyDecl', () => {
     expect(ctx.warnings.filter((w) => w.startsWith('strategy():'))).toHaveLength(0);
   });
 
+  it('strategy() accepts dynamic_requests without a not-implemented warning', async () => {
+    const src = `strategy("t", dynamic_requests=true)
+plot(close)`;
+    const r = await runScript(parse(src), mkBars(3, 10), { symbol: 'TEST', timeframe: 'D' });
+    expect(r.warnings.filter((w) => w.includes('declared but not implemented'))).toEqual([]);
+  });
+
   it('applies defaults for missing args', () => {
     const { ctx } = mkRtCtx(mkBars(1));
     strategyDecl(ctx, { type: 'strategy', args: [] });

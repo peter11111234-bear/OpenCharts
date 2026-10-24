@@ -1974,7 +1974,7 @@ export const STRATEGY_UNSUPPORTED_PARAMS = [
   'calc_on_order_fills', 'calc_on_every_tick', 'max_bars_back',
   'backtest_fill_limits_assumption', 'close_entries_rule',
   'risk_free_rate', 'use_bar_magnifier',
-  'calc_bars_count', 'fill_orders_on_standard_ohlc', 'dynamic_requests',
+  'calc_bars_count', 'fill_orders_on_standard_ohlc',
   'calc_on_every_history_tick',
 ] as const;
 
