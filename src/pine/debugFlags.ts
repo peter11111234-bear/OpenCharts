@@ -69,17 +69,27 @@ export const DEBUG_FLAGS: Record<DebugFlagId, SwitchDef> = {
 
 type GlobalSlot = Record<string, unknown>;
 
+/** The globalThis half of a switch. Per-bar hot paths read this one: a handle
+ *  write takes effect on the next bar and costs about 0.03 µs. */
+export function debugFlagGlobal(id: DebugFlagId): boolean {
+  const def = DEBUG_FLAGS[id];
+  if (def.global === undefined) return false;
+  const g = (globalThis as GlobalSlot)[def.global];
+  return def.strict === true ? g === true : Boolean(g);
+}
+
+/** The environment half of a switch. Read once per RunState (session start):
+ *  process.env costs roughly 20–30 µs per read, too much for every bar. */
+export function debugFlagEnv(id: DebugFlagId): boolean {
+  const def = DEBUG_FLAGS[id];
+  if (def.env === undefined || typeof process === 'undefined') return false;
+  for (const [key, on] of def.env) if (process.env?.[key] === on) return true;
+  return false;
+}
+
 /** Is the switch on? globalThis beats the environment, as it did before. */
 export function debugFlag(id: DebugFlagId): boolean {
-  const def = DEBUG_FLAGS[id];
-  if (def.global !== undefined) {
-    const g = (globalThis as GlobalSlot)[def.global];
-    if (def.strict === true ? g === true : Boolean(g)) return true;
-  }
-  if (def.env !== undefined && typeof process !== 'undefined') {
-    for (const [key, on] of def.env) if (process.env?.[key] === on) return true;
-  }
-  return false;
+  return debugFlagGlobal(id) || debugFlagEnv(id);
 }
 
 /** Set the run-phase breadcrumb (no-op cost is one property write). */

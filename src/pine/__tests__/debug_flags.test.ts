@@ -7,7 +7,7 @@
 // `true`, non-strict ones accept whatever is truthy.
 
 import { describe, expect, it } from 'vitest';
-import { DEBUG_FLAGS, debugFlag, markStage, recordRunTiming } from '../debugFlags';
+import { DEBUG_FLAGS, debugFlag, debugFlagEnv, debugFlagGlobal, markStage, recordRunTiming } from '../debugFlags';
 import { engineCode, engineSources } from './sourceScan';
 
 const SWITCH_IDS = Object.keys(DEBUG_FLAGS) as (keyof typeof DEBUG_FLAGS)[];
@@ -94,6 +94,19 @@ describe('diagnostic switches', () => {
     } finally {
       if (prevUdf === undefined) delete process.env.PINE_JIT_UDF;
       else process.env.PINE_JIT_UDF = prevUdf;
+    }
+    // The env half and the globalThis half are read separately: the hot path
+    // reads globalThis per bar, process.env only once per RunState.
+    const prevJitEnv = process.env.PINE_JIT_UDF;
+    try {
+      process.env.PINE_JIT_UDF = '1';
+      withoutGlobal('__pineJitUdf', () => {
+        expect(debugFlagEnv('jitUdf')).toBe(true);
+        expect(debugFlagGlobal('jitUdf')).toBe(false);
+      });
+    } finally {
+      if (prevJitEnv === undefined) delete process.env.PINE_JIT_UDF;
+      else process.env.PINE_JIT_UDF = prevJitEnv;
     }
     // The PyneCore spelling is accepted as an alias.
     const prevSeq = process.env.PYNE_AST_SEQUENTIAL;

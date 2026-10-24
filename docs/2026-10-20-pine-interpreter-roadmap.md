@@ -48,6 +48,7 @@
 
 ### F2　每個 builtin 呼叫的固定成本偏高（真正的效能題目）
 - 證據：同一台機器同一時刻，評分腳本 1.9 ms/bar；只有一個 `ta.sma` 的腳本 0.062 ms/bar → 約 **40µs／呼叫／根**。瀏覽器裡一樣存在。
+- **【2026-10-24 註記：以下數字無法重現，條件不明，待重測】** 同一份程式碼在安靜機器上量到評分腳本約 0.3 ms/bar、每次 builtin 呼叫約 3 µs。見 `docs/superpowers/plans/2026-10-24-pine-f2-builtin-call-overhead.md` 第 2.7 節。
 - profile（只計 `src/pine/`）：`interpreter.ts` 48%、`ta.ts` 24%、`math.ts` 6%。前幾名分散：`evalCallDispatch` 6.6%、`evalNode` 5.8%、`invokeBuiltin` 4.7%、`ta.get` 4.3%、`evalArg` 3.4%、`callBuiltin` 2.7%、`vsOf` 2.3%、`bindArgs` 2.1%、`stateFor` 1.7%、`lookup` 1.5%。
 - 解讀：**沒有單一熱點**，是樹走訪直譯器「每呼叫：分派 → 包參數 → 綁定 → 查狀態」的固定開銷。前一輪 G.2 的 H3（`evalArg` 包 series）、H4（每 bar 配置）是同一件事的一部分。
 - 對你的影響：300 根算一次 0.6–0.9 秒。評分面板已經放進 Worker，所以不卡畫面；但多支指標同時開、或 live tick 時會累加。

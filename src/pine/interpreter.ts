@@ -53,7 +53,7 @@ import {
   type WhileStmt,
 } from './contracts';
 import { PineRuntimeError, pineErr, wrapPineError } from './errors';
-import { debugFlag, markStage } from './debugFlags';
+import { debugFlag, debugFlagEnv, debugFlagGlobal, markStage } from './debugFlags';
 import { FOR_IN } from './parser';
 import { BarSeries, CellSeries, ForwardingSeries, LitSeries, histGetAt, setActiveSeriesSet, valueAt, type IncSnap } from './series';
 import { Scope, blockFrame, seriesOf, type Frame } from './scope';
@@ -205,6 +205,10 @@ interface RunState {
    *  `compiledEnabled()` already documents for the same class of switch. */
   evalCount: boolean;
   udfJitOn: boolean;
+  /** UDF-JIT env switches, read once when this RunState is born (session start).
+   *  evalOneBar combines them with the per-bar globalThis handles (udfJitNow). */
+  envNoJitUdf: boolean;
+  envJitUdf: boolean;
  /** Call node → selfType → resolved UdtMethodDef (null = none). Registry
   *  resets per runScript, so the cache lives on RunState, not module level. */
  udtMethodCache: WeakMap<Node, Map<string, Map<string, UdtMethodDef | null>>>;
@@ -262,6 +266,8 @@ function runOf(ctx: BuiltinCtx): RunState {
     // child frames); evalOneBar refreshes both once per bar.
     evalCount: debugFlag('evalCount'),
     udfJitOn: udfJitDefault(),
+    envNoJitUdf: debugFlagEnv('noJitUdf'),
+    envJitUdf: debugFlagEnv('jitUdf'),
   };
   Object.defineProperty(ctx, RUN_STATE, { value: r, enumerable: false, writable: false, configurable: false });
   return r;
@@ -2311,6 +2317,13 @@ function udfJitDefault(): boolean {
   return debugFlag('noJitUdf') ? false : debugFlag('jitUdf');
 }
 
+/** Per-bar form of udfJitDefault: globalThis handles now, env snapshot from the
+ *  RunState. NoJit wins over Jit, as in udfJitDefault. */
+function udfJitNow(run: RunState): boolean {
+  if (debugFlagGlobal('noJitUdf') || run.envNoJitUdf) return false;
+  return debugFlagGlobal('jitUdf') || run.envJitUdf;
+}
+
 /** Compile-or-fetch the per-UDF-body JitState. Cached on run.udfJit keyed by
  * the body Node[] (stable parse object). `udfR` (the jitRuntime object) is
  * built once alongside — per-call cost is then just scope swap + js.fn. */
@@ -3027,10 +3040,11 @@ function evalOneBar(s: PineSess, bar: number): 'ok' | 'ret' | PineRuntimeError {
   const { run, ctx } = s;
   if (ctx.barIndex !== bar) s.barCtx.seek(bar);
   // Diagnostic switches, re-probed once per bar instead of once per evalNode /
-  // per UDF call (see RunState.evalCount). A toggle between live-session ticks
-  // still lands on the next bar.
+  // per UDF call (see RunState.evalCount). globalThis handles land on the next
+  // bar; env values are snapshotted when the RunState is born, because
+  // process.env is too slow to read per bar.
   run.evalCount = debugFlag('evalCount');
-  run.udfJitOn = udfJitDefault();
+  run.udfJitOn = udfJitNow(run);
   try {
     // Decl slots created while topLevelBody is set are written every bar —
     // their ensureBar is a no-op, so slotFor keeps them out of ensureList
