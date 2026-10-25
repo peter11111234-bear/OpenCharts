@@ -162,6 +162,13 @@ export class BarSeries extends Series {
    *  flagged series — scalar-only series rewind by truncation alone. */
   hasContainers = false;
 
+  /** Deepest history read ever seen (`rAt(k)` with the largest k), i.e. how far
+   *  back the script can still reach into this series. The incremental driver
+   *  narrows its container snapshot to that window. Monotone by design: it is
+   *  an observation log, not state — never snapshotted, never rewound, and not
+   *  zeroed by a null rewind (reads of a discarded tick still happened). */
+  protected maxOff = 0;
+
   /** `len` of the most recent incSnap(). Snaps sharing one array only grow in
    *  length over time, so the newest one covers every entry the others do. */
   private snapLen = -1;
@@ -250,6 +257,11 @@ export class BarSeries extends Series {
     return this.buf;
   }
 
+  /** Deepest history read so far — the container-window bound (see `maxOff`). */
+  get incMaxOff(): number {
+    return this.maxOff;
+  }
+
   /** Bar index of the newest written slot (-1 when empty). */
   get currentBar(): number {
     return this.lastBar;
@@ -262,6 +274,7 @@ export class BarSeries extends Series {
 
   /** Value at ring index k (0 = newest); undefined outside recorded history. */
   protected rAt(k: number): Value | undefined {
+    if (k > this.maxOff) this.maxOff = k;
     return k >= 0 && k < this.buf.length - this.head ? this.buf[this.buf.length - 1 - k] : undefined;
   }
 
@@ -400,6 +413,7 @@ export class LitSeries extends BarSeries {
 
   /** Every recorded slot holds the literal; outside the window → undefined. */
   protected override rAt(k: number): Value | undefined {
+    if (k > this.maxOff) this.maxOff = k;
     if (!this.virtual) return super.rAt(k);
     return k >= 0 && k < this.rLen() ? this.lit : undefined;
   }
@@ -510,6 +524,7 @@ export class CellSeries extends BarSeries {
 
   /** Storage view: every visible entry holds the current value. */
   protected override rAt(k: number): Value | undefined {
+    if (k > this.maxOff) this.maxOff = k;
     if (!this.virtual) return super.rAt(k);
     return k >= 0 && k < this.n ? this.v : undefined;
   }
@@ -616,6 +631,7 @@ export class LiftedSeries extends BarSeries {
   }
 
   protected override rAt(k: number): Value | undefined {
+    if (k > this.maxOff) this.maxOff = k;
     if (!this.fn) return super.rAt(k);
     if (!(k >= 0 && k < Math.min(this.vLen + this.shift, this.capN))) return undefined;
     return k <= this.shift ? this.memo[0] : this.orig(k - this.shift);

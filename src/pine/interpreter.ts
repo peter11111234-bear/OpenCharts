@@ -3281,6 +3281,12 @@ interface IncCkpt {
   seriesCount: number;
   /** series → buf-index → cloned container Value (hasContainers only). */
   containers: Map<BarSeries, Map<number, Value>>;
+  /** series → oldest bar (`lo`) this checkpoint's container snapshot covers.
+   *  Only cells at incBarAt(i) >= lo are cloned: the script can rebuild at
+   *  most `incMaxOff + 1` bars back through history reads, so older container
+   *  cells are unreachable from the committed state (and a read that reaches
+   *  further forces a full rebuild — see incAdvance's window check). */
+  containerWin: Map<BarSeries, number>;
   declSlots: Map<object, BarSeries>;
   declCows: Map<object, CowSeries>;
   declAliased: Set<object>;
@@ -3508,21 +3514,31 @@ function checkpoint(s: PineSess, bar: number): IncCkpt {
   const ids = new Map<unknown, unknown>();
   const seriesSnaps = new Map<BarSeries, IncSnap>();
   const containers = new Map<BarSeries, Map<number, Value>>();
+  const containerWin = new Map<BarSeries, number>();
   for (const se of s.seriesSet) {
     seriesSnaps.set(se, se.incSnap());
-    if (se.hasContainers) {
-      const m = new Map<number, Value>();
-      const buf = se.incBuf;
-      for (let i = 0; i < buf.length; i++) {
-        const v = buf[i];
-        if (!v || typeof v !== 'object') continue;
-        const k = v.kind;
-        if (k === 'array' || k === 'map' || k === 'matrix' || k === 'udt') {
-          m.set(se.incBarAt(i), cloneDeep(v, ids));
-        }
+    if (!se.hasContainers) continue;
+    // Only the cells the script can still reach: everything newer than the
+    // deepest history read plus one bar of slack (a forming bar reading `x[n]`
+    // at the same time as writing itself reads relative to the checkpoint bar).
+    const lo = bar - se.incMaxOff - 1;
+    containerWin.set(se, lo);
+    const m = new Map<number, Value>();
+    const buf = se.incBuf;
+    // Walk from the newest cell back; the first cell outside the window ends
+    // the scan (buffer indexes are bar-ordered), so an old series costs one
+    // comparison instead of a full-buffer sweep.
+    for (let i = buf.length - 1; i >= 0; i--) {
+      const at = se.incBarAt(i);
+      if (at < lo) break;
+      const v = buf[i];
+      if (!v || typeof v !== 'object') continue;
+      const k = v.kind;
+      if (k === 'array' || k === 'map' || k === 'matrix' || k === 'udt') {
+        m.set(at, cloneDeep(v, ids));
       }
-      if (m.size > 0) containers.set(se, m);
     }
+    if (m.size > 0) containers.set(se, m);
   }
   const scopeVars = new Map<string, Series | Value>();
   for (const [n, v] of s.scope.varsCopy()) scopeVars.set(n, cloneDeep(v, ids));
@@ -3555,6 +3571,7 @@ function checkpoint(s: PineSess, bar: number): IncCkpt {
     seriesSnaps,
     seriesCount: s.seriesSet.size,
     containers,
+    containerWin,
     declSlots: new Map(run.declSlots),
     declCows: new Map(run.declCows),
     declAliased: new Set(run.declAliased),
@@ -3889,7 +3906,8 @@ export async function incAdvance(
     // `cwPeak` is a module-level monotone max; zero it so a caller reads this
     // run's absolute value instead of a stale high-water mark.
     mtf?.resetPeak?.();
-    restoreCkpt(s, live.ckpt);
+    const restored = live.ckpt;
+    restoreCkpt(s, restored);
     s.barCtx.rewindCursor(live.ckpt.bar);
     // Tape grew or tail bar crossed into a new bucket → higher-tf feeds may
     // carry freshly closed bars. Refresh AFTER the checkpoint restore (restore
@@ -3911,6 +3929,14 @@ export async function incAdvance(
     // of the newest closed bar — the commit loop already cleaned it).
     const r = evalOneBar(s, last);
     if (r === 'ret' || r !== 'ok') { live.dead = true; return 'fallback'; }
+    // The restore above only put back container cells inside the window that
+    // checkpoint recorded. A read deeper than that window (a growing offset,
+    // seen through the monotone `maxOff`) reached cells left at their
+    // post-eval values, so this session's state can no longer be trusted:
+    // drop it and let the caller rebuild from scratch.
+    for (const [se, lo] of restored.containerWin) {
+      if (restored.bar - se.incMaxOff - 1 < lo) { live.dead = true; return 'fallback'; }
+    }
   } finally {
     setActiveSeriesSet(null);
     setDirtySeriesTracking(null);
