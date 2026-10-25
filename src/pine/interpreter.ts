@@ -3693,6 +3693,10 @@ function restoreCkpt(s: PineSess, ck: IncCkpt): void {
   // Accumulators: truncate anything the forming bar appended.
   ctx.alerts.length = ck.alertsLen;
   ctx.warnings.length = ck.warningsLen;
+  // `warned` dedupes pushes, so it must roll back with `warnings`: a message
+  // dropped above would otherwise never be re-emitted by the re-evaluated bar.
+  run.warned.clear();
+  for (const w of ctx.warnings) run.warned.add(w);
   if (ctx.alertconditions) ctx.alertconditions.length = ck.alertcondLen;
   if (ctx.inputSchemas) ctx.inputSchemas.length = ck.inSchemaLen;
   if (ctx.plotSeq !== undefined) ctx.plotSeq = ck.plotSeq;
