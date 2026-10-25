@@ -108,6 +108,59 @@ const KBARS_TTL_MS = 15_000;
 const kbarsInflight = new Map<string, Promise<KbarsResponse>>();
 const kbarsCache = new Map<string, { at: number; res: KbarsResponse }>();
 
+/**
+ * Derived-data memo keyed by kbars RESPONSE IDENTITY. The 15 s cache above hands
+ * the very same response object to every timeframe of one window, but each call
+ * used to re-parse ~30k rows (futures) and re-sort them, then resample — eight
+ * times for a request.security script with eight timeframes. WeakMaps keep the
+ * memo alive exactly as long as the response, so it expires with the TTL; there
+ * is no second expiry to tune.
+ */
+interface ParsedKbars {
+  securityType: string;
+  oneMin: Candle[];
+}
+const parsedKbars = new WeakMap<KbarsResponse, ParsedKbars>();
+const resampledKbars = new WeakMap<KbarsResponse, Map<string, Candle[]>>();
+
+// Test-only counter: how many payloads have been row-parsed (memo-hit proof).
+let parsedPayloads = 0;
+export function kbarsParseCount(): number {
+  return parsedPayloads;
+}
+
+/** Parallel arrays → sorted 1m Candle[]. Drops malformed rows (see below). */
+function parseOneMin(res: KbarsResponse, securityType: string): Candle[] {
+  parsedPayloads++;
+  const n = res.datetime.length;
+  const bars: Candle[] = [];
+  for (let i = 0; i < n; i++) {
+    const dt = res.datetime[i];
+    if (dt === undefined) continue;
+    const open = res.Open[i], high = res.High[i], low = res.Low[i], close = res.Close[i];
+    // A row whose parallel arrays are short/null is a MALFORMED row, not a bar priced
+    // at 0: the old `?? 0` filled 0 and Vela's price autoscale then folded a real 0
+    // into the visible range, flattening the whole chart. Drop the row instead.
+    if (open == null || high == null || low == null || close == null) continue;
+    if (![open, high, low, close].every(Number.isFinite)) continue;
+    // The timestamp comes off an unvalidated `res.json()` too: an unparsable one
+    // yields NaN, which survives the sort and reaches Vela as a bar with no time.
+    const time = kbarStartSec(dt, securityType);
+    if (!Number.isFinite(time)) continue;
+    const volume = res.Volume[i];
+    bars.push({
+      time,
+      open,
+      high,
+      low,
+      close,
+      volume: typeof volume === 'number' && Number.isFinite(volume) ? volume : 0,
+    });
+  }
+  bars.sort((a, b) => a.time - b.time);
+  return bars;
+}
+
 async function getKbarsDedup(contract: Parameters<typeof getKbars>[0], start: string, end: string): Promise<KbarsResponse> {
   const key = JSON.stringify([contract, start, end]);
   const hit = kbarsCache.get(key);
@@ -154,33 +207,32 @@ export async function getShioajiHistory(
   }
   const res = await getKbarsDedup(contract, toDateStr(start), toDateStr(end));
 
-  const n = res.datetime.length;
-  const bars: Candle[] = [];
-  for (let i = 0; i < n; i++) {
-    const dt = res.datetime[i];
-    if (dt === undefined) continue;
-    const open = res.Open[i], high = res.High[i], low = res.Low[i], close = res.Close[i];
-    // A row whose parallel arrays are short/null is a MALFORMED row, not a bar priced
-    // at 0: the old `?? 0` filled 0 and Vela's price autoscale then folded a real 0
-    // into the visible range, flattening the whole chart. Drop the row instead.
-    if (open == null || high == null || low == null || close == null) continue;
-    if (![open, high, low, close].every(Number.isFinite)) continue;
-    // The timestamp comes off an unvalidated `res.json()` too: an unparsable one
-    // yields NaN, which survives the sort and reaches Vela as a bar with no time.
-    const time = kbarStartSec(dt, contract.security_type);
-    if (!Number.isFinite(time)) continue;
-    const volume = res.Volume[i];
-    bars.push({
-      time,
-      open,
-      high,
-      low,
-      close,
-      volume: typeof volume === 'number' && Number.isFinite(volume) ? volume : 0,
-    });
+  // Parse once per payload. security_type feeds kbarStartSec, so a payload seen
+  // under a different contract type is re-parsed (and its resamples dropped).
+  const cachedParse = parsedKbars.get(res);
+  let oneMin: Candle[];
+  if (cachedParse && cachedParse.securityType === contract.security_type) {
+    oneMin = cachedParse.oneMin;
+  } else {
+    oneMin = parseOneMin(res, contract.security_type);
+    parsedKbars.set(res, { securityType: contract.security_type, oneMin });
+    resampledKbars.delete(res);
   }
-  bars.sort((a, b) => a.time - b.time);
-  const out = resample(bars, timeframe);
+
+  // Resample once per (payload, timeframe).
+  let byTimeframe = resampledKbars.get(res);
+  if (!byTimeframe) {
+    byTimeframe = new Map<string, Candle[]>();
+    resampledKbars.set(res, byTimeframe);
+  }
+  let out = byTimeframe.get(timeframe);
+  if (!out) {
+    out = resample(oneMin, timeframe);
+    byTimeframe.set(timeframe, out);
+  }
+
+  // Cached arrays/objects must never escape: callers own what they receive, and
+  // for "1m" `out` IS the cached oneMin array. Copy the (≤ want) result.
   if (range && range.toMs > range.fromMs) {
     const fromSec = Math.floor(range.fromMs / 1000);
     const toSec = Math.floor(range.toMs / 1000);
@@ -189,7 +241,9 @@ export async function getShioajiHistory(
     // window (e.g. "since session open") then bypassed `want` entirely and the
     // engine evaluated thousands of bars per first paint. Cap to `want` (tail =
     // newest) exactly like the non-window branch.
-    return win.length > want ? win.slice(-want) : win;
+    const tail = win.length > want ? win.slice(-want) : win;
+    return tail.map((c) => ({ ...c }));
   }
-  return out.length > want ? out.slice(-want) : out;
+  const tail = out.length > want ? out.slice(-want) : out;
+  return tail.map((c) => ({ ...c }));
 }
