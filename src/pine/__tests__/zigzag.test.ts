@@ -156,6 +156,23 @@ describe('zigzag (self-implemented)', () => {
     });
   });
 
+  it('earlier bar index: resets instead of throwing, then behaves like a fresh run', () => {
+    const bars = oscBars(120);
+    const state = createZigZagState();
+    for (const bar of bars) zigZagStep(state, bar, 1, 3);
+    expect(state.pivots.length).toBeGreaterThan(0);
+
+    // Rewind to bar 5: must not throw. The reset makes bar 5 the first bar seen,
+    // so the outcome must equal a brand-new state fed only that bar.
+    const fresh = createZigZagState();
+    const expected = zigZagStep(fresh, bars[5]!, 1, 3);
+    let got: boolean | undefined;
+    expect(() => { got = zigZagStep(state, bars[5]!, 1, 3); }).not.toThrow();
+    expect(got).toBe(expected);
+    expect(state.pivots).toEqual(fresh.pivots);
+    expect(zigZagLastPivot(state)).toEqual(zigZagLastPivot(fresh));
+  });
+
   it('pivot price/time come from the actual extreme bar', () => {
     const bars = oscBars(200);
     const { pivots } = runOnce(bars, 1, 3);

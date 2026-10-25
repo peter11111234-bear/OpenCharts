@@ -101,7 +101,10 @@ export function zigZagStep(
   if (state.lastIndex >= 0 && n === state.lastIndex && state.snapshot) {
     applySnapshot(state, state.snapshot);
   }
-  if (n < state.lastIndex) throw new Error('zigzag: bar index went backwards');
+  // An earlier index than the last one processed means the tape was rewritten
+  // under us. The pivots built from the old tape no longer describe it, so
+  // start over from this bar instead of failing the whole indicator run.
+  if (n < state.lastIndex) Object.assign(state, createZigZagState());
 
   state.snapshot = takeSnapshot(state);
   state.lastIndex = n;
