@@ -25,9 +25,39 @@ interface PendingRun {
   resolve: (r: RunResult) => void;
   reject: (e: Error) => void;
   fetchSeries?: FetchSeriesFn;
+  /** Deadline handle — cleared by EVERY settle point (see clearTimer), so a
+   *  finished run can't be rejected/terminated by its own stale timer. */
+  timer?: ReturnType<typeof setTimeout>;
+  /** Deadline budget left, in ms. Held across pauses so a run that spends
+   *  minutes waiting on `fetchSeries` neither loses nor resets its clock. */
+  remaining: number;
+  /** Wall-clock start of the current (unpaused) timing stretch. */
+  startedAt: number;
+  /** In-flight fetches on this thread; >0 pauses the run deadline. */
+  fetchDepth: number;
+  /** One ceiling per in-flight fetch (`timeoutMs` each) — the run deadline is
+   *  paused, so a provider that never answers would otherwise stall forever. */
+  fetchTimers: Set<ReturnType<typeof setTimeout>>;
+  /** Wall-clock ceiling for the whole run — unlike `timer` it does NOT pause
+   *  while a provider call is served, so a script that fans out unbounded
+   *  `request.security` calls (each one cheap) still dies. */
+  totalTimer?: ReturnType<typeof setTimeout>;
 }
 
 const isObj = (x: unknown): x is Record<string, unknown> => x !== null && typeof x === 'object';
+
+/** A run that blew a deadline (per-run, per-fetch, or the whole-run ceiling).
+ *  Typed so the engine can tell "this script is wedged" from "this script
+ *  threw" — only the former suspends the session. Message keeps the
+ *  `Pine script run timed out after Ns` shape callers/tests match on. */
+export class PineRunTimeoutError extends Error {
+  constructor(secs: number, reason?: string) {
+    super(reason
+      ? `Pine script run timed out after ${secs}s ${reason}`
+      : `Pine script run timed out after ${secs}s`);
+    this.name = 'PineRunTimeoutError';
+  }
+}
 
 function reviveError(e: FailError): Error {
   if (e.name === 'PineRuntimeError') {
@@ -107,10 +137,94 @@ export class PineRunClient {
 
   get unavailable(): boolean { return this._unavailable; }
   private readonly factory?: () => WorkerLike;
+  /** Deadline for one run. A wedged worker (infinite loop, OOM thrash, a
+   *  dropped reply) never settles `pending`, which leaves the editor stuck on
+   *  "Running…" with the run slot locked. */
+  private readonly timeoutMs: number;
+  /** Whole-run wall-clock ceiling, provider waits included. The paused
+   *  per-run clock alone cannot bound a script whose cost is spread over many
+   *  cheap provider calls; this one can. */
+  private readonly totalTimeoutMs: number;
 
-  constructor(opts?: { factory?: () => WorkerLike }) {
+  constructor(opts?: { factory?: () => WorkerLike; timeoutMs?: number; totalTimeoutMs?: number }) {
     this.factory = opts?.factory;
+    // 60s: past this a run is wedged, not slow. Long Shioaji fetches are
+    // exempt — the clock pauses while a fetchReq is being served (below).
+    this.timeoutMs = opts?.timeoutMs ?? 60_000;
+    // 300s: the outer bound. Wall clock, never paused — a fetch storm is still
+    // one run and still costs the user a stuck chart.
+    this.totalTimeoutMs = opts?.totalTimeoutMs ?? 300_000;
     this._unavailable = typeof Worker === 'undefined' && !opts?.factory;
+  }
+
+  /** Cancel a run's deadlines (run + every in-flight fetch cap). Called from
+   *  every settle path (done/fail, transport error, sync postMessage throw,
+   *  dispose, timeout) — a surviving timer would reject an already-settled run
+   *  and terminate a live worker. */
+  private clearTimer(p: PendingRun | null): void {
+    if (!p) return;
+    if (p.timer !== undefined) { clearTimeout(p.timer); p.timer = undefined; }
+    if (p.totalTimer !== undefined) { clearTimeout(p.totalTimer); p.totalTimer = undefined; }
+    for (const t of p.fetchTimers) clearTimeout(t);
+    p.fetchTimers.clear();
+  }
+
+  /** A provider call started: bank the elapsed deadline budget and stop the
+   *  run clock. Provider latency is not the script's latency. */
+  private pauseTimer(p: PendingRun): void {
+    if (p.timer === undefined) return;
+    clearTimeout(p.timer);
+    p.timer = undefined;
+    p.remaining = Math.max(0, p.remaining - (Date.now() - p.startedAt));
+  }
+
+  /** Last provider call settled: resume the run clock with the time that was
+   *  left, NOT a fresh `timeoutMs`. */
+  private resumeTimer(p: PendingRun): void {
+    if (this.pending !== p || p.timer !== undefined) return;
+    p.startedAt = Date.now();
+    p.timer = setTimeout(() => this.onDeadline(p), Math.max(0, p.remaining));
+  }
+
+  private onDeadline(p: PendingRun): void {
+    // A stale timer (clearTimeout missed somewhere) must never settle the run
+    // that currently owns the slot.
+    if (this.pending?.id !== p.id) return;
+    this.pending = null;
+    p.timer = undefined;
+    this.clearTimer(p);
+    // The worker never answered: it is wedged, not slow. Kill it so the next
+    // run spawns a clean one; its incremental session dies with it.
+    const stuck = this.worker;
+    this.worker = null;
+    this.incAlive = false;
+    p.reject(new PineRunTimeoutError(this.timeoutMs / 1000));
+    stuck?.terminate();
+  }
+
+  private onFetchDeadline(p: PendingRun): void {
+    if (this.pending?.id !== p.id) return;
+    this.pending = null;
+    this.clearTimer(p);
+    const stuck = this.worker;
+    this.worker = null;
+    this.incAlive = false;
+    p.reject(new PineRunTimeoutError(this.timeoutMs / 1000, 'waiting for series data'));
+    stuck?.terminate();
+  }
+
+  /** The whole run blew its wall-clock ceiling — same settle shape as the
+   *  per-run deadline, but the message names the total limit so a caller can
+   *  tell a provider storm from a wedged script. */
+  private onTotalDeadline(p: PendingRun): void {
+    if (this.pending?.id !== p.id) return;
+    this.pending = null;
+    this.clearTimer(p);
+    const stuck = this.worker;
+    this.worker = null;
+    this.incAlive = false;
+    p.reject(new PineRunTimeoutError(this.totalTimeoutMs / 1000, '(total run-time limit)'));
+    stuck?.terminate();
   }
 
   private ensureWorker(): WorkerLike {
@@ -128,8 +242,10 @@ export class PineRunClient {
     // engine falls back to in-process instead of looping spawn→crash.
     this._unavailable = true;
     const err = e instanceof Error ? e : new Error('worker error');
-    this.pending?.reject(err);
+    const p = this.pending;
     this.pending = null;
+    this.clearTimer(p);
+    p?.reject(err);
     this.dispose();
   }
 
@@ -144,6 +260,7 @@ export class PineRunClient {
         const p = this.pending;
         if (!p || p.id !== msg.id) return; // stale/stray result must not settle the live run
         this.pending = null;
+        this.clearTimer(p);
         // A done that kept a resumable session must NOT release its worker
         // to the pool — pooling hands the worker to the next session with a
         // different incKey, and this session's next tick would land on a
@@ -192,17 +309,37 @@ export class PineRunClient {
         // after dispose/respawn must not post into a NEW worker, where a
         // colliding fid would silently feed it stale bars.
         const w = this.worker;
-        const fetch = this.pending?.fetchSeries;
+        const p = this.pending;
+        const fetch = p?.fetchSeries;
         // Malformed payloads answer ok:false (when a fid exists) instead of
         // being dropped — a dropped reply leaves the worker's pending Map
         // entry leaked until the run settles.
-        if (!fetch || !w || typeof fid !== 'number' || typeof msg.sym !== 'string' || typeof msg.tf !== 'string') {
+        if (!fetch || !w || !p || typeof fid !== 'number' || typeof msg.sym !== 'string' || typeof msg.tf !== 'string') {
           if (w && typeof fid === 'number') w.postMessage({ t: 'fetchRes', fid, ok: false, error: 'malformed or unpending fetchReq' } satisfies ToWorker);
           return;
         }
+        // Provider latency is not the script's latency: pause the run clock
+        // while a fetch is served (resumed with the remaining budget), and cap
+        // each fetch so a silent provider cannot stall the run forever.
+        p.fetchDepth++;
+        if (p.fetchDepth === 1) this.pauseTimer(p);
+        const cap = setTimeout(() => this.onFetchDeadline(p), this.timeoutMs);
+        p.fetchTimers.add(cap);
+        const settleFetch = () => {
+          clearTimeout(cap);
+          p.fetchTimers.delete(cap);
+          p.fetchDepth--;
+          if (p.fetchDepth === 0) this.resumeTimer(p);
+        };
         fetch(msg.sym, msg.tf).then(
-          (bars) => w.postMessage({ t: 'fetchRes', fid, ok: true, bars } satisfies ToWorker),
-          (e) => w.postMessage({ t: 'fetchRes', fid, ok: false, error: e instanceof Error ? e.message : String(e) } satisfies ToWorker),
+          (bars) => {
+            settleFetch();
+            w.postMessage({ t: 'fetchRes', fid, ok: true, bars } satisfies ToWorker);
+          },
+          (e) => {
+            settleFetch();
+            w.postMessage({ t: 'fetchRes', fid, ok: false, error: e instanceof Error ? e.message : String(e) } satisfies ToWorker);
+          },
         );
       }
     } catch (e) {
@@ -211,6 +348,7 @@ export class PineRunClient {
       // uncaught — it does NOT surface as worker.onerror).
       const p = this.pending;
       this.pending = null;
+      this.clearTimer(p);
       p?.reject(e instanceof Error ? e : new Error(String(e)));
     }
   }
@@ -227,27 +365,36 @@ export class PineRunClient {
     }
     const id = this.nextId++;
     const { fetchSeries, ...opts } = input.opts ?? {};
-    return new Promise<RunResult>((resolve, reject) => {
-      this.pending = { id, resolve, reject, fetchSeries };
-      try {
-        w.postMessage({
-          t: 'run', id,
-          source: input.source, parsed: input.parsed, bars: input.bars,
-          opts: { ...opts, hasFetch: !!fetchSeries },
-        } satisfies ToWorker);
-      } catch (e) {
-        // Sync postMessage throw (e.g. uncloneable inputValues) must not
-        // strand pending — every later run would reject 'run in flight'.
-        this.pending = null;
-        reject(e instanceof Error ? e : new Error(String(e)));
-      }
-    });
+    const { promise, resolve, reject } = Promise.withResolvers<RunResult>();
+    const pending: PendingRun = {
+      id, resolve, reject, fetchSeries,
+      remaining: this.timeoutMs, startedAt: Date.now(), fetchDepth: 0, fetchTimers: new Set(),
+    };
+    this.pending = pending;
+    pending.timer = setTimeout(() => this.onDeadline(pending), this.timeoutMs);
+    pending.totalTimer = setTimeout(() => this.onTotalDeadline(pending), this.totalTimeoutMs);
+    try {
+      w.postMessage({
+        t: 'run', id,
+        source: input.source, parsed: input.parsed, bars: input.bars,
+        opts: { ...opts, hasFetch: !!fetchSeries },
+      } satisfies ToWorker);
+    } catch (e) {
+      // Sync postMessage throw (e.g. uncloneable inputValues) must not
+      // strand pending — every later run would reject 'run in flight'.
+      this.pending = null;
+      this.clearTimer(pending);
+      reject(e instanceof Error ? e : new Error(String(e)));
+    }
+    return promise;
   }
 
   dispose(): void {
     this.incAlive = false;
-    this.pending?.reject(new Error('disposed'));
+    const p = this.pending;
     this.pending = null;
+    this.clearTimer(p);
+    p?.reject(new Error('disposed'));
     this.worker?.terminate();
     this.worker = null;
   }

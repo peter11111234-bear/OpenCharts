@@ -22,6 +22,7 @@ import { recordRunTiming } from './debugFlags';
 import { collectInputs, incRun, type IncLive, type ParsedInput, type RunOptions } from './interpreter';
 import { tfFloor, tfNext } from './mtf';
 import { modelCacheGet, modelCachePut } from './modelCache';
+import { PineRunTimeoutError } from './pineWorkerClient';
 import './builtins/index';
 import './mtf';
 
@@ -328,6 +329,16 @@ export class PineInterpreterEngine implements ScriptingEngine {
     // under a live tick stream would starve completion forever.
     let running = false;
     let pending: OHLCV[] | null = null;
+    // A run that blew the deadline means the script is wedged (infinite loop,
+    // data blow-up), not slow. Re-running it on the next tick would time out
+    // and report again — forever. Suspend until the user edits the source (a
+    // new session = a fresh closure) or changes inputs (update() bypasses).
+    let suspended = false;
+    // One-shot key for the suspension: a user input change (update()) pokes a
+    // single run through. If that run SUCCEEDS the suspension lifts (the user
+    // asked for this configuration and it works); if it times out again the
+    // suspension holds and the next update() is the only way back through.
+    let reviveOnce = false;
     // ── Adaptive tick policy ─────────────────────────────────────────────
     // A full re-run per tick is fine for cheap scripts; for heavy ones the
     // worker can never keep up and the chart appears hung. After any run
@@ -342,8 +353,13 @@ export class PineInterpreterEngine implements ScriptingEngine {
     // time. Identical + same time → same forming bar, newer data.
     let lastTapeKey = '';
     const tapeKey = (b: OHLCV[]) => `${b.length}:${b[b.length - 1]?.time ?? 0}`;
-    const request = (bars: OHLCV[], force = false) => {
+    const request = (bars: OHLCV[], force = false, bypassSuspend = false) => {
       if (stopped) return;
+      // Suspended: automatic paths (tick, 'complete', re-drain) never re-arm
+      // the wedged script. `bypassSuspend` is reserved for update() — a user
+      // input change is a deliberate re-run.
+      if (suspended && !bypassSuspend) return;
+      if (bypassSuspend) reviveOnce = true;
       const key = tapeKey(bars);
       if (!force && lastRunMs > HEAVY_RUN_MS && !incHolder.live && !incHolder.active && key === lastTapeKey) return;
       lastTapeKey = key;
@@ -356,9 +372,13 @@ export class PineInterpreterEngine implements ScriptingEngine {
       // session — `running` stuck true would silently deaden every future
       // request() forever.
       try {
-        while (pending && !stopped) {
+        while (pending && !stopped && (!suspended || reviveOnce)) {
           const bars = pending;
           pending = null;
+          // Consumed here; `revived` remembers whether THIS run came through a
+          // user input change so only that run may lift the suspension.
+          const revived = reviveOnce;
+          reviveOnce = false;
           const myRun = ++runId;
           try {
             const barData = toBarData(bars);
@@ -423,10 +443,21 @@ export class PineInterpreterEngine implements ScriptingEngine {
             for (const a of result.alerts) {
               handlers.onAlert?.({ id: a.id, message: a.msg, time: bars[bars.length - 1]?.time ?? 0, barIndex: bars.length - 1 });
             }
+            // A user input change that re-ran successfully clears the timeout
+            // suspension — the configuration the user chose actually runs.
+            if (revived) suspended = false;
             handlers.onDone?.();
           } catch (e) {
             if (stopped || myRun !== runId) continue;
             try {
+              if (e instanceof PineRunTimeoutError) {
+                // Only the CURRENT run may suspend: a superseded run's timeout
+                // must not freeze the fresh session that replaced it.
+                suspended = true;
+                pending = null;
+                handlers.onError?.(new Error(`腳本執行逾時（${e.message}），已暫停；修改程式碼或參數後會重新執行`));
+                continue;
+              }
               handlers.onError?.(e instanceof Error ? e : new Error(String(e)));
             } catch {
               // Host handler threw — the run already failed; keep the session alive.
@@ -437,7 +468,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
         running = false;
         // A request may have arrived between the while-check and the flag
         // flip — re-drain so it isn't stranded.
-        if (pending && !stopped) void drain();
+        if (pending && !stopped && !suspended) void drain();
       }
     };
 
@@ -453,8 +484,9 @@ export class PineInterpreterEngine implements ScriptingEngine {
       update: (next: Record<string, InputValue>) => {
         inputs = { ...inputs, ...next };
         // Input changes always force a run even for heavy scripts — the user
-        // edited settings; the forming-bar skip must not swallow it.
-        if (!deferred) request(getBars(), true);
+        // edited settings; the forming-bar skip must not swallow it. They also
+        // pierce a timeout suspension: the user asked for exactly this.
+        if (!deferred) request(getBars(), true, true);
       },
       setVisibleRange: () => { /* interpreter has no viewport builtins */ },
       notifyBars: (reason) => {

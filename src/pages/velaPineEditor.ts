@@ -803,6 +803,11 @@ function popMeta(): void {
   const s = editorState.currentId ? pineLibGet(editorState.currentId) : undefined;
   popPost({ t: "meta",
     name: s?.name ?? "Untitled script",
+    // hasId tells the popout whether Save needs a name; suggestName is the
+    // indicator() title it should prefill. Both must come from here: the
+    // popout cannot see editorState or the buffer's source text.
+    hasId: !!editorState.currentId,
+    suggestName: scriptTitle(pendingValue, "Untitled script"),
     dirty: editorState.dirty,
     recent: pineLibRecent().slice(0, 6)
       .map((id) => pineLibGet(id)).filter(Boolean)
@@ -811,17 +816,19 @@ function popMeta(): void {
     versions: (s?.versions ?? []).map((v, i) => ({ i, t: v.t })).reverse(),
   });
 }
-function popConfirmDiscard(): boolean {
-  return !editorState.dirty ||
-    !!(lastCmdCtx?.host.ownerDocument.defaultView ?? window).confirm?.("Discard unsaved changes?");
-}
-
-function popSave(): void {
+function popSave(nameFromPop?: string): void {
   const src = pendingValue;
   try {
     if (!editorState.currentId) {
       const def = scriptTitle(src, "Untitled script");
-      const name = (lastCmdCtx?.host.ownerDocument.defaultView ?? window).prompt?.("Script name", def) ?? "";
+      // The name comes from the POPOUT window: a prompt() called here (the main
+      // window) is not tied to the click that asked for it, so Chrome treats it
+      // as gesture-less and returns null → "Save cancelled" on every first save.
+      // Only fall back to prompting here when the popout supplied nothing.
+      let name = nameFromPop;
+      if (name === undefined) {
+        name = (lastCmdCtx?.host.ownerDocument.defaultView ?? window).prompt?.("Script name", def) ?? "";
+      }
       if (!name.trim()) { popStatus("Save cancelled", "err"); return; }
       const s = pineLibCreate(name.trim(), src);
       if (pineLibWriteFailed()) { popStatus("Save failed (storage)", "err"); return; }
@@ -829,13 +836,28 @@ function popSave(): void {
       popStatus(`Saved "${s.name}"`, "ok");
     } else {
       const s = pineLibGet(editorState.currentId);
-      if (!s) { editorState.currentId = null; popSave(); return; }
+      if (!s) { editorState.currentId = null; popSave(nameFromPop); return; }
       pineLibSave(s.id, src);
+      if (pineLibWriteFailed()) { popStatus("Save failed (storage)", "err"); return; }
       popStatus(`Saved "${s.name}"`, "ok");
     }
     editorState.dirty = false;
   } catch (e) { popStatus(`Save failed: ${e instanceof Error ? e.message : e}`, "err"); }
 }
+/** Run `updateCode` and normalise its result. The SDK never rejects — it
+ *  reports failure as {ok:false,error} — so callers must inspect the result
+ *  instead of assuming the new code is running. */
+async function applyCodeUpdate(
+  handle: { updateCode(src: string): Promise<{ ok: boolean; error: Error | null }> },
+  src: string,
+): Promise<{ ok: boolean; error: string | null }> {
+  const r = await handle.updateCode(src);
+  if (r && typeof r === "object" && "ok" in r && r.ok === false) {
+    return { ok: false, error: r.error?.message ?? "unknown" };
+  }
+  return { ok: true, error: null };
+}
+
 async function popRun(): Promise<void> {
   const chart = lastCmdCtx?.chart;
   if (!chart) { popStatus("No chart context", "err"); return; }
@@ -844,7 +866,12 @@ async function popRun(): Promise<void> {
   try {
     if (editorState.handleId) {
       const handle = chart.indicators().find((h) => h.id === editorState.handleId);
-      if (handle) { handle.updateCode(src); popStatus("Updated in place", "ok"); return; }
+      if (handle) {
+        const u = await applyCodeUpdate(handle, src);
+        if (!u.ok) { popStatus(`Error: ${u.error}`, "err"); return; }
+        popStatus("Updated in place", "ok");
+        return;
+      }
       editorState.handleId = undefined;
     }
     const r = await chart.runIndicator(src);
@@ -877,12 +904,28 @@ function ensurePopChannel(): void {
       popMeta();
     }
     if (m.t === "cmd") {
-      if (m.c === "save") popSave();
+      // Only save/run consume the buffer. Adopting `m.v` for every command
+      // would rewrite `pendingValue` behind copy/rename, which read the
+      // LIBRARY (not the buffer) and must not be silently re-pointed.
+      if ((m.c === "save" || m.c === "run") && typeof m.v === "string") pendingValue = m.v;
+      if (m.c === "save") popSave(m.name);
       if (m.c === "run") void popRun();
       if (m.c === "reload") popReload();
       if (m.c === "copy") {
         if (editorState.currentId) {
+          // Capture the live buffer first: duplicating the stored entry alone
+          // would copy the last-saved version and drop unsaved edits.
+          if (typeof m.v === "string") {
+            pineLibSave(editorState.currentId, m.v);
+            pendingValue = m.v;
+            editorState.dirty = false;
+          }
           const c = pineLibDuplicate(editorState.currentId);
+          if (pineLibWriteFailed()) { popStatus("Copy failed (storage)", "err"); return; }
+          editorState.currentId = c.id;
+          editorState.handleId = undefined;
+          pendingValue = c.source;
+          popPost({ t: "value", v: pendingValue });
           popStatus(`Copied as "${c.name}"`, "ok");
         } else popStatus("Save the script first", "err");
       }
@@ -890,7 +933,11 @@ function ensurePopChannel(): void {
         pineLibRename(editorState.currentId, m.name);
         popStatus(`Renamed to "${m.name}"`, "ok");
       }
-      if (m.c === "new" && m.k && m.k in TEMPLATES && popConfirmDiscard()) {
+      // The popout already ran its own confirm discarding gate before sending
+      // these; re-confirming here would fire confirm() from a window that has
+      // no user activation, which Chrome answers with `false` — that silently
+      // swallowed "New template" / "Open" / "Version history" while dirty.
+      if (m.c === "new" && m.k && m.k in TEMPLATES) {
         editorState.currentId = null;
         editorState.handleId = undefined;
         pendingValue = TEMPLATES[m.k as keyof typeof TEMPLATES];
@@ -898,7 +945,7 @@ function ensurePopChannel(): void {
         popPost({ t: "value", v: pendingValue });
         popStatus("New template", "ok");
       }
-      if (m.c === "open" && m.id && popConfirmDiscard()) {
+      if (m.c === "open" && m.id) {
         const s = pineLibGet(m.id);
         if (s) {
           editorState.currentId = s.id;
@@ -913,7 +960,7 @@ function ensurePopChannel(): void {
       if (m.c === "hist" && typeof m.i === "number" && editorState.currentId) {
         const s = pineLibGet(editorState.currentId);
         const v = s?.versions[m.i];
-        if (v && popConfirmDiscard()) {
+        if (v) {
           pendingValue = v.src;
           editorState.dirty = true;
           popPost({ t: "value", v: pendingValue });
@@ -1388,7 +1435,8 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
         if (editorState.handleId) {
           const handle = ctx.chart.indicators().find((h) => h.id === editorState.handleId);
           if (handle) {
-            handle.updateCode(src);
+            const u = await applyCodeUpdate(handle, src);
+            if (!u.ok) { markRunError(u.error ?? "unknown"); return; }
             setStatus("Updated in place", "ok");
           } else {
             const r = await ctx.chart.runIndicator(src);

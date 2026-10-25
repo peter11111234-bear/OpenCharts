@@ -22,6 +22,10 @@ export interface PineScriptEntry {
 type Doc = { version: 1; scripts: PineScriptEntry[] };
 
 const LIB_KEY = 'opencharts.pine.lib';
+const CORRUPT_KEY = 'opencharts.pine.lib.corrupt';
+/** Backup keys are `corrupt-<ts>[-<seq>]`; the bare key is the pre-timestamp
+ *  legacy slot and still counts as (the oldest) backup. */
+const CORRUPT_CAP = 3;
 const RECENT_KEY = 'opencharts.pine.recent';
 const LEGACY_PREFIX = 'pine-hist:';
 const VERSION_CAP = 50;
@@ -68,8 +72,63 @@ let lastWriteFailed = false;
  *  (the editor's save path) report failure instead of "Saved". */
 export function pineLibWriteFailed(): boolean { return lastWriteFailed; }
 
+/** A stored doc is corrupt when it cannot be parsed, has the wrong version, or
+ *  its `scripts` is not an array — i.e. readDoc() would silently drop it. */
+function isCorruptJson(raw: string): boolean {
+  try {
+    const d = JSON.parse(raw);
+    return d?.version !== 1 || !Array.isArray(d?.scripts);
+  } catch {
+    return true;
+  }
+}
+
+/** Corrupt-doc backup keys, oldest → newest. The bare legacy key sorts first. */
+function backupKeysOldestFirst(): string[] {
+  const keys: string[] = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k === CORRUPT_KEY || k?.startsWith(CORRUPT_KEY + '-')) keys.push(k);
+  }
+  const stamp = (k: string): number =>
+    k === CORRUPT_KEY ? 0 : parseInt(k.slice(CORRUPT_KEY.length + 1), 10) || 0;
+  return keys.sort((a, b) => stamp(a) - stamp(b));
+}
+
+/** Keep the original bytes of a corrupt doc before the first overwrite, so a
+ *  failed parse can never destroy the user's library. A second, DIFFERENT
+ *  corrupt doc gets its own timestamped slot instead of clobbering the first;
+ *  at most CORRUPT_CAP backups are kept and the oldest original is never
+ *  retired. Returns false when the backup could not be read/written (the
+ *  caller must then not overwrite). */
+function backupCorruptDoc(): boolean {
+  try {
+    const raw = localStorage.getItem(LIB_KEY);
+    // Empty/whitespace means "no data" (readDoc() agrees) — not corruption.
+    if (raw === null || raw.trim() === '' || !isCorruptJson(raw)) return true;
+    const existing = backupKeysOldestFirst();
+    // Byte-identical to an existing backup → nothing new to preserve.
+    for (const k of existing) if (localStorage.getItem(k) === raw) return true;
+    // `-<seq>` breaks same-millisecond key collisions.
+    const ts = Date.now();
+    let key = `${CORRUPT_KEY}-${ts}`;
+    for (let seq = 1; localStorage.getItem(key) !== null; seq++) key = `${CORRUPT_KEY}-${ts}-${seq}`;
+    localStorage.setItem(key, raw);
+    // Over the cap: retire the second-oldest, never the oldest original.
+    const all = [...existing, key];
+    while (all.length > CORRUPT_CAP) localStorage.removeItem(all.splice(1, 1)[0]!);
+    return true;
+  } catch (e) {
+    // Blocked storage throws SecurityError on read as well as write — the
+    // caller must see a failed write, not an exception out of writeDoc().
+    reportWriteError(e);
+    return false;
+  }
+}
+
 function writeDoc(d: Doc): void {
   lastWriteFailed = false;
+  if (!backupCorruptDoc()) { lastWriteFailed = true; return; }
   try {
     localStorage.setItem(LIB_KEY, JSON.stringify(d));
   } catch (e) {

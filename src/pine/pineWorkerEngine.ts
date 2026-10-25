@@ -11,7 +11,7 @@
 // transparent in-process run via super.runProgram, identical semantics.
 
 import { PineInterpreterEngine } from './engine';
-import { PineRunClient } from './pineWorkerClient';
+import { PineRunClient, PineRunTimeoutError } from './pineWorkerClient';
 import type { BarData, RunResult } from './contracts';
 import type { ParsedInput, RunOptions, IncLive } from './interpreter';
 
@@ -49,6 +49,15 @@ export class PineWorkerEngine extends PineInterpreterEngine {
         return r;
       })
       .catch((e: unknown) => {
+        // A deadline rejection leaves no live worker session behind it (the
+        // client terminated the wedged worker), so the holder must not keep
+        // advertising one — the engine's incremental/tick decisions read it.
+        // No fallback: running a timed-out script in-process would re-wedge
+        // the UI thread.
+        if (e instanceof PineRunTimeoutError) {
+          if (incHolder) { incHolder.live = null; incHolder.active = false; }
+          throw e;
+        }
         // Construction/transport failure flips client.unavailable → in-process
         // retry keeps behavior. A 'disposed' rejection (stop raced the run) must
         // NOT re-run the script the caller already cancelled.

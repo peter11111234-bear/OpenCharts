@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PineWorkerEngine } from '../pineWorkerEngine';
+import { PineInterpreterEngine } from '../engine';
 import { PineRunClient, type WorkerLike } from '../pineWorkerClient';
 import { createWorkerHandler } from '../pineWorker';
 import type { FromWorker, ToWorker } from '../pineWorkerProto';
@@ -343,5 +344,67 @@ describe('PineRunClient', () => {
     await expect(client.run({ source: '', bars: [], opts: { fetchSeries: async () => [] } }))
       .rejects.toThrow('x');
     expect(w.replies).toEqual([{ t: 'fetchRes', fid: 7, ok: false, error: 'malformed or unpending fetchReq' }]);
+  });
+});
+
+// BUG 4 / engine seam: a run whose worker never replies must reject through
+// the engine WITHOUT falling back to the in-process interpreter (a fallback
+// would silently run the wedged script on the UI thread) and without poisoning
+// the client for later runs.
+describe('PineWorkerEngine run timeout', () => {
+  class SilentWorker implements WorkerLike {
+    onmessage: ((e: { data: unknown }) => void) | null = null;
+    onerror: ((e: unknown) => void) | null = null;
+    onmessageerror: ((e: unknown) => void) | null = null;
+    readonly postMessage = vi.fn((_m: unknown) => { /* never answers */ });
+    readonly terminate = vi.fn();
+  }
+
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  /** Starts a run against a mute worker and advances past the deadline. */
+  const runToDeadline = async (timeoutMs: number) => {
+    const w = new SilentWorker();
+    const client = new PineRunClient({ factory: () => w, timeoutMs });
+    const engine = new PineWorkerEngine(() => client);
+    const prepared = await engine.prepare(`//@version=6
+indicator("t")
+plot(close)
+`, 't1');
+    const err = Promise.withResolvers<Error>();
+    const models: IndicatorModel[] = [];
+    const state = { settled: false };
+    void err.promise.then(() => { state.settled = true; }, () => { state.settled = true; });
+    vi.useFakeTimers();
+    const session = engine.execute(mkReq(prepared, mkBars(4)), {
+      onModel: (m) => models.push(m),
+      onError: err.resolve,
+    });
+    await vi.advanceTimersByTimeAsync(timeoutMs);
+    return { w, client, models, session, error: err.promise, state };
+  };
+
+  it('rejects without falling back to the in-process interpreter', async () => {
+    // super.runProgram is the fallback seam; a timeout must not reach it.
+    const spy = vi.spyOn(
+      PineInterpreterEngine.prototype as unknown as { runProgram: (...a: unknown[]) => Promise<unknown> },
+      'runProgram',
+    );
+    const run = await runToDeadline(5_000);
+    expect(run.state.settled).toBe(true);
+    const e = await run.error;
+    expect(e.message).toMatch(/timed out/);
+    expect(spy).not.toHaveBeenCalled();
+    expect(run.models).toHaveLength(0);
+    run.session.stop();
+  });
+
+  it('does not mark the client unavailable — later runs still use the worker', async () => {
+    const run = await runToDeadline(5_000);
+    expect(run.state.settled).toBe(true);
+    await run.error;
+    expect(run.client.unavailable).toBe(false);
+    expect(run.w.terminate).toHaveBeenCalledTimes(1);   // wedged worker killed
+    run.session.stop();
   });
 });

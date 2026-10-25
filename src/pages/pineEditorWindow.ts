@@ -13,7 +13,7 @@ const menuEl = document.getElementById("menu") as HTMLDivElement;
 
 let applying = false;
 let dirty = false;
-let meta: { name?: string; dirty?: boolean; recent?: {id:string;name:string}[]; all?: {id:string;name:string}[]; versions?: {i:number;t:number}[] } | null = null;
+let meta: { name?: string; dirty?: boolean; hasId?: boolean; suggestName?: string; recent?: {id:string;name:string}[]; all?: {id:string;name:string}[]; versions?: {i:number;t:number}[] } | null = null;
 
 function setDirty(d: boolean): void {
   dirty = d;
@@ -33,9 +33,33 @@ ed.addEventListener("input", () => {
 });
 ed.addEventListener("keyup", updateCursor);
 ed.addEventListener("click", updateCursor);
+// Save: the name prompt MUST run in THIS window. A prompt() in the main window
+// is not tied to the click that triggered it, so Chrome returns null and every
+// first-time save reported "Save cancelled" (red status) without saving.
+// The dirty dot is cleared by the parent's status reply, never optimistically —
+// an optimistic clear hid storage failures.
+function saveWithName(): void {
+  // Every command carries the live buffer (`v`). The parent used to act on its
+  // own `pendingValue` copy, which lags whenever the `input` message has not
+  // landed yet — that stale copy is what got saved/run instead of what is on
+  // screen. The buffer travels with the command now, so there is no window
+  // where the two disagree.
+  let name: string | undefined;
+  if (!meta || !meta.hasId) {
+    // Derive the default from THIS buffer, not from meta: meta.suggestName is
+    // a round-trip old and would suggest the previous script's title.
+    const suggested = /(?:indicator|strategy)\s*\([^)]*?(?:title\s*=\s*)?["']([^"']+)["']/.exec(ed.value)?.[1]
+      ?? meta?.suggestName ?? "Untitled script";
+    const input = window.prompt("Script name", suggested);
+    if (input === null || !input.trim()) { statusEl.textContent = "Save cancelled"; statusEl.dataset.kind = ""; return; }
+    name = input;
+  }
+  ch.postMessage({ t: "cmd", c: "save", v: ed.value, ...(name !== undefined ? { name } : {}) });
+}
+
 ed.addEventListener("keydown", (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); ch.postMessage({ t: "cmd", c: "save" }); setDirty(false); }
-  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); ch.postMessage({ t: "cmd", c: "run" }); }
+  if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); saveWithName(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); cmd("run"); }
   if (e.key === "Tab") { // indent without focus escape
     e.preventDefault();
     const s = ed.selectionStart, en = ed.selectionEnd;
@@ -45,9 +69,9 @@ ed.addEventListener("keydown", (e) => {
   }
 });
 
-document.getElementById("btn-run")!.addEventListener("click", () => ch.postMessage({ t: "cmd", c: "run" }));
-document.getElementById("btn-save")!.addEventListener("click", () => { ch.postMessage({ t: "cmd", c: "save" }); setDirty(false); });
-document.getElementById("btn-reload")!.addEventListener("click", () => ch.postMessage({ t: "cmd", c: "reload" }));
+document.getElementById("btn-run")!.addEventListener("click", () => cmd("run"));
+document.getElementById("btn-save")!.addEventListener("click", saveWithName);
+document.getElementById("btn-reload")!.addEventListener("click", () => cmd("reload"));
 document.getElementById("btn-clear")!.addEventListener("click", () => {
   ed.value = "";
   setDirty(true);
@@ -57,6 +81,7 @@ document.getElementById("btn-clear")!.addEventListener("click", () => {
 
 ch.onmessage = (e) => {
   const m = e.data as { t?: string; v?: string; name?: string; kind?: string; dirty?: boolean;
+    hasId?: boolean; suggestName?: string;
     recent?: {id:string;name:string}[]; all?: {id:string;name:string}[]; versions?: {i:number;t:number}[] };
   if (m.t === "value" && typeof m.v === "string" && m.v !== ed.value) {
     const pos = ed.selectionStart;
@@ -68,11 +93,16 @@ ch.onmessage = (e) => {
   if (m.t === "status") {
     statusEl.textContent = m.v ?? "";
     statusEl.dataset.kind = m.kind ?? "";
-    if (m.v === "Saved" || (m.v ?? "").startsWith("Added") || (m.v ?? "").startsWith("Updated")) setDirty(false);
+    // Parent says `Saved "<name>"` on first save and `Saved` afterwards; both
+    // mean the buffer is persisted. Previously only the exact string "Saved"
+    // matched, so the dot stayed lit after a first-time save.
+    const v = m.v ?? "";
+    if (m.kind === "ok" && (v.startsWith("Saved") || v.startsWith("Added") || v.startsWith("Updated"))) setDirty(false);
   }
   if (m.t === "name" && m.name) { nameEl.textContent = m.name; document.title = `${m.name} — Pine Editor`; }
   if (m.t === "meta") {
-    meta = { name: m.name, dirty: m.dirty, recent: m.recent, all: m.all, versions: m.versions };
+    meta = { name: m.name, dirty: m.dirty, hasId: m.hasId, suggestName: m.suggestName,
+      recent: m.recent, all: m.all, versions: m.versions };
     if (m.name) { nameEl.textContent = m.name; document.title = `${m.name} — Pine Editor`; }
     if (typeof m.dirty === "boolean") setDirty(m.dirty);
   }
@@ -80,7 +110,10 @@ ch.onmessage = (e) => {
 
 // ── Name dropdown — TV-parity script menu. All actions go through the
 // parent via `cmd` messages; `meta` payloads carry the lists. ──
-const cmd = (c: string, extra: Record<string, unknown> = {}) => ch.postMessage({ t: "cmd", c, ...extra });
+// Every command carries the live buffer so the parent never acts on a stale
+// copy (its `pendingValue` lags behind the last `input` message).
+const cmd = (c: string, extra: Record<string, unknown> = {}) =>
+  ch.postMessage({ t: "cmd", c, v: ed.value, ...extra });
 
 function closeMenu(): void { menuEl.classList.remove("open"); }
 function item(label: string, key: string | null, fn: () => void): HTMLButtonElement {
@@ -111,7 +144,7 @@ function confirmDiscard(): boolean {
 function renderMenu(): void {
   menuEl.textContent = "";
   menuEl.append(
-    item("Save script", "Ctrl+S", () => { cmd("save"); setDirty(false); }),
+    item("Save script", "Ctrl+S", saveWithName),
     item("Make a copy…", null, () => cmd("copy")),
     item("Rename…", null, () => {
       const name = window.prompt("Rename script", nameEl.textContent ?? "Untitled script");
