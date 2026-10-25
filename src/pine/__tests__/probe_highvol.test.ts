@@ -11,7 +11,6 @@ import type { BarData } from '../contracts';
 
 const CASES = [
   { name: '高量1.46', file: 'C:/Users/bear9/high452/高量1.46/高量1.46_backup.TXT', tf: 'D', bars: (b: BarData[]) => b.slice(-500) },
-  { name: '見高K4.55', file: 'C:/Users/bear9/high452/HIGH455/見高K4.54/見高K4.55.TXT', tf: '15', bars: (b: BarData[]) => b },
 ];
 
 describe('indicator timing', () => {

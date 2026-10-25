@@ -78,6 +78,7 @@ import {
 import { jitCompile, jitCompileUdf } from './jit';
 import { isNum, numVal, stmtMayExitTop, walkNodes } from './astUtil';
 import { collectInputs, declOverlay, declProps, declShortTitle, declTitle } from './scriptDecl';
+import { libStubNamespace } from './libStubs';
 
 export type { Frame } from './scope';
 export { PineRuntimeError } from './errors';
@@ -946,9 +947,15 @@ function evalNode(node: Node, frame: Frame): Value {
 
     case 'field': return { kind: 'void' };
 
-    case 'import':
+    case 'import': {
+      const stub = libStubNamespace(node.alias, node.name);
+      if (stub !== undefined && node.alias !== undefined) {
+        scope.define(node.alias, stub);
+        return { kind: 'void' };
+      }
       warn(run, ctx, `import '${node.ns}.${node.name}' ignored (libraries not supported)`);
       return { kind: 'void' };
+    }
 
     case 'export': return evalExpr(node.decl, frame);
 
@@ -1380,6 +1387,14 @@ function evalCallDispatch(node: Call, frame: Frame, run: RunState): Value {
       if (def) {
         const bound = bindCallArgs(node.args, def.params.slice(1), frame, paramFlags(def.params, def.body));
         return callUdtMethod(obj.v, prop, bound, ctx);
+      }
+      // Library stubs bind plain functions as fields (`zigZag.update()`,
+      // `zigzag.Settings.new(…)`): no Pine type declares these methods, so a
+      // function-valued field is the call target.
+      const fv = obj.v.fields.get(prop);
+      if (fv !== undefined && fv.kind === 'function') {
+        if (typeof fv.v === 'function') return invokeBuiltin(fv.v, node, frame);
+        return invokeUdf(fv.v as UdfDecl, node, frame);
       }
     } else {
       const b = kindBuiltin(obj.kind, prop);
@@ -2205,8 +2220,14 @@ function compileStmt(stmt: Node): CompiledStmt {
       return { kind: 'direct', fn: wrapCompiled(stmt, () => { registerType(stmt); return { kind: 'void' }; }) };
     case 'field':
       return { kind: 'direct', fn: wrapCompiled(stmt, () => ({ kind: 'void' })) };
-    case 'import': { const msg = `import '${stmt.ns}.${stmt.name}' ignored (libraries not supported)`;
-      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => { warn(run, frame.ctx, msg); return { kind: 'void' }; }) };
+    case 'import': {
+      const stub = libStubNamespace(stmt.alias, stmt.name);
+      const msg = `import '${stmt.ns}.${stmt.name}' ignored (libraries not supported)`;
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
+        if (stub !== undefined && stmt.alias !== undefined) { frame.scope.define(stmt.alias, stub); return { kind: 'void' }; }
+        warn(run, frame.ctx, msg);
+        return { kind: 'void' };
+      }) };
     }
     case 'export':
       return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => evalExpr(stmt.decl, frame)) };
@@ -2579,6 +2600,12 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
       if (def) {
         const bound = bindArgsJit(state, run, ctx, node.args, ds, def.params.slice(1), paramFlags(def.params, def.body));
         return callUdtMethod(obj.v, prop, bound, ctx);
+      }
+      // Function-valued field = library-stub method (see eval path).
+      const fv = obj.v.fields.get(prop);
+      if (fv !== undefined && fv.kind === 'function') {
+        if (typeof fv.v === 'function') return jitBuiltinArgsInvoke(state, run, ctx, fv.v, ds, node);
+        return callUdfValue(fv.v as UdfDecl, bindArgsJit(state, run, ctx, node.args, ds, fv.v.params, paramFlags(fv.v.params, fv.v.body)), frame, node);
       }
     } else {
       const b = kindBuiltin(obj.kind, prop);
