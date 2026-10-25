@@ -26,7 +26,7 @@ interface SwitchDef {
 
 export type DebugFlagId =
   | 'interp' | 'jit' | 'jitUdf' | 'noJitUdf' | 'jitQuiet' | 'evalCount'
-  | 'astSequential' | 'stage' | 'runLog';
+  | 'astSequential' | 'stage' | 'runLog' | 'incVerifyClean';
 
 export const DEBUG_FLAGS: Record<DebugFlagId, SwitchDef> = {
   interp: {
@@ -64,6 +64,10 @@ export const DEBUG_FLAGS: Record<DebugFlagId, SwitchDef> = {
   runLog: {
     global: '__pineRunLog',
     why: 'dev-only {bars, ms} run-timing log, read by browser QA',
+  },
+  incVerifyClean: {
+    env: [['PINE_INC_VERIFY_CLEAN', '1']], strict: true,
+    why: 'assert that every series outside the incremental dirty set still equals its checkpoint snap (audit of the dirty-tracking write paths)',
   },
 };
 

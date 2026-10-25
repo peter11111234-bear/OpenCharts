@@ -35,6 +35,57 @@ export function setActiveSeriesSet(s: Set<BarSeries> | null): void {
   activeSeriesSet = s;
 }
 
+/** Series written since the last epoch bump. Installed and dropped exactly
+ *  like `activeSeriesSet` (the owning session turns both on together), so
+ *  untracked runs never pay the `markDirty` branch.
+ *
+ *  Why: a session's registry holds every series it ever built — for a script
+ *  that allocates a handful of short-lived series per bar (CellSeries +
+ *  LiftedSeries + CowSeries) that is ~40 objects per bar, so rewinding the
+ *  whole set per tick is O(bars) work on state that the discarded eval never
+ *  touched. Only series whose state actually changed since the checkpoint can
+ *  differ from their snap; those are the ones a restore has to put back. */
+///
+/// One tracker PER SESSION: a worker interleaves several indicators' sessions
+/// on one thread, and a shared list let session B's checkpoint/restore wipe
+/// the marks session A's forming-bar eval left for A's next restore.
+export interface DirtyTracker {
+  /** Series written since the last epoch bump. Live — do not mutate. */
+  list: BarSeries[];
+  /** Monotone stamp — a series is listed at most once per epoch. */
+  epoch: number;
+}
+export function newDirtyTracker(): DirtyTracker {
+  return { list: [], epoch: 0 };
+}
+let dirtyTracker: DirtyTracker | null = null;
+
+/** Install the evaluating session's tracker, or null between runs (mirrors
+ *  `setActiveSeriesSet`). Uninstalling KEEPS the marks: they describe the
+ *  eval that just ended, and that session's next restore still has to rewind
+ *  it. `advanceDirtyEpoch` empties them. */
+export function setDirtySeriesTracking(t: DirtyTracker | null): void {
+  dirtyTracker = t;
+}
+
+/** Start a new epoch: everything written so far is accounted for (either
+ *  snapshotted by a checkpoint or rewound by a restore). */
+export function advanceDirtyEpoch(t: DirtyTracker): void {
+  t.epoch++;
+  t.list.length = 0;
+}
+
+/** State view of one series for the `incVerifyClean` restore assertion. */
+export interface IncVerifyView {
+  buf: readonly Value[];
+  len: number;
+  head: number;
+  lastBar: number;
+  firstBar: number;
+  /** `LiftedSeries` memo length; -1 for classes without a lazy memo. */
+  memoLen: number;
+}
+
 /** Opaque checkpoint payload for one series — produced by incSnap, consumed
  *  by incRewind on the SAME object. */
 export interface IncSnap {
@@ -57,12 +108,15 @@ export interface LitSnapX { virtual: boolean }
 /** CellSeries extra snap fields — the scalar current-value window. */
 export interface CellSnapX { v: Value; n: number; virtual: boolean }
 
-/** LiftedSeries extra snap fields — lazy-kernel state. */
+/** LiftedSeries extra snap fields — lazy-kernel state. `memoLen` feeds the
+ *  `incVerifyClean` assertion only (a clean series must keep exactly the memo
+ *  it had at snapshot time); incRewind ignores it. */
 export interface LiftedSnapX {
   fn: ((k: number) => Value) | null;
   len: number;
   vLen: number;
   shift: number;
+  memoLen: number;
 }
 
 /**
@@ -108,8 +162,37 @@ export class BarSeries extends Series {
    *  flagged series — scalar-only series rewind by truncation alone. */
   hasContainers = false;
 
+  /** `len` of the most recent incSnap(). Snaps sharing one array only grow in
+   *  length over time, so the newest one covers every entry the others do. */
+  private snapLen = -1;
+
+  /** Tracker + epoch this series was last listed under (null/-1 = never).
+   *  Not part of the snapshotted state: it is a stamp, not a value. */
+  private dirtyOwner: DirtyTracker | null = null;
+  private dirtyMark = -1;
+
+  /** Record that this series' state is about to change. Every write primitive
+   *  calls this BEFORE mutating, so a restore that runs while the eval is
+   *  abandoned still rewinds it. One load when tracking is off. */
+  protected markDirty(): void {
+    const t = dirtyTracker;
+    if (t !== null && (this.dirtyMark !== t.epoch || this.dirtyOwner !== t)) {
+      this.dirtyOwner = t;
+      this.dirtyMark = t.epoch;
+      t.list.push(this);
+    }
+  }
+
+  /** Debug view for the `incVerifyClean` assertion in the interpreter's
+   *  restoreCkpt — everything an incRewind could have put back. `memoLen` is
+   *  -1 here; the classes that own a lazy memo override it. */
+  incVerify(): IncVerifyView {
+    return { buf: this.buf, len: this.buf.length, head: this.head, lastBar: this.lastBar, firstBar: this.firstBar, memoLen: -1 };
+  }
+
   /** Checkpoint payload for the incremental driver. */
   incSnap(): IncSnap {
+    this.snapLen = this.buf.length;
     return { lastBar: this.lastBar, firstBar: this.firstBar, head: this.head, buf: this.buf, len: this.buf.length };
   }
 
@@ -127,6 +210,13 @@ export class BarSeries extends Series {
    *  left alone when it already matches, so the append-only case stays
    *  allocation-free.
    *
+   *  The common tick — the forming bar appended exactly one entry since the
+   *  newest snap — pops that entry in place instead of copying the whole
+   *  buffer. Popping is safe only for the newest snap on this very array: an
+   *  older aliasing snap is never longer, so the popped entry is outside every
+   *  snapshot. Anything else (an older snap, a replaced array, a larger
+   *  overshoot) takes the copying path.
+   *
    *  The `null` path still empties `this.buf` in place, so a snapshot aliasing
    *  that array loses its data with it — the same loss the old drop arithmetic
    *  had, kept deliberately to avoid a fresh array per born-this-bar series. */
@@ -139,7 +229,10 @@ export class BarSeries extends Series {
       this.hasContainers = false;
       return;
     }
-    if (this.buf.length !== snap.len) this.buf = snap.buf.slice(0, snap.len);
+    if (this.buf.length !== snap.len) {
+      if (this.buf === snap.buf && snap.len === this.snapLen && this.buf.length === snap.len + 1 && snap.len >= this.head) this.buf.pop();
+      else this.buf = snap.buf.slice(0, snap.len);
+    }
     this.head = snap.head;
     this.lastBar = snap.lastBar;
     this.firstBar = snap.firstBar;
@@ -184,6 +277,7 @@ export class BarSeries extends Series {
 
   /** Write (or same-bar overwrite) the value for absolute `bar`. */
   setAt(bar: number, v: Value): void {
+    this.markDirty();
     if (!this.hasContainers) {
       const k = v.kind;
       if (k === 'array' || k === 'map' || k === 'matrix' || k === 'udt') this.hasContainers = true;
@@ -241,6 +335,7 @@ export class BarSeries extends Series {
    */
   ensureBar(bar: number): void {
     if (bar <= this.lastBar) return;
+    this.markDirty();
     // Fresh series: nothing recorded to carry forward — advancing lastBar
     // makes the whole window virtual-NA without materializing bar+1 slots.
     if (this.buf.length === this.head) { this.lastBar = bar; return; }
@@ -294,7 +389,7 @@ export class LitSeries extends BarSeries {
   /** Same-literal touch (one call site, one literal): extend the window. */
   bump(bar: number): void {
     if (!this.virtual) { super.setAt(bar, this.lit); return; }
-    if (bar > this.lastBar) this.lastBar = bar;
+    if (bar > this.lastBar) { this.markDirty(); this.lastBar = bar; }
   }
 
   /** Virtual history length: one entry per bar in [firstBar, lastBar], capped. */
@@ -311,6 +406,7 @@ export class LitSeries extends BarSeries {
 
   /** Copy the virtual window into real storage, then plain BarSeries rules. */
   private materialize(): void {
+    this.markDirty();
     const n = this.rLen();
     const out = new Array<Value>(n);
     for (let k = 0; k < n; k++) out[n - 1 - k] = this.lit;
@@ -404,6 +500,7 @@ export class CellSeries extends BarSeries {
 
   /** Copy the virtual window into real storage, then plain BarSeries rules. */
   private materialize(): void {
+    this.markDirty();
     const out = new Array<Value>(this.n);
     out.fill(this.v);
     this.buf = out;
@@ -425,6 +522,7 @@ export class CellSeries extends BarSeries {
       // newest-slot write must not rewrite them. `touch` mirrors the
       // bookkeeping the write would have performed.
       if (bar === this.lastBar && this.n === 1 && !isContainerValue(v)) {
+        this.markDirty();
         this.v = v;
         seriesHooks.touch(this);
         return;
@@ -437,6 +535,7 @@ export class CellSeries extends BarSeries {
   override ensureBar(bar: number): void {
     if (bar <= this.lastBar) return;
     if (!this.virtual) { super.ensureBar(bar); return; }
+    this.markDirty();
     // Carry-forward repeats the one value: extend the window in O(1). n === 0
     // (rewound to never-written) keeps a virtual-na window, like an empty
     // buffer's — the whole span reads na either way.
@@ -502,6 +601,10 @@ export class LiftedSeries extends BarSeries {
     if (k >= this.len) return NA;
     let v = this.memo[k];
     if (v === undefined) {
+      // A memo entry IS state: it pins `fn(k)` (a source's value at a fixed
+      // absolute bar). Writing one must therefore make the series dirty, or a
+      // kept memo could outlive a discarded eval.
+      this.markDirty();
       v = this.fn!(k);
       this.memo[k] = v;
     }
@@ -519,6 +622,7 @@ export class LiftedSeries extends BarSeries {
   }
 
   private materialize(): void {
+    this.markDirty();
     const n = this.rLen();
     const out = new Array<Value>(n);
     for (let k = 0; k < n; k++) out[n - 1 - k] = this.rAt(k)!;
@@ -542,13 +646,20 @@ export class LiftedSeries extends BarSeries {
       return;
     }
     if (bar <= this.lastBar) return;
+    this.markDirty();
     this.shift += bar - this.lastBar;
     this.lastBar = bar;
   }
 
   override incSnap(): IncSnap {
     const s = super.incSnap();
-    s.x = { fn: this.fn, len: this.len, vLen: this.vLen, shift: this.shift };
+    s.x = { fn: this.fn, len: this.len, vLen: this.vLen, shift: this.shift, memoLen: this.memo.length };
+    return s;
+  }
+
+  override incVerify(): IncVerifyView {
+    const s = super.incVerify();
+    s.memoLen = this.memo.length;
     return s;
   }
 

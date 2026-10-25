@@ -55,7 +55,7 @@ import {
 import { PineRuntimeError, pineErr, wrapPineError } from './errors';
 import { debugFlag, debugFlagEnv, debugFlagGlobal, markStage } from './debugFlags';
 import { FOR_IN } from './parser';
-import { BarSeries, CellSeries, ForwardingSeries, LitSeries, histGetAt, setActiveSeriesSet, valueAt, type IncSnap } from './series';
+import { BarSeries, CellSeries, ForwardingSeries, LitSeries, advanceDirtyEpoch, histGetAt, newDirtyTracker, setActiveSeriesSet, setDirtySeriesTracking, valueAt, type DirtyTracker, type IncSnap, type LiftedSnapX } from './series';
 import { Scope, blockFrame, seriesOf, type Frame } from './scope';
 import { BarCtx, MemoryDrawSink, type DrawSnap } from './context';
 import { BUILTINS, HIST_BUILTINS, SCALAR_BUILTINS, getConstant, histSpecHas, kindBuiltin, positionalSlots, registerConstant } from './builtins/registry';
@@ -2873,6 +2873,8 @@ interface PineSess {
   /** Every BarSeries born while this session evaluates — the incremental
    *  driver snapshots and rewinds them. */
   seriesSet: Set<BarSeries>;
+  /** This session's own dirty list (see DirtyTracker in series.ts). */
+  dirty: DirtyTracker;
   /** This session's MTF store (request.* scripts) — re-activated per run so
    *  sibling runs can't wipe its spec state. */
   mtf?: unknown;
@@ -2912,7 +2914,8 @@ async function buildSess(
   const body = Array.isArray(parsed) ? parsed : parsed.body;
   // Register ctx-series births (BarCtx ctor) into the incremental set too —
   // rewind rewrites them wholesale, but membership keeps parity checks cheap.
-  if (seriesSet) setActiveSeriesSet(seriesSet);
+  const dirty = newDirtyTracker();
+  if (seriesSet) { setActiveSeriesSet(seriesSet); setDirtySeriesTracking(dirty); }
 
   // UDT registries are module globals — clear types/methods/scope from any
   // previous run before this script's decls re-register.
@@ -3058,7 +3061,7 @@ async function buildSess(
       jitR = null;
     }
   }
-  return { decl, body, barCtx, ctx, drawSink, run, scope, frame0, compiledBody, jit, jitR, seriesSet: seriesSet ?? new Set(), mtf: mtfStore };
+  return { decl, body, barCtx, ctx, drawSink, run, scope, frame0, compiledBody, jit, jitR, seriesSet: seriesSet ?? new Set(), dirty, mtf: mtfStore };
 }
 
 /** Evaluate one bar. 'ok' = continue; 'ret' = top-level return, stop the
@@ -3411,11 +3414,25 @@ export function snapCtxState(state: Map<unknown, unknown> | undefined, ids: Map<
 /** Restore a ctx.state snapshot against `bar` (the committed index). */
 export function restoreCtxState(ck: CtxStateSnap, bar: number, ids: Map<unknown, unknown>): void {
   for (const e of ck.vs) {
+    const memo = e.e.memo;
+    if (memo) {
+      // Every VS writes memo keys only at bars ≤ its `last` (ta.ts memoVs /
+      // stateVs / emaSelf / winAgg), so the keys to drop are the integers in
+      // (bar, last] — usually just the forming bar. Walking the whole memo
+      // here made each tick O(bars) on long charts. A non-integer bound
+      // falls back to the full scan.
+      const hi = e.e.last;
+      if (Number.isInteger(hi) && Number.isInteger(bar) && hi - bar <= memo.size) {
+        for (let k = bar + 1; k <= hi; k++) memo.delete(k);
+      } else {
+        for (const k of memo.keys()) if (k > bar) memo.delete(k);
+      }
+    }
     e.e.last = e.last;
-    if (e.e.memo) for (const k of [...e.e.memo.keys()]) if (k > bar) e.e.memo.delete(k);
     if (e.snap !== undefined && e.e.restore) e.e.restore(e.snap);
   }
-  for (const m of ck.nummaps) for (const k of [...m.keys()]) if (k > bar) m.delete(k);
+  // Deleting the current entry during Map iteration is well-defined.
+  for (const m of ck.nummaps) for (const k of m.keys()) if (k > bar) m.delete(k);
   for (const a of ck.arrays) {
     a.arr.length = 0;
     for (const x of a.items) a.arr.push(cloneDeep(x, ids));
@@ -3527,6 +3544,11 @@ function checkpoint(s: PineSess, bar: number): IncCkpt {
     sbufLens.push(Array.isArray(b) ? b.length : -1);
   }
   const deep2 = (x: unknown) => cloneDeep(x, ids);
+  // MTF state is part of the snapshot — take it before closing the epoch.
+  const mtfSnap = mtf?.checkpoint?.(s);
+  // Every write since the previous epoch is now inside `seriesSnaps`, so the
+  // next restore only has to cover writes made after this point.
+  advanceDirtyEpoch(s.dirty);
   return {
     bar,
     scopeVars,
@@ -3571,7 +3593,7 @@ function checkpoint(s: PineSess, bar: number): IncCkpt {
     plotSeq: ctx.plotSeq ?? 0,
     declQuotas: ctx.declQuotas ? { ...ctx.declQuotas } : undefined,
     warnKeys: ctx.warnKeys ? new Set(ctx.warnKeys) : undefined,
-    mtfSnap: mtf?.checkpoint?.(s),
+    mtfSnap,
   };
 }
 
@@ -3579,20 +3601,52 @@ function checkpoint(s: PineSess, bar: number): IncCkpt {
 function restoreCkpt(s: PineSess, ck: IncCkpt): void {
   const { run, ctx } = s;
   const ids = new Map<unknown, unknown>();
-  // Series: rewind to snap; series born during the forming bar → unseen (null).
-  for (const se of s.seriesSet) se.incRewind(ck.seriesSnaps.get(se) ?? null);
-  // …and drop them from the registry. Rewinding alone leaves them in the Set
-  // (which drifts one entry per series per re-evaluated bar, for the life of
-  // the session); the insertion order makes everything past the checkpoint's
-  // size the exact set born during that re-evaluated bar. They are unreachable
-  // from the restored state by construction — the re-eval re-creates every
-  // series the committed state can still see — so nothing is lost by removing
-  // them, and nothing keeps growing if we don't.
+  // Series: put back only the ones this session actually wrote since the
+  // checkpoint. Everything else is already at its snapshot state by
+  // construction — that is the whole point of the dirty set: a script that
+  // allocates short-lived series per bar keeps tens of thousands of objects in
+  // the registry, and rewinding each of them on every tick was O(bars) work on
+  // untouched state.
+  //
+  // `incVerifyClean` re-checks that claim structurally: every snapshotted
+  // series outside the dirty set must still be at its snap. A failure means a
+  // write primitive forgot its `markDirty`.
+  if (debugFlag('incVerifyClean')) {
+    const dirty = new Set(s.dirty.list);
+    for (const [se, snap] of ck.seriesSnaps) {
+      if (dirty.has(se)) continue;
+      const st = se.incVerify();
+      const memoLen = (snap.x as LiftedSnapX | undefined)?.memoLen ?? -1;
+      if (st.buf !== snap.buf || st.len !== snap.len || st.head !== snap.head
+          || st.lastBar !== snap.lastBar || st.firstBar !== snap.firstBar || st.memoLen !== memoLen) {
+        throw new Error(`incVerifyClean: ${se.constructor.name} changed since checkpoint `
+          + `(buf=${st.buf === snap.buf}/${st.len === snap.len} len=${st.len}/${snap.len} `
+          + `head=${st.head}/${snap.head} lastBar=${st.lastBar}/${snap.lastBar} `
+          + `firstBar=${st.firstBar}/${snap.firstBar} memo=${st.memoLen}/${memoLen})`);
+      }
+    }
+  }
+  for (const se of s.dirty.list) {
+    const snap = ck.seriesSnaps.get(se);
+    if (snap !== undefined) se.incRewind(snap);
+  }
+  // …and drop series born during the forming bar from the registry (they have
+  // no snapshot). Rewinding alone leaves them in the Set (which drifts one
+  // entry per series per re-evaluated bar, for the life of the session); the
+  // insertion order makes everything past the checkpoint's size the exact set
+  // born during that re-evaluated bar. They are unreachable from the restored
+  // state by construction — the re-eval re-creates every series the committed
+  // state can still see — so nothing is lost by removing them, and nothing
+  // keeps growing if we don't. A series with no snap that is NOT in the set
+  // belongs to another owner (the MTF store) and is left alone.
   if (s.seriesSet.size > ck.seriesCount) {
     const leaked: BarSeries[] = [];
     let i = 0;
     for (const se of s.seriesSet) if (i++ >= ck.seriesCount) leaked.push(se);
-    for (const se of leaked) s.seriesSet.delete(se);
+    for (const se of leaked) {
+      se.incRewind(null);
+      s.seriesSet.delete(se);
+    }
   }
   // Container slot payloads — the fresh clones re-share identity within this
   // restore pass (two names bound to the same array see the same clone).
@@ -3716,6 +3770,9 @@ function restoreCkpt(s: PineSess, ck: IncCkpt): void {
   run.topLevelBody = false;
   run.topStmtIdx = -1;
   run.siteCtx.length = 0;
+  // The restore's own writes (container re-clones) are part of the committed
+  // state now: start a fresh epoch so the next restore covers the re-eval only.
+  advanceDirtyEpoch(s.dirty);
 }
 
 /** First incremental run: build, evaluate every bar, checkpoint after each
@@ -3775,6 +3832,7 @@ export async function incRunStart(
     if (barErr) throw barErr;
   } finally {
     setActiveSeriesSet(null);
+    setDirtySeriesTracking(null);
   }
   markStage('assemble');
   if (opts.shouldAbort?.()) return { live: null, result: empty() };
@@ -3821,6 +3879,7 @@ export async function incAdvance(
   // have prepared security against its own store meanwhile.
   if (s.mtf !== undefined) mtf?.activate?.(s.mtf);
   setActiveSeriesSet(s.seriesSet);
+  setDirtySeriesTracking(s.dirty);
   try {
     // Discard last tick's tentative forming-bar eval FIRST — committed bars
     // must evaluate on clean checkpoint state, not on top of stale writes.
@@ -3854,6 +3913,7 @@ export async function incAdvance(
     if (r === 'ret' || r !== 'ok') { live.dead = true; return 'fallback'; }
   } finally {
     setActiveSeriesSet(null);
+    setDirtySeriesTracking(null);
   }
   return assembleRunResult(s);
 }

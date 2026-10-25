@@ -306,3 +306,76 @@ describe('BarCtx', () => {
     expect(draw.objects).toHaveLength(0);
   });
 });
+
+describe('BarSeries incRewind', () => {
+  const f = (v: number): Value => ({ kind: 'float', v });
+  const vals = (s: BarSeries): number[] => s.incBuf.map(num);
+  const filled = (n: number): BarSeries => {
+    const s = new BarSeries();
+    for (let b = 0; b < n; b++) s.setAt(b, f(b));
+    return s;
+  };
+
+  it('a one-entry forming write rewinds in place (buffer identity kept)', () => {
+    const s = filled(5);
+    const snap = s.incSnap();
+    const buf = s.incBuf;
+    for (let tick = 0; tick < 3; tick++) {
+      s.setAt(5, f(100 + tick));
+      s.incRewind(snap);
+      expect(s.incBuf).toBe(buf);
+      expect(vals(s)).toEqual([0, 1, 2, 3, 4]);
+      expect(s.currentBar).toBe(4);
+    }
+  });
+
+  it('a multi-entry overshoot falls back to a fresh truncated copy', () => {
+    const s = filled(5);
+    const snap = s.incSnap();
+    for (let b = 5; b < 8; b++) s.setAt(b, f(b));
+    s.incRewind(snap);
+    expect(vals(s)).toEqual([0, 1, 2, 3, 4]);
+    expect(s.currentBar).toBe(4);
+    expect(snap.buf).toHaveLength(8);
+  });
+
+  it('two snaps taken together rewind once; the second rewind is a no-op', () => {
+    // The interpreter and the MTF store snapshot a tf-frame series at the same
+    // checkpoint, then rewind it twice in a row.
+    const s = filled(4);
+    const a = s.incSnap();
+    const b = s.incSnap();
+    const buf = s.incBuf;
+    s.setAt(4, f(9));
+    s.incRewind(a);
+    s.incRewind(b);
+    expect(s.incBuf).toBe(buf);
+    expect(vals(s)).toEqual([0, 1, 2, 3]);
+  });
+
+  it('a capped series restores head after the forming write advanced it', () => {
+    const s = new BarSeries(3);
+    for (let b = 0; b < 5; b++) s.setAt(b, f(b));
+    const snap = s.incSnap();
+    s.setAt(5, f(5));
+    s.incRewind(snap);
+    expect(s.currentBar).toBe(4);
+    expect([0, 1, 2].map((k) => num(s.get(k)))).toEqual([4, 3, 2]);
+    expect(Number.isNaN(num(s.get(3)))).toBe(true);
+  });
+
+  it('two aliased snaps one entry apart restore without losing data', () => {
+    // Rewinding the older snap must not truncate the shared array in place:
+    // the newer snap still covers the entry the older one drops.
+    const s = filled(3);
+    const older = s.incSnap();
+    s.setAt(3, f(3));
+    const newer = s.incSnap();
+    expect(newer.buf).toBe(older.buf);
+    s.incRewind(older);
+    expect(vals(s)).toEqual([0, 1, 2]);
+    s.incRewind(newer);
+    expect(vals(s)).toEqual([0, 1, 2, 3]);
+    expect(s.currentBar).toBe(3);
+  });
+});
