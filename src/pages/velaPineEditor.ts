@@ -41,6 +41,7 @@ import {
   pineLibMigrateLegacyHist, pineLibSubscribe,
 } from "../pine/lib/pineLib.ts";
 import { openScriptsDialog } from "./velaPineScriptsDialog.ts";
+import { draftRestore, readPineDraft, writePineDraft } from "./pineDraft.ts";
 import { combinedManifestEntries } from "../pineScripts.ts";
 import type { PineEditorHandle, PineLintError } from "../pine/pineMonaco.ts";
 
@@ -1460,7 +1461,7 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
       setStatus("Docked at side", "ok");
       return;
     }
-    try { sessionStorage.setItem("opencharts.pine.draft", JSON.stringify({ id: editorState.currentId, src: area.value })); } catch { /* quota */ }
+    writePineDraft(sessionStorage, { id: editorState.currentId, src: area.value });
     panelCtx.togglePanel?.(PANEL_ID, false);
     undockStrip = panelCtx.dockStrip?.(panelRoot) ?? null;
     bottomDocked = !!undockStrip;
@@ -1472,19 +1473,26 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
 
   // ── Buffer init: pendingOpen src (staged by applyOpenArgs) > collapsed
   // draft > current library entry > template ──
-  const draft = (() => { try { return JSON.parse(sessionStorage.getItem("opencharts.pine.draft") || "null") as { id: string | null; src: string } | null; } catch { return null; } })();
+  const restored = pendingValue ? null : draftRestore(readPineDraft(sessionStorage), editorState.currentId, (id) => !!pineLibGet(id));
   if (pendingValue) {
     area.value = pendingValue;
-  } else if (draft?.src && !editorState.currentId) {
-    area.value = draft.src;
-    editorState.currentId = draft.id && pineLibGet(draft.id) ? draft.id : null;
+  } else if (restored) {
+    area.value = restored.src;
+    editorState.currentId = restored.id;
   } else if (editorState.currentId) {
     area.value = pineLibGet(editorState.currentId)?.source ?? "";
   } else {
     area.value = TEMPLATES.indicator;
   }
-  try { sessionStorage.removeItem("opencharts.pine.draft"); } catch { /* noop */ }
   refreshName();
+
+  /** Keep the live buffer in sessionStorage so an F5 reload restores unsaved
+   *  text (per tab). Written on every change and again on unload, because
+   *  programmatic loads do not fire a change. */
+  function persistDraft(): void {
+    writePineDraft(sessionStorage, { id: editorState.currentId, src: area.value });
+  }
+  doc.defaultView?.addEventListener("beforeunload", persistDraft);
 
   /** Single change hook for both monaco (`ed.onChange`) and fallback
    *  (`input` listener) — dirty tracking + debounced live lint. */
@@ -1492,6 +1500,7 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
     editorState.dirty = true;
     refreshName();
     lintOnChange();
+    persistDraft();
     if (popWin && !popWin.closed) popChannel?.postMessage({ t: "value", v: area.value });
   }
 
