@@ -3,7 +3,7 @@
 import type { BarData, RunResult } from './contracts';
 import type { ParsedInput, RunOptions } from './interpreter';
 import { PineRuntimeError } from './errors';
-import type { FailError, ToWorker, FromWorker } from './pineWorkerProto';
+import type { FailError, TapePatch, ToWorker, FromWorker } from './pineWorkerProto';
 
 /** Minimal Worker surface — tests inject a FakeWorker implementing this. */
 export interface WorkerLike {
@@ -51,6 +51,14 @@ interface PendingRun {
   parsed?: ParsedInput;
   /** Message as sent (parsed stripped when the worker already had the AST). */
   runMsg?: RunMsg;
+  /** Incremental key this run belongs to — the tape record is keyed by it. */
+  incKey?: string;
+  /** Full tape of this run, kept so a PineTapeMiss can resend it. */
+  bars: BarData[];
+  /** The message carried a `tape` patch — a PineTapeMiss is then ours to fix. */
+  tapeSent: boolean;
+  /** The single PineTapeMiss resend already happened — never retry twice. */
+  tapeResent: boolean;
 }
 
 const isObj = (x: unknown): x is Record<string, unknown> => x !== null && typeof x === 'object';
@@ -159,6 +167,38 @@ function rememberAst(w: WorkerLike, id: string): void {
   if (known === undefined) { known = new Set(); workerAsts.set(w, known); }
   known.add(id);
 }
+
+/** Per-worker record of the tape last SENT for an incKey — a shallow copy of
+ *  the array only. The diff therefore relies on callers never mutating a
+ *  BarData object they already passed in: a bar edited in place compares
+ *  equal to itself and is never resent (engine.ts toBarData builds fresh
+ *  objects every run; keep it that way). Keyed by worker like workerAsts: the pool hands
+ *  workers between clients, and the record must describe what the worker
+ *  actually holds. A terminated worker takes its record with it (WeakMap), so
+ *  a respawn gets the full tape again. */
+const workerTapes = new WeakMap<WorkerLike, Map<string, BarData[]>>();
+
+/** A run's tape shipped in full: the worker now holds exactly these bars. */
+function rememberTape(w: WorkerLike, incKey: string, bars: BarData[]): void {
+  let tapes = workerTapes.get(w);
+  if (tapes === undefined) { tapes = new Map(); workerTapes.set(w, tapes); }
+  tapes.set(incKey, bars.slice());
+}
+
+/** The worker's copy can no longer be trusted (failed run) — the next run for
+ *  this key ships everything. */
+function forgetTape(w: WorkerLike | null, incKey: string): void {
+  if (w) workerTapes.get(w)?.delete(incKey);
+}
+
+/** Same field-for-field predicate the interpreter uses to decide "this prefix
+ *  is untouched" (src/pine/interpreter.ts barsEq) — the client's `from` must
+ *  agree with incAdvance's `firstDiff` or a run would patch a prefix the
+ *  worker's session treats as new. */
+const sameBar = (a: BarData | undefined, b: BarData | undefined): boolean =>
+  a === b || (!!a && !!b && a.openTime === b.openTime && a.open === b.open &&
+    a.high === b.high && a.low === b.low && a.close === b.close &&
+    a.volume === b.volume && a.closeTime === b.closeTime);
 
 export class PineRunClient {
   private worker: WorkerLike | null = null;
@@ -302,22 +342,32 @@ export class PineRunClient {
       if (msg.t === 'done' || msg.t === 'fail') {
         const p = this.pending;
         if (!p || p.id !== msg.id) return; // stale/stray result must not settle the live run
-        if (msg.t === 'fail' && msg.error.name === 'PineAstMiss' && p.astOmitted
-          && !p.astResent && p.astId !== undefined && p.runMsg !== undefined) {
-          // The worker evicted an AST we sent by reference. It says so instead
-          // of silently re-parsing — withdraw the id from its record and
-          // resend the body ONCE on the same run id: same pending, same
-          // deadlines (no provider time is spent), same worker. A second
-          // miss is a genuine failure and falls through below.
-          p.astResent = true;
-          p.astOmitted = false;
+        if (msg.t === 'fail' && p.runMsg !== undefined) {
           const w = this.worker;
-          if (w) {
-            workerAsts.get(w)?.delete(p.astId);
-            p.runMsg = { ...p.runMsg, parsed: p.parsed };
+          const astMiss = msg.error.name === 'PineAstMiss' && p.astOmitted
+            && !p.astResent && p.astId !== undefined;
+          const tapeMiss = msg.error.name === 'PineTapeMiss' && p.tapeSent && !p.tapeResent;
+          if (w && (astMiss || tapeMiss)) {
+            // The worker evicted something we referenced (an AST body, or a
+            // whole tape). It says so instead of guessing — resend ONCE on the
+            // same run id (same pending, same deadlines, same worker) carrying
+            // BOTH the AST body and the full bars, so the second miss of the
+            // pair cannot fire. A second miss of the same kind is a genuine
+            // failure and falls through below. The two flags stay separate:
+            // either miss uses the same single extra round trip.
+            if (astMiss) {
+              p.astResent = true;
+              workerAsts.get(w)?.delete(p.astId!);
+            }
+            if (tapeMiss) p.tapeResent = true;
+            const resend: RunMsg = { ...p.runMsg, bars: p.bars, tape: undefined };
+            if (p.astOmitted) { p.astOmitted = false; resend.parsed = p.parsed; }
+            p.tapeSent = false;
             try {
-              w.postMessage(p.runMsg);
-              rememberAst(w, p.astId);
+              w.postMessage(resend);
+              p.runMsg = resend;
+              if (resend.parsed !== undefined && p.astId !== undefined) rememberAst(w, p.astId);
+              if (p.incKey !== undefined) rememberTape(w, p.incKey, p.bars);
               return;
             } catch {
               // Post failed on the resend — settle as a normal failure.
@@ -326,6 +376,10 @@ export class PineRunClient {
         }
         this.pending = null;
         this.clearTimer(p);
+        // A failed run leaves the worker's tape for this key unverifiable
+        // (partially applied, or an incRun throw) — drop the record so the
+        // next run for it ships the whole tape.
+        if (msg.t === 'fail' && p.incKey !== undefined) forgetTape(this.worker, p.incKey);
         // A done that kept a resumable session must NOT release its worker
         // to the pool — pooling hands the worker to the next session with a
         // different incKey, and this session's next tick would land on a
@@ -435,10 +489,26 @@ export class PineRunClient {
     // clone (19–27ms for TRIS390 at 500 bars, paid per tick otherwise).
     const astId = input.parsed !== undefined ? astIdFor(input.parsed) : undefined;
     const omitAst = astId !== undefined && workerAsts.get(w)?.has(astId) === true;
+    // Tail-only bars: when this worker already holds the key's tape, ship the
+    // base length plus everything from the first difference on. No record, a
+    // shorter tape, or a different worker all fall back to the full array — the
+    // client never guesses the worker's session state (eviction, terminate,
+    // dispose), it lets the PineTapeMiss handshake say so.
+    const incKey = opts.incKey;
+    const prev = incKey !== undefined ? workerTapes.get(w)?.get(incKey) : undefined;
+    let tape: TapePatch | undefined;
+    if (prev !== undefined && input.bars.length >= prev.length) {
+      let from = prev.length;
+      for (let i = 0; i < prev.length; i++) {
+        if (!sameBar(input.bars[i], prev[i])) { from = i; break; }
+      }
+      tape = { base: prev.length, from, tail: input.bars.slice(from) };
+    }
     const pending: PendingRun = {
       id, resolve, reject, fetchSeries,
       remaining: this.timeoutMs, startedAt: Date.now(), fetchDepth: 0, fetchTimers: new Set(),
       astId, astOmitted: omitAst, astResent: false, parsed: input.parsed,
+      incKey, bars: input.bars, tapeSent: tape !== undefined, tapeResent: false,
     };
     this.pending = pending;
     pending.timer = setTimeout(() => this.onDeadline(pending), this.timeoutMs);
@@ -448,7 +518,8 @@ export class PineRunClient {
       source: input.source,
       parsed: omitAst ? undefined : input.parsed,
       astId,
-      bars: input.bars,
+      bars: tape === undefined ? input.bars : undefined,
+      tape,
       opts: { ...opts, hasFetch: !!fetchSeries },
     };
     pending.runMsg = runMsg;
@@ -456,6 +527,7 @@ export class PineRunClient {
       w.postMessage(runMsg);
       // Only after a successful post does the worker own the body.
       if (!omitAst && astId !== undefined) rememberAst(w, astId);
+      if (incKey !== undefined) rememberTape(w, incKey, input.bars);
     } catch (e) {
       // Sync postMessage throw (e.g. uncloneable inputValues) must not
       // strand pending — every later run would reject 'run in flight'.

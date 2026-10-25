@@ -20,13 +20,27 @@ export interface WorkerOpts {
   incKey?: string;
 }
 
+/** Tail patch for the worker's copy of an incKey's tape: "your tape for this
+ *  key should be `base` long; keep the first `from` bars, then these". The
+ *  worker rebuilds the tape from its own copy, so a per-tick run clones a
+ *  couple of bars instead of the whole history. `0 <= from <= base`. */
+export interface TapePatch {
+  base: number;
+  from: number;
+  tail: BarData[];
+}
+
 // ToWorker
 // `astId` names the parsed AST by object identity. The client omits `parsed`
 // once the target worker holds that AST (see workerAsts in pineWorkerClient);
 // a worker that evicted it answers `fail` with name 'PineAstMiss' and the
 // client resends the AST once on the same run id.
+// Same idea for bars: `bars` = the whole tape (backward compatible), `tape` =
+// a patch against the worker's copy for `opts.incKey`. A worker with no (or a
+// mismatched) copy answers `fail` with name 'PineTapeMiss' and the client
+// resends the full `bars` once on the same run id.
 export type ToWorker =
-  | { t: 'run'; id: number; source?: string; parsed?: ParsedInput; astId?: string; bars: BarData[]; opts: WorkerOpts }
+  | { t: 'run'; id: number; source?: string; parsed?: ParsedInput; astId?: string; bars?: BarData[]; tape?: TapePatch; opts: WorkerOpts }
   | { t: 'fetchRes'; fid: number; ok: boolean; bars?: BarData[]; error?: string };
 
 // FromWorker

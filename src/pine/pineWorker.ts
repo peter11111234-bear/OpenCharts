@@ -107,6 +107,22 @@ export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWo
     astCache.set(id, parsed);
   };
 
+  // Tapes per incKey — the worker's own copy of the bars, seeded by every
+  // full-bars run and patched in place by `tape` runs. The client ships only
+  // the changed tail; a MISS (evicted key, no key) is reported instead of
+  // guessing, and the client resends the whole tape once. Same bounded,
+  // insertion-ordered map as incSessions/astCache — evicting a tape is
+  // harmless (the next run for that key just sends everything), so evicting an
+  // incSession never has to touch it.
+  const tapes = new Map<string, BarData[]>();
+  const tapePut = (key: string, bars: BarData[]) => {
+    if (tapes.size >= INC_CAP && !tapes.has(key)) {
+      const oldest = tapes.keys().next().value;
+      if (oldest !== undefined) tapes.delete(oldest);
+    }
+    tapes.set(key, bars);
+  };
+
   return (msg) => {
     // Shape guard: a nullish/primitive payload must not throw out of the
     // handler — a sync throw here reaches worker.onerror, the client then
@@ -152,8 +168,38 @@ export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWo
         parsed = parse(msg.source ?? '');
       }
       const incKey = msg.opts.incKey;
+      // Bars: a full tape wins and seeds the worker's copy; a patch is applied
+      // to that copy — synchronously, before incRun, so the tape the next run
+      // patches is always the one this run evaluated.
+      let bars: BarData[];
+      if (msg.bars !== undefined) {
+        bars = msg.bars;
+        if (incKey !== undefined) tapePut(incKey, bars);
+      } else if (msg.tape !== undefined) {
+        const patch = msg.tape;
+        if (incKey === undefined) {
+          const miss = new Error('PineTapeMiss: tape patch without an incKey');
+          miss.name = 'PineTapeMiss';
+          throw miss;
+        }
+        const stored = tapes.get(incKey);
+        if (stored === undefined || stored.length !== patch.base || patch.from > patch.base) {
+          const miss = new Error(`PineTapeMiss: worker tape for ${incKey} is ${stored?.length ?? 'absent'}, client expected ${patch.base}`);
+          miss.name = 'PineTapeMiss';
+          throw miss;
+        }
+        // Prefix equality is not re-checked: the rebuilt tape matches the
+        // client's field for field, so incAdvance's own firstDiff/committed
+        // and shrink checks stay authoritative.
+        const rebuilt = stored.slice(0, patch.from);
+        for (const b of patch.tail) rebuilt.push(b);
+        bars = rebuilt;
+        tapePut(incKey, rebuilt);
+      } else {
+        throw new Error('run message carried neither bars nor tape');
+      }
       const prior = incKey !== undefined ? incSessions.get(incKey) ?? null : null;
-      incRun(parsed, msg.bars, {
+      incRun(parsed, bars, {
         symbol: msg.opts.symbol,
         timeframe: msg.opts.timeframe,
         inputValues: msg.opts.inputValues,
