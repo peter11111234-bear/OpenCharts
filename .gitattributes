@@ -1,0 +1,3 @@
+# patch-package diffs target LF files in node_modules; a CRLF checkout of
+# the patch (core.autocrlf=true) would stop it from applying.
+patches/*.patch text eol=lf
