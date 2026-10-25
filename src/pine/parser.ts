@@ -243,7 +243,15 @@ class Parser {
     }
 
     // expression statement / assignment / reassignment / compound assign
-    const e = this.expr();
+    return this.assignTail(this.expr());
+  }
+
+  /** Trailing assignment operators after a statement head expression:
+   *  `e := v`, `e += v` (desugared to `e := e + v`), and — when
+   *  `allowDecl` — `name = v`. Returns the head expression unchanged when
+   *  no operator follows. Switch arm values (inline `=> v`) share this so
+   *  `cond => x += 1` parses; they pass allowDecl=false. */
+  private assignTail(e: Node, allowDecl = true): Node {
     if (this.atOp(':=')) {
       this.next();
       const value = this.expr();
@@ -258,7 +266,7 @@ class Parser {
       const value: Binary = { type: 'binary', op: p1.v, left: e, right: rhs, loc: e.loc };
       return { type: 'reassign', target: e, value, loc: e.loc } as Reassign;
     }
-    if (this.atOp('=')) {
+    if (allowDecl && this.atOp('=')) {
       if (e.type === 'ident') {
         this.next();
         const value = this.expr();
@@ -274,6 +282,18 @@ class Parser {
   private isTypedDeclAhead(): boolean {
     const t1 = this.peek(1);
     if (t1.type === 'ident') return true;                       // int x
+    // `ns.Type name` — qualified type from an import alias. The ident after
+    // the dot must be followed by the variable name; `a.b(...)`/`a.b = e` are
+    // expressions and fall through to the expr path.
+    if (t1.type === 'op' && t1.v === '.') {
+      let i = 1;
+      while (this.toks[this.pos + i]?.type === 'op' &&
+             this.toks[this.pos + i]!.v === '.' &&
+             this.toks[this.pos + i + 1]?.type === 'ident') {
+        i += 2;
+      }
+      return i > 1 && this.toks[this.pos + i]?.type === 'ident'; // a.b.C x
+    }
     if (t1.type === 'op' && t1.v === '[') {
       return this.peek(2).type === 'op' && this.peek(2).v === ']' &&
              this.peek(3).type === 'ident';                     // int[] x
@@ -398,6 +418,11 @@ class Parser {
       this.err('expected type name');
     }
     let ann = (quals.length ? quals.join(' ') + ' ' : '') + this.next().v;
+    // `zigzag.ZigZag` — qualified type name from an import alias.
+    while (this.atOp('.') && this.peek(1).type === 'ident') {
+      this.next();
+      ann += '.' + this.next().v;
+    }
     if (this.atOp('<')) {
       ann += this.next().v;
       let depth = 1;
@@ -653,8 +678,12 @@ class Parser {
     return { type: 'switch', subject, cases, loc: kw.loc };
   }
 
+  /** Arm body: a block after `=>`, or a single inline value. The inline
+   *  value may be a compound assignment (`cond => x += 1`). */
   private armBody(): Node[] {
-    return this.at('newline') ? this.block() : [this.expr()];
+    return this.at('newline')
+      ? this.block()
+      : [this.assignTail(this.expr(), false)];
   }
 
   // ── module / script decls ──────────────────────────────────────────────────

@@ -162,11 +162,16 @@ export function tokenize(src: string): Token[] {
     // ── string ───────────────────────────────────────────────────────────────
     if (ch === '"' || ch === "'") {
       const quote = ch;
+      const startLine = line;
       advance();
       let v = '';
       for (;;) {
-        if (pos >= src.length || src[pos] === '\n') err('unterminated string literal');
+        // Only EOF terminates a malformed string: TradingView accepts string
+        // literals spanning physical lines, so a '\n' is ordinary content.
+        if (pos >= src.length) err('unterminated string literal');
         const c = src[pos];
+        if (c === '\n') { v += '\n'; advance(); line++; col = 1; continue; }
+        if (c === '\r' && src[pos + 1] === '\n') { advance(); continue; } // CRLF: drop CR
         if (c === '\\') {
           const e = src[pos + 1];
           const esc: Record<string, string> = {
@@ -181,7 +186,7 @@ export function tokenize(src: string): Token[] {
         v += c;
         advance();
       }
-      push('str', v, undefined, line, startCol);
+      push('str', v, undefined, startLine, startCol);
       continue;
     }
 
