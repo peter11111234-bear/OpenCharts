@@ -21,8 +21,12 @@ export interface WorkerOpts {
 }
 
 // ToWorker
+// `astId` names the parsed AST by object identity. The client omits `parsed`
+// once the target worker holds that AST (see workerAsts in pineWorkerClient);
+// a worker that evicted it answers `fail` with name 'PineAstMiss' and the
+// client resends the AST once on the same run id.
 export type ToWorker =
-  | { t: 'run'; id: number; source?: string; parsed?: ParsedInput; bars: BarData[]; opts: WorkerOpts }
+  | { t: 'run'; id: number; source?: string; parsed?: ParsedInput; astId?: string; bars: BarData[]; opts: WorkerOpts }
   | { t: 'fetchRes'; fid: number; ok: boolean; bars?: BarData[]; error?: string };
 
 // FromWorker

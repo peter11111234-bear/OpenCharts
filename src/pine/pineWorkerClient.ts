@@ -42,9 +42,22 @@ interface PendingRun {
    *  while a provider call is served, so a script that fans out unbounded
    *  `request.security` calls (each one cheap) still dies. */
   totalTimer?: ReturnType<typeof setTimeout>;
+  /** AST this run referenced by id; kept so a PineAstMiss can resend it. */
+  astId?: string;
+  /** The parsed body was NOT in the run message (worker claimed to have it). */
+  astOmitted: boolean;
+  /** The single PineAstMiss resend already happened — never retry twice. */
+  astResent: boolean;
+  parsed?: ParsedInput;
+  /** Message as sent (parsed stripped when the worker already had the AST). */
+  runMsg?: RunMsg;
 }
 
 const isObj = (x: unknown): x is Record<string, unknown> => x !== null && typeof x === 'object';
+
+/** The `run` arm of the worker protocol — the client keeps the message it sent
+ *  so a PineAstMiss can resend the AST body on the same run id. */
+type RunMsg = Extract<ToWorker, { t: 'run' }>;
 
 /** A run that blew a deadline (per-run, per-fetch, or the whole-run ceiling).
  *  Typed so the engine can tell "this script is wedged" from "this script
@@ -115,6 +128,36 @@ function releaseWorker(w: WorkerLike): void {
   w.onerror = () => { deadWorkers.add(w); };
   if (w.onmessageerror !== undefined) w.onmessageerror = () => { deadWorkers.add(w); };
   workerPool.push(w);
+}
+
+/** AST identity table: a prepared script's `parsed` object gets one stable id
+ *  for its lifetime, so a client can tell the worker "you already have this
+ *  AST" instead of paying structured-clone (~19–27ms for TRIS390) on every
+ *  live tick. Weak: an edited script re-parses to a NEW object → new id.
+ *  Module-level (not per-client) because the pool hands workers between
+ *  clients. */
+const astIds = new WeakMap<object, string>();
+let astSeq = 0;
+function astIdFor(parsed: object): string {
+  let id = astIds.get(parsed);
+  if (id === undefined) {
+    id = String(++astSeq);
+    astIds.set(parsed, id);
+  }
+  return id;
+}
+
+/** Per-worker record of the AST ids whose FULL body that worker has received —
+ *  the only ids it may be sent by reference. Also module-level: a worker is
+ *  shared across clients through the pool. A fresh worker has no entry, so its
+ *  first run always carries `parsed`. */
+const workerAsts = new WeakMap<WorkerLike, Set<string>>();
+/** Record that `w` now holds AST `id` in full — only called after a successful
+ *  post that actually carried the body (or one the worker will cache). */
+function rememberAst(w: WorkerLike, id: string): void {
+  let known = workerAsts.get(w);
+  if (known === undefined) { known = new Set(); workerAsts.set(w, known); }
+  known.add(id);
 }
 
 export class PineRunClient {
@@ -259,6 +302,28 @@ export class PineRunClient {
       if (msg.t === 'done' || msg.t === 'fail') {
         const p = this.pending;
         if (!p || p.id !== msg.id) return; // stale/stray result must not settle the live run
+        if (msg.t === 'fail' && msg.error.name === 'PineAstMiss' && p.astOmitted
+          && !p.astResent && p.astId !== undefined && p.runMsg !== undefined) {
+          // The worker evicted an AST we sent by reference. It says so instead
+          // of silently re-parsing — withdraw the id from its record and
+          // resend the body ONCE on the same run id: same pending, same
+          // deadlines (no provider time is spent), same worker. A second
+          // miss is a genuine failure and falls through below.
+          p.astResent = true;
+          p.astOmitted = false;
+          const w = this.worker;
+          if (w) {
+            workerAsts.get(w)?.delete(p.astId);
+            p.runMsg = { ...p.runMsg, parsed: p.parsed };
+            try {
+              w.postMessage(p.runMsg);
+              rememberAst(w, p.astId);
+              return;
+            } catch {
+              // Post failed on the resend — settle as a normal failure.
+            }
+          }
+        }
         this.pending = null;
         this.clearTimer(p);
         // A done that kept a resumable session must NOT release its worker
@@ -366,19 +431,31 @@ export class PineRunClient {
     const id = this.nextId++;
     const { fetchSeries, ...opts } = input.opts ?? {};
     const { promise, resolve, reject } = Promise.withResolvers<RunResult>();
+    // AST already on this worker → send the id alone and skip the structured
+    // clone (19–27ms for TRIS390 at 500 bars, paid per tick otherwise).
+    const astId = input.parsed !== undefined ? astIdFor(input.parsed) : undefined;
+    const omitAst = astId !== undefined && workerAsts.get(w)?.has(astId) === true;
     const pending: PendingRun = {
       id, resolve, reject, fetchSeries,
       remaining: this.timeoutMs, startedAt: Date.now(), fetchDepth: 0, fetchTimers: new Set(),
+      astId, astOmitted: omitAst, astResent: false, parsed: input.parsed,
     };
     this.pending = pending;
     pending.timer = setTimeout(() => this.onDeadline(pending), this.timeoutMs);
     pending.totalTimer = setTimeout(() => this.onTotalDeadline(pending), this.totalTimeoutMs);
+    const runMsg: RunMsg = {
+      t: 'run', id,
+      source: input.source,
+      parsed: omitAst ? undefined : input.parsed,
+      astId,
+      bars: input.bars,
+      opts: { ...opts, hasFetch: !!fetchSeries },
+    };
+    pending.runMsg = runMsg;
     try {
-      w.postMessage({
-        t: 'run', id,
-        source: input.source, parsed: input.parsed, bars: input.bars,
-        opts: { ...opts, hasFetch: !!fetchSeries },
-      } satisfies ToWorker);
+      w.postMessage(runMsg);
+      // Only after a successful post does the worker own the body.
+      if (!omitAst && astId !== undefined) rememberAst(w, astId);
     } catch (e) {
       // Sync postMessage throw (e.g. uncloneable inputValues) must not
       // strand pending — every later run would reject 'run in flight'.

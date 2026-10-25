@@ -93,6 +93,20 @@ export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWo
     incSessions.set(key, live);
   };
 
+  // ASTs sent by reference: the client omits `parsed` once this worker holds
+  // it, so a per-tick run costs no structured clone. Insertion order evicts
+  // the oldest — a MISS is reported (never silently re-parsed from `source`,
+  // which the client may not even send) and the client resends once.
+  const AST_CAP = 8;
+  const astCache = new Map<string, ParsedInput>();
+  const astPut = (id: string, parsed: ParsedInput) => {
+    if (astCache.size >= AST_CAP && !astCache.has(id)) {
+      const oldest = astCache.keys().next().value;
+      if (oldest !== undefined) astCache.delete(oldest);
+    }
+    astCache.set(id, parsed);
+  };
+
   return (msg) => {
     // Shape guard: a nullish/primitive payload must not throw out of the
     // handler — a sync throw here reaches worker.onerror, the client then
@@ -118,7 +132,25 @@ export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWo
     };
 
     try {
-      const parsed: ParsedInput = msg.parsed ?? parse(msg.source ?? '');
+      // Body wins (fresh from the client) and seeds the reference cache with
+      // THIS object; then the cached body by id; only then a re-parse. A
+      // referenced id we no longer hold is reported instead of re-parsed:
+      // `source` is absent on reference runs, so guessing would run ''.
+      let parsed: ParsedInput | undefined;
+      if (msg.parsed !== undefined) {
+        parsed = msg.parsed;
+        if (msg.astId !== undefined) astPut(msg.astId, parsed);
+      } else if (msg.astId !== undefined) {
+        parsed = astCache.get(msg.astId);
+      }
+      if (parsed === undefined) {
+        if (msg.astId !== undefined) {
+          const miss = new Error(`PineAstMiss: worker has no AST for id ${msg.astId}`);
+          miss.name = 'PineAstMiss';
+          throw miss;
+        }
+        parsed = parse(msg.source ?? '');
+      }
       const incKey = msg.opts.incKey;
       const prior = incKey !== undefined ? incSessions.get(incKey) ?? null : null;
       incRun(parsed, msg.bars, {
