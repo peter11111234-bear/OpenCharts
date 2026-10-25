@@ -168,3 +168,31 @@ describe('pineLib corrupt-document protection', () => {
     expect(pineLibWriteFailed()).toBe(false);
   });
 });
+
+describe('pineLib read memo', () => {
+  it('repeated reads reuse one parse until the stored doc changes', () => {
+    const a = pineLibCreate('A', 'x');
+    const parse = vi.spyOn(JSON, 'parse');
+    expect(pineLibGet(a.id)).toBe(pineLibGet(a.id));
+    pineLibList();
+    expect(parse.mock.calls.filter(([s]) => typeof s === 'string' && s.includes('"scripts"')).length).toBe(1);
+  });
+  it('a write from elsewhere (another tab) is seen on the next read', () => {
+    const a = pineLibCreate('A', 'x');
+    expect(pineLibGet(a.id)!.name).toBe('A');
+    const d = JSON.parse(localStorage.getItem(LIB_KEY)!);
+    d.scripts[0].name = 'Z';
+    localStorage.setItem(LIB_KEY, JSON.stringify(d));
+    expect(pineLibGet(a.id)!.name).toBe('Z');
+  });
+  it('a failed save does not leak the unsaved edit into later reads', () => {
+    const a = pineLibCreate('A', 'x');
+    expect(pineLibGet(a.id)!.source).toBe('x');
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+    pineLibSave(a.id, 'y');
+    expect(pineLibWriteFailed()).toBe(true);
+    vi.restoreAllMocks();
+    expect(pineLibGet(a.id)!.source).toBe('x');
+    expect(pineLibGet(a.id)!.versions.length).toBe(1);
+  });
+});

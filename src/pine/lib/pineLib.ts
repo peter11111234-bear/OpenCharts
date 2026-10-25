@@ -56,9 +56,8 @@ function reportWriteError(e: unknown): void {
   for (const f of errorSubs) f(msg);
 }
 
-function readDoc(): Doc {
+function parseDoc(raw: string | null): Doc {
   try {
-    const raw = localStorage.getItem(LIB_KEY);
     if (!raw) return { version: 1, scripts: [] };
     const d = JSON.parse(raw) as Doc;
     if (d?.version !== 1 || !Array.isArray(d.scripts)) return { version: 1, scripts: [] };
@@ -66,6 +65,33 @@ function readDoc(): Doc {
   } catch {
     return { version: 1, scripts: [] };
   }
+}
+/** Fresh, privately-owned doc — mutators edit it in place before writeDoc. */
+function readDoc(): Doc {
+  try {
+    return parseDoc(localStorage.getItem(LIB_KEY));
+  } catch {
+    return { version: 1, scripts: [] };
+  }
+}
+// Read-only paths (picker, menus, dialogs) hit the library many times per
+// render and every call used to JSON.parse the whole doc including the
+// 50-deep version stacks. Memo keyed on the stored string: a write from this
+// tab, another tab, or a test's localStorage.setItem changes the string and
+// misses. The shared doc is never handed to a mutator (they use readDoc), so
+// callers of pineLibList/pineLibGet must treat entries as read-only.
+let readCache: { raw: string | null; doc: Doc } | null = null;
+function readDocShared(): Doc {
+  let raw: string | null;
+  try {
+    raw = localStorage.getItem(LIB_KEY);
+  } catch {
+    return { version: 1, scripts: [] };
+  }
+  if (readCache && readCache.raw === raw) return readCache.doc;
+  const doc = parseDoc(raw);
+  readCache = { raw, doc };
+  return doc;
 }
 let lastWriteFailed = false;
 /** True when the most recent writeDoc hit a quota/denied error — lets callers
@@ -145,10 +171,10 @@ function uid(): string {
 }
 
 export function pineLibList(): PineScriptEntry[] {
-  return [...readDoc().scripts].sort((a, b) => b.updatedAt - a.updatedAt);
+  return [...readDocShared().scripts].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 export function pineLibGet(id: string): PineScriptEntry | undefined {
-  return readDoc().scripts.find(s => s.id === id);
+  return readDocShared().scripts.find(s => s.id === id);
 }
 export function pineLibCreate(name: string, source: string): PineScriptEntry {
   const now = Date.now();
