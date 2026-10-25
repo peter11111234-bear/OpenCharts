@@ -1,0 +1,19 @@
+diff --git a/node_modules/@luxalgo/vela/dist/chunk-UNUVPQFW.js b/node_modules/@luxalgo/vela/dist/chunk-UNUVPQFW.js
+index f6fe8f5..c2642d0 100644
+--- a/node_modules/@luxalgo/vela/dist/chunk-UNUVPQFW.js
++++ b/node_modules/@luxalgo/vela/dist/chunk-UNUVPQFW.js
+@@ -5032,7 +5032,13 @@ var PaneControls = class {
+         this.root.appendChild(cluster);
+         this.clusters.set(p.id, cluster);
+       }
+-      this.buildButtons(cluster, p);
++      // OpenCharts patch (L4): refresh() runs ~3x per indicator mount; only
++      // rebuild a cluster when the state its buttons encode changed.
++      const sig = `${p.kind}|${p.index}|${p.count}|${p.collapsed ? 1 : 0}|${p.maximized ? 1 : 0}`;
++      if (cluster.dataset.velaSig !== sig) {
++        cluster.dataset.velaSig = sig;
++        this.buildButtons(cluster, p);
++      }
+     }
+     for (const [id, cluster] of this.clusters) {
+       if (!seen.has(id)) {
