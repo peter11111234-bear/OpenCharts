@@ -2,8 +2,10 @@
 // Re-running a heavy Pine script on every page restore is the dominant first-
 // paint cost (見高K ~16ms/bar × the loaded window, × every indicator). The
 // built IndicatorModel is plain JSON, and `modelId` is already a source
-// content hash, so a (modelId, symbol, tf, inputs, bar-window) key is exact:
-// any edit, symbol/timeframe change, input change, or new bar misses the cache.
+// content hash, so a (modelId, symbol, tf, inputs) key pins the script and
+// market. The bar window is NOT in the key — a reload almost always lands on a
+// later forming bar — so a hit is only a first paint: the engine trims it to
+// bars before `lastTime` (the run's forming bar) and re-runs right behind it.
 //
 // No-op when IndexedDB is unavailable (SSR/jsdom/node tests).
 
@@ -11,7 +13,10 @@ const DB_NAME = 'opencharts-pine-model';
 const STORE = 'models';
 const MAX_ENTRIES = 24;
 
-type CacheRow = { key: string; at: number; model: unknown };
+// `lastTime` is the open time of the run's last (forming) bar; rows without it
+// predate the trimmed-prefix restore and are a miss.
+type CacheRow = { key: string; at: number; model: unknown; lastTime?: number };
+export type CachedModel = { model: unknown; lastTime: number };
 
 let dbP: Promise<IDBDatabase | null> | null = null;
 
@@ -34,15 +39,20 @@ function db(): Promise<IDBDatabase | null> {
   return dbP;
 }
 
-/** Read a cached model, or null on miss/unavailable storage. */
-export async function modelCacheGet(key: string): Promise<unknown | null> {
+/** Read a cached model (+ its forming-bar time), or null on miss/unavailable storage. */
+export async function modelCacheGet(key: string): Promise<CachedModel | null> {
   const d = await db();
   if (!d) return null;
   return new Promise((resolve) => {
     try {
       const tx = d.transaction(STORE, 'readonly');
       const rq = tx.objectStore(STORE).get(key);
-      rq.onsuccess = () => resolve((rq.result as CacheRow | undefined)?.model ?? null);
+      rq.onsuccess = () => {
+        const row = rq.result as CacheRow | undefined;
+        resolve(row?.model && typeof row.lastTime === 'number'
+          ? { model: row.model, lastTime: row.lastTime }
+          : null);
+      };
       rq.onerror = () => resolve(null);
     } catch {
       resolve(null);
@@ -51,12 +61,12 @@ export async function modelCacheGet(key: string): Promise<unknown | null> {
 }
 
 /** Store a model and evict the oldest rows past MAX_ENTRIES. */
-export async function modelCachePut(key: string, model: unknown): Promise<void> {
+export async function modelCachePut(key: string, model: unknown, lastTime: number): Promise<void> {
   const d = await db();
   if (!d) return;
   try {
     const tx = d.transaction(STORE, 'readwrite');
-    tx.objectStore(STORE).put({ key, at: Date.now(), model } satisfies CacheRow);
+    tx.objectStore(STORE).put({ key, at: Date.now(), model, lastTime } satisfies CacheRow);
     tx.oncomplete = () => { void prune(d); };
   } catch { /* quota / private mode — cache is best-effort */ }
 }

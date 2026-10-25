@@ -257,6 +257,48 @@ const markerLocationToYLoc = (loc: string | undefined): ModelLabel['yloc'] => {
   return 'belowbar';
 };
 
+// Parse + compile-gate results by exact source. Vela only calls prepare after
+// the chart's history has arrived, so a boot restore paid every script's parse
+// on the main thread right when bars landed; prewarmPrepare() lets the page
+// parse during the fetch instead. The AST is shared between instances of one
+// source — nothing writes to AST nodes (node-keyed caches are side tables),
+// and the worker already reuses one AST per astId. Failures are not cached.
+// Small on purpose: entries pin whole ASTs (editor drafts included) on the
+// main thread for the page's lifetime.
+const PARSE_CAP = 8;
+const parseCache = new Map<string, { parsed: ReturnType<typeof parse>; requirements: ReturnType<typeof assertScript> }>();
+const parseChecked = (clean: string) => {
+  const hit = parseCache.get(clean);
+  if (hit) {
+    parseCache.delete(clean); // LRU: re-insert as newest
+    parseCache.set(clean, hit);
+    return hit;
+  }
+  const parsed = parse(clean);
+  // Compile gate: TV's transform-time rejects (plot scope / outer write /
+  // export capture / security drawings) become a source-located error here,
+  // before any bar runs — TV refuses to save such a script, so running it
+  // would be a silent divergence. The requirements scan rides the same walk.
+  const entry = { parsed, requirements: assertScript(parsed) };
+  parseCache.set(clean, entry);
+  if (parseCache.size > PARSE_CAP) parseCache.delete(parseCache.keys().next().value!);
+  return entry;
+};
+
+/** Parse sources ahead of Vela's prepare (see parseCache). One script per
+ *  macrotask so boot painting isn't blocked; bad scripts are skipped here and
+ *  report their error through the real prepare. */
+export function prewarmPrepare(sources: string[]): void {
+  const queue = sources.map((s) => s.replace(/^﻿/, ''));
+  const step = () => {
+    const src = queue.shift();
+    if (src === undefined) return;
+    try { parseChecked(src); } catch { /* surfaced by prepare() */ }
+    setTimeout(step, 0);
+  };
+  setTimeout(step, 0);
+}
+
 export class PineInterpreterEngine implements ScriptingEngine {
   readonly language = 'pine';
   // Per-ENGINE abilities (the Vela port's `capabilities` is fixed per engine);
@@ -268,12 +310,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
 
   async prepare(source: string, instanceId: string): Promise<PreparedScript> {
     const clean = source.replace(/^\uFEFF/, '');
-    const parsed = parse(clean);
-    // Compile gate: TV's transform-time rejects (plot scope / outer write /
-    // export capture / security drawings) become a source-located error here,
-    // before any bar runs — TV refuses to save such a script, so running it
-    // would be a silent divergence. The requirements scan rides the same walk.
-    const requirements = assertScript(parsed);
+    const { parsed, requirements } = parseChecked(clean);
     const body = Array.isArray(parsed) ? parsed : parsed.body;
     const inputs = collectInputs(body).map(toInputSchema);
     const declArgs = !Array.isArray(parsed) && parsed.decl ? parseDeclArgs(parsed.decl) : {};
@@ -380,6 +417,9 @@ export class PineInterpreterEngine implements ScriptingEngine {
           const revived = reviveOnce;
           reviveOnce = false;
           const myRun = ++runId;
+          // Set when this run painted a cache prefix: Vela already treats the
+          // indicator as loaded, so a failed full run must wipe it (see catch).
+          let shownPrefix: IndicatorModel | undefined;
           try {
             const barData = toBarData(bars);
             const barTimes = barData.map(b => b.openTime);
@@ -391,25 +431,32 @@ export class PineInterpreterEngine implements ScriptingEngine {
             // ship the run off-thread; shouldAbort stays meaningful only on the
             // in-process path (worker abort rides the client protocol).
             const si = req.market.symbolInfo ? syminfoOf(req.market.symbolInfo) : undefined;
-            // Restore-path fast lane: a page reload re-runs every indicator from
-            // scratch (~16ms/bar for heavy scripts). The built model is pure JSON
-            // and the key pins source hash + symbol/tf + inputs + the exact bar
-            // window, so a hit is byte-identical to what a run would emit. Only
-            // the FIRST run of a session (the restore) is served from cache;
-            // update()/tick runs always recompute.
+            // Restore-path first paint: a page reload re-runs every indicator
+            // from scratch (seconds for heavy scripts). The key pins source hash
+            // + symbol/tf + inputs but not the bar window — a reload usually
+            // lands on a later forming bar — so a hit paints only the cached
+            // closed bars that are still on the chart, then falls through to
+            // the full run below, which replaces it (alerts and warnings come
+            // from that run). Only the FIRST run of a session (the restore)
+            // consults the cache; update()/tick runs always recompute.
             const cacheKey = firstRun
-              ? `${token.modelId}|${req.market.symbol}|${req.market.timeframe}|${JSON.stringify(runInputs)}|${barData.length}|${barData[barData.length - 1]?.openTime ?? 0}`
+              ? `${token.modelId}|${req.market.symbol}|${req.market.timeframe}|${JSON.stringify(runInputs)}`
               : null;
             firstRun = false;
             if (cacheKey) {
-              const cached = await modelCacheGet(cacheKey);
-              if (cached) {
-                if (!stopped && myRun === runId) {
-                  handlers.onModel(cached as IndicatorModel);
-                  handlers.onDone?.();
+              // A bad cached row must not take the real run down with it: the
+              // row is only rewritten after a successful run, so throwing here
+              // would fail every restore of this indicator.
+              try {
+                const cached = await modelCacheGet(cacheKey);
+                if (cached && !stopped && myRun === runId) {
+                  const prefix = cachedPrefix(cached.model as IndicatorModel, barTimes, cached.lastTime);
+                  if (prefix) {
+                    handlers.onModel(prefix);
+                    shownPrefix = prefix;
+                  }
                 }
-                continue;
-              }
+              } catch { /* fall through to the full run */ }
             }
             const result: RunResult = await this.runProgram(token.parsed, barData, {
               symbol: req.market.symbol,
@@ -437,7 +484,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
             } catch { /* headless */ }
             if (stopped || myRun !== runId) continue;
             const model = buildModel(token.modelId, req, result, barTimes, runInputs);
-            if (cacheKey) void modelCachePut(cacheKey, model);
+            if (cacheKey) void modelCachePut(cacheKey, model, barTimes[barTimes.length - 1] ?? 0);
             handlers.onModel(model);
             for (const w of result.warnings) handlers.onWarning?.({ message: w, bar: bars.length - 1 });
             for (const a of result.alerts) {
@@ -449,6 +496,11 @@ export class PineInterpreterEngine implements ScriptingEngine {
             handlers.onDone?.();
           } catch (e) {
             if (stopped || myRun !== runId) continue;
+            // Stale cached curves must not stay up as if current: empty every
+            // series before reporting the error.
+            if (shownPrefix) {
+              try { handlers.onModel(clearedModel(shownPrefix)); } catch { /* host handler */ }
+            }
             try {
               if (e instanceof PineRunTimeoutError) {
                 // Only the CURRENT run may suspend: a superseded run's timeout
@@ -584,6 +636,55 @@ const mapDrawingLine = (p: Record<string, unknown>, id: string): ModelLine | und
   };
 };
 
+
+/** Exported for tests — the part of a cached model that is safe to paint on a
+ *  chart whose window may have moved since it was built: time-keyed output on
+ *  bars still in `barTimes` and older than the cached run's forming bar
+ *  `before`. Drawing objects (lines/labels/boxes/tables/polylines/linefills)
+ *  carry last-bar state, so they wait for the real run. Undefined when nothing
+ *  survives, and for models with bgcolor/barcolor: the prefix becomes the
+ *  mounted model and Vela's value patch from the full run never updates
+ *  those layers, so they would stay cut at `before` until a remount. Trades
+ *  ARE patched; they are skipped too only to keep strategy restores simple.
+ *  Markers alone don't count as painted — Vela draws plotshape via labels,
+ *  which the prefix drops. */
+export const cachedPrefix = (m: IndicatorModel, barTimes: number[], before: number): IndicatorModel | undefined => {
+  if (m.backgrounds?.length || m.barColors?.length || m.trades?.length) return undefined;
+  const onChart = new Set(barTimes);
+  const keep = (t: number) => t < before && onChart.has(t);
+  const series = m.series.map((s) => {
+    if ('points' in s && s.points) return { ...s, points: s.points.filter((p) => keep(p.time)) };
+    if ('markers' in s && s.markers) return { ...s, markers: s.markers.filter((p) => keep(p.time)) };
+    if ('bars' in s && s.bars) return { ...s, bars: s.bars.filter((b) => keep(b.time)) };
+    return s;
+  });
+  const painted = series.some((s) =>
+    ('points' in s && (s.points?.length ?? 0) > 0) ||
+    ('bars' in s && (s.bars?.length ?? 0) > 0));
+  if (!painted) return undefined;
+  return {
+    ...m,
+    series,
+    lines: undefined,
+    boxes: undefined,
+    labels: undefined,
+    tables: undefined,
+    polylines: undefined,
+    linefills: undefined,
+  };
+};
+
+/** A prefix with every point/marker/bar removed — same series ids, so Vela's
+ *  value patch blanks the mounted curves. */
+const clearedModel = (m: IndicatorModel): IndicatorModel => ({
+  ...m,
+  series: m.series.map((s) => {
+    if ('points' in s && s.points) return { ...s, points: [] };
+    if ('markers' in s && s.markers) return { ...s, markers: [] };
+    if ('bars' in s && s.bars) return { ...s, bars: [] };
+    return s;
+  }),
+});
 
 /** Exported for tests — maps an interpreter RunResult onto the Vela model. */
 export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult, barTimes: number[], inputOverrides?: Record<string, InputValue>): IndicatorModel => {

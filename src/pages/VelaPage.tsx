@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { VelaWorkspace, type ChartCell } from "@luxalgo/vela/workspace";
 import type { InputValue } from "@luxalgo/vela/plugin";
 import { InterpreterPineEngine } from "./velaPineEditor.ts";
+import { prewarmPrepare } from "../pine/engine.ts";
 import { ShioajiVelaProvider } from "../services/shioaji/velaProvider.ts";
 import { TW_INSTRUMENTS } from "../services/shioaji/instruments.ts";
 import { combinedManifestEntries } from "../pineScripts.ts";
@@ -205,8 +206,8 @@ function mountIndicatorCountBadge(ws: VelaWorkspace, cell: ChartCell): void {
  *
  * - Provider: 'shioaji' — symbols resolve as bare tickers (2330, TXFJ6) or
  *   listing-prefixed (TSE:2330, TAIFEX:TXFJ6).
- * - Pine scripts: src/pine/*.pine via loadPineManifest(), run in-process by the
- *   from-scratch interpreter engine (PineInterpreterEngine, src/pine/).
+ * - Pine scripts: src/pine/*.pine via loadPineManifest(), parsed on the main
+ *   thread and run in a pooled Web Worker (PineWorkerEngine, src/pine/).
  * - Live bars: the provider kicks wsClient.connect() on first subscription,
  *   which starts feed.ts's SSE tick stream.
  *
@@ -241,6 +242,12 @@ export function VelaPage() {
     // O(bars×tf-bars) and hung the page on TRIS-class scripts). Light scripts
     // (EMA/VWAP/FVG…) restore normally, matching TV's reload behaviour.
     const fresh = new URLSearchParams(window.location.search).has("fresh");
+    // Pine scripts this boot will restore (kept + parked) — sizes the worker
+    // pre-warm below so the 3rd+ indicator doesn't cold-spawn a worker.
+    let pineRestoreCount = 0;
+    // Sources of the scripts restoring now (not parked) — parsed while the
+    // history fetch is in flight, see prewarmPrepare.
+    const pineRestoreSources: string[] = [];
     try {
       if (fresh) localStorage.removeItem("vela-workspace-v2");
       else {
@@ -272,12 +279,15 @@ export function VelaPage() {
                 parked.push({ chartIndex, entry: e });
               }
             }
+            pineRestoreCount += kept.length;
+            for (const e of kept) if (typeof e.script === "string") pineRestoreSources.push(e.script);
             if (kept.length !== entries.length) {
               if (kept.length) c.ext!["opencharts.pine-scripts"] = kept;
               else delete c.ext!["opencharts.pine-scripts"];
               stripped = true;
             }
           });
+          pineRestoreCount += parked.length;
           if (parked.length) {
             try { localStorage.setItem("vela-workspace-v2.parked-pine", JSON.stringify(parked)); } catch { /* quota */ }
           }
@@ -319,8 +329,10 @@ export function VelaPage() {
     initVelaLayouts(ws);
     bindVelaWorkspace(ws);
     // Pre-warm pine workers while provider history fetches — restore storms
-    // hit hot workers instead of paying N×spawn.
-    void import("../pine/pineWorkerClient.ts").then((m) => m.prewarmPineWorkers(2)).catch(() => { /* workerless env */ });
+    // hit hot workers instead of paying N×spawn. One per restoring script
+    // (floor 2 for scripts added right after boot; the pool caps it).
+    void import("../pine/pineWorkerClient.ts").then((m) => m.prewarmPineWorkers(Math.max(2, pineRestoreCount))).catch(() => { /* workerless env */ });
+    if (pineRestoreSources.length) prewarmPrepare(pineRestoreSources);
 
     // Deferred restore of parked heavy scripts — they were moved off the
     // workspace doc above (not deleted), now re-run on idle so boot stays
