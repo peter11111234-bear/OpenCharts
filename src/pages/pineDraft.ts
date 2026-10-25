@@ -27,17 +27,30 @@ export function createDraftWriter(
   store: Storage,
   read: () => PineDraft,
   delayMs = 500,
-): { schedule: () => void; flush: () => void } {
+): { schedule: () => void; flush: () => void; dispose: () => void } {
   let timer: ReturnType<typeof setTimeout> | null = null;
-  const flush = (): void => {
+  let disposed = false;
+  const cancel = (): void => {
     if (timer !== null) { clearTimeout(timer); timer = null; }
+  };
+  const flush = (): void => {
+    if (disposed) return;
+    cancel();
     try { writePineDraft(store, read()); } catch { /* buffer unreadable mid-teardown */ }
   };
   const schedule = (): void => {
-    if (timer !== null) clearTimeout(timer);
+    if (disposed) return;
+    cancel();
     timer = setTimeout(flush, delayMs);
   };
-  return { schedule, flush };
+  // Write the last good text once (the caller must dispose while the editor still
+  // holds it), then refuse every later write so a torn-down editor cannot
+  // overwrite the draft.
+  const dispose = (): void => {
+    flush();
+    disposed = true;
+  };
+  return { schedule, flush, dispose };
 }
 
 /** Read the draft back, or null when it is missing or malformed. */

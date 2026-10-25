@@ -46,9 +46,9 @@ import { combinedManifestEntries } from "../pineScripts.ts";
 import type { PineEditorHandle, PineLintError } from "../pine/pineMonaco.ts";
 
 // The docked editor flushes its draft on unload. One module-level listener (not
-// one per mount) calls whichever editor is mounted right now.
-let flushPineDraft: (() => void) | null = null;
-if (typeof window !== "undefined") window.addEventListener("beforeunload", () => flushPineDraft?.());
+// one per mount) flushes whichever editor is mounted right now.
+let activeDraftWriter: { flush: () => void; dispose: () => void } | null = null;
+if (typeof window !== "undefined") window.addEventListener("beforeunload", () => activeDraftWriter?.flush());
 
 // ── Panel styles ── the vela-pine-* classes are ours; nothing ships them.
 // The editor lives in a shell side PANEL (TV parity: right-dock, not a modal) —
@@ -1494,8 +1494,9 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
   /** Keep the live buffer in sessionStorage so an F5 reload restores unsaved
    *  text (per tab). Writes are debounced on change and flushed on unload,
    *  because programmatic loads do not fire a change. */
+  activeDraftWriter?.dispose();  // a remount replaces the previous editor's writer
   const draftWriter = createDraftWriter(sessionStorage, () => ({ id: editorState.currentId, src: area.value }));
-  flushPineDraft = draftWriter.flush;
+  activeDraftWriter = draftWriter;
 
   /** Single change hook for both monaco (`ed.onChange`) and fallback
    *  (`input` listener) — dirty tracking + debounced live lint. */
@@ -1729,6 +1730,9 @@ registerSidePanel({
         undockStrip?.(); undockStrip = null; bottomDocked = false;
         floatWin?.remove(); floatWin = null; floating = false;
         headbarEl = () => null; headbarSlot = () => null;
+        // Flush the draft while the editor still holds the buffer, then refuse
+        // further writes: the disposed editor must not overwrite the draft.
+        activeDraftWriter?.dispose(); activeDraftWriter = null;
         edHandle?.dispose(); edHandle = null;
         popChannel?.close(); popChannel = null; popWin = null;
         panelCtx = null; panelBody = null; panelRoot = null; refreshPanel = null;

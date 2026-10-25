@@ -97,6 +97,33 @@ describe('createDraftWriter', () => {
     expect(s.map.has(PINE_DRAFT_KEY)).toBe(false);
   });
 
+  it('dispose writes the last text once and cancels the pending write', () => {
+    vi.useFakeTimers();
+    const s = memStore();
+    let text = 'good';
+    const w = createDraftWriter(s, () => ({ id: 'a', src: text }), 500);
+    w.schedule(); text = 'good+typed';
+    w.dispose();
+    expect(readPineDraft(s)).toEqual({ id: 'a', src: 'good+typed' });
+    s.map.clear();
+    vi.advanceTimersByTime(1000);
+    expect(s.map.has(PINE_DRAFT_KEY)).toBe(false);
+  });
+
+  it('after dispose, schedule and flush never write (a torn-down editor cannot overwrite the draft)', () => {
+    vi.useFakeTimers();
+    const s = memStore();
+    let text = 'good';
+    const w = createDraftWriter(s, () => ({ id: null, src: text }), 500);
+    w.dispose();
+    s.map.clear();
+    text = 'stale-empty';
+    w.schedule();
+    w.flush();
+    vi.advanceTimersByTime(1000);
+    expect(s.map.has(PINE_DRAFT_KEY)).toBe(false);
+  });
+
   it('a read that throws (editor torn down) is ignored by flush', () => {
     const s = memStore();
     const w = createDraftWriter(s, () => { throw new Error('disposed'); });
