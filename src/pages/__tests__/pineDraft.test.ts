@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { PINE_DRAFT_KEY, draftRestore, readPineDraft, writePineDraft } from '../pineDraft.ts';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { PINE_DRAFT_KEY, createDraftWriter, draftRestore, readPineDraft, writePineDraft } from '../pineDraft.ts';
 
 /** Minimal in-memory Storage. */
 function memStore(): Storage & { map: Map<string, string> } {
@@ -66,6 +66,42 @@ describe('writePineDraft / readPineDraft', () => {
     const s = memStore();
     s.getItem = () => { throw new DOMException('denied', 'SecurityError'); };
     expect(readPineDraft(s)).toBeNull();
+  });
+});
+
+describe('createDraftWriter', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('a burst of schedules writes once, after the pause', () => {
+    vi.useFakeTimers();
+    const s = memStore();
+    let text = 'a';
+    const w = createDraftWriter(s, () => ({ id: null, src: text }), 500);
+    w.schedule(); text = 'ab'; w.schedule(); text = 'abc'; w.schedule();
+    vi.advanceTimersByTime(499);
+    expect(s.map.has(PINE_DRAFT_KEY)).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(readPineDraft(s)).toEqual({ id: null, src: 'abc' });
+  });
+
+  it('flush writes immediately and cancels the pending timer', () => {
+    vi.useFakeTimers();
+    const s = memStore();
+    let text = 'x';
+    const w = createDraftWriter(s, () => ({ id: 'a', src: text }), 500);
+    w.schedule(); text = 'xy';
+    w.flush();
+    expect(readPineDraft(s)).toEqual({ id: 'a', src: 'xy' });
+    s.map.clear();
+    vi.advanceTimersByTime(1000);
+    expect(s.map.has(PINE_DRAFT_KEY)).toBe(false);
+  });
+
+  it('a read that throws (editor torn down) is ignored by flush', () => {
+    const s = memStore();
+    const w = createDraftWriter(s, () => { throw new Error('disposed'); });
+    expect(() => w.flush()).not.toThrow();
+    expect(s.map.has(PINE_DRAFT_KEY)).toBe(false);
   });
 });
 

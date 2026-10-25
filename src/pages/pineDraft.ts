@@ -17,6 +17,29 @@ export function writePineDraft(store: Storage, draft: PineDraft): void {
   try { store.setItem(PINE_DRAFT_KEY, JSON.stringify(draft)); } catch { /* quota or disabled */ }
 }
 
+/**
+ * Debounced draft writer: keystrokes call `schedule()`, and the write happens
+ * once typing pauses for `delayMs`. `flush()` writes now and is what the unload
+ * handler calls, so the last keystrokes are never lost. A `read()` that throws
+ * (editor already torn down) is ignored rather than surfacing as an error.
+ */
+export function createDraftWriter(
+  store: Storage,
+  read: () => PineDraft,
+  delayMs = 500,
+): { schedule: () => void; flush: () => void } {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const flush = (): void => {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+    try { writePineDraft(store, read()); } catch { /* buffer unreadable mid-teardown */ }
+  };
+  const schedule = (): void => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(flush, delayMs);
+  };
+  return { schedule, flush };
+}
+
 /** Read the draft back, or null when it is missing or malformed. */
 export function readPineDraft(store: Storage): PineDraft | null {
   try {

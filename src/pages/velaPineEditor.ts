@@ -41,9 +41,14 @@ import {
   pineLibMigrateLegacyHist, pineLibSubscribe,
 } from "../pine/lib/pineLib.ts";
 import { openScriptsDialog } from "./velaPineScriptsDialog.ts";
-import { draftRestore, readPineDraft, writePineDraft } from "./pineDraft.ts";
+import { createDraftWriter, draftRestore, readPineDraft, writePineDraft } from "./pineDraft.ts";
 import { combinedManifestEntries } from "../pineScripts.ts";
 import type { PineEditorHandle, PineLintError } from "../pine/pineMonaco.ts";
+
+// The docked editor flushes its draft on unload. One module-level listener (not
+// one per mount) calls whichever editor is mounted right now.
+let flushPineDraft: (() => void) | null = null;
+if (typeof window !== "undefined") window.addEventListener("beforeunload", () => flushPineDraft?.());
 
 // ── Panel styles ── the vela-pine-* classes are ours; nothing ships them.
 // The editor lives in a shell side PANEL (TV parity: right-dock, not a modal) —
@@ -1487,12 +1492,10 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
   refreshName();
 
   /** Keep the live buffer in sessionStorage so an F5 reload restores unsaved
-   *  text (per tab). Written on every change and again on unload, because
-   *  programmatic loads do not fire a change. */
-  function persistDraft(): void {
-    writePineDraft(sessionStorage, { id: editorState.currentId, src: area.value });
-  }
-  doc.defaultView?.addEventListener("beforeunload", persistDraft);
+   *  text (per tab). Writes are debounced on change and flushed on unload,
+   *  because programmatic loads do not fire a change. */
+  const draftWriter = createDraftWriter(sessionStorage, () => ({ id: editorState.currentId, src: area.value }));
+  flushPineDraft = draftWriter.flush;
 
   /** Single change hook for both monaco (`ed.onChange`) and fallback
    *  (`input` listener) — dirty tracking + debounced live lint. */
@@ -1500,7 +1503,7 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
     editorState.dirty = true;
     refreshName();
     lintOnChange();
-    persistDraft();
+    draftWriter.schedule();
     if (popWin && !popWin.closed) popChannel?.postMessage({ t: "value", v: area.value });
   }
 
