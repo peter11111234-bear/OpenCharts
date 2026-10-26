@@ -24,6 +24,9 @@ export interface RtCtx extends BuiltinCtx {
   /** call-site → id for the 2nd+ input sharing a title (scriptDecl.planInputIds).
    *  Such an input answers to this id only, never to the shared title. */
   dupInputIds?: Map<string, string>;
+  /** Call node → that id, for the whole script. Set on the chart ctx before the
+   *  run; mtf copies it into each request.security ctx with `inputs`. */
+  inputPlan?: Map<object, string>;
   /** call-site → plot sink index. */
   plotIds?: Map<string, number>;
   /** Next free plot sink index (also counts hline sinks). */

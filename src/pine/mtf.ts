@@ -37,6 +37,7 @@ import { FOR_IN } from './parser';
 import { BUILTINS, CONSTANTS } from './builtins/registry';
 import type { Frame } from './scope';
 import { buildSyminfo } from './context';
+import type { RtCtx } from './builtins/util';
 
 // ── evaluator hooks ─────────────────────────────────────────────────────────
 // Real interpreter evaluation, adapted to the (node, scope, ctx) triple so tf
@@ -1214,6 +1215,9 @@ function ensureTfFrame(spec: SecuritySpec, frame: { scope: Scope; ctx: BuiltinCt
       mainPeriod: parent.timeframe.mainPeriod,
     },
     callUdf: (fn, args) => invokeUdf(spec, fn, args),
+    // Globals the expression reads re-run their input.* calls here: same user
+    // overrides, same per-input ids as on the chart.
+    ...{ inputs: (parent as RtCtx).inputs, inputPlan: (parent as RtCtx).inputPlan },
   };
 }
 

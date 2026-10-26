@@ -180,7 +180,7 @@ interface RunState {
   callsiteSeq: number;
   /** planInputIds result; callsiteId copies each hit into `dupInputIds` keyed
    *  by the site it mints, which is what builtins/input.ts can see. */
-  inputPlan: Map<Node, string> | null;
+  inputPlan: Map<object, string> | null;
   dupInputIds: Map<string, string> | null;
   /** Site-path trie: callsite string → … → node → stable key object for
    *  declSlots/callHist/tupleKeys. Root map keyed by callsite string. */
@@ -276,6 +276,9 @@ function runOf(ctx: BuiltinCtx): RunState {
     envNoJitUdf: debugFlagEnv('noJitUdf'),
     envJitUdf: debugFlagEnv('jitUdf'),
   };
+  // A request.security ctx carries the chart's plan (mtf.ts) — its own sites.
+  const plan = (ctx as RtCtx).inputPlan;
+  if (plan) { r.inputPlan = plan; (ctx as RtCtx).dupInputIds = r.dupInputIds = new Map(); }
   Object.defineProperty(ctx, RUN_STATE, { value: r, enumerable: false, writable: false, configurable: false });
   return r;
 }
@@ -2958,8 +2961,9 @@ async function buildSess(
   ctx.inputSchemas = [];
   {
     // Before anything evaluates: mtf prefetch runs globals ahead of bar 0.
+    ctx.inputPlan = planInputIds(body);
     const run = runOf(ctx);
-    run.inputPlan = planInputIds(body);
+    run.inputPlan = ctx.inputPlan;
     ctx.dupInputIds = run.dupInputIds = new Map();
   }
   ctx.plotIds = new Map();
