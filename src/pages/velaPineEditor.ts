@@ -40,6 +40,7 @@ import {
   pineLibMigrateLegacyHist, pineLibSubscribe,
 } from "../pine/lib/pineLib.ts";
 import { openScriptsDialog } from "./velaPineScriptsDialog.ts";
+import { pineRunWarnings } from "../pine/engine.ts";
 import { createDraftWriter, draftRestore, readPineDraft, writePineDraft } from "./pineDraft.ts";
 import { combinedManifestEntries } from "../pineScripts.ts";
 import type { PineEditorHandle, PineLintError } from "../pine/pineMonaco.ts";
@@ -786,6 +787,8 @@ function popMeta(): void {
   const s = editorState.currentId ? pineLibGet(editorState.currentId) : undefined;
   popPost({ t: "meta",
     name: s?.name ?? "Untitled script",
+    // id rides back on every cmd so a reloaded main window can re-attach.
+    id: editorState.currentId ?? undefined,
     // hasId tells the popout whether Save needs a name; suggestName is the
     // indicator() title it should prefill. Both must come from here: the
     // popout cannot see editorState or the buffer's source text.
@@ -808,10 +811,10 @@ function popSave(nameFromPop?: string): void {
       // window) is not tied to the click that asked for it, so Chrome treats it
       // as gesture-less and returns null → "Save cancelled" on every first save.
       // Only fall back to prompting here when the popout supplied nothing.
-      let name = nameFromPop;
-      if (name === undefined) {
-        name = (lastCmdCtx?.host.ownerDocument.defaultView ?? window).prompt?.("Script name", def) ?? "";
-      }
+      // No name supplied (the popout believed the script was already saved, but
+      // the id is gone): a prompt() here is gesture-less and Chrome returns
+      // null, so save under the script's own title — Rename can change it.
+      const name = nameFromPop ?? def;
       if (!name.trim()) { popStatus("Save cancelled", "err"); return; }
       const s = pineLibCreate(name.trim(), src);
       if (pineLibWriteFailed()) { popStatus("Save failed (storage)", "err"); return; }
@@ -841,8 +844,41 @@ async function applyCodeUpdate(
   return { ok: true, error: null };
 }
 
+/** runIndicator/updateCode settle only after the script runs over bars — with
+ *  no bars on the chart (market data server down, closed-market fresh load)
+ *  they wait indefinitely and the status sat on "Running…" forever. Say why
+ *  after a while; the run still lands (and the status updates) once bars come. */
+const SLOW_RUN_MS = 12_000;
+const SLOW_RUN_MSG = "還在等計算 — 若圖上沒有 K 棒（行情伺服器 :8080 沒開），資料到了才會畫出";
+function whileSlow<T>(p: Promise<T>, onSlow: () => void): Promise<T> {
+  const t = setTimeout(onSlow, SLOW_RUN_MS);
+  return p.finally(() => clearTimeout(t));
+}
+
+/** A run can "succeed" while drawing nothing: the interpreter turns names it
+ *  cannot resolve into na with a warning instead of failing. A Pine v4 script
+ *  (study(), bare rsi()/sma()/pivothigh()) hits this on every line — the
+ *  status said "Added" over an empty pane. Look up this source's latest run
+ *  warnings in the engine (keyed by source: VELA's chart-wide `warning` event
+ *  drops which indicator raised it, and an unchanged updateCode never re-runs).
+ *  Only unresolved-name warnings count: "declared but not implemented" notes
+ *  (max_bars_back, …) don't change what gets drawn. */
+const BROKEN_WARNING = /not found|not a function|unknown constant/;
+function runVerdict(src: string, okText: string): { text: string; kind: "ok" | "err" } {
+  const broken = [...new Set(pineRunWarnings(src) ?? [])].filter((m) => BROKEN_WARNING.test(m));
+  if (!broken.length) return { text: okText, kind: "ok" };
+  const ver = Number(/\/\/\s*@version\s*=\s*(\d+)/.exec(src)?.[1] ?? 0);
+  if (ver && ver < 5) {
+    return { text: `${okText}，但畫不出來：這是 Pine v${ver} 腳本，只支援 v5/v6 — 請先轉換（study→indicator、rsi→ta.rsi…）`, kind: "err" };
+  }
+  return { text: `${okText}，但有 ${broken.length} 個錯誤，可能畫不出來：${broken[0]}`, kind: "err" };
+}
+
 async function popRun(): Promise<void> {
-  const chart = lastCmdCtx?.chart;
+  // The chart getter throws while the workspace has no active cell — report
+  // it instead of letting it escape the channel handler with no status.
+  let chart: WidgetContext["chart"] | undefined;
+  try { chart = lastCmdCtx?.chart; } catch { chart = undefined; }
   if (!chart) { popStatus("No chart context", "err"); return; }
   const src = pendingValue;
   popStatus("Running…");
@@ -850,20 +886,24 @@ async function popRun(): Promise<void> {
     if (editorState.handleId) {
       const handle = chart.indicators().find((h) => h.id === editorState.handleId);
       if (handle) {
-        const u = await applyCodeUpdate(handle, src);
+        const u = await whileSlow(applyCodeUpdate(handle, src), () => popStatus(SLOW_RUN_MSG));
         if (!u.ok) { popStatus(`Error: ${u.error}`, "err"); return; }
-        popStatus("Updated in place", "ok");
+        const v = runVerdict(src, "Updated in place");
+        popStatus(v.text, v.kind);
         return;
       }
       editorState.handleId = undefined;
     }
-    const r = await chart.runIndicator(src);
+    const r = await whileSlow(chart.runIndicator(src), () => popStatus(SLOW_RUN_MSG));
     if (r && typeof r === "object" && "ok" in r && r.ok === false) {
       popStatus(`Error: ${"error" in r ? String(r.error) : "unknown"}`, "err");
       return;
     }
-    editorState.handleId = chart.indicators().at(-1)?.id;
-    popStatus("Added", "ok");
+    // r.handle, not indicators().at(-1): parked scripts restore asynchronously
+    // on boot and can land after this one.
+    editorState.handleId = r.handle?.id ?? chart.indicators().at(-1)?.id;
+    const v = runVerdict(src, "Added");
+    popStatus(v.text, v.kind);
   } catch (e) { popStatus(`Error: ${e instanceof Error ? e.message : e}`, "err"); }
 }
 function popReload(): void {
@@ -879,8 +919,25 @@ function ensurePopChannel(): void {
   if (popChannel) return;
   popChannel = new BroadcastChannel("opencharts.pine.win");
   popChannel.onmessage = (e) => {
-    const m = e.data as { t?: string; v?: string; c?: string; id?: string; name?: string; k?: string; i?: number };
+    const m = e.data as { t?: string; v?: string; c?: string; id?: string; name?: string; k?: string; i?: number; dirty?: boolean };
     if (m.t === "hello" || m.t === "bye") { popPost({ t: "value", v: pendingValue }); popMeta(); }
+    // A popout reload sends bye then hello: drop the owner flag on bye and take
+    // it back on hello only if this tab holds that popout, so a tab whose
+    // popout closed for good stops re-attaching (and double-running cmds).
+    if (m.t === "bye") setPopOwner(false);
+    if (m.t === "hello" && (adoptedPop || (popWin !== null && !popWin.closed))) setPopOwner(true);
+    // Reply to our load-time ping: the popout outlived a reload of this window
+    // and still holds the buffer — take it over rather than overwrite it. Every
+    // tab on the channel sees an adopt, so only the tab that just pinged takes it.
+    if (m.t === "adopt" && awaitingAdopt && typeof m.v === "string") {
+      awaitingAdopt = false;
+      adoptedPop = true;
+      pendingValue = m.v;
+      editorState.currentId = m.id && pineLibGet(m.id) ? m.id : null;
+      editorState.handleId = undefined;
+      editorState.dirty = !!m.dirty;
+      popMeta();
+    }
     if (m.t === "value" && typeof m.v === "string") {
       pendingValue = m.v;
       editorState.dirty = true;
@@ -891,6 +948,9 @@ function ensurePopChannel(): void {
       // would rewrite `pendingValue` behind copy/rename, which read the
       // LIBRARY (not the buffer) and must not be silently re-pointed.
       if ((m.c === "save" || m.c === "run") && typeof m.v === "string") pendingValue = m.v;
+      // Missed the adopt (e.g. ping raced the popout): recover the script id
+      // from the command so Save updates it instead of creating a duplicate.
+      if (!editorState.currentId && m.id && pineLibGet(m.id)) editorState.currentId = m.id;
       if (m.c === "save") popSave(m.name);
       if (m.c === "run") void popRun();
       if (m.c === "reload") popReload();
@@ -955,6 +1015,35 @@ function ensurePopChannel(): void {
   };
 }
 
+// Listen from page load, not from the first openEditor(): a popout left open
+// across a reload (F5, vite full reload) otherwise talks to nobody — Save and
+// Add to chart silently did nothing. The ping makes it hand back its buffer.
+// Only the tab that opened the popout re-attaches (sessionStorage is per tab and
+// survives F5): every /vela tab answering would blank the popout on `hello`,
+// and Save/Add to chart would run once per tab — duplicate library entries.
+const POP_OWNER_KEY = "opencharts.pine.popOwner";
+/** How long after the load-time ping this tab accepts the popout's adopt. */
+const ADOPT_WINDOW_MS = 2000;
+let awaitingAdopt = false;
+/** This tab took over a popout after a reload (it has no popWin handle for it). */
+let adoptedPop = false;
+function setPopOwner(on: boolean): void {
+  try {
+    if (on) sessionStorage.setItem(POP_OWNER_KEY, "1");
+    else sessionStorage.removeItem(POP_OWNER_KEY);
+  } catch { /* blocked storage */ }
+}
+if (typeof BroadcastChannel !== "undefined") {
+  let owner = false;
+  try { owner = sessionStorage.getItem(POP_OWNER_KEY) === "1"; } catch { /* blocked storage */ }
+  if (owner) {
+    ensurePopChannel();
+    awaitingAdopt = true;
+    setTimeout(() => { awaitingAdopt = false; }, ADOPT_WINDOW_MS);
+    popPost({ t: "ping" });
+  }
+}
+
 function popOpen(): void {
   if (popWin && !popWin.closed) { popWin.focus(); return; }
   const w = (lastCmdCtx?.host.ownerDocument.defaultView ?? window)
@@ -965,6 +1054,7 @@ function popOpen(): void {
 
 function openEditor(ctx: WidgetContext, initialSrc = "", editingId?: string, scriptId?: string): void {
   lastCmdCtx = ctx;
+  setPopOwner(true);
   ctx.togglePanel?.(PANEL_ID, false);   // hide any stale side-dock mount
   applyOpenArgs({ src: initialSrc, editingId, scriptId });
   ensurePopChannel();
@@ -1418,27 +1508,30 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
         if (editorState.handleId) {
           const handle = ctx.chart.indicators().find((h) => h.id === editorState.handleId);
           if (handle) {
-            const u = await applyCodeUpdate(handle, src);
+            const u = await whileSlow(applyCodeUpdate(handle, src), () => setStatus(SLOW_RUN_MSG));
             if (!u.ok) { markRunError(u.error ?? "unknown"); return; }
-            setStatus("Updated in place", "ok");
+            const v = runVerdict(src, "Updated in place");
+            setStatus(v.text, v.kind);
           } else {
-            const r = await ctx.chart.runIndicator(src);
+            const r = await whileSlow(ctx.chart.runIndicator(src), () => setStatus(SLOW_RUN_MSG));
             if (r && typeof r === 'object' && 'ok' in r && r.ok === false) {
               markRunError('error' in r ? String(r.error) : 'unknown');
               return;
             }
-            setStatus("Original gone — added new", "ok");
             // Update handleId to the new indicator so next Add hits updateCode.
-            const added = ctx.chart.indicators().at(-1);
-            if (added) editorState.handleId = added.id;
+            const addedId = r.handle?.id ?? ctx.chart.indicators().at(-1)?.id;
+            if (addedId) editorState.handleId = addedId;
+            const v = runVerdict(src, "Original gone — added new");
+            setStatus(v.text, v.kind);
           }
         } else {
-          const r = await ctx.chart.runIndicator(src);
+          const r = await whileSlow(ctx.chart.runIndicator(src), () => setStatus(SLOW_RUN_MSG));
           if (r && typeof r === 'object' && 'ok' in r && r.ok === false) {
             markRunError('error' in r ? String(r.error) : 'unknown');
             return;
           }
-          setStatus("Added", "ok");
+          const v = runVerdict(src, "Added");
+          setStatus(v.text, v.kind);
         }
         rebuildOnChart();
       } catch (e) {
@@ -1523,8 +1616,9 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
   refreshName();
 
   /** Keep the live buffer in sessionStorage so an F5 reload restores unsaved
-   *  text (per tab). Writes are debounced on change and flushed on unload,
-   *  because programmatic loads do not fire a change. */
+   *  text (per tab; cleared by the browser when the tab closes). Writes are
+   *  debounced on change and flushed on unload, because programmatic loads
+   *  don't fire change. */
   activeDraftWriter?.dispose();  // a remount replaces the previous editor's writer
   const draftWriter = createDraftWriter(sessionStorage, () => ({ id: editorState.currentId, src: area.value }));
   activeDraftWriter = draftWriter;
@@ -1790,8 +1884,14 @@ registerWidgetAttachment({
   id: "opencharts.pine-rail",
   mount(ctx) {
     const doc = ctx.host.ownerDocument;
+    // Chart context for a popout that outlived a reload of this window — until
+    // the user reopens the editor, Add to chart has no other way to a chart.
+    // Latest mount wins: an earlier one (StrictMode double mount, workspace
+    // re-render) is disposed and its chart getter throws "no active cell".
+    lastCmdCtx = ctx;
     const main = ctx.host.querySelector?.(".vela-ws-main") as HTMLElement | null;
-    if (!main) return () => {}; // layout variant without the row → skip rail
+    // Layout variant without the row → skip the rail (but still release the ctx).
+    if (!main) return () => { if (lastCmdCtx === ctx) lastCmdCtx = null; };
     if (!doc.querySelector("style[data-vela-pine-rail]")) {
       const s = doc.createElement("style");
       s.dataset.velaPineRail = "";
@@ -1816,6 +1916,6 @@ registerWidgetAttachment({
       mkBtn("My scripts", FOLDER, () => openScriptsDialog(ctx, (id) => openPineEditorWithScript(ctx, id))),
     );
     main.appendChild(rail);
-    return () => rail.remove();
+    return () => { rail.remove(); if (lastCmdCtx === ctx) lastCmdCtx = null; };
   },
 });

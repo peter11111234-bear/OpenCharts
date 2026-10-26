@@ -21,18 +21,66 @@
   #ed{flex:1;width:100%;resize:none;background:#161a24;color:#d5d8e0;border:0;outline:none;
       padding:10px 14px;font:13px/1.55 ui-monospace,Consolas,monospace;white-space:pre;tab-size:4}
   #foot{display:flex;align-items:center;gap:12px;padding:2px 10px;border-top:1px solid #2a2e39;color:#8b8f9c;font-size:12px}
-  #menu{position:absolute;top:34px;left:8px;z-index:10;min-width:220px;max-height:70vh;overflow:auto;
-      background:#1e222d;border:1px solid #363c4e;border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.5);padding:4px;display:none}
-  #menu.open{display:block}
-  #menu button{display:flex;width:100%;justify-content:space-between;gap:16px;padding:6px 10px;font-size:13px;text-align:left}
-  #menu button:hover{background:#2a2e39;color:#fff}
-  #menu .k{color:#6b7080;font-size:11px}
-  #menu .head{padding:6px 10px 2px;color:#6b7080;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
-  #menu .sep{height:1px;background:#2a2e39;margin:4px 6px}
-  #sub{position:absolute;left:calc(100% - 4px);top:-4px;background:#1e222d;border:1px solid #363c4e;border-radius:6px;
-      box-shadow:0 8px 24px rgba(0,0,0,.5);padding:4px;min-width:140px;display:none}
-  #menu .parent{position:relative}
-  #menu .parent.open #sub{display:block}
+  /* Script menu — one accent (#2962ff), the app's cool grays, opacity/transform-only motion. */
+  #menu{position:absolute;top:36px;left:8px;z-index:10;width:340px;max-height:min(560px,calc(100dvh - 56px));
+      display:flex;flex-direction:column;overflow:hidden;
+      background:#1c202b;border:1px solid #3a4052;border-radius:8px;
+      box-shadow:0 14px 32px rgba(6,9,16,.55),0 2px 6px rgba(6,9,16,.35);
+      font:13px/1.35 "Segoe UI","Microsoft JhengHei","PingFang TC",system-ui,sans-serif;
+      opacity:0;transform:translateY(-4px);visibility:hidden;pointer-events:none;
+      transition:opacity .12s ease,transform .12s ease,visibility 0s linear .12s}
+  #menu.open{opacity:1;transform:none;visibility:visible;pointer-events:auto;transition:opacity .12s ease,transform .12s ease}
+  /* Contrast: labels ≥4.5:1 on #1c202b, body text ~12:1, hover/current rows clearly lifted. */
+  #menu .m-search{padding:8px;border-bottom:1px solid #303544}
+  #menu .m-search input{width:100%;box-sizing:border-box;padding:6px 10px;border:1px solid #454c60;border-radius:6px;
+      background:#131722;color:#eceef2;font:inherit;outline:none;transition:border-color .12s ease}
+  #menu .m-search input:focus{border-color:#2962ff;box-shadow:0 0 0 2px rgba(41,98,255,.25)}
+  #menu .m-search input::placeholder{color:#8a90a2}
+  #menu .m-scroll{overflow:auto;padding:4px 4px 6px;overscroll-behavior:contain}
+  #menu .m-row{display:flex;align-items:center;gap:10px;width:100%;padding:6px 10px;border-radius:5px;
+      color:#e3e5ea;font:inherit;text-align:left;transition:background-color .1s ease,color .1s ease}
+  #menu .m-row svg{width:15px;height:15px;flex:none;color:#a3a9b8}
+  #menu .m-row:hover,#menu .m-row:focus-visible{background:#323a4d;color:#fff;outline:none}
+  #menu .m-row:focus-visible{box-shadow:inset 0 0 0 1px #2962ff}
+  #menu .m-row:hover svg,#menu .m-row:focus-visible svg{color:#fff}
+  #menu .m-row:active{transform:translateY(1px)}
+  #menu .m-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #menu .k{color:#9aa0b0;font-size:11px;font-variant-numeric:tabular-nums}
+  #menu .m-dot{width:6px;height:6px;flex:none;border-radius:50%}
+  #menu .m-row.current{background:rgba(41,98,255,.18);color:#fff;font-weight:600}
+  #menu .m-row.current:hover{background:rgba(41,98,255,.28)}
+  #menu .m-row.current .k{color:#9fbaff;font-weight:400}
+  #menu .head{padding:10px 10px 4px;color:#9aa0b0;font-size:11px;font-weight:600;letter-spacing:.02em}
+  #menu .head:first-child{padding-top:4px}
+  #menu .sep{height:1px;background:#303544;margin:6px 6px}
+  #menu .m-new{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;padding:2px 6px}
+  #menu .m-chip{padding:6px 0;border:1px solid #4a5166;border-radius:5px;color:#e3e5ea;font:inherit;font-size:12px;
+      transition:border-color .1s ease,background-color .1s ease,color .1s ease}
+  #menu .m-chip:hover,#menu .m-chip:focus-visible{border-color:#2962ff;color:#fff;background:rgba(41,98,255,.2);outline:none}
+  #menu .m-chip:active{transform:translateY(1px)}
+  #menu .m-empty{padding:4px 10px 6px;color:#8a90a2;font-size:12px}
+  #menu .m-more{color:#8fb0ff;font-size:12px}
+  /* Tones: each section/kind gets its own hue. No red/green — those mean up/down on a TW chart. */
+  #menu{--c-blue:#6b96ff;--c-teal:#3cc8cc;--c-amber:#f2b04a;--c-violet:#b39cff}
+  #menu [data-tone=blue]{--tone:var(--c-blue)}
+  #menu [data-tone=teal]{--tone:var(--c-teal)}
+  #menu [data-tone=amber]{--tone:var(--c-amber)}
+  #menu [data-tone=violet]{--tone:var(--c-violet)}
+  #menu .head[data-tone]{color:var(--tone)}
+  #menu .head[data-tone]::before{content:"";display:inline-block;width:3px;height:10px;margin-right:7px;
+      border-radius:2px;background:var(--tone);vertical-align:-1px}
+  #menu .m-row[data-tone] svg{color:var(--tone)}
+  #menu .m-row[data-tone]:hover{background:color-mix(in srgb,var(--tone) 16%,#232838)}
+  #menu .m-chip[data-tone]{color:var(--tone);border-color:color-mix(in srgb,var(--tone) 45%,transparent);
+      background:color-mix(in srgb,var(--tone) 7%,transparent)}
+  #menu .m-chip[data-tone]:hover,#menu .m-chip[data-tone]:focus-visible{color:#fff;border-color:var(--tone);
+      background:color-mix(in srgb,var(--tone) 26%,transparent)}
+  #menu .m-row.ver .m-label{flex:none;min-width:30px;padding:1px 6px;border-radius:4px;font:600 11px/1.4 ui-monospace,Consolas,monospace;
+      color:var(--c-teal);background:color-mix(in srgb,var(--c-teal) 14%,transparent);text-align:center}
+  #menu .m-row.ver .k{margin-left:auto}
+  #menu .m-row.ver.latest .k{color:var(--c-teal)}
+  #menu .m-row.recent .m-dot{background:color-mix(in srgb,var(--c-amber) 70%,transparent)}
+  #menu .m-row.current .m-dot{background:#5b8cff}
 </style>
 </head>
 <body>
