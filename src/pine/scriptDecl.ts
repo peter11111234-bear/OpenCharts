@@ -5,6 +5,7 @@
 import { NA, VFALSE, VTRUE, type Arg, type IndicatorDecl, type InputSchemaLite, type Node, type StrategyDecl, type Value } from './contracts';
 import { getConstant } from './builtins/registry';
 import { isNum, numVal, walkNodes } from './astUtil';
+import { slugify } from './builtins/util';
 
 // ── script declaration (indicator/strategy) ───────────────────────────────────
 
@@ -67,6 +68,50 @@ function staticLit(n: Node): Value | undefined {
 
 // ── input schema collection (prepare-time backstop) ───────────────────────────
 
+function inputArg(args: Arg[], idx: number, name: string): Value | undefined {
+  const named = args.find(a => a.name === name);
+  const node = named?.value ?? args.filter(a => a.name === undefined)[idx]?.value;
+  return node ? staticLit(node) : undefined;
+}
+
+function isInputCall(n: Node): n is Extract<Node, { type: 'call' }> {
+  if (n.type !== 'call') return false;
+  const c = n.callee;
+  return c.type === 'member' && c.obj.type === 'ident' && c.obj.name === 'input';
+}
+
+/**
+ * Ids for the 2nd+ `input.*` sharing a literal title, keyed by call node. TV
+ * tells inputs apart by position, so `"Type"` twice is two settings: the first
+ * keeps its title/slug id (saved settings still find it), later ones get
+ * `type_2`, `type_3`, … (raw title when the slug is empty: `週期_2`), bumped
+ * past any id a real title already slugs to. Numbered in source order once, so
+ * the run (builtins/input.ts) and collectInputs agree whatever order the run
+ * reaches the calls in.
+ */
+export function planInputIds(body: Node[]): Map<Node, string> {
+  const titled: { node: Node; title: string }[] = [];
+  walkNodes(body, n => {
+    if (!isInputCall(n)) return;
+    const t = inputArg(n.args, 1, 'title');
+    if (t?.kind === 'string' && t.v) titled.push({ node: n, title: t.v });
+  });
+  const taken = new Set<string>();
+  for (const { title } of titled) { taken.add(title); taken.add(slugify(title, title)); }
+  const count = new Map<string, number>();
+  const plan = new Map<Node, string>();
+  for (const { node, title } of titled) {
+    let nth = (count.get(title) ?? 0) + 1;
+    count.set(title, nth);
+    if (nth === 1) continue;
+    const base = slugify(title, title);
+    while (taken.has(`${base}_${nth}`)) nth++;
+    taken.add(`${base}_${nth}`);
+    plan.set(node, `${base}_${nth}`);
+  }
+  return plan;
+}
+
 /**
  * Walk `body` for `input.<kind>(...)` calls and emit InputSchemaLite entries.
  * Live runs prefer ctx.inputSchemas (populated by builtins/input.ts with
@@ -75,25 +120,20 @@ function staticLit(n: Node): Value | undefined {
 export function collectInputs(body: Node[]): InputSchemaLite[] {
   const out: InputSchemaLite[] = [];
   const seen = new Set<string>();
+  const dupIds = planInputIds(body);
   let seq = 0;
-
-  const argVal = (args: Arg[], idx: number, name: string): Value | undefined => {
-    const named = args.find(a => a.name === name);
-    const node = named?.value ?? args.filter(a => a.name === undefined)[idx]?.value;
-    return node ? staticLit(node) : undefined;
-  };
+  const argVal = inputArg;
 
   walkNodes(body, n => {
-    if (n.type !== 'call') return;
-    const c = n.callee;
-    if (c.type !== 'member' || c.obj.type !== 'ident' || c.obj.name !== 'input') return;
-    const kind = c.prop;
+    if (!isInputCall(n) || n.callee.type !== 'member') return;
+    const kind = n.callee.prop;
     const defval = argVal(n.args, 0, 'defval');
     const title = argVal(n.args, 1, 'title');
     const idArg = argVal(n.args, -1, 'id');
     const titleStr = title?.kind === 'string' ? title.v : '';
     const id =
-      idArg?.kind === 'string' && idArg.v ? idArg.v : titleStr || `input_${kind}_${seq++}`;
+      idArg?.kind === 'string' && idArg.v ? idArg.v
+        : dupIds.get(n) ?? (titleStr || `input_${kind}_${seq++}`);
     if (seen.has(id)) return;
     seen.add(id);
     const schema: InputSchemaLite = {

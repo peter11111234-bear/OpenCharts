@@ -77,7 +77,7 @@ import {
 } from './udt';
 import { jitCompile, jitCompileUdf } from './jit';
 import { isNum, numVal, stmtMayExitTop, walkNodes } from './astUtil';
-import { collectInputs, declOverlay, declProps, declShortTitle, declTitle } from './scriptDecl';
+import { collectInputs, planInputIds, declOverlay, declProps, declShortTitle, declTitle } from './scriptDecl';
 import { libStubNamespace } from './libStubs';
 
 export type { Frame } from './scope';
@@ -178,6 +178,10 @@ interface RunState {
   /** Call node → stable callsite id for plot/alert routing. */
   callsites: Map<Node, string>;
   callsiteSeq: number;
+  /** planInputIds result; callsiteId copies each hit into `dupInputIds` keyed
+   *  by the site it mints, which is what builtins/input.ts can see. */
+  inputPlan: Map<Node, string> | null;
+  dupInputIds: Map<string, string> | null;
   /** Site-path trie: callsite string → … → node → stable key object for
    *  declSlots/callHist/tupleKeys. Root map keyed by callsite string. */
   siteTrie: Map<unknown, unknown>;
@@ -254,6 +258,8 @@ function runOf(ctx: BuiltinCtx): RunState {
     argSites: new Map(),
     callsites: new Map(),
     callsiteSeq: 0,
+    inputPlan: null,
+    dupInputIds: null,
     siteTrie: new Map(),
     siteCtx: [],
     warned: new Set(),
@@ -1252,6 +1258,8 @@ function callsiteId(run: RunState, node: Node): string {
   if (!id) {
     id = `#${run.callsiteSeq++}`;
     run.callsites.set(node, id);
+    const dup = run.inputPlan?.get(node);
+    if (dup !== undefined) run.dupInputIds!.set(id, dup);
   }
   return id;
 }
@@ -2948,6 +2956,12 @@ async function buildSess(
   ctx.drawings = [drawSink];
   ctx.inputs = opts.inputValues ?? {};
   ctx.inputSchemas = [];
+  {
+    // Before anything evaluates: mtf prefetch runs globals ahead of bar 0.
+    const run = runOf(ctx);
+    run.inputPlan = planInputIds(body);
+    ctx.dupInputIds = run.dupInputIds = new Map();
+  }
   ctx.plotIds = new Map();
   ctx.plotSeq = 0;
   ctx.liveLines = [];

@@ -21,6 +21,9 @@ export interface RtCtx extends BuiltinCtx {
   inputs?: Record<string, unknown>;
   /** `input.*` pushes collected schemas here (dedup by id). */
   inputSchemas?: InputSchemaLite[];
+  /** call-site → id for the 2nd+ input sharing a title (scriptDecl.planInputIds).
+   *  Such an input answers to this id only, never to the shared title. */
+  dupInputIds?: Map<string, string>;
   /** call-site → plot sink index. */
   plotIds?: Map<string, number>;
   /** Next free plot sink index (also counts hline sinks). */

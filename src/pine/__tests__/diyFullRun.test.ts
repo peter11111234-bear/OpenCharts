@@ -55,6 +55,13 @@ const SWITCHES_ON = {
   'Range Detector': true,
   Fibonacci: true,
   'Liquidity Zone': true,
+  // These five titles appear twice: a title key sets the first (the
+  // confirmation toggle), the switchboard one is the 2nd and goes by its id.
+  range_filter_2: true,
+  half_trend_2: true,
+  ichimoku_cloud_2: true,
+  vwap_2: true,
+  range_detector_2: true,
 };
 
 const nonNa = (r: RunResult, title: string): number => {

@@ -82,6 +82,8 @@ function rawDefval(v: Value): unknown {
 interface InputMemo {
   id: string;
   title: string;
+  /** False for the 2nd+ input sharing a title: its override is read by id only. */
+  byTitle: boolean;
   /** defval normalized to the declared kind — the no-override value. */
   coercedDefval: Value;
 }
@@ -107,9 +109,12 @@ function recordAndOverride(
   if (memo === undefined) {
     __inputSchemaBuilds++;
     const title = strArg(bound, 'title', 'input');
+    // Numbered in source order before the run, not here: prefetch and lazy
+    // ternaries reach inputs out of source order.
+    const dupId = ctx.dupInputIds?.get(site);
     // Fallback id must be stable per call site: CJK titles slug to '' and a
     // per-bar id would mint a fresh name every bar, defeating schema dedup.
-    const id = slugify(title, `input_${site}`);
+    const id = dupId ?? slugify(title, `input_${site}`);
 
     const schema: InputSchemaLite = { id, name: title, type, defval };
     const minval = bound.get('minval');
@@ -130,13 +135,14 @@ function recordAndOverride(
     ctx.inputSchemas ??= [];
     if (!ctx.inputSchemas.some(s => s.id === schema.id)) ctx.inputSchemas.push(schema);
 
-    memo = { id, title, coercedDefval: coerce(defval, undefined) };
+    memo = { id, title, byTitle: dupId === undefined, coercedDefval: coerce(defval, undefined) };
     inputMemoOf(ctx).set(site, memo);
   }
   // Re-read the override per bar — one dict lookup, correct whether ctx.inputs
   // is injected or deleted mid-run. Fresh {...} wrapper — callers may mutate
   // the returned Value, so the memoized object must never escape.
-  const override = ctx.inputs?.[memo.title] ?? ctx.inputs?.[memo.id];
+  // A shared title names the FIRST input only — the later ones answer to their id.
+  const override = (memo.byTitle ? ctx.inputs?.[memo.title] : undefined) ?? ctx.inputs?.[memo.id];
   const v = override !== undefined ? coerce(memo.coercedDefval, override) : memo.coercedDefval;
   return { id: memo.id, title: memo.title, value: { ...v } };
 }
