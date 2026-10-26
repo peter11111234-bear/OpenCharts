@@ -634,13 +634,21 @@ export async function prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, allBars?:
       ctx.warnings = realWarnings;
     }
     const pfFrame: Frame = { scope: pfScope, ctx: frame?.ctx ?? ctx };
-    for (const spec of store.byNode.values()) {
-      if (spec.sym === DYNAMIC && spec.symNode) {
-        const s = runConst(spec.symNode, pfFrame); if (s) spec.symResolved = s;
+    // Also speculative: a UDF-parameter sym/tf is unbound at global scope.
+    const pfCtx = pfFrame.ctx;
+    const keptWarnings = pfCtx.warnings;
+    pfCtx.warnings = [];
+    try {
+      for (const spec of store.byNode.values()) {
+        if (spec.sym === DYNAMIC && spec.symNode) {
+          const s = runConst(spec.symNode, pfFrame); if (s) spec.symResolved = s;
+        }
+        if (spec.tf === DYNAMIC && spec.tfNode) {
+          const t = runConst(spec.tfNode, pfFrame); if (t) spec.tfResolved = t;
+        }
       }
-      if (spec.tf === DYNAMIC && spec.tfNode) {
-        const t = runConst(spec.tfNode, pfFrame); if (t) spec.tfResolved = t;
-      }
+    } finally {
+      pfCtx.warnings = keptWarnings;
     }
   }
   // Per-job timeout + failure isolation: a hung provider promise would hold
@@ -673,6 +681,10 @@ export async function prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, allBars?:
       return [] as BarData[];
     }));
   }
+  const ck = unresolvedChartFeedKey(ctx);
+  if (ck !== null && !store.fetched.has(ck) && !jobs.has(ck)) {
+    jobs.set(ck, Promise.resolve(allBars ?? chartBarsFromCtx(ctx)));
+  }
   const keys = [...jobs.keys()];
   const results = await Promise.all(keys.map(k => jobs.get(k)!));
   keys.forEach((k, i) => store.fetched.set(k, results[i]!));
@@ -681,6 +693,22 @@ export async function prefetchSecurity(ctx: BuiltinCtx, frame?: Frame, allBars?:
     if (sym === DYNAMIC || tf === DYNAMIC) continue;
     spec.bars = store.fetched.get(`${sym}\n${tf}`) ?? [];
   }
+}
+
+/** Key of the chart's own feed when some dynamic spec's sym/tf stayed
+ *  unresolved at prefetch (they are UDF parameters, e.g. `f(res) =>
+ *  request.security(syminfo.tickerid, res, …)` called with `""`). Those
+ *  calls resolve per call at run time and can only read an already-fetched
+ *  feed; the chart's own is the usual target and needs no fetch — it is the
+ *  chart's bars. null when every spec resolved. */
+function unresolvedChartFeedKey(ctx: BuiltinCtx): string | null {
+  for (const spec of store.byNode.values()) {
+    if (resolvedSym(spec) === DYNAMIC || resolvedTf(spec) === DYNAMIC) {
+      const ticker = ctx.syminfo?.tickerid?.kind === 'string' ? ctx.syminfo.tickerid.v : CHART_SYM;
+      return `${ticker}\n${ctx.timeframe.period}`;
+    }
+  }
+  return null;
 }
 
 /** Live-session refresh: re-fetch every spec's feed. Called from incAdvance
@@ -715,6 +743,12 @@ export async function refreshSecurity(ctx: BuiltinCtx, _frame?: Frame): Promise<
       console.warn(`[pine] refresh ${sym} ${tf} failed:`, e instanceof Error ? e.message : e);
       return store.fetched.get(key) ?? ([] as BarData[]); // stale beats empty
     }));
+  }
+  // The chart's own feed (see unresolvedChartFeedKey) grows with the tape.
+  const ck = unresolvedChartFeedKey(ctx);
+  if (ck !== null && !jobs.has(ck)) {
+    keys.push(ck);
+    jobs.set(ck, Promise.resolve(chartBarsFromCtx(ctx)));
   }
   const results = await Promise.all(keys.map(k => jobs.get(k)!));
   const sameFeed = (a: BarData[] | null, b: BarData[]): boolean => {
@@ -2027,6 +2061,7 @@ export function tryEvalSecurity(node: Node, frame: Frame): Value | null {
     if (sym === DYNAMIC && spec.symNode) sym = runConst(spec.symNode, frame) ?? CHART_SYM;
     if (sym === CHART_SYM && ctx.syminfo?.tickerid?.kind === 'string') sym = ctx.syminfo.tickerid.v;
     if (tf === DYNAMIC && spec.tfNode) tf = runConst(spec.tfNode, frame) ?? ctx.timeframe.period;
+    if (tf === '') tf = ctx.timeframe.period; // "" = chart tf — the key unresolvedChartFeedKey fetched
     const bars = store.fetched.get(`${sym}\n${tf}`);
     if (!bars) {
       warnOnce(spec, ctx,
