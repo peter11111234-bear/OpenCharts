@@ -4,15 +4,15 @@ import '../builtins/index';
 import '../mtf';
 
 // In-memory stand-in for the IndexedDB cache (node has no indexedDB).
-const store = vi.hoisted(() => new Map<string, { model: unknown; lastTime: number }>());
+const store = vi.hoisted(() => new Map<string, { model: unknown; warnings: string[]; lastTime: number }>());
 vi.mock('../modelCache', () => ({
   modelCacheGet: async (key: string) => store.get(key) ?? null,
-  modelCachePut: async (key: string, model: unknown, lastTime: number) => {
-    store.set(key, { model: structuredClone(model), lastTime });
+  modelCachePut: async (key: string, model: unknown, warnings: string[], lastTime: number) => {
+    store.set(key, { model: structuredClone(model), warnings, lastTime });
   },
 }));
 
-const { PineInterpreterEngine, cachedPrefix } = await import('../engine');
+const { PineInterpreterEngine, cachedPrefix, pineRunWarnings } = await import('../engine');
 
 const H = 3600000;
 const mkBars = (from: number, n: number): OHLCV[] =>
@@ -149,10 +149,29 @@ describe('restore through the model cache', () => {
     expect(linePoints(models[1]!)).toEqual([]);
   });
 
+  // The editor reads these to say why an "Added" script drew nothing (a Pine v4
+  // script still "succeeds"); they ride with the cached model so a cache hit
+  // can re-raise them.
+  it('records the run warnings by source and stores them with the cached model', async () => {
+    const broken = '//@version=6\nindicator("w")\nplot(rsi(close, 14), "r")\n';
+    expect(pineRunWarnings(broken)).toBeUndefined();
+    const engine = new PineInterpreterEngine();
+    const prepared = await engine.prepare(broken, 'w1');
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const s = engine.execute(mkReq(prepared, mkBars(0, 30)), { onModel: () => resolve() });
+    await promise;
+    s.stop();
+    const got = pineRunWarnings(broken) ?? [];
+    expect(got.some((w) => w.includes('rsi'))).toBe(true);
+    expect([...store.values()][0]!.warnings).toEqual(got);
+    // Keyed by source: the BOM a pasted file may carry does not split the key.
+    expect(pineRunWarnings('﻿' + broken)).toEqual(got);
+  });
+
   it('a malformed cached row falls through to the full run', async () => {
     await session(mkBars(0, 30));
     const [key] = [...store.keys()];
-    store.set(key!, { model: { series: null }, lastTime: 29 * H });
+    store.set(key!, { model: { series: null }, warnings: [], lastTime: 29 * H });
     const r = await session(mkBars(0, 30));
     expect(r.models).toHaveLength(1);
     expect(r.models[0]!.labels?.length).toBeGreaterThan(0);

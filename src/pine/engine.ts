@@ -160,6 +160,25 @@ const sourceHash = (source: string): string => {
   return (h >>> 0).toString(36);
 };
 
+// Warnings of the latest finished run per script source (modelId). A run that
+// cannot resolve names (a Pine v4 script: study(), bare rsi()) still
+// "succeeds" and draws nothing, so the editor reads these to say why. VELA's
+// chart-wide `warning` event drops which indicator raised it, and an
+// unchanged updateCode does not re-run at all — hence a lookup by source.
+const RUN_WARNINGS_CAP = 50;
+const runWarningsByModel = new Map<string, readonly string[]>();
+function recordRunWarnings(modelId: string, warnings: readonly string[]): void {
+  runWarningsByModel.delete(modelId);
+  runWarningsByModel.set(modelId, warnings);
+  if (runWarningsByModel.size > RUN_WARNINGS_CAP) {
+    runWarningsByModel.delete(runWarningsByModel.keys().next().value!);
+  }
+}
+/** Warnings from the latest run of `source`, or undefined if it never ran. */
+export function pineRunWarnings(source: string): readonly string[] | undefined {
+  return runWarningsByModel.get(`pine-${sourceHash(source.replace(/^﻿/, ''))}`);
+}
+
 /** Prop on a DrawObj as a finite number (or undefined). */
 const propNum = (props: Record<string, unknown>, k: string): number | undefined => {
   const v = props[k];
@@ -471,6 +490,7 @@ export class PineInterpreterEngine implements ScriptingEngine {
                 if (cached && !stopped && myRun === runId) {
                   const prefix = cachedPrefix(cached.model as IndicatorModel, barTimes, cached.lastTime);
                   if (prefix) {
+                    recordRunWarnings(token.modelId, cached.warnings);
                     handlers.onModel(prefix);
                     shownPrefix = prefix;
                   }
@@ -510,7 +530,9 @@ export class PineInterpreterEngine implements ScriptingEngine {
             if (cacheKey || changeFrom === undefined) lineCache.clear();
             const model = buildModel(token.modelId, req, result, barTimes, runInputs,
               cacheKey ? undefined : { from: changeFrom, cache: lineCache });
-            if (cacheKey) void modelCachePut(cacheKey, model, barTimes[barTimes.length - 1] ?? 0);
+            if (cacheKey) void modelCachePut(cacheKey, model, result.warnings, barTimes[barTimes.length - 1] ?? 0);
+            // Before onModel: that is what settles runIndicator/updateCode.
+            recordRunWarnings(token.modelId, result.warnings);
             handlers.onModel(model);
             for (const w of result.warnings) handlers.onWarning?.({ message: w, bar: bars.length - 1 });
             for (const a of result.alerts) {
