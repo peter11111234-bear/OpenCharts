@@ -14,6 +14,7 @@ import type {
   OHLCV,
   PreparedScript,
   ScriptingEngine,
+  SeriesDisplay,
 } from '@luxalgo/vela';
 import type { BarData, DrawObj, PlotOpts, RunResult, Value } from './contracts';
 import { parse } from './parser';
@@ -100,6 +101,19 @@ const PLOT_KIND: Record<string, 'line' | 'area' | 'step' | 'histogram' | 'column
 
 const plotKindOf = (style: string | undefined): 'line' | 'area' | 'step' | 'histogram' | 'columns' | 'circles' | 'cross' =>
   ((style && PLOT_KIND[style]) ?? 'line') as 'line' | 'area' | 'step' | 'histogram' | 'columns' | 'circles' | 'cross';
+
+/** plot `display=` that keeps a series off the pane → the one surface it keeps.
+ *  Vela leaves a series out of the price-scale range unless pane or priceScale
+ *  is on, so a data-window-only signal no longer squashes the candles.
+ *  display.all / display.pane (and unset) draw everywhere: undefined. */
+const OFF_PANE: Record<string, SeriesDisplay> = {
+  'display.data_window': { pane: false, priceScale: false, legend: false, dataWindow: true },
+  'display.status_line': { pane: false, priceScale: false, legend: true, dataWindow: false },
+  'display.price_scale': { pane: false, priceScale: true, legend: false, dataWindow: false },
+  'display.pine_screener': { pane: false, priceScale: false, legend: false, dataWindow: false },
+};
+const surfacesOf = (display: string | undefined): SeriesDisplay | undefined =>
+  display ? OFF_PANE[display] : undefined;
 
 const toBarData = (bars: OHLCV[]): BarData[] =>
   bars.map(b => ({
@@ -918,6 +932,7 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
       id, title, paneId: '', kind: plotKindOf(style),
       points, style: { color: opts.color ?? '#2962FF', width: opts.linewidth ?? 1, lineStyle: 'solid' as const },
       overlay: opts.overlay,
+      display: surfacesOf(opts.display),
     });
   }
 
