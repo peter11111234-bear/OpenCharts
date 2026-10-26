@@ -16,18 +16,17 @@ import type { FromWorker, PlotDelta, ToWorker } from './pineWorkerProto';
 import { marshalError, sanitizeRunResult, sanitizeValue } from './pineMarshal';
 
 
-/** Last plots payload sent per run id — the incremental path reuses it to
+/** Last plots payload a handler sent — the incremental path reuses it to
  *  ship only the changed tail instead of cloning ~5000 Value objects per
- *  tick (structured-clone was ~9.5ms at 500 bars × 11 plots). Keyed by the
- *  client's run id; entries live only for the current session's runs and
- *  reset whenever a fresh full result goes out. */
-let lastPlots: Map<string, { index: number; len: number; tailV: Value; tailC: string | undefined; opts: unknown }> | null = null;
+ *  tick (structured-clone was ~9.5ms at 500 bars × 11 plots). One per
+ *  handler (createWorkerHandler); reset whenever a fresh full result goes out. */
+type PlotBaseline = Map<string, { index: number; len: number; tailV: Value; tailC: string | undefined; opts: unknown }>;
 
 /** Diff a RunResult's plots against `lastPlots`. Returns deltas when every
  *  entry resolves to tail-only changes; null when the shape changed (new /
  *  removed / re-ordered plots or different opts) — caller then sends the
  *  full sanitized result. */
-function plotsDelta(plots: RunResult['plots']): PlotDelta[] | null {
+function plotsDelta(lastPlots: PlotBaseline | null, plots: RunResult['plots']): PlotDelta[] | null {
   if (!lastPlots) return null;
   const out: PlotDelta[] = [];
   for (const [key, p] of plots) {
@@ -83,6 +82,9 @@ export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWo
   // Live-tick sessions: incKey → IncLive (committed checkpoint + forming-bar
   // rollback). Bounded — a pooled worker can host a few sessions before the
   // oldest evicts; evicted = next run just builds a fresh session.
+  // Plot-diff baseline of this handler's live session (see PlotBaseline).
+  let lastPlots: PlotBaseline | null = null;
+
   const INC_CAP = 8;
   const incSessions = new Map<string, IncLive | null>();
   const incPut = (key: string, live: IncLive | null) => {
@@ -214,8 +216,11 @@ export function createWorkerHandler(post: (msg: FromWorker) => void): (msg: ToWo
             // Delta path: an advancing session's plots only changed at the
             // tail — diff BEFORE sanitize (sanitize re-wraps every Value,
             // which would both cost O(N) per tick and defeat ref-equality).
-            const delta = out.live !== null ? plotsDelta(out.result.plots) : null;
-            lastPlots = null; // full-result runs reset diff state
+            // plotsDelta already advanced `lastPlots` to this result, so only
+            // a full emit resets it — resetting after a delta too made every
+            // other tick ship the whole plot map again.
+            const delta = out.live !== null ? plotsDelta(lastPlots, out.result.plots) : null;
+            if (delta === null) lastPlots = null; // full-result runs reset diff state
             if (delta !== null) {
               // Sanitize only the delta tails + non-plot surfaces — the plots
               // map ships EMPTY and the client patches its retained copy.
