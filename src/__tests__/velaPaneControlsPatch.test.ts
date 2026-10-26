@@ -66,6 +66,32 @@ describe('vela PaneControls patch (L4)', () => {
     pc.destroy();
   });
 
+  it('modelToValuePatch passes series arrays through without scanning them (T4)', () => {
+    // Same patch file: the dirty range it computed (a pass over every point of
+    // every series per update) had no reader. A points array that throws on
+    // iteration proves the pass is gone; the arrays must still go through by
+    // reference.
+    const fnStart = chunk.indexOf('function modelToValuePatch(model) {');
+    const fnEnd = chunk.indexOf('\n}\n', fnStart) + 2;
+    expect(fnStart).toBeGreaterThan(0);
+    const modelToValuePatch = new Function('isLineLikeSeries', `${chunk.slice(fnStart, fnEnd)}\nreturn modelToValuePatch;`)(
+      (s: { kind: string }) => s.kind === 'line',
+    ) as (m: unknown) => { dirty: unknown; series: { points?: unknown; bars?: unknown }[] };
+    const untouchable = new Proxy([{ time: 1, value: 1 }], {
+      get(t, k, r) {
+        if (k === Symbol.iterator) throw new Error('points were scanned');
+        return Reflect.get(t, k, r);
+      },
+    });
+    const bars = [{ time: 1, open: 1, high: 1, low: 1, close: 1 }];
+    const out = modelToValuePatch({
+      id: 'm', series: [{ id: 'a', kind: 'line', points: untouchable }, { id: 'b', kind: 'candle', bars }],
+    });
+    expect(out.series[0]!.points).toBe(untouchable);
+    expect(out.series[1]!.bars).toBe(bars);
+    expect(out.dirty).toEqual({ from: 0, to: 0 });
+  });
+
   it('adding a pane updates index/count-dependent buttons', () => {
     const { pc, panes, buttons } = mk();
     panes.forEach((p) => { p.count = 3; });

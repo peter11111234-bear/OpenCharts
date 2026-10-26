@@ -1,5 +1,5 @@
 diff --git a/node_modules/@luxalgo/vela/dist/chunk-UNUVPQFW.js b/node_modules/@luxalgo/vela/dist/chunk-UNUVPQFW.js
-index f6fe8f5..c2642d0 100644
+index f6fe8f5..6e56907 100644
 --- a/node_modules/@luxalgo/vela/dist/chunk-UNUVPQFW.js
 +++ b/node_modules/@luxalgo/vela/dist/chunk-UNUVPQFW.js
 @@ -5032,7 +5032,13 @@ var PaneControls = class {
@@ -17,3 +17,35 @@ index f6fe8f5..c2642d0 100644
      }
      for (const [id, cluster] of this.clusters) {
        if (!seen.has(id)) {
+@@ -25996,27 +26002,20 @@ function blankedModel(model) {
+ }
+ function modelToValuePatch(model) {
+   const series = [];
+-  let from = Number.POSITIVE_INFINITY;
+-  let to = 0;
+   for (const s of model.series) {
+     if (s.kind === "candle" || s.kind === "bar") {
+       series.push({ seriesId: s.id, kind: "bars", bars: s.bars, barColors: s.barColors ?? [] });
+-      for (const b of s.bars) {
+-        if (b.time < from) from = b.time;
+-        if (b.time > to) to = b.time;
+-      }
+     } else if (isLineLikeSeries(s)) {
+       series.push({ seriesId: s.id, kind: "points", points: s.points });
+-      for (const p of s.points) {
+-        if (p.time < from) from = p.time;
+-        if (p.time > to) to = p.time;
+-      }
+     }
+   }
+   return {
+     kind: "value",
+     indicatorId: model.id,
+-    dirty: { from: Number.isFinite(from) ? from : 0, to },
++    // OpenCharts patch: nothing reads `dirty` (the renderer repaints from the
++    // series arrays), and computing it scanned every point of every series on
++    // each update. Kept as a constant so the patch shape stays typed.
++    dirty: { from: 0, to: 0 },
+     // ALWAYS stated, `null` included: an omitted key leaves the renderer on the previous
+     // run's offset, so a re-run that widened to the whole chart could not clear it.
+     anchorTime: model.anchorTime ?? null,
