@@ -182,6 +182,9 @@ interface RunState {
    *  by the site it mints, which is what builtins/input.ts can see. */
   inputPlan: Map<object, string> | null;
   dupInputIds: Map<string, string> | null;
+  /** UDFs by name. Pine keeps functions apart from variables, so `ma = 1.0`
+   *  after `ma(x) => …` must not hide the function from `ma(…)` calls. */
+  udfByName: Map<string, Value>;
   /** Site-path trie: callsite string → … → node → stable key object for
    *  declSlots/callHist/tupleKeys. Root map keyed by callsite string. */
   siteTrie: Map<unknown, unknown>;
@@ -260,6 +263,7 @@ function runOf(ctx: BuiltinCtx): RunState {
     callsiteSeq: 0,
     inputPlan: null,
     dupInputIds: null,
+    udfByName: new Map(),
     siteTrie: new Map(),
     siteCtx: [],
     warned: new Set(),
@@ -936,7 +940,9 @@ function evalNode(node: Node, frame: Frame): Value {
         body: node.body,
         closure: scope,
       };
-      scope.define(node.name, { kind: 'function', v: decl });
+      const fv: Value = { kind: 'function', v: decl };
+      scope.define(node.name, fv);
+      runOf(frame.ctx).udfByName.set(node.name, fv);
       return { kind: 'void' };
     }
 
@@ -1250,6 +1256,15 @@ function evalMember(node: Member, frame: Frame): Value {
     }
   }
   if (obj.kind === 'map') return obj.v.get(prop) ?? NA;
+  // A variable that shares a namespace's name (`size = 3`) has no members, so
+  // `size.tiny` still means the builtin — Pine keeps the two apart.
+  if (head.type === 'ident') {
+    const key = `${head.name}.${parts.join('.')}`;
+    const c = getConstant(key, ctx);
+    if (c !== undefined) return c;
+    const b = BUILTINS.get(key);
+    if (b) return { kind: 'function', v: b };
+  }
   warn(run, ctx, `cannot access '${prop}' on ${obj.kind}`);
   return NA;
 }
@@ -1319,6 +1334,17 @@ function udtMethodAt(run: RunState, node: Call, selfType: string, name: string):
   return hit ?? undefined;
 }
 
+/** `array.get(array, 0)`: the head is a variable, but it is also the first
+ *  argument — that is the namespace call, not a method on the variable. A UDT
+ *  variable keeps its own methods (`box.set_left(box, …)` on a `B` named box). */
+function headIsFirstArg(node: Call, headName: string, scope: Scope): boolean {
+  const a = node.args[0];
+  if (a === undefined || a.name !== undefined || a.value.type !== 'ident' || a.value.name !== headName) return false;
+  const bound = scope.lookup(headName) as Value | Series | undefined;
+  const v = (bound as Series | undefined)?.cur?.() ?? (bound as Value | undefined);
+  return v?.kind !== 'udt';
+}
+
 function evalCallDispatch(node: Call, frame: Frame, run: RunState): Value {
   const { scope, ctx } = frame;
 
@@ -1379,7 +1405,7 @@ function evalCallDispatch(node: Call, frame: Frame, run: RunState): Value {
       }
       RESOLVED_BUILTIN.set(node, hit);
     }
-    if (hit.fn !== undefined && scope.lookup(hit.headName) === undefined) {
+    if (hit.fn !== undefined && (scope.lookup(hit.headName) === undefined || headIsFirstArg(node, hit.headName, scope))) {
       return invokeBuiltin(hit.fn, node, frame);
     }
     // fall through — scope-bound head or non-builtin callee.
@@ -1456,7 +1482,7 @@ function evalCallDispatch(node: Call, frame: Frame, run: RunState): Value {
       const b = BUILTINS.get(callee.name);
       if (b) return invokeBuiltin(b, node, frame);
     }
-    fn = evalIdent(callee.name, frame);
+    fn = (!callable && bound !== undefined && run.udfByName.get(callee.name)) || evalIdent(callee.name, frame);
   } else {
     fn = evalExpr(callee, frame);
   }
@@ -2213,9 +2239,11 @@ function compileStmt(stmt: Node): CompiledStmt {
       }) };
     }
     case 'func': { const name = stmt.name, params = stmt.params, body = stmt.body;
-      return { kind: 'direct', fn: wrapCompiled(stmt, (frame) => {
+      return { kind: 'direct', fn: wrapCompiled(stmt, (frame, run) => {
         const decl: UdfDecl = { name, params, body, closure: frame.scope }; // live scope — never bake
-        frame.scope.define(name, { kind: 'function', v: decl });
+        const fv: Value = { kind: 'function', v: decl };
+        frame.scope.define(name, fv);
+        run.udfByName.set(name, fv);
         return { kind: 'void' };
       }) };
     }
@@ -2593,7 +2621,7 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
       } else hit = { headName: '', fn: undefined };
       RESOLVED_BUILTIN.set(node, hit);
     }
-    if (hit.fn !== undefined && scope.lookup(hit.headName) === undefined) {
+    if (hit.fn !== undefined && (scope.lookup(hit.headName) === undefined || headIsFirstArg(node, hit.headName, scope))) {
       const args: Value[] = [];
       const named: Record<string, Value> = {};
       const spec = HIST_BUILTINS.get(hit.fn);
@@ -2657,7 +2685,7 @@ function jitCallDispatch(state: JitState, run: RunState, ctx: BuiltinCtx,
       const b = BUILTINS.get(callee.name);
       if (b) return jitBuiltinArgsInvoke(state, run, ctx, b, ds, node);
     }
-    fn = evalIdent(callee.name, frame);
+    fn = (!callable && bound !== undefined && run.udfByName.get(callee.name)) || evalIdent(callee.name, frame);
   } else {
     fn = evalExpr(callee, frame);
   }
