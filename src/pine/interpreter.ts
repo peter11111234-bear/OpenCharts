@@ -2875,6 +2875,11 @@ interface PineSess {
   seriesSet: Set<BarSeries>;
   /** This session's own dirty list (see DirtyTracker in series.ts). */
   dirty: DirtyTracker;
+  /** Series a restore rewound since the last checkpoint. They must be
+   *  re-snapshotted even if the committed eval never writes them again: the
+   *  slice path of `incRewind` replaces `buf`, so the previous snap would point
+   *  at the abandoned array (see checkpoint's update set). */
+  sinceCkpt: Set<BarSeries>;
   /** This session's MTF store (request.* scripts) — re-activated per run so
    *  sibling runs can't wipe its spec state. */
   mtf?: unknown;
@@ -3061,7 +3066,7 @@ async function buildSess(
       jitR = null;
     }
   }
-  return { decl, body, barCtx, ctx, drawSink, run, scope, frame0, compiledBody, jit, jitR, seriesSet: seriesSet ?? new Set(), dirty, mtf: mtfStore };
+  return { decl, body, barCtx, ctx, drawSink, run, scope, frame0, compiledBody, jit, jitR, seriesSet: seriesSet ?? new Set(), dirty, sinceCkpt: new Set(), mtf: mtfStore };
 }
 
 /** Evaluate one bar. 'ok' = continue; 'ret' = top-level return, stop the
@@ -3509,15 +3514,64 @@ function cloneDeep<T>(v: T, ids: Map<unknown, unknown>): T {
   return v;
 }
 
-function checkpoint(s: PineSess, bar: number): IncCkpt {
+function checkpoint(s: PineSess, bar: number, prev: IncCkpt | null): IncCkpt {
   const { run, ctx } = s;
   const ids = new Map<unknown, unknown>();
-  const seriesSnaps = new Map<BarSeries, IncSnap>();
+  // Series snapshots: the first checkpoint of a session scans the registry (it
+  // has no predecessor to diff against); later ones touch only what changed
+  // since the previous checkpoint — the dirty list plus everything a restore
+  // rewound. A 5000-bar tech-rating session holds ~200k series, so rescanning
+  // them on every new bar was the whole cost of a new-bar tick.
+  const seriesSnaps = prev === null ? new Map<BarSeries, IncSnap>() : prev.seriesSnaps;
+  const containerSet: BarSeries[] = [];
+  if (prev === null) {
+    for (const se of s.seriesSet) {
+      seriesSnaps.set(se, se.incSnap());
+      if (se.hasContainers) containerSet.push(se);
+    }
+  } else {
+    // MTF-store series mark themselves dirty too, but they carry their own
+    // snaps (mtfSnap) — handing them an interpreter snap would rewind them
+    // twice, so the registry membership test is part of the filter.
+    const update = new Set<BarSeries>();
+    for (const se of s.sinceCkpt) if (s.seriesSet.has(se)) update.add(se);
+    for (const se of s.dirty.list) if (s.seriesSet.has(se)) update.add(se);
+    for (const se of update) seriesSnaps.set(se, se.incSnap());
+    // Containers: every series that has (or had) container payloads inside a
+    // reachable window, plus whatever became one. The whole set is re-cloned
+    // here on purpose — the previous checkpoint's clones were produced by a
+    // different cloneDeep pass, and mixing clones across passes splits the
+    // aliasing the I1-③ snapshot exists to preserve.
+    const want = new Set<BarSeries>();
+    for (const se of prev.containerWin.keys()) if (s.seriesSet.has(se) && se.hasContainers) want.add(se);
+    for (const se of update) if (se.hasContainers) want.add(se);
+    for (const se of want) containerSet.push(se);
+    if (debugFlag('incVerifyClean')) {
+      // Every registry member must have a snap, and a carried-over snap must
+      // still describe live state. `incVerify` (not `incSnap`) — taking a snap
+      // here would rewrite `snapLen` and hide the very drift being checked.
+      for (const se of s.seriesSet) {
+        const snap = seriesSnaps.get(se);
+        if (snap === undefined) {
+          throw new Error(`incVerifyClean: ${se.constructor.name} has no snap in the incremental checkpoint`);
+        }
+        const st = se.incVerify();
+        const memoLen = (snap.x as LiftedSnapX | undefined)?.memoLen ?? -1;
+        if (st.buf !== snap.buf || st.len !== snap.len || st.head !== snap.head
+            || st.lastBar !== snap.lastBar || st.firstBar !== snap.firstBar || st.memoLen !== memoLen) {
+          throw new Error(`incVerifyClean: ${se.constructor.name} changed since checkpoint `
+            + `(buf=${st.buf === snap.buf}/${st.len === snap.len} len=${st.len}/${snap.len} `
+            + `head=${st.head}/${snap.head} lastBar=${st.lastBar}/${snap.lastBar} `
+            + `firstBar=${st.firstBar}/${snap.firstBar} memo=${st.memoLen}/${memoLen})`);
+        }
+      }
+    }
+  }
   const containers = new Map<BarSeries, Map<number, Value>>();
+  // Always a fresh Map: incAdvance's I1-③ window check reads the restored
+  // (previous) checkpoint's containerWin after a new checkpoint replaced it.
   const containerWin = new Map<BarSeries, number>();
-  for (const se of s.seriesSet) {
-    seriesSnaps.set(se, se.incSnap());
-    if (!se.hasContainers) continue;
+  for (const se of containerSet) {
     // Only the cells the script can still reach: everything newer than the
     // deepest history read plus one bar of slack (a forming bar reading `x[n]`
     // at the same time as writing itself reads relative to the checkpoint bar).
@@ -3563,7 +3617,10 @@ function checkpoint(s: PineSess, bar: number): IncCkpt {
   // MTF state is part of the snapshot — take it before closing the epoch.
   const mtfSnap = mtf?.checkpoint?.(s);
   // Every write since the previous epoch is now inside `seriesSnaps`, so the
-  // next restore only has to cover writes made after this point.
+  // next restore only has to cover writes made after this point. A restore's
+  // rewinds are accounted for the same way: the snap they may have invalidated
+  // was just replaced for every one of them.
+  s.sinceCkpt.clear();
   advanceDirtyEpoch(s.dirty);
   return {
     bar,
@@ -3646,6 +3703,10 @@ function restoreCkpt(s: PineSess, ck: IncCkpt): void {
   for (const se of s.dirty.list) {
     const snap = ck.seriesSnaps.get(se);
     if (snap !== undefined) se.incRewind(snap);
+    // The rewind may have replaced `buf` (slice path), so the snap this series
+    // carries is no longer guaranteed to describe live state — the next
+    // checkpoint must re-snapshot it even if the commit eval skips it.
+    s.sinceCkpt.add(se);
   }
   // …and drop series born during the forming bar from the registry (they have
   // no snapshot). Rewinding alone leaves them in the Set (which drifts one
@@ -3834,7 +3895,7 @@ export async function incRunStart(
       if (bar <= lastClosed) committed = bar;
       // Single checkpoint at the committed boundary — per-bar checkpoints
       // were O(N^2) snapshots on first load (60s+ on 500-bar scripts).
-      if (bar === lastClosed) ckpt = checkpoint(s, bar);
+      if (bar === lastClosed) ckpt = checkpoint(s, bar, null);
       // The only checkpoint this session can restore sits at `lastClosed`, so
       // the log's pre-`lastClosed` share can never be replayed — it just grew
       // with the tape. A tape that never reaches `lastClosed` (one bar, or a
@@ -3923,7 +3984,7 @@ export async function incAdvance(
       const r = evalOneBar(s, b);
       if (r === 'ret' || r !== 'ok') { live.dead = true; return 'fallback'; }
       live.committed = b;
-      live.ckpt = checkpoint(s, b);
+      live.ckpt = checkpoint(s, b, live.ckpt);
     }
     // Re-evaluate the forming bar with its newest data (state = post-eval
     // of the newest closed bar — the commit loop already cleaned it).

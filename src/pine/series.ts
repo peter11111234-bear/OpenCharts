@@ -155,6 +155,11 @@ export class BarSeries extends Series {
     super(cap);
     this.capN = cap;
     if (activeSeriesSet) activeSeriesSet.add(this);
+    // A series born between two checkpoints has no snap in the previous one, so
+    // the incremental checkpoint must see it in the dirty list even if nothing
+    // writes it: that is what makes the dirty list a complete "changed since
+    // the last checkpoint" set without rescanning the whole registry.
+    this.markDirty();
   }
 
   /** Set when any written Value is a mutable container (array/map/udt/
