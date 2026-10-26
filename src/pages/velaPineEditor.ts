@@ -1,8 +1,8 @@
 /**
  * Pine script editor for the Vela workspace.
  *
- * Vela ships no script-editing UI — this registers a topbar contributed action
- * ("Pine", pen icon, right cluster) that opens a modal with:
+ * Vela ships no script-editing UI — this registers a right-rail "Pine Editor"
+ * button (and redirects the dock's Pine Editor icon) that opens a window with:
  *   - a dropdown of bundled src/pine/*.pine scripts (load into the editor)
  *   - a textarea to paste/edit any TradingView-style script
  *   - Run → ctx.chart.runIndicator(source) on the ACTIVE cell, or Add →
@@ -16,7 +16,6 @@
 // so the contribution registry Map is duplicated. Registering on the root while
 // the workspace reads the plugin instance → callouts/actions never render.
 import {
-  registerWidgetAction,
   registerWidgetAttachment,
   registerSidePanel,
   registerStatePersistence,
@@ -31,7 +30,7 @@ import {
 // registry itself is chunk-BZQM2XO7.js, shared via plugin's re-export.
 // IndicatorHandle only re-exports from the root barrel; a type-only import is
 // erased at compile time, so this cannot duplicate the contribution registry.
-import type { IndicatorHandle, SerializedDrawing } from "@luxalgo/vela";
+import type { IndicatorHandle } from "@luxalgo/vela";
 import { svg16 } from "@luxalgo/vela/ui";
 import type { WorkspaceWidgetContext } from "@luxalgo/vela/workspace";
 import {
@@ -111,16 +110,6 @@ const PINE_CSS = `
 .vela-pine-scriptmore{background:none;border:0;color:#8b8f9c;font-size:14px;cursor:pointer;padding:0 6px}
 .vela-pine-scriptmore:hover{color:#fff}
 .vela-pine-onchart-del:hover{color:#ef5350}
-.vela-objtree{display:flex;flex-direction:column;height:100%;overflow:auto;background:var(--vela-bg,#1e222d);color:var(--vela-fg,#d1d4dc);font:12px/1.5 sans-serif;padding:4px 0}
-.vela-objtree-group{color:#787b86;font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:8px 12px 3px}
-.vela-objtree-row{display:flex;align-items:center;gap:6px;padding:4px 8px;margin:0 4px;border-radius:4px;cursor:pointer}
-.vela-objtree-row:hover{background:#2a2e39}
-.vela-objtree-row.off .vela-objtree-name{color:#5d606b}
-.vela-objtree-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.vela-objtree-id{color:#565a68;font-size:10px}
-.vela-objtree-btn{display:flex;align-items:center;background:none;border:0;color:#8b8f9c;cursor:pointer;padding:2px 3px;border-radius:3px;line-height:1}
-.vela-objtree-btn:hover{color:#fff;background:#363c4e}
-.vela-objtree-empty{color:#565a68;padding:4px 12px;font-size:11px}
 `;
 {
   const style = document.createElement("style");
@@ -407,7 +396,6 @@ registerLegendAction({
 // vertical (⋮); TV uses horizontal "..." so register our own.
 registerIcon("more-h", svg16('<circle cx="3" cy="8" r="1.4"/><circle cx="8" cy="8" r="1.4"/><circle cx="13" cy="8" r="1.4"/>', 'fill="currentColor" stroke="none"'));
 registerIcon("edit", svg16('<path d="M11.5 3.5 12.7 4.7a1 1 0 0 1 0 1.4l-8.2 8.2-2.8.7.7-2.8 8.2-8.2a1 1 0 0 1 1.4 0Z"/>'));
-registerIcon("objtree", svg16('<path d="M2.5 3.5h4M4 3.5v7a2 2 0 0 0 2 2h5"/><circle cx="9" cy="3.5" r="1.5"/><circle cx="13.5" cy="12.5" r="1.5"/>'));
 // Legend ⋯ (more) — a legend-row action at the END of the hover controls
 // (eye / move / edit / ⋯ / ✕). The callout API renders an always-visible
 // bubble instead, which floats OVER the controls — wrong slot. So this is a
@@ -549,12 +537,9 @@ function toggleMoreMenu(ctx: WidgetContext, ind: { id: string; title: string; so
     { label: '隱藏', run: () => { chartForIndicator(ctx, ind, openPoint).indicators().find(x => x.id === ind.id)?.setVisible(false); } },
     { label: '移除', run: () => { chartForIndicator(ctx, ind, openPoint).indicators().find(x => x.id === ind.id)?.remove(); } },
     { label: '', sep: true },
-    { label: '物件樹', run: () => {
-        // Stash the row's owning chart — the panel's mount ctx is the ACTIVE
-        // cell, but the ⋯ row can live on another cell's legend.
-        objTreeChart = chartForIndicator(ctx, ind, openPoint);
-        ctx.togglePanel?.(OBJTREE_PANEL_ID, true);
-      } },
+    // VELA's built-in Object tree; it follows the active cell, which the ⋯
+    // click has already moved to this row's cell.
+    { label: '物件樹', run: () => ctx.togglePanel?.('objects', true) },
     { label: '', sep: true },
     { label: '設定…', run: () => {
         const renderer = chartForIndicator(ctx, ind, openPoint).renderer;
@@ -733,8 +718,6 @@ function scriptTitle(src: string, fallback = "pine"): string {
 }
 
 
-
-const EDITOR_ID = "pine-editor";
 
 // Editor session state — which library script is loaded, whether the buffer
 // has unsaved edits, and (if launched from the legend ⋯) which on-chart
@@ -1562,7 +1545,13 @@ function mountEditor(ctx: WidgetContext, body: HTMLElement, header: SidePanelHea
   const onChartLabel = doc.createElement("div");
   onChartLabel.className = "vela-pine-onchart-label";
   const rebuildOnChart = () => {
-    const handles = (panelCtx ?? ctx).chart.indicators().filter(h => typeof h.source === 'string' && h.source.length > 0);
+    // The workspace mounts this panel before its first cell is active, when the
+    // chart getter throws. List nothing until then — the panel handle's
+    // onChart calls back here once the dock binds the cell's chart.
+    let handles: IndicatorHandle[] = [];
+    try {
+      handles = (panelCtx ?? ctx).chart.indicators().filter(h => typeof h.source === 'string' && h.source.length > 0);
+    } catch { /* no active cell yet */ }
     onChartLabel.textContent = handles.length === 0 ? "On-chart indicators (none)" : `On-chart indicators (${handles.length}) — click to load`;
     [...onChart.querySelectorAll('.vela-pine-onchart-item, .vela-pine-onchart-empty')].forEach(e => e.remove());
     if (handles.length === 0) {
@@ -1718,18 +1707,9 @@ export function openPineEditorWithScript(ctx: WidgetContext, scriptId: string): 
 }
 
 
-registerWidgetAction({
-  id: EDITOR_ID,
-  target: "topbar",
-  align: "right",
-  icon: "pen",
-  label: "Pine",
-  order: 0,
-  run: (ctx) => openEditor(ctx),
-});
-
 // ── Right rail (TV parity) ── TV puts Pine Editor in the right-hand vertical
-// toolbar; the topbar button alone isn't the same affordance. A widget
+// toolbar; this rail is the standalone-window entry (the dock's own Pine
+// Editor icon opens the side-panel mount — no separate topbar button). A widget
 // attachment appends a slim icon column at the end of the .vela-ws-main flex
 // row — after the panel dock, so it stays the outermost right column.
 const RAIL_CSS = `
@@ -1744,8 +1724,8 @@ const RAIL_CSS = `
 .vela-pine-rail svg{width:16px;height:16px}
 `;
 // The contributed SIDE PANEL registration stays — its dock column is only
-// reachable via "Dock editor to side panel" from the pop-out menu; the
-// default Pine entry opens the standalone window instead.
+// reachable via "Dock editor to side panel" from the pop-out menu; every Pine
+// button opens the standalone window instead (see opencharts.pine-dock-window).
 registerSidePanel({
   id: PANEL_ID,
   title: "Pine Editor",
@@ -1788,156 +1768,23 @@ registerSidePanel({
     };
   },
 });
-
-// ── Object tree panel (legend ⋯ → 物件樹; TV parity: "Object tree") ──
-// A contributed side panel listing the owning chart's indicators and user
-// drawings — flat grouped list (TV nests drawings under panes; keep it simple).
-// `objTreeChart` carries a one-shot override from the legend opener: without
-// it mount would bind the ACTIVE cell, but a ⋯ menu can belong to another
-// cell. Mount consumes the override, then onChart re-follows the active cell.
-const OBJTREE_PANEL_ID = "opencharts.objtree";
-let objTreeChart: WidgetContext['chart'] | null = null;
-const OT_EYE = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8 12.1 12.5 8 12.5 1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2"/></svg>';
-const OT_EYE_OFF = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3 3l10 10M6.8 4.2A7 7 0 0 1 8 4c4.1 0 6.5 4 6.5 4a15 15 0 0 1-2.3 2.7M9.6 11.7A7 7 0 0 1 8 12c-4.1 0-6.5-4-6.5-4a15 15 0 0 1 2-2.4"/></svg>';
-const OT_GEAR = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4"/></svg>';
-const OT_TRASH = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2.5 4.5h11M6.5 4.5v-1a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1M4.5 4.5l.7 8a1 1 0 0 0 1 .9h3.6a1 1 0 0 0 1-.9l.7-8"/></svg>';
-
-function mountObjectTree(ctx: WidgetContext, body: HTMLElement): { onChart(c: WidgetContext['chart']): void; destroy(): void } {
-  const doc = ctx.host.ownerDocument;
-  let chart = ctx.chart;
-  let unsubs: (() => void)[] = [];
-
-  const root = doc.createElement("div");
-  root.className = "vela-objtree";
-  body.appendChild(root);
-
-  const mkBtn = (title: string, svg: string, onClick: () => void): HTMLButtonElement => {
-    const b = doc.createElement("button");
-    b.type = "button";
-    b.className = "vela-objtree-btn";
-    b.title = title;
-    b.setAttribute("aria-label", title);
-    b.innerHTML = svg;
-    b.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
-    return b;
-  };
-
-  const refresh = () => { if (root.isConnected) rebuild(); };
-
-  function bind(c: WidgetContext['chart']): void {
-    chart = c;
-    for (const u of unsubs) u();
-    unsubs = [];
-    // Rebuild on every object-tree-relevant mutation so external edits (in-chart
-    // deletes, legend eye toggles, pane merges) stay reflected without polling.
-    for (const ev of [
-      "indicator:added", "indicator:removed", "indicator:moved", "indicator:visibility",
-      "pane:changed", "pane:moved",
-      "drawing:created", "drawing:removed", "drawing:edited",
-    ] as const) {
-      unsubs.push(chart.on(ev, refresh));
-    }
-    rebuild();
-  }
-
-  function rebuild(): void {
-    root.textContent = "";
-    const group = (label: string): void => {
-      const g = doc.createElement("div");
-      g.className = "vela-objtree-group";
-      g.textContent = label;
-      root.appendChild(g);
+// VELA gives every side panel a dock icon that opens its narrow column — too
+// cramped for long Pine scripts. Catch that click before the dock sees it and
+// open the standalone window, like the rail button. Docking from the window's
+// menu calls togglePanel directly, so it still reaches the column.
+registerWidgetAttachment({
+  id: "opencharts.pine-dock-window",
+  mount(ctx) {
+    const onClick = (e: MouseEvent): void => {
+      const t = e.target as Element | null;
+      if (!t?.closest?.(`[class~="vela-widget-panel-${PANEL_ID}"]`)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      openEditor(ctx);
     };
-    const empty = (label: string): void => {
-      const d = doc.createElement("div");
-      d.className = "vela-objtree-empty";
-      d.textContent = label;
-      root.appendChild(d);
-    };
-    const row = (name: string, meta: string | null): HTMLElement => {
-      const r = doc.createElement("div");
-      r.className = "vela-objtree-row";
-      const n = doc.createElement("span");
-      n.className = "vela-objtree-name";
-      n.textContent = name;
-      r.appendChild(n);
-      if (meta) {
-        const m = doc.createElement("span");
-        m.className = "vela-objtree-id";
-        m.textContent = meta;
-        r.appendChild(m);
-      }
-      return r;
-    };
-
-    // ── 指標 ── eye → setVisible, gear → renderer settings dialog, ✕ → remove
-    group("指標");
-    let handles: IndicatorHandle[] = [];
-    try { handles = chart.indicators(); } catch { /* disposed cell */ }
-    if (!handles.length) empty("無指標");
-    for (const h of handles) {
-      const r = row(h.title, null);
-      if (!h.visible) r.classList.add("off");
-      r.title = h.id;
-      r.addEventListener("click", () => {
-        if (chart.renderer.supportsIndicatorSettings) chart.renderer.openIndicatorSettings(h.id);
-      });
-      r.appendChild(mkBtn(h.visible ? "隱藏" : "顯示", h.visible ? OT_EYE : OT_EYE_OFF, () => {
-        try { h.setVisible(!h.visible); } catch { /* gone */ }
-        rebuild();
-      }));
-      r.appendChild(mkBtn("設定…", OT_GEAR, () => {
-        if (chart.renderer.supportsIndicatorSettings) chart.renderer.openIndicatorSettings(h.id);
-      }));
-      r.appendChild(mkBtn("移除", OT_TRASH, () => {
-        try { h.remove(); } catch { /* gone */ }
-        rebuild();
-      }));
-      root.appendChild(r);
-    }
-
-    // ── 繪圖 ── row click selects + opens settings; eye → show, ✕ → remove
-    group("繪圖");
-    let drawings: SerializedDrawing[] = [];
-    try { drawings = chart.drawings.all(); } catch { /* disposed cell */ }
-    if (!drawings.length) empty("無繪圖");
-    for (const d of drawings) {
-      const r = row(d.type, `…${d.id.slice(-4)}`);
-      if (!d.visible) r.classList.add("off");
-      r.title = d.id;
-      r.addEventListener("click", () => {
-        try { chart.drawings.select([d.id]); chart.drawings.openSettings(d.id); }
-        catch { /* gone */ }
-      });
-      r.appendChild(mkBtn(d.visible ? "隱藏" : "顯示", d.visible ? OT_EYE : OT_EYE_OFF, () => {
-        try { chart.drawings.show(d.id, !d.visible); } catch { /* gone */ }
-        rebuild();
-      }));
-      r.appendChild(mkBtn("移除", OT_TRASH, () => {
-        try { chart.drawings.remove(d.id); } catch { /* gone */ }
-        rebuild();
-      }));
-      root.appendChild(r);
-    }
-  }
-
-  bind(objTreeChart ?? chart); // consume the legend-opener override if set
-  objTreeChart = null;
-  return {
-    // Rebind to the cell's chart whenever the active cell changes.
-    onChart(c) { bind(c); },
-    destroy() { for (const u of unsubs) u(); unsubs = []; },
-  };
-}
-
-registerSidePanel({
-  id: OBJTREE_PANEL_ID,
-  title: "物件樹",
-  icon: "objtree",
-  width: 280,
-  resizable: true,
-  minWidth: 220,
-  mount(ctx, body) { return mountObjectTree(ctx, body); },
+    ctx.host.addEventListener("click", onClick, true);
+    return () => ctx.host.removeEventListener("click", onClick, true);
+  },
 });
 registerWidgetAttachment({
   id: "opencharts.pine-rail",

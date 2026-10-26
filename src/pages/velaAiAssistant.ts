@@ -1,13 +1,13 @@
 /**
- * Registers the AI 副駕駛 side panel and its topbar toggle with Vela (side
- * effect, imported once by VelaPage). The panel is aiAssistantPanel.ts; this
+ * Registers the AI 副駕駛 side panel with Vela (side effect, imported once by
+ * VelaPage; the dock supplies its toggle button). The panel is aiAssistantPanel.ts; this
  * file wires it to the live chart: the snapshot the LLM sees and the actions
  * a confirmed card runs.
  *
  * Import from "@luxalgo/vela/plugin", NOT the root barrel (separate module
  * instances — see velaPineEditor.ts header).
  */
-import { registerIcon, registerSidePanel, registerWidgetAction, type WidgetContext } from "@luxalgo/vela/plugin";
+import { registerIcon, registerSidePanel, type WidgetContext } from "@luxalgo/vela/plugin";
 import { svg16 } from "@luxalgo/vela/ui";
 import { PROMPT_BARS, streamChat } from "../services/ai-assistant/chat.ts";
 import type { ChartSnapshot } from "../services/ai-assistant/tools.ts";
@@ -75,13 +75,5 @@ registerSidePanel({
     };
   },
 });
-
-registerWidgetAction({
-  id: "opencharts.ai-assistant.toggle",
-  target: "topbar",
-  align: "right",
-  icon: "ai-assistant",
-  label: "AI",
-  order: 5,
-  run: (ctx) => ctx.togglePanel(PANEL_ID),
-});
+// No separate topbar toggle: the dock already gives every side panel its own
+// icon button, and a second "AI" button duplicated it.

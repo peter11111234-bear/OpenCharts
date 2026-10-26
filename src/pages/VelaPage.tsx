@@ -6,13 +6,13 @@ import { prewarmPrepare } from "../pine/engine.ts";
 import { ShioajiVelaProvider } from "../services/shioaji/velaProvider.ts";
 import { TW_INSTRUMENTS } from "../services/shioaji/instruments.ts";
 import { combinedManifestEntries } from "../pineScripts.ts";
-import "./velaPineEditor.ts"; // 註冊頂列 "Pine" 按鈕（side effect）
+import "./velaPineEditor.ts"; // 註冊 Pine 面板、右側直排按鈕（side effect）
 import { bindVelaWorkspace, unbindVelaWorkspace, normScript } from "./velaPineEditor.ts";
 import { initVelaLayouts } from "./velaLayouts.ts";
 import "./velaNautilusBacktest.ts"; // 註冊頂列 "Nautilus 回測" 按鈕（side effect）
 import "./velaTechRating.ts"; // 註冊「技術評分」側邊面板與頂列 "評分" 按鈕（side effect）
 import "./velaMarketWidgets.ts"; // 註冊報價列、電子熱力圖與排行榜（side effect）
-import "./velaAiAssistant.ts"; // 註冊「AI 副駕駛」側邊面板與頂列 "AI" 按鈕（side effect）
+import "./velaAiAssistant.ts"; // 註冊「AI 副駕駛」側邊面板（side effect）
 import "./velaMcpClient.ts"; // 連上 /__mcp 中轉，讓外部 AI（Claude Code／OMP）用 MCP 控制圖表（side effect）
 import "./velaContractRoll.ts"; // 期貨自動換月：以券商近月為準、假日／颱風順延（side effect）
 
@@ -386,7 +386,7 @@ export function VelaPage() {
     else setTimeout(() => void restoreParked(), 3000);
 
     // Pine seeding disabled — the auto-run loop was a freeze suspect. Pine scripts
-    // now load manually via the topbar Pine button.
+    // now load manually via the right-rail Pine Editor button.
 
     // Per-cell market chips: mount into every live cell host now, and re-mount
     // when layout changes spawn/destroy cells. Cells that disappear take their
