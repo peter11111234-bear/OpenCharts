@@ -5,7 +5,7 @@
 // (what the client hands the engine, against an independent full run).
 import { describe, it, expect } from 'vitest';
 import { createWorkerHandler } from '../pineWorker';
-import { PineRunClient, type WorkerLike } from '../pineWorkerClient';
+import { PineRunClient, plotChangeFrom, type WorkerLike } from '../pineWorkerClient';
 import { parse } from '../parser';
 import { runScript } from '../interpreter';
 import type { BarData, RunResult } from '../contracts';
@@ -116,5 +116,33 @@ describe('worker plot deltas on every advance', () => {
     expect(last.plotDelta).toBeDefined();
     expect(last.plotDelta!.every((d) => d.from === 0)).toBe(true);
     expect(view(r)).toEqual(view(await runScript(parse(SRC), bars)));
+  });
+
+  it('the client exposes plotChangeFrom: unset on a full emit, one bound per plot on a delta', async () => {
+    // The engine needs to know, per tick, which plots changed and from which
+    // bar — that is how buildModel rebuilds only the tail instead of all
+    // 5000 points per plot. A full emit (or any path that ships whole plots)
+    // must leave the WeakMap empty so the engine rebuilds everything.
+    const handler = createWorkerHandler((m) => { queueMicrotask(() => w.onmessage?.({ data: m })); });
+    const w: WorkerLike = {
+      onmessage: null, onerror: null, onmessageerror: null,
+      postMessage: (m: unknown) => queueMicrotask(() => handler(m as ToWorker)),
+      terminate: () => {},
+    };
+    const c = new PineRunClient({ factory: () => w });
+    const parsed = parse(SRC);
+    let bars = mkBars(60);
+    const first = await c.run({ parsed, bars, opts: { incKey: 'pc' } });
+    expect(plotChangeFrom.get(first)).toBeUndefined();
+    for (let t = 1; t < 5; t++) {
+      bars = nextTape(bars, t);
+      const r = await c.run({ parsed, bars, opts: { incKey: 'pc' } });
+      const from = plotChangeFrom.get(r);
+      expect(from, `tick ${t}`).toBeDefined();
+      expect([...from!.keys()].sort()).toEqual([...r.plots.keys()].sort());
+      for (const [k, p] of r.plots) {
+        expect(from!.get(k), `tick ${t} ${k}`).toBeLessThanOrEqual(p.values.length);
+      }
+    }
   });
 });

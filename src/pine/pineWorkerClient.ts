@@ -200,6 +200,16 @@ const sameBar = (a: BarData | undefined, b: BarData | undefined): boolean =>
     a.high === b.high && a.low === b.low && a.close === b.close &&
     a.volume === b.volume && a.closeTime === b.closeTime);
 
+/**
+ * Per-result record of the first changed bar of EVERY surviving plot:
+ * `plotKey → index`. A delta key carries the worker's `from`; a plot the delta
+ * did not mention maps to its current length (unchanged). Only delta emits carry
+ * an entry — a full emit, an in-process run, or a failed run leaves it absent,
+ * and the model builder then rebuilds every point. Weak so the retained plot map
+ * and the emitted result stay collectable together.
+ */
+export const plotChangeFrom = new WeakMap<RunResult, Map<string, number>>();
+
 export class PineRunClient {
   private worker: WorkerLike | null = null;
   private pending: PendingRun | null = null;
@@ -395,9 +405,12 @@ export class PineRunClient {
           if (msg.plotDelta !== undefined) {
             // Incremental reuse — patch the retained plot map in place.
             const plots = this.lastPlots ?? new Map();
+            // First changed bar per plot, for the engine's tail-only rebuild.
+            const changed = new Map<string, number>();
             for (const d of msg.plotDelta) {
               if (d.drop) { plots.delete(d.key); continue; }
               const t = d.tail!;
+              changed.set(d.key, d.from);
               const cur = plots.get(d.key);
               if (!cur || d.from === 0) {
                 plots.set(d.key, { index: t.index, time: t.time.slice(), values: t.values.slice(), opts: t.opts, colors: t.colors.slice() });
@@ -411,8 +424,13 @@ export class PineRunClient {
               cur.colors.push(...t.colors);
               cur.opts = t.opts;
             }
+            // A plot the delta did not mention is unchanged: its tail starts at
+            // the current end, so the builder keeps every point it already has.
+            for (const [k, pl] of plots) if (!changed.has(k)) changed.set(k, pl.values.length);
             this.lastPlots = plots;
-            p.resolve({ ...msg.result, plots });
+            const result: RunResult = { ...msg.result, plots };
+            plotChangeFrom.set(result, changed);
+            p.resolve(result);
           } else {
             // Full emit — retain as the new baseline for future deltas.
             this.lastPlots = msg.result.plots;

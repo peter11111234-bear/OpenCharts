@@ -22,7 +22,7 @@ import { recordRunTiming } from './debugFlags';
 import { collectInputs, incRun, type IncLive, type ParsedInput, type RunOptions } from './interpreter';
 import { tfFloor, tfNext } from './mtf';
 import { modelCacheGet, modelCachePut } from './modelCache';
-import { PineRunTimeoutError } from './pineWorkerClient';
+import { PineRunTimeoutError, plotChangeFrom } from './pineWorkerClient';
 import './builtins/index';
 import './mtf';
 
@@ -386,6 +386,11 @@ export class PineInterpreterEngine implements ScriptingEngine {
     // tick costs ~one bar of eval, not a full tape — keep updating.
     const HEAVY_RUN_MS = 500;
     let lastRunMs = 0;
+    // Retained line-series points of the last emitted model, keyed by series
+    // id — buildModel truncates+appends only the tail the worker changed
+    // (see its `reuse` param). Cleared whenever a run cannot prove its tail
+    // is honest: a full emit, the cached first run, or a failed run.
+    const lineCache = new Map<string, SeriesPointLike[]>();
     // Fingerprint of the tape a run was requested with: length + last bar's
     // time. Identical + same time → same forming bar, newer data.
     let lastTapeKey = '';
@@ -483,7 +488,14 @@ export class PineInterpreterEngine implements ScriptingEngine {
               recordRunTiming(barData.length, Math.round(lastRunMs));
             } catch { /* headless */ }
             if (stopped || myRun !== runId) continue;
-            const model = buildModel(token.modelId, req, result, barTimes, runInputs);
+            // Which plots changed, and from which bar (worker delta emits only).
+            // Undefined → no tail information: rebuild every point. The first
+            // (cached) run must never hand its arrays to the async cache write,
+            // so it rebuilds too — and drops its arrays from the cache.
+            const changeFrom = plotChangeFrom.get(result);
+            if (cacheKey || changeFrom === undefined) lineCache.clear();
+            const model = buildModel(token.modelId, req, result, barTimes, runInputs,
+              cacheKey ? undefined : { from: changeFrom, cache: lineCache });
             if (cacheKey) void modelCachePut(cacheKey, model, barTimes[barTimes.length - 1] ?? 0);
             handlers.onModel(model);
             for (const w of result.warnings) handlers.onWarning?.({ message: w, bar: bars.length - 1 });
@@ -496,6 +508,9 @@ export class PineInterpreterEngine implements ScriptingEngine {
             handlers.onDone?.();
           } catch (e) {
             if (stopped || myRun !== runId) continue;
+            // The failed run may have left the worker's session inconsistent, so
+            // no retained tail is trustworthy — the next run rebuilds fully.
+            lineCache.clear();
             // Stale cached curves must not stay up as if current: empty every
             // series before reporting the error.
             if (shownPrefix) {
@@ -686,8 +701,19 @@ const clearedModel = (m: IndicatorModel): IndicatorModel => ({
   }),
 });
 
+/** One point of a line-like series (Vela's `SeriesPoint` is not re-exported). */
+export type SeriesPointLike = { time: number; value: number | null; color?: string };
+
+/** Tail-reuse hint for `buildModel`: per-plot first changed bar index (absent
+ *  `from` = rebuild everything) plus the frozen points arrays retained from the
+ *  previous model, keyed by series id. */
+export interface ModelReuse {
+  from: Map<string, number> | undefined;
+  cache: Map<string, SeriesPointLike[]>;
+}
+
 /** Exported for tests — maps an interpreter RunResult onto the Vela model. */
-export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult, barTimes: number[], inputOverrides?: Record<string, InputValue>): IndicatorModel => {
+export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult, barTimes: number[], inputOverrides?: Record<string, InputValue>, reuse?: ModelReuse): IndicatorModel => {
   const series: IndicatorModel['series'] = [];
   const fills: ModelFill[] = [];
   const backgrounds: ModelBg[] = [];
@@ -859,12 +885,34 @@ export const buildModel = (modelId: string, req: ExecutionRequest, r: RunResult,
       }
       continue;
     }
-    const points = plot.values.map((v, i) => ({
-      time: plot.time[i] ?? barTimes[i] ?? 0,
-      value: numOf(v),
-      // Per-bar `color=` (conditional colors) — SeriesPoint.color override.
-      color: plot.colors[i],
-    }));
+    // Line points: rebuild only the tail the worker said changed. The array is
+    // mutated in place — Vela reads a series' contents every frame and holds no
+    // identity-based cache, so the retaining (and truncation) is safe, and it
+    // skips ~5000 point objects per plot per tick. Points stay 1:1 with
+    // plot.values (no filtering here), so index alignment is preserved.
+    const retained = reuse?.cache.get(id);
+    const from = reuse?.from?.get(title);
+    let points: SeriesPointLike[];
+    if (reuse !== undefined && from !== undefined && retained !== undefined) {
+      points = retained;
+      points.length = Math.min(from, points.length);
+      for (let i = points.length; i < plot.values.length; i++) {
+        points.push({
+          time: plot.time[i] ?? barTimes[i] ?? 0,
+          value: numOf(plot.values[i]!),
+          // Per-bar `color=` (conditional colors) — SeriesPoint.color override.
+          color: plot.colors[i],
+        });
+      }
+    } else {
+      points = plot.values.map((v, i) => ({
+        time: plot.time[i] ?? barTimes[i] ?? 0,
+        value: numOf(v),
+        // Per-bar `color=` (conditional colors) — SeriesPoint.color override.
+        color: plot.colors[i],
+      }));
+    }
+    reuse?.cache.set(id, points);
     plotSeriesId.set(plot.index, id);
     series.push({
       id, title, paneId: '', kind: plotKindOf(style),
