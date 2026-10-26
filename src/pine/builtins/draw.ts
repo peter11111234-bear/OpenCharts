@@ -109,7 +109,7 @@ function created(ctx: RtCtx, kind: 'line' | 'label' | 'box' | 'table' | 'polylin
   while (live.length > quota) {
     const old = live[0]!;
     live.shift();
-    if (old !== obj) drawSink(ctx).remove(old);
+    if (old !== obj) { drawSink(ctx).remove(old); markDeleted(old); }
   }
   return obj;
 }
@@ -187,10 +187,20 @@ function asObj(v: Value | undefined): DrawObj | undefined {
   switch (v?.kind) {
     case 'line': case 'label': case 'box': case 'table':
     case 'polyline': case 'linefill':
-      return v.v;
+      return v.v.props[DELETED] ? undefined : v.v;
     default:
       return undefined;
   }
+}
+
+/** Props flag on a deleted drawing. Scripts keep the handle in their arrays;
+ *  TV then reads na from it and ignores its setters and copy — asObj treats
+ *  it as gone.
+ *  It lives in props so an incremental rollback (which restores props from
+ *  the checkpoint) revives a drawing deleted on a discarded tick. */
+const DELETED = '__deleted';
+function markDeleted(obj: DrawObj): void {
+  obj.props[DELETED] = true;
 }
 
 type PropType = 'num' | 'coord' | 'str' | 'bool';
@@ -362,6 +372,7 @@ registerBuiltin('line', 'delete', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) {
     drawSink(ctx).remove(obj);
+    markDeleted(obj);
     const live = liveArr(ctx, 'line');
     const i = live.indexOf(obj);
     if (i >= 0) live.splice(i, 1);
@@ -432,6 +443,7 @@ registerBuiltin('label', 'delete', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) {
     drawSink(ctx).remove(obj);
+    markDeleted(obj);
     const live = liveArr(ctx, 'label');
     const i = live.indexOf(obj);
     if (i >= 0) live.splice(i, 1);
@@ -518,6 +530,7 @@ registerBuiltin('box', 'delete', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) {
     drawSink(ctx).remove(obj);
+    markDeleted(obj);
     const live = liveArr(ctx, 'box');
     const i = live.indexOf(obj);
     if (i >= 0) live.splice(i, 1);
@@ -664,6 +677,7 @@ registerBuiltin('table', 'delete', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) {
     drawSink(ctx).remove(obj);
+    markDeleted(obj);
     const live = liveArr(ctx, 'table');
     const i = live.indexOf(obj);
     if (i >= 0) live.splice(i, 1);
@@ -761,6 +775,7 @@ registerBuiltin('polyline', 'delete', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) {
     drawSink(ctx).remove(obj);
+    markDeleted(obj);
     const live = liveArr(ctx, 'polyline');
     const i = live.indexOf(obj);
     if (i >= 0) live.splice(i, 1);
@@ -825,6 +840,7 @@ registerBuiltin('linefill', 'delete', (c, args) => {
   const obj = asObj(args[0]);
   if (obj) {
     drawSink(ctx).remove(obj);
+    markDeleted(obj);
     const live = liveArr(ctx, 'linefill');
     const i = live.indexOf(obj);
     if (i >= 0) live.splice(i, 1);

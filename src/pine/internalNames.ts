@@ -51,4 +51,5 @@ export const INTERNAL_NAMES: Record<string, string> = {
 
   // sentinels
   '__dynamic__': 'mtf sentinel: sym/tf spec that must be resolved at run time',
+  '__deleted': 'draw.ts props flag: the drawing was deleted or evicted; handles to it read na',
 };
