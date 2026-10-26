@@ -50,6 +50,14 @@ describe('e2e user scripts', () => {
     console.log('MACD701 → title:', r.title, '| plots:', [...r.plots.keys()].length, '| drawings:', r.drawings.length, '| warns:', r.warnings.slice(0, 6));
     check(r, { minPlots: 3 });
   }, 60000);
+  // The repo copy (scripts/golden/src): the old high452 path is gone.
+  it('見高K4.55', async () => {
+    const src = readFileSync('scripts/golden/src/見高K4.55.TXT', 'utf8').replace(/^﻿/, '');
+    const parsed = parse(src);
+    const r = await runScript(parsed, mkBars(500), { symbol: '2330', timeframe: '15' });
+    console.log('K455 → plots:', [...r.plots.keys()].length, '| drawings:', r.drawings.length, '| warns:', r.warnings.slice(0, 6));
+    check(r, { minPlots: 5, minDrawings: 1 });
+  }, 60000);
   it('TRIS390', async () => {
     const src = readFileSync('C:/Users/bear9/high452/TRIS39/TRIS390.TXT', 'utf8').replace(/^\uFEFF/, '');
     const parsed = parse(src);

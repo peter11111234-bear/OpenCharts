@@ -1250,7 +1250,8 @@ function ensureTfFrame(spec: SecuritySpec, frame: { scope: Scope; ctx: BuiltinCt
     },
     callUdf: (fn, args) => invokeUdf(spec, fn, args),
     // Globals the expression reads re-run their input.* calls here: same user
-    // overrides, same per-input ids as on the chart.
+    // overrides, same per-input ids as on the chart. Spread, because these are
+    // RtCtx fields the BuiltinCtx literal type would reject as excess properties.
     ...{ inputs: (parent as RtCtx).inputs, inputPlan: (parent as RtCtx).inputPlan },
   };
 }

@@ -12,11 +12,10 @@ import { parse } from '../parser';
 import { checkScript } from '../checks';
 
 /** Scripts shipped in the repo — always present. */
-const IN_REPO = ['src/pine/ema-sample.pine', 'src/pine/TRIS390.pine', 'final.pine'];
+const IN_REPO = ['src/pine/ema-sample.pine', 'src/pine/TRIS390.pine', 'final.pine', 'scripts/golden/src/見高K4.55.TXT'];
 
 /** The user's real scripts (the e2e corpus). Absent on a fresh clone. */
 const LOCAL_CORPUS = [
-  'C:/Users/bear9/high452/HIGH455/見高K4.54/見高K4.55.TXT',
   'C:/Users/bear9/high452/HP/MZigZag - HP.TXT',
   'C:/Users/bear9/high452/MACD701.TXT',
   'C:/Users/bear9/high452/MACDV7.04/MACD701_v72.pine',
