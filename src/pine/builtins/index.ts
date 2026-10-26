@@ -10,6 +10,7 @@ import './math';
 import './str';
 import './array';
 import './map';
+import './matrix';
 import './color';
 import './request';
 import './datasource';
