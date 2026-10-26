@@ -38,7 +38,7 @@
 import type { ArrowFunc, Call, FuncDecl, Member, MethodDecl, Node, Reassign } from './contracts';
 import { childNodes } from './astWalk';
 import { debugFlag } from './debugFlags';
-import { CONST_INPUTS, defvalArg, provenSeries } from './qualifiers';
+import { CONST_INPUTS, defvalArg, provenPriceSource, provenSeries } from './qualifiers';
 import { ParseError } from './parser';
 import type { ParsedInput } from './interpreter';
 
@@ -204,6 +204,10 @@ const RULES: readonly Rule[] = [
       const defval = defvalArg(node.args);
       if (defval === undefined) return;
       const globalValues = ctx.globalValues;
+      // Bare `input(close)` is TV's series overload (same meaning as
+      // input.source) and builtins/input.ts implements that branch, so a price
+      // source default is legal — only scalar `input.*` spellings demand const.
+      if (name === 'input' && provenPriceSource(defval)) return;
       if (provenSeries(defval, (n) => globalValues.get(n), ctx.mutable)) {
         diag(ctx, node, 'input-const',
           `Cannot call '${name}' with a series 'defval' — TV requires a const default`);

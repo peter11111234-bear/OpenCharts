@@ -8,6 +8,9 @@ import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { parse } from '../parser';
 import { checkScript } from '../checks';
+import { runScript } from '../interpreter';
+import '../builtins/index';
+import { mkBars } from './golden';
 import { provenSeries } from '../qualifiers';
 import type { Node } from '../contracts';
 
@@ -93,13 +96,32 @@ describe('input-const gate', () => {
     ].join('\n');
     expect(rules(indicator(clean))).toEqual([]);
   });
+
+  it('accepts a bare input() with a price-source default (TV series overload)', () => {
+    expect(rules(indicator('a = input(close)\nb = input(hl2, "src")\nplot(a + b)'))).toEqual([]);
+  });
+
+  it('the exempted input(close) really tracks close on every bar', async () => {
+    const r = await runScript(parse(indicator('a = input(close)\nplot(a, "a")\nplot(close, "c")')),
+      mkBars(6), { symbol: 'X', timeframe: '1' } as never);
+    const [a, c] = [...r.plots.values()].map((p) => p.values.map((v) => (v.kind === 'float' ? v.v : null)));
+    expect(new Set(c).size).toBeGreaterThan(1);
+    expect(a).toEqual(c);
+  });
+
+  it('still rejects a bare input() whose series default is not a price source', () => {
+    expect(rules(indicator('a = input(ta.sma(close, 3))\nplot(close)'))).toEqual(['input-const']);
+    // An alias is not exempt: at run time input() only recognises the price
+    // series itself, so `input(p)` would freeze at bar 0's value.
+    expect(rules(indicator('p = ohlc4\na = input(p)\nplot(a)'))).toEqual(['input-const']);
+  });
 });
 
 describe('the gate against real scripts', () => {
   it('does not fire on the shipped corpus', () => {
     const files = [
       'src/pine/ema-sample.pine', 'src/pine/TRIS390.pine', 'final.pine',
-      'C:/Users/bear9/high452/HIGH455/見高K4.54/見高K4.55.TXT',
+      'scripts/golden/src/見高K4.55.TXT',
       'C:/Users/bear9/high452/HP/MZigZag - HP.TXT',
       'C:/Users/bear9/high452/MACD701.TXT',
       'C:/Users/bear9/high452/MACDV7.04/MACD701_v72.pine',

@@ -27,13 +27,33 @@ const SERIES_NAMES = new Set([
 const SERIES_PREFIXES = ['ta.', 'request.', 'strategy.'];
 
 /** input.* spellings whose `defval` TV documents as `const` — so a series
- *  default is a compile error there and a wrong default here. `input.source`
- *  is deliberately absent: its defval IS allowed to be a series. */
+ *  default is a compile error there and a wrong default here.
+ *  `input.source` is deliberately absent: its defval IS allowed to be a series.
+ *  Bare `input` IS listed but exempted in checks.ts for price sources — see
+ *  `provenPriceSource`: `input(close)` is TV's series overload (same as
+ *  input.source), and builtins/input.ts implements exactly that branch. */
 export const CONST_INPUTS = new Set([
   'input', 'input.bool', 'input.int', 'input.float', 'input.string', 'input.color',
   'input.time', 'input.timeframe', 'input.symbol', 'input.session', 'input.text_area',
   'input.price', 'input.enum',
 ]);
+
+/** Builtin price series a bare `input(...)` may take as its default — the same
+ *  list builtins/input.ts recognises as a source (SOURCES there). */
+const SOURCE_NAMES: Record<string, true> = {
+  open: true, high: true, low: true, close: true,
+  hl2: true, hlc3: true, ohlc4: true, hlcc4: true,
+  volume: true, time: true,
+};
+
+/** True when `node` names one of the builtin price series directly, so a bare
+ *  `input(x)` is a source input rather than a scalar default. An alias
+ *  (`p = ohlc4; input(p)`) does not count: builtins/input.ts matches the
+ *  series object itself, and a declared name holds a copy-on-write wrapper,
+ *  so at run time it takes the scalar branch and freezes at bar 0. */
+export function provenPriceSource(node: Node): boolean {
+  return node.type === 'ident' && SOURCE_NAMES[node.name] === true;
+}
 
 /** Resolves a global name to the expression that produced it (top-level decls). */
 export type QualifierLookup = (name: string) => Node | undefined;
